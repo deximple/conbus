@@ -1,5 +1,5 @@
 ---
-name: Shared workspace context
+name: Conbus
 overview: 목적지는 버스가 루프를 소유하고 턴 단위로 라우팅하는 것(A)이고, 0단계 수단은 벤더 TUI를 그대로 두는 훅 사이드카(B)다. Attach는 처음부터 두 모드를 갖고 정책을 아키텍처가 흡수한다. 첫 커밋은 레코더이며, 다음 벤더 정책 이벤트가 런치 창이다.
 todos:
   - id: recorder-first

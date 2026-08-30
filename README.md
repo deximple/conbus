@@ -4,7 +4,7 @@ A conversation bus for coding agents.
 
 One conversation keeps its identity while the harness underneath it changes. Claude Code hits its limit mid-task, the turn continues in Codex, and nothing gets re-explained. The bus owns the conversation state, the ID, and the routing. The vendor CLI stays exactly as you know it.
 
-Status: design. No code yet. See [PLAN.md](PLAN.md) for the full design, the risk register, and what is still undecided.
+Status: design. No code yet. The full design, the risk register, and the open decisions live in [the plan](.cursor/plans/shared_workspace_context_3f7139b8.plan.md), which is the single source of truth while this is still a design. A reader-facing copy gets generated under `docs/` when the repo goes public.
 
 ## The shape of it
 
