@@ -13,12 +13,19 @@ fn map_bodies(event: &Event, f: impl Fn(&Body) -> Body) -> Event {
             author: author.clone(),
             prompt: f(prompt),
         },
+        // Spelled out rather than `..`: retention withholds bodies, and
+        // silencing this arm by dropping the identity or the timing would
+        // withhold metadata at every level, including `Full`.
         Event::ToolUse {
             tool,
+            tool_use_id,
+            duration_ms,
             input,
             output,
         } => Event::ToolUse {
             tool: tool.clone(),
+            tool_use_id: tool_use_id.clone(),
+            duration_ms: *duration_ms,
             input: f(input),
             output: f(output),
         },
@@ -102,7 +109,7 @@ impl Retention {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::{Author, Body, Event, Harness, Source};
+    use crate::event::{Author, Body, Event, Harness, Source, VendorToolUseId};
     use crate::record::SCHEMA_VERSION;
 
     fn tool_use(input: Body, output: Body) -> Record {
@@ -120,6 +127,8 @@ mod tests {
             vendor_agent_id: None,
             event: Event::ToolUse {
                 tool: "Read".into(),
+                tool_use_id: None,
+                duration_ms: None,
                 input,
                 output,
             },
@@ -183,6 +192,43 @@ mod tests {
             "clip must not waste a whole character"
         );
         assert_eq!(*original_bytes, korean.len());
+    }
+
+    #[test]
+    fn redaction_keeps_a_tool_calls_identity_and_duration() {
+        // Retention withholds tool *bodies*. The identity and the timing are
+        // metadata, and metadata is what keeps an elided log useful — the same
+        // reason `Body::Elided` keeps its byte count. Silencing the compiler
+        // here with `..` or `None` would drop both at every level.
+        let record = Record {
+            event: Event::ToolUse {
+                tool: "Read".into(),
+                tool_use_id: Some(VendorToolUseId::new("toolu_01ABC")),
+                duration_ms: Some(37),
+                input: Body::kept("in"),
+                output: Body::kept("out"),
+            },
+            ..tool_use(Body::kept(""), Body::kept(""))
+        };
+
+        for level in [Retention::Full, Retention::ConversationOnly] {
+            let redacted = level.redact(&record).expect("a tool use is logged");
+
+            let Event::ToolUse {
+                tool_use_id,
+                duration_ms,
+                ..
+            } = &redacted.event
+            else {
+                panic!("the event kind must survive redaction");
+            };
+            assert_eq!(
+                tool_use_id.as_ref().map(VendorToolUseId::as_str),
+                Some("toolu_01ABC"),
+                "{level:?} dropped the tool use id"
+            );
+            assert_eq!(*duration_ms, Some(37), "{level:?} dropped the duration");
+        }
     }
 
     #[test]

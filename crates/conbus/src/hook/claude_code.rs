@@ -10,13 +10,16 @@
 //! Which fields are pinned by which: `session_id`, `hook_event_name`, `cwd`,
 //! `prompt`, `prompt_id`, `error`, `last_assistant_message`, and `reason` all
 //! appear in the captures. `agent_id`, `tool_name`, `tool_input`,
-//! `tool_response`, and `error_details` are from the schema only — no capture
-//! has exercised a subagent or a successful tool call yet. Treat those as
-//! unverified until a capture covers them.
+//! `tool_response`, `tool_use_id`, `duration_ms`, and `error_details` are from
+//! the schema and the emit sites only — **no capture contains a `PostToolUse`
+//! at all**, and none has exercised a subagent. Treat those as unverified until
+//! a capture covers them, and keep this list exhaustive when adding a field.
 
-use conbus_core::event::{Author, Body, Event, Harness, TurnState, VendorAgentId, VendorTurnId};
+use conbus_core::event::{
+    Author, Body, Event, Harness, TurnState, VendorAgentId, VendorToolUseId, VendorTurnId,
+};
 use conbus_core::registry::{Observed, SessionKey};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 
 /// Whether the payload's `prompt_id` names a turn of *this* conversation.
@@ -75,6 +78,17 @@ pub struct Payload {
     pub tool_name: Option<String>,
     #[serde(default)]
     pub tool_input: Option<Value>,
+    /// `PostToolUse`, `PreToolUse`, `PostToolUseFailure`. Required by the
+    /// schema on all three, so an absent one means the vendor changed — but
+    /// nothing here detects that, and the record is written without it rather
+    /// than rejected, because a hook that refuses a payload takes the turn down.
+    #[serde(default)]
+    pub tool_use_id: Option<String>,
+    /// `PostToolUse`, `PostToolUseFailure`. The schema marks it optional, and
+    /// 2.1.241 in fact measures on every path, so an absent one today means the
+    /// vendor changed rather than that it declined to measure.
+    #[serde(default, deserialize_with = "lenient_millis")]
+    pub duration_ms: Option<u64>,
     #[serde(default)]
     pub tool_response: Option<Value>,
     /// `StopFailure`. One of eleven values; see `failure_state`.
@@ -128,6 +142,8 @@ pub fn normalize(json: &str) -> Result<Normalized, HookError> {
         },
         "PostToolUse" => Event::ToolUse {
             tool: payload.tool_name.unwrap_or_default(),
+            tool_use_id: payload.tool_use_id.map(VendorToolUseId::new),
+            duration_ms: payload.duration_ms,
             input: body_of(payload.tool_input),
             output: body_of(payload.tool_response),
         },
@@ -157,6 +173,30 @@ pub fn normalize(json: &str) -> Result<Normalized, HookError> {
             event,
         },
     })
+}
+
+/// Read a duration without ever failing the payload.
+///
+/// Every other field here is a string or a raw `Value` so that an unfamiliar
+/// shape costs one field rather than the record. A typed number would break
+/// that invariant, and the vendor left room for it: this field is declared
+/// `number` with no integer constraint, unlike a dozen sibling duration fields
+/// in the same bundle that do carry one. `Payload` is also one struct for every
+/// hook event, so a strict parse here would let a future `duration_ms` on
+/// `Stop` start dropping turn-end records.
+///
+/// Anything that is not a finite, non-negative number that fits is recorded as
+/// no measurement at all, which is honest — we did not receive one we could
+/// read — and costs nothing else on the line.
+fn lenient_millis<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    Ok(value
+        .and_then(|value| value.as_f64())
+        .filter(|ms| ms.is_finite() && *ms >= 0.0 && *ms <= u64::MAX as f64)
+        .map(|ms| ms.round() as u64))
 }
 
 fn body_of(value: Option<Value>) -> Body {
@@ -374,20 +414,106 @@ mod tests {
     }
 
     #[test]
-    fn a_tool_call_keeps_its_name_and_both_bodies() {
+    fn a_tool_call_keeps_its_name_its_bodies_and_its_own_id() {
         let event = event_of(
             r#"{"session_id":"abc123","hook_event_name":"PostToolUse","tool_name":"Read",
-                "tool_input":{"file_path":"/etc/hosts"},"tool_response":{"ok":true}}"#,
+                "tool_input":{"file_path":"/etc/hosts"},"tool_response":{"ok":true},
+                "tool_use_id":"toolu_01ABC","duration_ms":37}"#,
         );
 
         assert_eq!(
             event,
             Event::ToolUse {
                 tool: "Read".into(),
+                tool_use_id: Some(VendorToolUseId::new("toolu_01ABC")),
+                duration_ms: Some(37),
                 input: Body::kept(r#"{"file_path":"/etc/hosts"}"#),
                 output: Body::kept(r#"{"ok":true}"#),
             }
         );
+    }
+
+    #[test]
+    fn a_duration_the_vendor_spells_differently_costs_the_duration_not_the_record() {
+        // Every other field on `Payload` is a string or a raw `Value` so that a
+        // shape surprise costs one field. A typed number breaks that invariant:
+        // the vendor declares this `number` with no integer constraint — unlike
+        // a dozen sibling duration fields in the same bundle, which do carry
+        // `.int()` — so a fractional millisecond is legal, and rejecting it
+        // would take the whole tool call out of the append-only log.
+        for (spelling, expected) in [
+            ("37", Some(37)),
+            ("37.0", Some(37)),
+            ("37.5", Some(38)),
+            ("-3", None),
+            ("\"37\"", None),
+            ("null", None),
+            ("1e300", None),
+        ] {
+            let event = event_of(&format!(
+                r#"{{"session_id":"abc123","hook_event_name":"PostToolUse","tool_name":"Read",
+                    "tool_input":{{}},"tool_response":{{}},"tool_use_id":"toolu_01ABC",
+                    "duration_ms":{spelling}}}"#
+            ));
+
+            let Event::ToolUse {
+                tool,
+                tool_use_id,
+                duration_ms,
+                ..
+            } = event
+            else {
+                panic!("a {spelling} duration cost the whole record");
+            };
+            assert_eq!(duration_ms, expected, "duration_ms:{spelling}");
+            assert_eq!(tool, "Read", "duration_ms:{spelling} lost the tool name");
+            assert_eq!(
+                tool_use_id,
+                Some(VendorToolUseId::new("toolu_01ABC")),
+                "duration_ms:{spelling} lost the tool use id"
+            );
+        }
+    }
+
+    #[test]
+    fn a_strange_duration_on_another_event_does_not_cost_that_record_either() {
+        // `Payload` is one struct for every hook event, so a `duration_ms` the
+        // vendor later adds to `Stop` in an unexpected shape must not start
+        // dropping the turn-end records the router depends on.
+        let event = event_of(
+            r#"{"session_id":"abc123","hook_event_name":"UserPromptSubmit","prompt":"hi",
+                "duration_ms":37.5}"#,
+        );
+
+        assert_eq!(
+            event,
+            Event::TurnStarted {
+                author: None,
+                prompt: Body::kept("hi"),
+            }
+        );
+    }
+
+    #[test]
+    fn a_tool_call_without_a_duration_records_no_duration_rather_than_zero() {
+        // `duration_ms` is optional on the wire — the emit site passes a
+        // parameter that can be undefined, which JSON drops. Zero is a
+        // measurement; absent is not, and a survival meter must tell them apart.
+        let event = event_of(
+            r#"{"session_id":"abc123","hook_event_name":"PostToolUse","tool_name":"Read",
+                "tool_input":{},"tool_response":{},"tool_use_id":"toolu_01ABC"}"#,
+        );
+
+        let Event::ToolUse {
+            duration_ms,
+            tool_use_id,
+            ..
+        } = event
+        else {
+            panic!("expected a tool call");
+        };
+        assert_eq!(duration_ms, None);
+        assert_eq!(tool_use_id, Some(VendorToolUseId::new("toolu_01ABC")));
     }
 
     #[test]

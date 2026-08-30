@@ -201,7 +201,8 @@ fn the_correlators_cross_the_socket_and_stay_with_their_own_records() {
         home.path(),
         r#"{"session_id":"s-1","hook_event_name":"PostToolUse","tool_name":"Read",
             "tool_input":{},"tool_response":{},"prompt_id":"TURN-1",
-            "agent_id":"AGENT-7","agent_type":"code-reviewer"}"#,
+            "agent_id":"AGENT-7","agent_type":"code-reviewer",
+            "tool_use_id":"toolu_01ABC","duration_ms":37}"#,
         &[],
     );
 
@@ -226,6 +227,12 @@ fn the_correlators_cross_the_socket_and_stay_with_their_own_records() {
         lines[2]
     );
     assert_eq!(lines[2]["vendor_turn_id"], "TURN-1");
+    assert_eq!(
+        lines[2]["tool_use_id"], "toolu_01ABC",
+        "the tool call's own id did not cross the socket: {:#?}",
+        lines[2]
+    );
+    assert_eq!(lines[2]["duration_ms"], 37, "{:#?}", lines[2]);
 
     daemon.stop();
 }

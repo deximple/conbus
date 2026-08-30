@@ -8,7 +8,7 @@ Written for whoever picks this up next. The design phase is finished and the rec
 - The plan is the single source of truth: [`.cursor/plans/shared_workspace_context_3f7139b8.plan.md`](.cursor/plans/shared_workspace_context_3f7139b8.plan.md). The filename is a generated ID and no longer matches the content; leave it alone so the Cursor plan UI keeps its association. A reader-facing copy under `docs/` gets generated when the repo goes public.
 - `cargo 1.94.1` and `rustc 1.94.1` are installed on this machine, so edition 2024 is available.
 - A cargo workspace exists: `crates/conbus` (the binary) and `crates/conbus-core` (the lib). Edition 2024.
-  95 tests, `cargo clippy --all-targets -- -D warnings` clean. See "Next task" for what is built and what is not.
+  103 tests, `cargo clippy --all-targets -- -D warnings` clean. See "Next task" for what is built and what is not.
 
 ## What Conbus is, in one paragraph
 
@@ -200,10 +200,19 @@ Take the lesson generally: **the adapter is only as good as the traffic it has b
   `error` has eleven values, collapsing account and request faults into `interrupted_quota` would make the failover
   counter lie, so there is now `interrupted_policy`. Both interrupted variants keep the vendor string verbatim.
   Nothing currently produces `interrupted_user` — Claude Code does not appear to distinguish it.
-- **Still dropped from payloads we already parse**, in the order they are worth having: `tool_use_id` on
-  `PostToolUse` (the only key that pairs a tool call with its `PreToolUse` and orders parallel calls in one batch),
-  `duration_ms`, `SessionStart.session_title` and `.model`, `permission_mode`, and `effort.level`. Each is a field on
-  a `Payload` we already deserialise.
+- **Still dropped from payloads we already parse**: `SessionStart.session_title` and `.model`, `permission_mode`,
+  and `effort.level`. Each is a field on a `Payload` we already deserialise.
+  (`tool_use_id` and `duration_ms` are recorded now, both verified at the emit site and not only in the schema —
+  the object literal carries them, unlike `UserPromptSubmit.source`, whose spread is compiled out. But do not
+  oversell `tool_use_id`: nothing joins on it yet, because the log holds one record per *successful* call and that
+  record already carries its own input and output. It becomes a join key when `PreToolUse` and
+  `PostToolUseFailure` are mirrored.)
+
+- **A tool call that fails produces no record at all.** The vendor emits `PostToolUseFailure` for it, not
+  `PostToolUse`, and we mirror only the latter. So the log's tool history is the *successful* tool history, which is
+  a strange thing for a source of truth to be — and it is the half a router would most want when deciding whether a
+  leg is healthy. Mirroring `PostToolUseFailure` (it carries `tool_use_id`, `error`, `is_interrupt`, `duration_ms`)
+  is the smallest change with the largest effect on what the log actually contains.
 - **`MessageDisplay` is not mirrored**, and it is the only official channel carrying every assistant message rather
   than the last one. High volume, and it collides with the "conversation only" shipping default, so it is a retention
   decision before it is an adapter change.
@@ -211,7 +220,9 @@ Take the lesson generally: **the adapter is only as good as the traffic it has b
 - **`agent_id` is recorded but unverified against traffic.** No capture has exercised a subagent yet. The schema says
   a subagent's hooks arrive under the parent's `session_id` with `agent_id` set; if that is wrong in the other
   direction — subagents getting their own `session_id` — the recorder has a bogus-session problem instead, which is
-  worse. Same for `tool_use_id`, `tool_input`, `tool_response` and `error_details`: schema only, no capture.
+  worse. Same for `tool_use_id`, `duration_ms`, `tool_input`, `tool_response` and `error_details`: read off the
+  schema and the emit sites, but **no capture has ever contained a `PostToolUse`** — neither probe session got past
+  authentication. That is the single most valuable capture still missing.
 - **`Registry::restore` reads the whole log at daemon start.** Correct, and cheap while the log is small. Once
   backfill lands it is a full scan on every start, and that is what the derived SQLite index is for.
 - **An older `v` is still read as if it were current.** `scan` rejects a record from a *newer* build; it has no

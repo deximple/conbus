@@ -37,7 +37,12 @@ fn summarise(record: &Record) -> String {
             format!("session-start {}", trigger.as_deref().unwrap_or("?"))
         }
         Event::TurnStarted { .. } => "turn-started".to_string(),
-        Event::ToolUse { tool, .. } => format!("tool {tool}"),
+        Event::ToolUse {
+            tool, duration_ms, ..
+        } => match duration_ms {
+            Some(ms) => format!("tool {tool} ({ms}ms)"),
+            None => format!("tool {tool}"),
+        },
         Event::TurnEnded { state, .. } => format!("turn-ended {state:?}"),
         Event::SessionEnded { reason } => {
             format!("session-end {}", reason.as_deref().unwrap_or("?"))
@@ -96,4 +101,74 @@ pub fn doctor(paths: &Paths) -> io::Result<()> {
         scan.defects.len()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use conbus_core::event::{Body, Harness, Source, VendorAgentId, VendorToolUseId};
+    use conbus_core::record::SCHEMA_VERSION;
+
+    fn record(event: Event) -> Record {
+        Record {
+            schema_version: SCHEMA_VERSION,
+            seq: 3,
+            ts: "2026-08-31T04:12:00.000Z".parse().expect("ts"),
+            bus_id: "01996b1e-2c4a-7c31-9d0e-4f2a6b8c1d3e".parse().expect("id"),
+            vendor_turn_id: None,
+            vendor_agent_id: None,
+            source: Source {
+                harness: Harness::new(Harness::CLAUDE_CODE),
+                harness_version: None,
+                vendor_session_id: None,
+            },
+            event,
+        }
+    }
+
+    fn tool(tool_use_id: Option<&str>, duration_ms: Option<u64>) -> Record {
+        record(Event::ToolUse {
+            tool: "Read".into(),
+            tool_use_id: tool_use_id.map(VendorToolUseId::new),
+            duration_ms,
+            input: Body::kept("i"),
+            output: Body::kept("o"),
+        })
+    }
+
+    #[test]
+    fn a_measured_tool_call_shows_its_duration_in_milliseconds() {
+        let line = summarise(&tool(None, Some(37)));
+
+        assert!(line.ends_with("tool Read (37ms)"), "{line}");
+    }
+
+    #[test]
+    fn an_unmeasured_tool_call_shows_no_duration_rather_than_zero() {
+        let line = summarise(&tool(None, None));
+
+        assert!(line.ends_with("tool Read"), "{line}");
+    }
+
+    #[test]
+    fn a_subagents_record_is_marked_so_two_agents_do_not_read_as_one() {
+        let mut record = tool(None, Some(37));
+        record.vendor_agent_id = Some(VendorAgentId::new("AGENT-7"));
+
+        let line = summarise(&record);
+
+        assert!(line.contains("[subagent AGENT-7]"), "{line}");
+    }
+
+    #[test]
+    fn the_summary_leads_with_the_timestamp_sequence_conversation_and_harness() {
+        let line = summarise(&tool(None, None));
+
+        assert!(line.starts_with("2026-08-31T04:12:00.000Z "), "{line}");
+        assert!(
+            line.contains("01996b1e-2c4a-7c31-9d0e-4f2a6b8c1d3e"),
+            "{line}"
+        );
+        assert!(line.contains("claude_code"), "{line}");
+    }
 }

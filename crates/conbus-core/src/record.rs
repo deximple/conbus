@@ -67,7 +67,7 @@ pub struct Entry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::{Author, Body, Harness, TurnState};
+    use crate::event::{Author, Body, Harness, TurnState, VendorToolUseId};
 
     fn source() -> Source {
         Source {
@@ -137,6 +137,8 @@ mod tests {
             },
             Event::ToolUse {
                 tool: "Read".into(),
+                tool_use_id: Some(VendorToolUseId::new("toolu_01ABC")),
+                duration_ms: Some(37),
                 input: Body::kept("i"),
                 output: Body::kept("o"),
             },
@@ -222,6 +224,19 @@ mod tests {
             );
         }
         assert!(line.contains(r#""author":"schedule_wakeup""#), "{line}");
+
+        // The same, for the fields that only exist on a tool call.
+        let line = serde_json::to_string(&fully_populated(Event::ToolUse {
+            tool: "Read".into(),
+            tool_use_id: Some(VendorToolUseId::new("toolu_01ABC")),
+            duration_ms: Some(37),
+            input: Body::kept("i"),
+            output: Body::kept("o"),
+        }))
+        .expect("serialise");
+
+        assert!(line.contains(r#""tool_use_id":"toolu_01ABC""#), "{line}");
+        assert!(line.contains(r#""duration_ms":37"#), "{line}");
     }
 
     #[test]
