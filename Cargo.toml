@@ -1,0 +1,24 @@
+[workspace]
+resolver = "3"
+members = ["crates/conbus", "crates/conbus-core"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.94"
+license = "Apache-2.0"
+repository = "https://github.com/deximple/conbus"
+publish = false
+
+[workspace.dependencies]
+conbus-core = { path = "crates/conbus-core" }
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+time = { version = "0.3", default-features = false, features = ["std", "formatting", "parsing", "macros"] }
+tempfile = "3"
+uuid = { version = "1", default-features = false, features = ["v7", "std"] }
+
+[profile.release]
+lto = "thin"
+strip = "debuginfo"

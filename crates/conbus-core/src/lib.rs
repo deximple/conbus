@@ -1,0 +1,11 @@
+//! Core types for the Conbus conversation bus: identity, events, and the
+//! append-only log that is the source of truth.
+
+pub mod clock;
+pub mod event;
+pub mod ids;
+pub mod paths;
+pub mod record;
+pub mod registry;
+pub mod retention;
+pub mod segment;
