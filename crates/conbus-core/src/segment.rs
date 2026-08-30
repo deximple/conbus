@@ -6,9 +6,7 @@ use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::clock::Timestamp;
-use crate::event::{Event, Source};
-use crate::ids::BusId;
-use crate::record::{Record, SCHEMA_VERSION};
+use crate::record::{Entry, Record, SCHEMA_VERSION};
 use crate::retention::Retention;
 
 const SEGMENT_PREFIX: &str = "segment-";
@@ -66,18 +64,31 @@ fn heal_torn_tail(path: &Path, file: &mut File) -> io::Result<u64> {
     Ok(len + 1)
 }
 
+/// Just enough of a record to resume the sequence.
+///
+/// Deliberately not `Record`: a line written by a newer build may carry an
+/// event variant this one cannot name, and parsing the whole record would make
+/// that line's sequence number invisible. The next append would then reuse a
+/// number already on disk — duplicate keys in the source of truth, with no
+/// defect to say so. A sequence is a sequence whatever the event turns out
+/// to be.
+#[derive(serde::Deserialize)]
+struct SequenceOnly {
+    seq: u64,
+}
+
 /// The highest sequence number already on disk.
 ///
-/// Walks segments newest-first and stops at the first one holding a readable
-/// record, so a restart costs one segment rather than the whole log.
+/// Walks segments newest-first and stops at the first one holding a numbered
+/// line, so a restart costs one segment rather than the whole log.
 fn last_sequence(segments: &[PathBuf]) -> io::Result<Option<u64>> {
     for segment in segments.iter().rev() {
         let reader = BufReader::new(File::open(segment)?);
         let highest = reader
             .lines()
             .map_while(Result::ok)
-            .filter_map(|line| serde_json::from_str::<Record>(&line).ok())
-            .map(|record| record.seq)
+            .filter_map(|line| serde_json::from_str::<SequenceOnly>(&line).ok())
+            .map(|numbered| numbered.seq)
             .max();
         if highest.is_some() {
             return Ok(highest);
@@ -152,19 +163,16 @@ impl SegmentLog {
 
     /// Append one event. Returns the sequence number it was written under, or
     /// `None` when retention withheld it.
-    pub fn append(
-        &mut self,
-        bus_id: BusId,
-        source: &Source,
-        event: Event,
-    ) -> io::Result<Option<u64>> {
+    pub fn append(&mut self, entry: Entry) -> io::Result<Option<u64>> {
         let record = Record {
             schema_version: SCHEMA_VERSION,
             seq: self.next_seq,
             ts: Timestamp::now(),
-            bus_id,
-            source: source.clone(),
-            event,
+            bus_id: entry.bus_id,
+            vendor_turn_id: entry.vendor_turn_id,
+            vendor_agent_id: entry.vendor_agent_id,
+            source: entry.source,
+            event: entry.event,
         };
         // Retention is applied here, inside the only path to disk, so that no
         // caller can write a body the workspace said to withhold.
@@ -218,6 +226,18 @@ impl SegmentLog {
                     continue;
                 }
                 match serde_json::from_str::<Record>(&line) {
+                    // A newer writer may have changed what a field means. Reading
+                    // it as though we understood it is worse than reporting it.
+                    Ok(record) if record.schema_version > SCHEMA_VERSION => {
+                        scan.defects.push(Defect {
+                            segment: segment.clone(),
+                            line: index as u64 + 1,
+                            reason: format!(
+                                "record schema v{} is newer than this build's v{SCHEMA_VERSION}",
+                                record.schema_version
+                            ),
+                        })
+                    }
                     Ok(record) => scan.records.push(record),
                     Err(err) => scan.defects.push(Defect {
                         segment: segment.clone(),
@@ -234,13 +254,31 @@ impl SegmentLog {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::{Body, Harness, TurnState};
+    use crate::event::{Body, Event, Harness, Source, TurnState};
+    use crate::ids::BusId;
 
     fn source() -> Source {
         Source {
             harness: Harness::new(Harness::CLAUDE_CODE),
             harness_version: None,
             vendor_session_id: None,
+        }
+    }
+
+    fn entry(bus_id: BusId, event: Event) -> Entry {
+        Entry {
+            bus_id,
+            source: source(),
+            vendor_turn_id: None,
+            vendor_agent_id: None,
+            event,
+        }
+    }
+
+    fn prompt(text: &str) -> Event {
+        Event::TurnStarted {
+            author: None,
+            prompt: Body::kept(text),
         }
     }
 
@@ -253,14 +291,8 @@ mod tests {
             .expect("open");
 
         for n in 0..12 {
-            log.append(
-                bus_id,
-                &source(),
-                Event::TurnStarted {
-                    prompt: Body::kept(format!("turn {n}")),
-                },
-            )
-            .expect("append");
+            log.append(entry(bus_id, prompt(&format!("turn {n}"))))
+                .expect("append");
         }
 
         let segments = std::fs::read_dir(dir.path())
@@ -288,31 +320,85 @@ mod tests {
         let mut log = SegmentLog::open_with_segment_size(dir.path(), Retention::default(), 512)
             .expect("open");
         for n in 0..12 {
-            log.append(
-                bus_id,
-                &source(),
-                Event::TurnStarted {
-                    prompt: Body::kept(format!("turn {n}")),
-                },
-            )
-            .expect("append");
+            log.append(entry(bus_id, prompt(&format!("turn {n}"))))
+                .expect("append");
         }
         drop(log);
 
         let mut log = SegmentLog::open_with_segment_size(dir.path(), Retention::default(), 512)
             .expect("reopen");
         let seq = log
-            .append(
+            .append(entry(
                 bus_id,
-                &source(),
                 Event::TurnEnded {
                     state: TurnState::Complete,
                     assistant_message: None,
                 },
-            )
+            ))
             .expect("append");
 
         assert_eq!(seq, Some(12));
+    }
+
+    #[test]
+    fn a_line_this_build_cannot_parse_still_advances_the_sequence() {
+        // A newer build may write an event variant this one does not know. If
+        // resuming skips those lines, the next append reuses a sequence number
+        // that is already on disk — silent duplicate keys in the source of
+        // truth, and no defect anywhere to say so.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut log = SegmentLog::open(dir.path(), Retention::default()).expect("open");
+        log.append(entry(BusId::mint(), prompt("from this build")))
+            .expect("append");
+        let segment = dir.path().join("segment-00000000.jsonl");
+        let mut newer = OpenOptions::new()
+            .append(true)
+            .open(&segment)
+            .expect("open segment");
+        newer
+            .write_all(
+                br#"{"v":1,"seq":41,"ts":"2026-08-30T07:41:02.481Z","bus_id":"01996b1e-2c4a-7c31-9d0e-4f2a6b8c1d3e","harness":"claude_code","event":"message_displayed","delta":"hi"}"#,
+            )
+            .expect("write");
+        newer.write_all(b"\n").expect("newline");
+        drop(newer);
+
+        let mut log = SegmentLog::open(dir.path(), Retention::default()).expect("reopen");
+        let seq = log
+            .append(entry(BusId::mint(), prompt("from this build again")))
+            .expect("append");
+
+        assert_eq!(
+            seq,
+            Some(42),
+            "resumed on top of a sequence already on disk"
+        );
+    }
+
+    #[test]
+    fn a_record_from_a_newer_build_is_reported_rather_than_read_as_if_understood() {
+        // A newer writer may have changed what a field means. Parsing it with
+        // this build's assumptions is a silent misread of the source of truth,
+        // which is worse than saying we cannot read it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut log = SegmentLog::open(dir.path(), Retention::default()).expect("open");
+        log.append(entry(BusId::mint(), prompt("from this build")))
+            .expect("append");
+        let segment = dir.path().join("segment-00000000.jsonl");
+        let future = std::fs::read_to_string(&segment)
+            .expect("read")
+            .replace("\"v\":1", "\"v\":99");
+        std::fs::write(&segment, future).expect("write");
+
+        let scan = SegmentLog::scan(dir.path()).expect("scan");
+
+        assert_eq!(scan.records, vec![], "a v99 record must not be read as v1");
+        assert_eq!(scan.defects.len(), 1, "and it must be reported");
+        assert!(
+            scan.defects[0].reason.contains("v99"),
+            "{:?}",
+            scan.defects[0]
+        );
     }
 
     #[test]
@@ -321,15 +407,7 @@ mod tests {
         let bus_id = BusId::mint();
         let mut log = SegmentLog::open(dir.path(), Retention::Ephemeral).expect("open");
 
-        let seq = log
-            .append(
-                bus_id,
-                &source(),
-                Event::TurnStarted {
-                    prompt: Body::kept("secret"),
-                },
-            )
-            .expect("append");
+        let seq = log.append(entry(bus_id, prompt("secret"))).expect("append");
 
         assert_eq!(seq, None);
         assert_eq!(
@@ -344,14 +422,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let bus_id = BusId::mint();
         let mut log = SegmentLog::open(dir.path(), Retention::default()).expect("open");
-        log.append(
-            bus_id,
-            &source(),
-            Event::TurnStarted {
-                prompt: Body::kept("intact"),
-            },
-        )
-        .expect("append");
+        log.append(entry(bus_id, prompt("intact"))).expect("append");
         drop(log);
 
         // The process died halfway through writing the next record.
@@ -378,14 +449,13 @@ mod tests {
         // And a restart must not reuse the sequence of the record that survived.
         let mut log = SegmentLog::open(dir.path(), Retention::default()).expect("reopen");
         let seq = log
-            .append(
+            .append(entry(
                 bus_id,
-                &source(),
                 Event::TurnEnded {
                     state: TurnState::Complete,
                     assistant_message: None,
                 },
-            )
+            ))
             .expect("append");
         assert_eq!(seq, Some(1));
 
@@ -406,36 +476,20 @@ mod tests {
         let bus_id = BusId::mint();
 
         let mut log = SegmentLog::open(dir.path(), Retention::default()).expect("open");
-        log.append(
+        log.append(entry(bus_id, prompt("before"))).expect("append");
+        log.append(entry(
             bus_id,
-            &source(),
-            Event::TurnStarted {
-                prompt: Body::kept("before"),
-            },
-        )
-        .expect("append");
-        log.append(
-            bus_id,
-            &source(),
             Event::TurnEnded {
                 state: TurnState::Complete,
                 assistant_message: None,
             },
-        )
+        ))
         .expect("append");
         drop(log);
 
         // The daemon died here.
         let mut log = SegmentLog::open(dir.path(), Retention::default()).expect("reopen");
-        let seq = log
-            .append(
-                bus_id,
-                &source(),
-                Event::TurnStarted {
-                    prompt: Body::kept("after"),
-                },
-            )
-            .expect("append");
+        let seq = log.append(entry(bus_id, prompt("after"))).expect("append");
 
         assert_eq!(seq, Some(2), "the sequence must not restart at zero");
         let scan = SegmentLog::scan(dir.path()).expect("scan");
@@ -452,22 +506,8 @@ mod tests {
         let bus_id = BusId::mint();
         let mut log = SegmentLog::open(dir.path(), Retention::default()).expect("open");
 
-        log.append(
-            bus_id,
-            &source(),
-            Event::TurnStarted {
-                prompt: Body::kept("first"),
-            },
-        )
-        .expect("append");
-        log.append(
-            bus_id,
-            &source(),
-            Event::TurnStarted {
-                prompt: Body::kept("second"),
-            },
-        )
-        .expect("append");
+        log.append(entry(bus_id, prompt("first"))).expect("append");
+        log.append(entry(bus_id, prompt("second"))).expect("append");
 
         let scan = SegmentLog::scan(dir.path()).expect("scan");
         assert_eq!(scan.defects, vec![]);
@@ -477,6 +517,7 @@ mod tests {
         assert_eq!(
             scan.records[0].event,
             Event::TurnStarted {
+                author: None,
                 prompt: Body::kept("first")
             }
         );

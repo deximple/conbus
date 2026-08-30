@@ -8,7 +8,7 @@ Written for whoever picks this up next. The design phase is finished and the rec
 - The plan is the single source of truth: [`.cursor/plans/shared_workspace_context_3f7139b8.plan.md`](.cursor/plans/shared_workspace_context_3f7139b8.plan.md). The filename is a generated ID and no longer matches the content; leave it alone so the Cursor plan UI keeps its association. A reader-facing copy under `docs/` gets generated when the repo goes public.
 - `cargo 1.94.1` and `rustc 1.94.1` are installed on this machine, so edition 2024 is available.
 - A cargo workspace exists: `crates/conbus` (the binary) and `crates/conbus-core` (the lib). Edition 2024.
-  67 tests, `cargo clippy --all-targets -- -D warnings` clean. See "Next task" for what is built and what is not.
+  95 tests, `cargo clippy --all-targets -- -D warnings` clean. See "Next task" for what is built and what is not.
 
 ## What Conbus is, in one paragraph
 
@@ -67,15 +67,30 @@ next to the real traffic that pins it. Read that before touching the adapter. Th
   recorder keeps the vendor's string verbatim so that is a re-read of the log, not a re-run of the traffic.
 - **`Stop`, `StopFailure`, and `SubagentStop` carry `last_assistant_message`**, described in the schema as: *"Text
   content of the last assistant message before stopping. Avoids the need to read and parse the transcript file."*
-  **This closes the contradiction between the flush barrier and the live-path rule.** The plan's "wait under 2s on
-  `Stop` for the last assistant message to land in the transcript" is not needed and should be struck: the vendor
-  hands us the text on the payload. The log can hold the conversation without ever opening a transcript.
+  **The plan's sub-2s flush barrier on `Stop` is not needed and should be struck** — the vendor hands us the text.
+  But do not overstate it, as an earlier version of this file did: it is the text blocks of the **last** assistant
+  message only, it collapses to absent when that message is pure tool use, and intermediate assistant text inside a
+  multi-step turn is not on `Stop` at all. Holding the whole conversation would mean mirroring `MessageDisplay`
+  (`turn_id`, `message_id`, `index`, `final`, `delta`), which is per-streamed-line-batch and needs its own retention
+  decision before it goes anywhere near the default "conversation only" level.
 - **`prompt_id` is on the common base** — "UUID correlating a user prompt with all subsequent events until the next
-  prompt", and the same value as the `prompt.id` OpenTelemetry attribute. This is the turn correlator `turn_state`
-  and turn atomicity need, and it matters more than it looks because subagents interleave. **Not yet recorded.**
-- **`UserPromptSubmit` has a `source`**: `user`, `sdk`, `system`, `loop_wakeup`, `schedule_wakeup`, `poll_event`.
-  A machine-injected turn is distinguishable from a human one at the source. That is a better self-exclusion signal
-  than our env marker and it is what keeps the survival meter honest. **Not yet recorded.**
+  prompt", and the same value as the `prompt.id` OpenTelemetry attribute. Recorded as `vendor_turn_id`, and read only
+  from `UserPromptSubmit`, `PostToolUse`, `Stop`, `StopFailure`. It is **one slot on a process-global request
+  journal**, so it is stale on the session-lifecycle events: `SessionStart` on resume and fork fires before the reset
+  and carries the previous conversation's value, compact never resets, and `SessionEnd` names the turn that just
+  finished. It also does **not** de-interleave subagents — it is the same value for a subagent and its parent.
+- **`agent_id` is on the common base too**, and it is the field that does what we wanted `prompt_id` to do. A
+  subagent's `PostToolUse` arrives under the **parent's** `session_id`; the agent identity travels only here. Without
+  it the log silently interleaves two agents under one conversation. Recorded as `vendor_agent_id`.
+- **`UserPromptSubmit` has a `source`** in the schema — `user`, `sdk`, `system`, `loop_wakeup`, `schedule_wakeup`,
+  `poll_event` — **and 2.1.241 never sends it.** Both emit sites have the spread compiled out, and a real `-p` run,
+  which must be `sdk`, produced a `UserPromptSubmit` with no `source` key. The schema's own note reads "payloads may
+  omit it while the field rolls out". It is parsed and recorded as `author` when present, and nothing branches on it.
+  It is **not** a self-exclusion signal and could not replace `CONBUS_INTERNAL_SESSION` even if it were emitted:
+  `sdk` also covers the user's own deliberate `claude -p` runs and `loop_wakeup`/`schedule_wakeup` are the user's own
+  automation, so excluding on it would delete real conversations from an append-only log. It appears on one event, so
+  it could not suppress that session's `SessionStart`, `PostToolUse`, or `Stop` either. The env marker stays the
+  exclusion mechanism; `author` is what will let the survival meter separate human turns from machine ones.
 - `SessionStart.source` is five values — `startup`, `resume`, `clear`, `compact`, `fork`. **Subagents are not a
   session source**; they get their own `SubagentStart` / `SubagentStop` with `agent_id` and `agent_type`.
 - `PostToolUse` carries `tool_use_id` and `duration_ms`; `PostToolUseFailure` carries `error` and `is_interrupt`.
@@ -129,6 +144,47 @@ A prompt mints on its own if the session start never arrived, so Desktop's `/cle
    real quota exhaustion. The quota fixture only arrives by actually hitting the limit, so treat the first dogfooding
    exhaustion as a recording opportunity rather than an interruption.
 
+**What the envelope now carries.**
+
+`Record` gained `vendor_turn_id` and `vendor_agent_id`, and `turn_started` gained `author`. Three things about that
+change are load-bearing rather than incidental, and each is pinned by a test:
+
+- The correlators ride **per observation**, not on the per-connection vendor stamp. A deferred `SessionStart` and the
+  prompt that flushes it are written in one batch but did not carry the same correlator — the vendor sends none on a
+  session start. One stamp for the batch would have invented that correlation, silently, in a place no existing test
+  looked.
+- `Record` flattens both the vendor stamp and the event body, which makes **every envelope key a reserved word for
+  every event body, now and later**. A collision serialises without complaint and then fails to read back as a
+  duplicate field — the line reaches the source of truth and is lost on scan, with no compile error anywhere. This is
+  not hypothetical: Claude Code already has a `turn_id` of its own on `MessageDisplay`, with a *different* value from
+  `prompt_id` on the same payload. `no_event_body_shadows_an_envelope_key` in `record.rs` is the only guard.
+- Retention governs content, not correlation or attribution. `author` sits inside `TurnStarted`, so the compiler
+  forces the retention arm to be rewritten — and the tempting fix, `author: None`, would erase it at every level
+  including `Full`, on the only path to disk, with every other test still green.
+
+`SegmentLog::append` now takes an `Entry` rather than growing positional arguments, and deliberately has no
+`Default`: a future envelope field should break every construction site loudly rather than default itself to absent.
+
+**Four things an adversarial review of that change found, all now fixed and pinned.** They are worth reading as a
+list of the shapes this project's bugs take.
+
+- **A daemon restart forked every live conversation.** The registry is derived state and was starting empty, so a
+  vendor session that outlived the daemon minted a second `bus_id`. It is now rebuilt from the segments on start —
+  which is what "derived state, always rebuildable from the log" was supposed to mean all along. The e2e test whose
+  name claimed this property never checked `bus_id`; it does now.
+- **A record the daemon could not place vanished without a word.** An orphan — the normal shape of a restart
+  mid-turn — was answered `Orphaned` and the hook client treated every non-failure reply as success. The turn's
+  remaining events left no record, no defect, and nothing on stderr. The client now reports orphaned and withheld.
+- **Resuming skipped lines it could not parse**, so a build reopening a log a newer build extended resumed at a
+  sequence number already on disk. `last_sequence` now parses a seq-only envelope: a sequence is a sequence whatever
+  the event turns out to be. (`SegmentLog::scan` separately reports a record whose `v` is newer than this build,
+  rather than reading it as though it understood it.)
+- **The flatten guard could not see the collisions that matter.** It built every event variant with its optional
+  fields `None`, and an absent field emits no key — so it could not catch a shadowed *optional* key, which is the
+  shape of every field this schema is likely to grow. It also matched on `Event` only, never on the `TurnState` that
+  `TurnEnded` flattens. Both fixed; verified by injecting an optional `bus_id` field into `TurnStarted` in a scratch
+  clone and watching it fail with `duplicate field`.
+
 **What the real-traffic probe changed.**
 
 The adapter was first built from field names read out of the binary's strings. One real session proved that wrong:
@@ -144,10 +200,29 @@ Take the lesson generally: **the adapter is only as good as the traffic it has b
   `error` has eleven values, collapsing account and request faults into `interrupted_quota` would make the failover
   counter lie, so there is now `interrupted_policy`. Both interrupted variants keep the vendor string verbatim.
   Nothing currently produces `interrupted_user` — Claude Code does not appear to distinguish it.
-- **`prompt_id` and `UserPromptSubmit.source` are not recorded yet.** Both are on the payloads today. The first is
-  the turn correlator; the second tells a human turn from a machine-injected one. Recording them means one optional
-  field on the record envelope, which is a schema change worth making deliberately rather than in passing.
+- **Still dropped from payloads we already parse**, in the order they are worth having: `tool_use_id` on
+  `PostToolUse` (the only key that pairs a tool call with its `PreToolUse` and orders parallel calls in one batch),
+  `duration_ms`, `SessionStart.session_title` and `.model`, `permission_mode`, and `effort.level`. Each is a field on
+  a `Payload` we already deserialise.
+- **`MessageDisplay` is not mirrored**, and it is the only official channel carrying every assistant message rather
+  than the last one. High volume, and it collides with the "conversation only" shipping default, so it is a retention
+  decision before it is an adapter change.
 - **Only `claude_code` is wired.** The event model and wire protocol are already harness-agnostic.
+- **`agent_id` is recorded but unverified against traffic.** No capture has exercised a subagent yet. The schema says
+  a subagent's hooks arrive under the parent's `session_id` with `agent_id` set; if that is wrong in the other
+  direction — subagents getting their own `session_id` — the recorder has a bogus-session problem instead, which is
+  worse. Same for `tool_use_id`, `tool_input`, `tool_response` and `error_details`: schema only, no capture.
+- **`Registry::restore` reads the whole log at daemon start.** Correct, and cheap while the log is small. Once
+  backfill lands it is a full scan on every start, and that is what the derived SQLite index is for.
+- **An older `v` is still read as if it were current.** `scan` rejects a record from a *newer* build; it has no
+  opinion about an older one. That is consistent with the bump rule written at `SCHEMA_VERSION` — a bump means an
+  older reader would be wrong, not a newer one — but it is an assumption, not an enforcement.
+- **The counters have to be written down with the fields.** Recording `author` without deciding how it is counted is
+  the worst of both worlds. Routing hops and re-explanation savings must be filtered to human turns or a `/loop`
+  firing every five minutes manufactures a passing kill criterion; injected-token cost must count all turns, because
+  that is real money and machine turns are where the volume is; and absent `author` must be its own bucket in every
+  one of them, never folded into human. The plan's kill criteria (its "킬 크리테리아" section) have no notion of who
+  authored a turn and need this amendment.
 
 Success for this milestone is narrow: every turn from both harnesses lands in the log, the log survives a daemon
 restart, and installed history is queryable. Routing, packs, and hops come after.

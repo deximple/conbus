@@ -1,13 +1,47 @@
 //! Claude Code hook payloads, normalised onto the bus event model.
 //!
-//! Field names and enum values below were read off the installed CLI
-//! (2.1.241), not guessed: `failure_reason`, and the `credits_required`
-//! reason that the handoff's list of four does not mention.
+//! Two sources of truth, and they are not equal. The extracted schema
+//! definitions in `tests/fixtures/claude_code_2.1.241_contract.md` come from the
+//! bundle's own `hook_event_name:Ct("...")` declarations; the captured payloads
+//! beside them are real traffic. A `strings` dump is neither, and reading names
+//! that way produced a `StopFailure` adapter that silently replaced the vendor's
+//! reason with `"unspecified"` while every test passed.
+//!
+//! Which fields are pinned by which: `session_id`, `hook_event_name`, `cwd`,
+//! `prompt`, `prompt_id`, `error`, `last_assistant_message`, and `reason` all
+//! appear in the captures. `agent_id`, `tool_name`, `tool_input`,
+//! `tool_response`, and `error_details` are from the schema only — no capture
+//! has exercised a subagent or a successful tool call yet. Treat those as
+//! unverified until a capture covers them.
 
-use conbus_core::event::{Body, Event, Harness, TurnState};
-use conbus_core::registry::SessionKey;
+use conbus_core::event::{Author, Body, Event, Harness, TurnState, VendorAgentId, VendorTurnId};
+use conbus_core::registry::{Observed, SessionKey};
 use serde::Deserialize;
 use serde_json::Value;
+
+/// Whether the payload's `prompt_id` names a turn of *this* conversation.
+///
+/// `prompt_id` is one slot on a process-global request journal rather than a
+/// per-event value, so recording it blindly can bind a record to a turn it does
+/// not belong to. The dangerous case is narrow and specific: a `SessionStart`
+/// whose source is `resume` or `fork` fires *before* the id is reset, so the
+/// value there is the pre-resume conversation's — a link across two
+/// conversations, which is the one thing the correlator must never invent.
+///
+/// Everywhere else the value belongs to the session in hand. `startup` and
+/// `clear` carry none at all (`clear` resets first). `compact` carries the turn
+/// the compaction happened inside, which is live. `SessionEnd` carries the turn
+/// that just finished, which is this conversation's by the vendor's own
+/// definition — "all subsequent events until the next prompt".
+///
+/// An unfamiliar `SessionStart` source is treated as unsafe: a missing
+/// correlator costs a join, a wrong one corrupts the conversation graph.
+fn turn_id_belongs_to_this_conversation(payload: &Payload) -> bool {
+    if payload.hook_event_name != "SessionStart" {
+        return true;
+    }
+    payload.source.as_deref() == Some("compact")
+}
 
 /// A Claude Code hook payload, read tolerantly.
 ///
@@ -20,9 +54,21 @@ pub struct Payload {
     pub hook_event_name: String,
     #[serde(default)]
     pub cwd: Option<String>,
-    /// `SessionStart`: startup | resume | clear | compact | fork | subagent.
+    /// Two vocabularies under one vendor key, told apart by `hook_event_name`.
+    /// On `SessionStart`: startup | resume | clear | compact | fork.
+    /// On `UserPromptSubmit`: user | sdk | system | loop_wakeup |
+    /// schedule_wakeup | poll_event — never emitted by 2.1.241, whose two emit
+    /// sites have it compiled out, but the schema says "payloads may omit it
+    /// while the field rolls out", so read it and never depend on it.
     #[serde(default)]
     pub source: Option<String>,
+    /// Common base. The turn correlator; see `EVENTS_WITH_A_LIVE_TURN_ID`.
+    #[serde(default)]
+    pub prompt_id: Option<String>,
+    /// Common base. Present only when the hook fired inside a subagent, whose
+    /// events otherwise arrive under the parent's `session_id`.
+    #[serde(default)]
+    pub agent_id: Option<String>,
     #[serde(default)]
     pub prompt: Option<String>,
     #[serde(default)]
@@ -40,7 +86,7 @@ pub struct Payload {
     /// `Stop`, `StopFailure`, `SubagentStop`: the assistant's closing text.
     #[serde(default)]
     pub last_assistant_message: Option<String>,
-    /// `SessionEnd`: clear | logout | prompt_input_exit | other.
+    /// `SessionEnd`: clear | resume | logout | prompt_input_exit | other.
     #[serde(default)]
     pub reason: Option<String>,
 }
@@ -50,7 +96,7 @@ pub struct Payload {
 pub enum Normalized {
     Event {
         key: SessionKey,
-        event: Event,
+        observed: Observed,
     },
     /// A hook event the recorder deliberately does not mirror.
     Ignored {
@@ -66,12 +112,18 @@ pub struct HookError(pub String);
 pub fn normalize(json: &str) -> Result<Normalized, HookError> {
     let payload: Payload = serde_json::from_str(json).map_err(|err| HookError(err.to_string()))?;
 
+    let vendor_turn_id = turn_id_belongs_to_this_conversation(&payload)
+        .then(|| payload.prompt_id.clone().map(VendorTurnId::new))
+        .flatten();
+    let vendor_agent_id = payload.agent_id.clone().map(VendorAgentId::new);
+
     let event = match payload.hook_event_name.as_str() {
         "SessionStart" => Event::SessionCandidate {
             trigger: payload.source,
             cwd: payload.cwd,
         },
         "UserPromptSubmit" => Event::TurnStarted {
+            author: payload.source.map(Author::new),
             prompt: Body::kept(payload.prompt.unwrap_or_default()),
         },
         "PostToolUse" => Event::ToolUse {
@@ -99,7 +151,11 @@ pub fn normalize(json: &str) -> Result<Normalized, HookError> {
 
     Ok(Normalized::Event {
         key: SessionKey::new(Harness::new(Harness::CLAUDE_CODE), payload.session_id),
-        event,
+        observed: Observed {
+            vendor_turn_id,
+            vendor_agent_id,
+            event,
+        },
     })
 }
 
@@ -137,14 +193,152 @@ mod tests {
         SessionKey::new(Harness::new(Harness::CLAUDE_CODE), "abc123")
     }
 
-    fn event_of(json: &str) -> Event {
+    fn observed_of(json: &str) -> Observed {
         match normalize(json).expect("normalise") {
-            Normalized::Event { key: got, event } => {
+            Normalized::Event { key: got, observed } => {
                 assert_eq!(got, key());
-                event
+                observed
             }
             other => panic!("expected an event, got {other:?}"),
         }
+    }
+
+    fn event_of(json: &str) -> Event {
+        observed_of(json).event
+    }
+
+    const TURN: &str = "ed06c859-f62e-418f-96f0-556d61fa97d5";
+
+    #[test]
+    fn the_turn_correlator_is_taken_from_every_event_that_carries_this_turns_id() {
+        // Each payload is shaped the way the vendor actually sends it: only
+        // `UserPromptSubmit` carries `prompt`, only `PostToolUse` carries
+        // `tool_name`. Gating on the wrong field would pass a uniform payload.
+        let payloads = [
+            r#"{"session_id":"abc123","hook_event_name":"UserPromptSubmit","prompt":"p","prompt_id":"TURN"}"#,
+            r#"{"session_id":"abc123","hook_event_name":"PostToolUse","tool_name":"Read","tool_input":{},"tool_response":{},"prompt_id":"TURN"}"#,
+            r#"{"session_id":"abc123","hook_event_name":"Stop","stop_hook_active":false,"prompt_id":"TURN"}"#,
+            r#"{"session_id":"abc123","hook_event_name":"StopFailure","error":"rate_limit","prompt_id":"TURN"}"#,
+            r#"{"session_id":"abc123","hook_event_name":"SessionEnd","reason":"other","prompt_id":"TURN"}"#,
+            r#"{"session_id":"abc123","hook_event_name":"SessionStart","source":"compact","prompt_id":"TURN"}"#,
+        ];
+
+        for payload in payloads {
+            let observed = observed_of(&payload.replace("TURN", TURN));
+
+            assert_eq!(
+                observed.vendor_turn_id.as_ref().map(VendorTurnId::as_str),
+                Some(TURN),
+                "dropped the correlator: {payload}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_resumed_or_forked_session_start_does_not_link_to_the_previous_conversation() {
+        // These two fire before the process-global prompt id is reset, so the
+        // value is the pre-resume conversation's. It is the one case where
+        // recording it would invent a link across two conversations.
+        for source in ["resume", "fork"] {
+            let observed = observed_of(&format!(
+                r#"{{"session_id":"abc123","hook_event_name":"SessionStart",
+                    "source":"{source}","prompt_id":"{TURN}"}}"#
+            ));
+
+            assert_eq!(
+                observed.vendor_turn_id, None,
+                "a {source} session start kept another conversation's turn"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unfamiliar_session_start_source_is_treated_as_unsafe() {
+        // A missing correlator costs a join; a wrong one corrupts the graph.
+        let observed = observed_of(&format!(
+            r#"{{"session_id":"abc123","hook_event_name":"SessionStart",
+                "source":"some_new_source","prompt_id":"{TURN}"}}"#
+        ));
+
+        assert_eq!(observed.vendor_turn_id, None);
+    }
+
+    #[test]
+    fn a_subagents_tool_call_is_marked_as_one() {
+        // A subagent's hooks arrive under the PARENT session id, so without
+        // this the log interleaves two agents' work under one conversation
+        // with nothing on the line to separate them. `prompt_id` does not help:
+        // it is the same value for a subagent and its parent.
+        let observed = observed_of(
+            r#"{"session_id":"abc123","hook_event_name":"PostToolUse","tool_name":"Read",
+                "prompt_id":"ed06c859-f62e-418f-96f0-556d61fa97d5","agent_id":"agent-7",
+                "agent_type":"code-reviewer"}"#,
+        );
+
+        assert_eq!(
+            observed.vendor_agent_id.as_ref().map(VendorAgentId::as_str),
+            Some("agent-7")
+        );
+    }
+
+    #[test]
+    fn a_main_thread_record_carries_no_agent_id() {
+        let observed = observed_of(
+            r#"{"session_id":"abc123","hook_event_name":"PostToolUse","tool_name":"Read"}"#,
+        );
+
+        assert_eq!(observed.vendor_agent_id, None);
+    }
+
+    #[test]
+    fn the_author_of_a_turn_is_recorded_when_the_vendor_sends_one() {
+        let event = event_of(
+            r#"{"session_id":"abc123","hook_event_name":"UserPromptSubmit","prompt":"hi",
+                "source":"schedule_wakeup"}"#,
+        );
+
+        let Event::TurnStarted { author, .. } = event else {
+            panic!("expected a started turn");
+        };
+        assert_eq!(
+            author.as_ref().map(Author::as_str),
+            Some(Author::SCHEDULE_WAKEUP)
+        );
+    }
+
+    #[test]
+    fn an_absent_author_stays_absent_rather_than_becoming_a_human() {
+        // Claude Code 2.1.241 never emits `source` — both emit sites have it
+        // compiled out — so this is the case that actually happens. Defaulting
+        // it to `user` is how a scheduled wakeup gets counted as a person.
+        let event = event_of(
+            r#"{"session_id":"abc123","hook_event_name":"UserPromptSubmit","prompt":"hi"}"#,
+        );
+
+        assert_eq!(
+            event,
+            Event::TurnStarted {
+                author: None,
+                prompt: Body::kept("hi")
+            }
+        );
+    }
+
+    #[test]
+    fn an_unknown_author_is_kept_verbatim() {
+        let event = event_of(
+            r#"{"session_id":"abc123","hook_event_name":"UserPromptSubmit","prompt":"hi",
+                "source":"some_new_entrypoint"}"#,
+        );
+
+        let Event::TurnStarted { author, .. } = event else {
+            panic!("expected a started turn");
+        };
+        assert_eq!(
+            author.as_ref().map(Author::as_str),
+            Some("some_new_entrypoint")
+        );
+        assert!(!author.expect("author").is_human());
     }
 
     #[test]
@@ -157,6 +351,7 @@ mod tests {
         assert_eq!(
             event,
             Event::TurnStarted {
+                author: None,
                 prompt: Body::kept("ship the recorder")
             }
         );
@@ -335,6 +530,7 @@ mod tests {
         assert_eq!(
             event,
             Event::TurnStarted {
+                author: None,
                 prompt: Body::kept("hi")
             }
         );

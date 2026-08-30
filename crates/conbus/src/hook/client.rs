@@ -31,7 +31,7 @@ pub fn run(harness: &str, stdin: &mut impl Read) -> Result<(), String> {
         .map_err(|err| format!("could not read the hook payload: {err}"))?;
 
     let normalized = claude_code::normalize(&payload).map_err(|err| err.0)?;
-    let Normalized::Event { key, event } = normalized else {
+    let Normalized::Event { key, observed } = normalized else {
         return Ok(());
     };
 
@@ -43,7 +43,9 @@ pub fn run(harness: &str, stdin: &mut impl Read) -> Result<(), String> {
     let request = Request {
         harness: Harness::new(harness),
         vendor_session_id: key.vendor_session_id,
-        event,
+        vendor_turn_id: observed.vendor_turn_id,
+        vendor_agent_id: observed.vendor_agent_id,
+        event: observed.event,
     };
     send(stream, &request)
 }
@@ -61,8 +63,19 @@ fn send(mut stream: UnixStream, request: &Request) -> Result<(), String> {
         .map_err(|err| format!("no reply from the daemon: {err}"))?;
 
     match serde_json::from_str::<Response>(reply.trim()) {
+        Ok(Response::Recorded { .. } | Response::Deferred) => Ok(()),
         Ok(Response::Failed { error }) => Err(format!("the daemon refused the record: {error}")),
-        Ok(_) => Ok(()),
+        // Not written, and the caller has to hear about it. An orphan is the
+        // normal shape of a daemon restart mid-turn: the session is unbound, so
+        // the rest of that turn belongs to no conversation. Reporting it is the
+        // difference between a known gap and a turn that quietly disappears.
+        Ok(Response::Orphaned) => Err(
+            "no conversation for this session; the daemon has no binding for it              (a restart mid-turn looks exactly like this)"
+                .to_string(),
+        ),
+        Ok(Response::Withheld) => {
+            Err("retention withheld this record from disk".to_string())
+        }
         Err(err) => Err(format!("unreadable reply {reply:?}: {err}")),
     }
 }

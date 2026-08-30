@@ -179,6 +179,58 @@ fn a_whole_turn_reaches_the_log_through_the_real_binary() {
 }
 
 #[test]
+fn the_correlators_cross_the_socket_and_stay_with_their_own_records() {
+    // `conbus hook` is a separate process, so a field the adapter parses can
+    // still be lost between there and the log. And the flushed session start
+    // must not inherit the correlator of the prompt that flushed it.
+    let home = tempfile::tempdir().expect("tempdir");
+    let daemon = start_daemon(home.path());
+
+    run_hook(
+        home.path(),
+        r#"{"session_id":"s-1","hook_event_name":"SessionStart","source":"startup","cwd":"/repo"}"#,
+        &[],
+    );
+    run_hook(
+        home.path(),
+        r#"{"session_id":"s-1","hook_event_name":"UserPromptSubmit","prompt":"review this",
+            "prompt_id":"TURN-1","source":"schedule_wakeup"}"#,
+        &[],
+    );
+    run_hook(
+        home.path(),
+        r#"{"session_id":"s-1","hook_event_name":"PostToolUse","tool_name":"Read",
+            "tool_input":{},"tool_response":{},"prompt_id":"TURN-1",
+            "agent_id":"AGENT-7","agent_type":"code-reviewer"}"#,
+        &[],
+    );
+
+    let lines = log_lines(home.path());
+    assert_eq!(lines.len(), 3, "{lines:#?}");
+
+    assert_eq!(
+        lines[0]["vendor_turn_id"],
+        serde_json::Value::Null,
+        "the flushed session start inherited a correlator it never had: {:#?}",
+        lines[0]
+    );
+    assert_eq!(lines[1]["vendor_turn_id"], "TURN-1");
+    assert_eq!(
+        lines[1]["author"], "schedule_wakeup",
+        "the author did not cross the socket: {:#?}",
+        lines[1]
+    );
+    assert_eq!(
+        lines[2]["vendor_agent_id"], "AGENT-7",
+        "the subagent id did not cross the socket, so the log interleaves two agents: {:#?}",
+        lines[2]
+    );
+    assert_eq!(lines[2]["vendor_turn_id"], "TURN-1");
+
+    daemon.stop();
+}
+
+#[test]
 fn the_log_survives_a_daemon_restart_and_the_conversation_continues() {
     let home = tempfile::tempdir().expect("tempdir");
 
@@ -204,6 +256,10 @@ fn the_log_survives_a_daemon_restart_and_the_conversation_continues() {
         lines[1]["seq"], 1,
         "the sequence must continue past the restart"
     );
+    assert_eq!(
+        lines[0]["bus_id"], lines[1]["bus_id"],
+        "the conversation must survive the restart, not fork into two: {lines:#?}"
+    );
 
     daemon.stop();
 }
@@ -225,6 +281,35 @@ fn the_hook_never_fails_the_session_when_the_daemon_is_down() {
         !stderr.is_empty(),
         "a dropped record must still say so on stderr rather than vanish"
     );
+}
+
+#[test]
+fn an_event_the_daemon_cannot_place_is_reported_rather_than_dropped_in_silence() {
+    // A tool call or a stop arriving for a session the daemon has no binding
+    // for — the normal shape of a daemon restart mid-turn — belongs to no
+    // conversation and cannot start one. It is not written, which is correct;
+    // vanishing without a word is not.
+    let home = tempfile::tempdir().expect("tempdir");
+    let daemon = start_daemon(home.path());
+
+    let (code, stderr) = run_hook(
+        home.path(),
+        r#"{"session_id":"s-orphan","hook_event_name":"Stop","stop_hook_active":false,
+            "prompt_id":"T-1","last_assistant_message":"work nobody will see"}"#,
+        &[],
+    );
+
+    assert_eq!(code, 0, "the hook must not fail the turn");
+    assert!(
+        log_lines(home.path()).is_empty(),
+        "an unplaceable event must not be written"
+    );
+    assert!(
+        !stderr.is_empty(),
+        "an unplaceable event must say so; silence is how a whole turn disappears"
+    );
+
+    daemon.stop();
 }
 
 #[test]

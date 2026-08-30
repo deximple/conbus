@@ -1,6 +1,6 @@
 //! The newline-delimited JSON protocol between `conbus hook` and the daemon.
 
-use conbus_core::event::{Event, Harness};
+use conbus_core::event::{Event, Harness, VendorAgentId, VendorTurnId};
 use conbus_core::ids::BusId;
 use serde::{Deserialize, Serialize};
 
@@ -9,6 +9,11 @@ use serde::{Deserialize, Serialize};
 pub struct Request {
     pub harness: Harness,
     pub vendor_session_id: String,
+    /// Optional so a newer hook and an older daemon still understand each other.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vendor_turn_id: Option<VendorTurnId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vendor_agent_id: Option<VendorAgentId>,
     pub event: Event,
 }
 

@@ -43,8 +43,15 @@ fn summarise(record: &Record) -> String {
             format!("session-end {}", reason.as_deref().unwrap_or("?"))
         }
     };
+    // A subagent's events arrive under the parent's session id, so without
+    // this marker the human view interleaves two agents with no sign of it.
+    let agent = record
+        .vendor_agent_id
+        .as_ref()
+        .map(|id| format!(" [subagent {}]", id.as_str()))
+        .unwrap_or_default();
     format!(
-        "{} {:>6} {} {} {what}",
+        "{} {:>6} {} {} {what}{agent}",
         record.ts,
         record.seq,
         record.bus_id,

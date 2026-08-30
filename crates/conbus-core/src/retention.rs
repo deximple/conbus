@@ -6,7 +6,13 @@ use crate::record::Record;
 /// Rebuild an event with every body passed through `f`.
 fn map_bodies(event: &Event, f: impl Fn(&Body) -> Body) -> Event {
     match event {
-        Event::TurnStarted { prompt } => Event::TurnStarted { prompt: f(prompt) },
+        // Spelled out rather than `..`: silencing this with `author: None`
+        // would erase the author at every retention level, on the only path to
+        // disk, and every existing test would still pass.
+        Event::TurnStarted { author, prompt } => Event::TurnStarted {
+            author: author.clone(),
+            prompt: f(prompt),
+        },
         Event::ToolUse {
             tool,
             input,
@@ -96,7 +102,7 @@ impl Retention {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::{Body, Event, Harness, Source};
+    use crate::event::{Author, Body, Event, Harness, Source};
     use crate::record::SCHEMA_VERSION;
 
     fn tool_use(input: Body, output: Body) -> Record {
@@ -110,6 +116,8 @@ mod tests {
                 harness_version: None,
                 vendor_session_id: None,
             },
+            vendor_turn_id: None,
+            vendor_agent_id: None,
             event: Event::ToolUse {
                 tool: "Read".into(),
                 input,
@@ -120,7 +128,10 @@ mod tests {
 
     fn turn_started(prompt: Body) -> Record {
         Record {
-            event: Event::TurnStarted { prompt },
+            event: Event::TurnStarted {
+                author: None,
+                prompt,
+            },
             ..tool_use(Body::kept(""), Body::kept(""))
         }
     }
@@ -133,7 +144,7 @@ mod tests {
             .redact(&turn_started(Body::kept(&huge)))
             .expect("a prompt is logged");
 
-        let Event::TurnStarted { prompt } = &redacted.event else {
+        let Event::TurnStarted { prompt, .. } = &redacted.event else {
             panic!("the event kind must survive redaction");
         };
         assert_eq!(
@@ -161,6 +172,7 @@ mod tests {
                     text,
                     original_bytes,
                 },
+            ..
         } = &redacted.event
         else {
             panic!("expected a clipped prompt, got {:?}", redacted.event);
@@ -174,6 +186,34 @@ mod tests {
     }
 
     #[test]
+    fn redaction_keeps_the_author_of_a_turn() {
+        // Retention governs content, not attribution. The compiler forces this
+        // arm to be rewritten when `author` is added, and the tempting fix —
+        // writing `author: None` — would erase it at every level including
+        // `Full`, on the only path to disk, with every other test still green.
+        let record = Record {
+            event: Event::TurnStarted {
+                author: Some(Author::new(Author::SCHEDULE_WAKEUP)),
+                prompt: Body::kept("wake up and check the deploy"),
+            },
+            ..turn_started(Body::kept(""))
+        };
+
+        for level in [Retention::Full, Retention::ConversationOnly] {
+            let redacted = level.redact(&record).expect("a prompt is logged");
+
+            let Event::TurnStarted { author, .. } = &redacted.event else {
+                panic!("the event kind must survive redaction");
+            };
+            assert_eq!(
+                author.as_ref().map(Author::as_str),
+                Some(Author::SCHEDULE_WAKEUP),
+                "{level:?} dropped the author"
+            );
+        }
+    }
+
+    #[test]
     fn the_default_level_still_keeps_the_conversation() {
         let record = turn_started(Body::kept("ship the recorder"));
 
@@ -184,6 +224,7 @@ mod tests {
         assert_eq!(
             redacted.event,
             Event::TurnStarted {
+                author: None,
                 prompt: Body::kept("ship the recorder")
             }
         );

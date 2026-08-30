@@ -24,6 +24,88 @@ impl Harness {
     }
 }
 
+/// The vendor's identifier for one turn: a prompt and everything after it
+/// until the next prompt.
+///
+/// Named for whose identifier it is, following `vendor_session_id`. The name
+/// matters more than it looks: Claude Code also has a field literally called
+/// `turn_id` (on `MessageDisplay`) whose value is *different* from the one we
+/// record here — both appear on the same payload with different UUIDs. Calling
+/// ours `turn_id` would claim the vendor's word for a different meaning, and
+/// would collide with it the moment that event is mirrored, because `Record`
+/// flattens the event body and a duplicate key makes the line unreadable.
+///
+/// Opaque on purpose. `BusId` parses strictly because Claude Code takes it back
+/// verbatim as `--session-id`; nothing hands this one back, and a harness whose
+/// correlator is not a UUID must not lose it to a parse.
+#[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct VendorTurnId(String);
+
+impl VendorTurnId {
+    pub fn new(id: impl Into<String>) -> Self {
+        VendorTurnId(id.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// The vendor's identifier for the subagent a record came from.
+///
+/// Present only when the hook fired inside a subagent. Without it a subagent's
+/// tool calls are indistinguishable from the main thread's, because they arrive
+/// under the *parent's* session id — so the log would interleave two agents'
+/// work under one conversation with nothing on the line to separate them.
+#[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct VendorAgentId(String);
+
+impl VendorAgentId {
+    pub fn new(id: impl Into<String>) -> Self {
+        VendorAgentId(id.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Who caused a turn to exist.
+///
+/// Open for the same reason `Harness` is: this vendor's enums grow, and a log
+/// written by a newer build must stay readable by an older one.
+#[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Author(String);
+
+impl Author {
+    pub const USER: &'static str = "user";
+    pub const SDK: &'static str = "sdk";
+    pub const SYSTEM: &'static str = "system";
+    pub const LOOP_WAKEUP: &'static str = "loop_wakeup";
+    pub const SCHEDULE_WAKEUP: &'static str = "schedule_wakeup";
+    pub const POLL_EVENT: &'static str = "poll_event";
+
+    pub fn new(author: impl Into<String>) -> Self {
+        Author(author.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// True only when the vendor said a person typed this turn.
+    ///
+    /// Absence is not humanity. An `Option<Author>` of `None` means the vendor
+    /// did not say, and belongs in its own bucket — counting it as human is how
+    /// a survival meter reports a scheduled wakeup as a person.
+    pub fn is_human(&self) -> bool {
+        self.0 == Self::USER
+    }
+}
+
 /// Where a record came from: the vendor stamp every record carries.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct Source {
@@ -64,8 +146,15 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cwd: Option<String>,
     },
-    /// The user submitted a prompt. This is where a `bus_id` is minted.
-    TurnStarted { prompt: Body },
+    /// The user submitted a prompt. This is where a `bus_id` is minted,
+    /// whatever the author turns out to be.
+    TurnStarted {
+        /// Declared before `prompt` so it stays visible in the first bytes of
+        /// the line; a prompt can run to the 16 KiB inline cap.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        author: Option<Author>,
+        prompt: Body,
+    },
     /// A tool ran.
     ToolUse {
         tool: String,
