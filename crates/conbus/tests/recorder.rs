@@ -238,6 +238,47 @@ fn the_correlators_cross_the_socket_and_stay_with_their_own_records() {
 }
 
 #[test]
+fn a_tool_call_that_fails_reaches_the_log_too() {
+    // Without this the log's tool history is the *successful* tool history:
+    // the vendor sends PostToolUseFailure instead of PostToolUse, so a failed
+    // call left no record at all.
+    let home = tempfile::tempdir().expect("tempdir");
+    let daemon = start_daemon(home.path());
+
+    run_hook(
+        home.path(),
+        r#"{"session_id":"s-1","hook_event_name":"UserPromptSubmit","prompt":"run it","prompt_id":"T-1"}"#,
+        &[],
+    );
+    run_hook(
+        home.path(),
+        r#"{"session_id":"s-1","hook_event_name":"PostToolUseFailure","tool_name":"Bash",
+            "tool_input":{"command":"false"},"tool_use_id":"toolu_01ABC","prompt_id":"T-1",
+            "error":"exit status 1","is_interrupt":false,"duration_ms":12}"#,
+        &[],
+    );
+
+    let lines = log_lines(home.path());
+    assert_eq!(lines.len(), 2, "the failed call left no record: {lines:#?}");
+
+    let failure = &lines[1];
+    assert_eq!(failure["event"], "tool_use");
+    assert_eq!(failure["outcome"], "failed", "{failure:#?}");
+    assert_eq!(failure["tool"], "Bash");
+    assert_eq!(failure["tool_use_id"], "toolu_01ABC");
+    assert_eq!(failure["duration_ms"], 12);
+    assert_eq!(failure["vendor_turn_id"], "T-1");
+    // Default retention: the error text is a tool body and stays off disk.
+    assert_eq!(failure["error"]["kind"], "elided", "{failure:#?}");
+    assert!(
+        failure.get("output").is_none(),
+        "a failure has no response: {failure:#?}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
 fn the_log_survives_a_daemon_restart_and_the_conversation_continues() {
     let home = tempfile::tempdir().expect("tempdir");
 

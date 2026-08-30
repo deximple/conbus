@@ -8,7 +8,7 @@ Written for whoever picks this up next. The design phase is finished and the rec
 - The plan is the single source of truth: [`.cursor/plans/shared_workspace_context_3f7139b8.plan.md`](.cursor/plans/shared_workspace_context_3f7139b8.plan.md). The filename is a generated ID and no longer matches the content; leave it alone so the Cursor plan UI keeps its association. A reader-facing copy under `docs/` gets generated when the repo goes public.
 - `cargo 1.94.1` and `rustc 1.94.1` are installed on this machine, so edition 2024 is available.
 - A cargo workspace exists: `crates/conbus` (the binary) and `crates/conbus-core` (the lib). Edition 2024.
-  103 tests, `cargo clippy --all-targets -- -D warnings` clean. See "Next task" for what is built and what is not.
+  111 tests, `cargo clippy --all-targets -- -D warnings` clean. See "Next task" for what is built and what is not.
 
 ## What Conbus is, in one paragraph
 
@@ -144,6 +144,25 @@ A prompt mints on its own if the session start never arrived, so Desktop's `/cle
    real quota exhaustion. The quota fixture only arrives by actually hitting the limit, so treat the first dogfooding
    exhaustion as a recording opportunity rather than an interruption.
 
+**A failed tool call is a tool call.**
+
+The vendor sends `PostToolUse` **or** `PostToolUseFailure` for one call, never both, so a failure is not a second
+kind of event — it is the same event with a different ending. `Event::ToolUse` therefore carries a `ToolOutcome`
+(`succeeded` with an `output`, or `failed` with an `error` and an `interrupted` flag) rather than there being a
+separate `tool_failed` variant. The reason is the shape of this project's bugs: a separate variant lets a consumer
+handle only the successful half, and forgetting is silent. An enum makes the compiler ask. That is not theoretical —
+the guard in `record.rs` had to grow `every_tool_outcome` for exactly the reason it had to grow
+`every_turn_state`, and a new variant now fails to compile rather than slipping past it.
+
+Two things follow that are worth knowing before reading the log:
+
+- **The error text is a tool body**, not a label, so the default retention level withholds it — a failed shell
+  command puts its output there, which is precisely the material "conversation only" exists to keep off disk. That a
+  call failed, which tool, how long it took, and whether a person stopped it all survive; only the text goes.
+- **`is_interrupt` is the only signal anywhere in the hook surface that a person stopped the work.** Nothing
+  derives `TurnState::InterruptedUser` from it yet — that is a turn-state decision, not a recording one — but this
+  is the evidence it would be derived from, and the plan lists a state nothing currently produces.
+
 **What the envelope now carries.**
 
 `Record` gained `vendor_turn_id` and `vendor_agent_id`, and `turn_started` gained `author`. Three things about that
@@ -208,11 +227,9 @@ Take the lesson generally: **the adapter is only as good as the traffic it has b
   record already carries its own input and output. It becomes a join key when `PreToolUse` and
   `PostToolUseFailure` are mirrored.)
 
-- **A tool call that fails produces no record at all.** The vendor emits `PostToolUseFailure` for it, not
-  `PostToolUse`, and we mirror only the latter. So the log's tool history is the *successful* tool history, which is
-  a strange thing for a source of truth to be — and it is the half a router would most want when deciding whether a
-  leg is healthy. Mirroring `PostToolUseFailure` (it carries `tool_use_id`, `error`, `is_interrupt`, `duration_ms`)
-  is the smallest change with the largest effect on what the log actually contains.
+- **`PreToolUse` is still not mirrored**, so `tool_use_id` still joins nothing: a call produces one record either
+  way, and that record already carries its own input. It becomes a join key when the request side is mirrored, which
+  would also double the tool records — a decision, not an oversight.
 - **`MessageDisplay` is not mirrored**, and it is the only official channel carrying every assistant message rather
   than the last one. High volume, and it collides with the "conversation only" shipping default, so it is a retention
   decision before it is an adapter change.

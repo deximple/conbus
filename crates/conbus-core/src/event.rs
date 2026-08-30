@@ -194,7 +194,8 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         duration_ms: Option<u64>,
         input: Body,
-        output: Body,
+        #[serde(flatten)]
+        outcome: ToolOutcome,
     },
     /// The turn finished, one way or another.
     TurnEnded {
@@ -211,6 +212,34 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
     },
+}
+
+/// How a tool call ended.
+///
+/// One call produces `PostToolUse` **or** `PostToolUseFailure`, never both, so
+/// this is one event with two endings rather than two events. Modelling it as
+/// an enum is deliberate: every consumer of a tool record has to handle both,
+/// and the compiler says so. A separate variant would let a reader forget the
+/// failing half, and forgetting is silent.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum ToolOutcome {
+    Succeeded {
+        output: Body,
+    },
+    Failed {
+        /// The vendor's error text. A body, not a label: a failed shell command
+        /// puts its output here, so retention treats it as a tool result.
+        error: Body,
+        /// The one signal anywhere in the hook surface that a person stopped
+        /// the work. Nothing derives `TurnState::InterruptedUser` from it yet.
+        #[serde(default, skip_serializing_if = "is_false")]
+        interrupted: bool,
+    },
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Text captured from a session, carrying whether it actually reached disk.

@@ -1,6 +1,6 @@
 //! What a workspace is willing to leave on disk.
 
-use crate::event::{Body, Event};
+use crate::event::{Body, Event, ToolOutcome};
 use crate::record::Record;
 
 /// Rebuild an event with every body passed through `f`.
@@ -21,13 +21,22 @@ fn map_bodies(event: &Event, f: impl Fn(&Body) -> Body) -> Event {
             tool_use_id,
             duration_ms,
             input,
-            output,
+            outcome,
         } => Event::ToolUse {
             tool: tool.clone(),
             tool_use_id: tool_use_id.clone(),
             duration_ms: *duration_ms,
             input: f(input),
-            output: f(output),
+            // A failure's error text is tool output too — a failed shell
+            // command puts its stdout there — so it goes through the same
+            // filter as a successful response.
+            outcome: match outcome {
+                ToolOutcome::Succeeded { output } => ToolOutcome::Succeeded { output: f(output) },
+                ToolOutcome::Failed { error, interrupted } => ToolOutcome::Failed {
+                    error: f(error),
+                    interrupted: *interrupted,
+                },
+            },
         },
         Event::TurnEnded {
             state,
@@ -109,7 +118,7 @@ impl Retention {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::{Author, Body, Event, Harness, Source, VendorToolUseId};
+    use crate::event::{Author, Body, Event, Harness, Source, ToolOutcome, VendorToolUseId};
     use crate::record::SCHEMA_VERSION;
 
     fn tool_use(input: Body, output: Body) -> Record {
@@ -130,7 +139,7 @@ mod tests {
                 tool_use_id: None,
                 duration_ms: None,
                 input,
-                output,
+                outcome: ToolOutcome::Succeeded { output },
             },
         }
     }
@@ -195,6 +204,43 @@ mod tests {
     }
 
     #[test]
+    fn a_failures_error_text_is_a_tool_body_and_is_withheld_by_default() {
+        // A failed shell command puts its output in `error`, so the same
+        // reasoning that keeps tool responses off disk applies to it. Keeping
+        // it because "it is only an error" would put the sensitive half of a
+        // failed command on disk at the level that promises not to.
+        let record = Record {
+            event: Event::ToolUse {
+                tool: "Bash".into(),
+                tool_use_id: None,
+                duration_ms: None,
+                input: Body::kept("in"),
+                outcome: ToolOutcome::Failed {
+                    error: Body::kept("secret.env: permission denied"),
+                    interrupted: true,
+                },
+            },
+            ..tool_use(Body::kept(""), Body::kept(""))
+        };
+
+        let default = Retention::default().redact(&record).expect("logged");
+        let full = Retention::Full.redact(&record).expect("logged");
+
+        let Event::ToolUse { outcome, .. } = &default.event else {
+            panic!("the event kind must survive redaction");
+        };
+        assert_eq!(
+            *outcome,
+            ToolOutcome::Failed {
+                error: Body::Elided { bytes: 29 },
+                interrupted: true,
+            },
+            "the error text reached disk at the level that promises it will not"
+        );
+        assert_eq!(full.event, record.event, "full retention keeps it verbatim");
+    }
+
+    #[test]
     fn redaction_keeps_a_tool_calls_identity_and_duration() {
         // Retention withholds tool *bodies*. The identity and the timing are
         // metadata, and metadata is what keeps an elided log useful — the same
@@ -206,7 +252,9 @@ mod tests {
                 tool_use_id: Some(VendorToolUseId::new("toolu_01ABC")),
                 duration_ms: Some(37),
                 input: Body::kept("in"),
-                output: Body::kept("out"),
+                outcome: ToolOutcome::Succeeded {
+                    output: Body::kept("out"),
+                },
             },
             ..tool_use(Body::kept(""), Body::kept(""))
         };
@@ -310,10 +358,15 @@ mod tests {
             .redact(&record)
             .expect("a tool use is still logged");
 
-        let Event::ToolUse { input, output, .. } = &redacted.event else {
+        let Event::ToolUse { input, outcome, .. } = &redacted.event else {
             panic!("the event kind must survive redaction");
         };
         assert_eq!(*input, Body::Elided { bytes: 21 });
-        assert_eq!(*output, Body::Elided { bytes: 19 });
+        assert_eq!(
+            *outcome,
+            ToolOutcome::Succeeded {
+                output: Body::Elided { bytes: 19 }
+            }
+        );
     }
 }

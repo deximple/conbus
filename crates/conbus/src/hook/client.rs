@@ -34,6 +34,7 @@ pub fn run(harness: &str, stdin: &mut impl Read) -> Result<(), String> {
     let Normalized::Event { key, observed } = normalized else {
         return Ok(());
     };
+    let observed = *observed;
 
     let paths = Paths::resolve().map_err(|_| "no home directory to resolve".to_string())?;
     let socket = paths.socket();

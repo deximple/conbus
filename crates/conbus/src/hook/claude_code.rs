@@ -16,7 +16,8 @@
 //! a capture covers them, and keep this list exhaustive when adding a field.
 
 use conbus_core::event::{
-    Author, Body, Event, Harness, TurnState, VendorAgentId, VendorToolUseId, VendorTurnId,
+    Author, Body, Event, Harness, ToolOutcome, TurnState, VendorAgentId, VendorToolUseId,
+    VendorTurnId,
 };
 use conbus_core::registry::{Observed, SessionKey};
 use serde::{Deserialize, Deserializer};
@@ -84,6 +85,10 @@ pub struct Payload {
     /// than rejected, because a hook that refuses a payload takes the turn down.
     #[serde(default)]
     pub tool_use_id: Option<String>,
+    /// `PostToolUseFailure`: the user pressed stop rather than the tool
+    /// failing on its own.
+    #[serde(default)]
+    pub is_interrupt: Option<bool>,
     /// `PostToolUse`, `PostToolUseFailure`. The schema marks it optional, and
     /// 2.1.241 in fact measures on every path, so an absent one today means the
     /// vendor changed rather than that it declined to measure.
@@ -110,12 +115,12 @@ pub struct Payload {
 pub enum Normalized {
     Event {
         key: SessionKey,
-        observed: Observed,
+        /// Boxed only to keep the two variants a similar size; one of these is
+        /// built per hook process and consumed immediately.
+        observed: Box<Observed>,
     },
     /// A hook event the recorder deliberately does not mirror.
-    Ignored {
-        hook_event_name: String,
-    },
+    Ignored { hook_event_name: String },
 }
 
 /// A payload we could not read at all.
@@ -145,7 +150,22 @@ pub fn normalize(json: &str) -> Result<Normalized, HookError> {
             tool_use_id: payload.tool_use_id.map(VendorToolUseId::new),
             duration_ms: payload.duration_ms,
             input: body_of(payload.tool_input),
-            output: body_of(payload.tool_response),
+            outcome: ToolOutcome::Succeeded {
+                output: body_of(payload.tool_response),
+            },
+        },
+        // The vendor sends this *instead of* `PostToolUse`, and it carries no
+        // `tool_response` — a call that fails would otherwise leave the log
+        // with no record at all, making the tool history a record of successes.
+        "PostToolUseFailure" => Event::ToolUse {
+            tool: payload.tool_name.unwrap_or_default(),
+            tool_use_id: payload.tool_use_id.map(VendorToolUseId::new),
+            duration_ms: payload.duration_ms,
+            input: body_of(payload.tool_input),
+            outcome: ToolOutcome::Failed {
+                error: Body::kept(payload.error.unwrap_or_default()),
+                interrupted: payload.is_interrupt.unwrap_or(false),
+            },
         },
         "Stop" => Event::TurnEnded {
             state: TurnState::Complete,
@@ -167,11 +187,11 @@ pub fn normalize(json: &str) -> Result<Normalized, HookError> {
 
     Ok(Normalized::Event {
         key: SessionKey::new(Harness::new(Harness::CLAUDE_CODE), payload.session_id),
-        observed: Observed {
+        observed: Box::new(Observed {
             vendor_turn_id,
             vendor_agent_id,
             event,
-        },
+        }),
     })
 }
 
@@ -237,7 +257,7 @@ mod tests {
         match normalize(json).expect("normalise") {
             Normalized::Event { key: got, observed } => {
                 assert_eq!(got, key());
-                observed
+                *observed
             }
             other => panic!("expected an event, got {other:?}"),
         }
@@ -428,7 +448,9 @@ mod tests {
                 tool_use_id: Some(VendorToolUseId::new("toolu_01ABC")),
                 duration_ms: Some(37),
                 input: Body::kept(r#"{"file_path":"/etc/hosts"}"#),
-                output: Body::kept(r#"{"ok":true}"#),
+                outcome: ToolOutcome::Succeeded {
+                    output: Body::kept(r#"{"ok":true}"#),
+                },
             }
         );
     }
@@ -514,6 +536,55 @@ mod tests {
         };
         assert_eq!(duration_ms, None);
         assert_eq!(tool_use_id, Some(VendorToolUseId::new("toolu_01ABC")));
+    }
+
+    #[test]
+    fn a_failed_tool_call_is_recorded_as_the_same_call_with_a_different_outcome() {
+        // The vendor sends `PostToolUse` or `PostToolUseFailure` for one call,
+        // never both, so a failure is the same event with a different ending —
+        // and there is no `tool_response` on it, only an `error`.
+        let event = event_of(
+            r#"{"session_id":"abc123","hook_event_name":"PostToolUseFailure","tool_name":"Bash",
+                "tool_input":{"command":"false"},"tool_use_id":"toolu_01ABC",
+                "error":"exit status 1","duration_ms":12}"#,
+        );
+
+        assert_eq!(
+            event,
+            Event::ToolUse {
+                tool: "Bash".into(),
+                tool_use_id: Some(VendorToolUseId::new("toolu_01ABC")),
+                duration_ms: Some(12),
+                input: Body::kept(r#"{"command":"false"}"#),
+                outcome: ToolOutcome::Failed {
+                    error: Body::kept("exit status 1"),
+                    interrupted: false,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn a_tool_call_the_user_interrupted_says_so() {
+        // `is_interrupt` is the only signal in the whole hook surface that a
+        // person stopped the work. Nothing derives `TurnState::InterruptedUser`
+        // from it yet, but losing it would remove the only evidence.
+        let event = event_of(
+            r#"{"session_id":"abc123","hook_event_name":"PostToolUseFailure","tool_name":"Bash",
+                "tool_input":{},"tool_use_id":"toolu_01ABC","error":"interrupted",
+                "is_interrupt":true}"#,
+        );
+
+        let Event::ToolUse { outcome, .. } = event else {
+            panic!("expected a tool call");
+        };
+        assert_eq!(
+            outcome,
+            ToolOutcome::Failed {
+                error: Body::kept("interrupted"),
+                interrupted: true,
+            }
+        );
     }
 
     #[test]

@@ -67,7 +67,7 @@ pub struct Entry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::{Author, Body, Harness, TurnState, VendorToolUseId};
+    use crate::event::{Author, Body, Harness, ToolOutcome, TurnState, VendorToolUseId};
 
     fn source() -> Source {
         Source {
@@ -118,6 +118,28 @@ mod tests {
         all
     }
 
+    /// Every `ToolOutcome` variant. `ToolUse` flattens this, so its tag and
+    /// fields are top-level keys of the log line — the same reach the guard
+    /// needs over `TurnState`, and the same exhaustive match that makes a new
+    /// variant break the build rather than slip past the guard.
+    fn every_tool_outcome() -> Vec<ToolOutcome> {
+        let all = vec![
+            ToolOutcome::Succeeded {
+                output: Body::kept("o"),
+            },
+            ToolOutcome::Failed {
+                error: Body::kept("exit status 1"),
+                interrupted: true,
+            },
+        ];
+        for outcome in &all {
+            match outcome {
+                ToolOutcome::Succeeded { .. } | ToolOutcome::Failed { .. } => {}
+            }
+        }
+        all
+    }
+
     /// Every `Event` variant, with **every optional field populated**.
     ///
     /// Populating them is the whole point. `skip_serializing_if` means an
@@ -135,13 +157,6 @@ mod tests {
                 author: Some(Author::new(Author::SCHEDULE_WAKEUP)),
                 prompt: Body::kept("p"),
             },
-            Event::ToolUse {
-                tool: "Read".into(),
-                tool_use_id: Some(VendorToolUseId::new("toolu_01ABC")),
-                duration_ms: Some(37),
-                input: Body::kept("i"),
-                output: Body::kept("o"),
-            },
             Event::SessionEnded {
                 reason: Some("other".into()),
             },
@@ -152,6 +167,17 @@ mod tests {
                 .map(|state| Event::TurnEnded {
                     state,
                     assistant_message: Some(Body::kept("done")),
+                }),
+        );
+        all.extend(
+            every_tool_outcome()
+                .into_iter()
+                .map(|outcome| Event::ToolUse {
+                    tool: "Read".into(),
+                    tool_use_id: Some(VendorToolUseId::new("toolu_01ABC")),
+                    duration_ms: Some(37),
+                    input: Body::kept("i"),
+                    outcome,
                 }),
         );
         for event in &all {
@@ -231,12 +257,56 @@ mod tests {
             tool_use_id: Some(VendorToolUseId::new("toolu_01ABC")),
             duration_ms: Some(37),
             input: Body::kept("i"),
-            output: Body::kept("o"),
+            outcome: ToolOutcome::Succeeded {
+                output: Body::kept("o"),
+            },
         }))
         .expect("serialise");
 
         assert!(line.contains(r#""tool_use_id":"toolu_01ABC""#), "{line}");
         assert!(line.contains(r#""duration_ms":37"#), "{line}");
+        assert!(line.contains(r#""outcome":"succeeded""#), "{line}");
+    }
+
+    #[test]
+    fn a_failed_tool_call_is_greppable_as_one() {
+        let line = serde_json::to_string(&fully_populated(Event::ToolUse {
+            tool: "Bash".into(),
+            tool_use_id: Some(VendorToolUseId::new("toolu_01ABC")),
+            duration_ms: Some(12),
+            input: Body::kept("i"),
+            outcome: ToolOutcome::Failed {
+                error: Body::kept("exit status 1"),
+                interrupted: true,
+            },
+        }))
+        .expect("serialise");
+
+        assert!(line.contains(r#""outcome":"failed""#), "{line}");
+        assert!(line.contains(r#""interrupted":true"#), "{line}");
+        assert!(
+            !line.contains(r#""output""#),
+            "a failure has no response: {line}"
+        );
+    }
+
+    #[test]
+    fn a_tool_call_nobody_interrupted_omits_the_flag() {
+        // `"interrupted":false` on every successful line would make the key
+        // match everywhere and cost a second filtering pass.
+        let line = serde_json::to_string(&fully_populated(Event::ToolUse {
+            tool: "Bash".into(),
+            tool_use_id: None,
+            duration_ms: None,
+            input: Body::kept("i"),
+            outcome: ToolOutcome::Failed {
+                error: Body::kept("exit status 1"),
+                interrupted: false,
+            },
+        }))
+        .expect("serialise");
+
+        assert!(!line.contains("interrupted"), "{line}");
     }
 
     #[test]

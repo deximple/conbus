@@ -3,7 +3,7 @@
 use std::io;
 use std::os::unix::net::UnixStream;
 
-use conbus_core::event::Event;
+use conbus_core::event::{Event, ToolOutcome};
 use conbus_core::paths::Paths;
 use conbus_core::record::Record;
 use conbus_core::segment::SegmentLog;
@@ -38,11 +38,25 @@ fn summarise(record: &Record) -> String {
         }
         Event::TurnStarted { .. } => "turn-started".to_string(),
         Event::ToolUse {
-            tool, duration_ms, ..
-        } => match duration_ms {
-            Some(ms) => format!("tool {tool} ({ms}ms)"),
-            None => format!("tool {tool}"),
-        },
+            tool,
+            duration_ms,
+            outcome,
+            ..
+        } => {
+            let ending = match outcome {
+                ToolOutcome::Succeeded { .. } => "",
+                ToolOutcome::Failed {
+                    interrupted: false, ..
+                } => " failed",
+                ToolOutcome::Failed {
+                    interrupted: true, ..
+                } => " interrupted",
+            };
+            match duration_ms {
+                Some(ms) => format!("tool {tool}{ending} ({ms}ms)"),
+                None => format!("tool {tool}{ending}"),
+            }
+        }
         Event::TurnEnded { state, .. } => format!("turn-ended {state:?}"),
         Event::SessionEnded { reason } => {
             format!("session-end {}", reason.as_deref().unwrap_or("?"))
@@ -106,7 +120,7 @@ pub fn doctor(paths: &Paths) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use conbus_core::event::{Body, Harness, Source, VendorAgentId, VendorToolUseId};
+    use conbus_core::event::{Body, Harness, Source, ToolOutcome, VendorAgentId, VendorToolUseId};
     use conbus_core::record::SCHEMA_VERSION;
 
     fn record(event: Event) -> Record {
@@ -132,7 +146,9 @@ mod tests {
             tool_use_id: tool_use_id.map(VendorToolUseId::new),
             duration_ms,
             input: Body::kept("i"),
-            output: Body::kept("o"),
+            outcome: ToolOutcome::Succeeded {
+                output: Body::kept("o"),
+            },
         })
     }
 
@@ -148,6 +164,41 @@ mod tests {
         let line = summarise(&tool(None, None));
 
         assert!(line.ends_with("tool Read"), "{line}");
+    }
+
+    fn failed_tool(interrupted: bool) -> Record {
+        record(Event::ToolUse {
+            tool: "Bash".into(),
+            tool_use_id: None,
+            duration_ms: Some(12),
+            input: Body::kept("i"),
+            outcome: ToolOutcome::Failed {
+                error: Body::kept("exit status 1"),
+                interrupted,
+            },
+        })
+    }
+
+    #[test]
+    fn a_failed_tool_call_does_not_read_as_a_successful_one() {
+        let succeeded = summarise(&tool(None, Some(12)));
+        let failed = summarise(&failed_tool(false));
+
+        assert!(failed.contains("failed"), "{failed}");
+        assert_ne!(
+            succeeded.split_whitespace().skip(4).collect::<Vec<_>>(),
+            failed.split_whitespace().skip(4).collect::<Vec<_>>(),
+            "a failure reads identically to a success"
+        );
+    }
+
+    #[test]
+    fn a_tool_call_a_person_stopped_reads_differently_from_one_that_broke() {
+        let broke = summarise(&failed_tool(false));
+        let stopped = summarise(&failed_tool(true));
+
+        assert!(stopped.contains("interrupted"), "{stopped}");
+        assert_ne!(broke, stopped);
     }
 
     #[test]
