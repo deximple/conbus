@@ -106,6 +106,8 @@ pub struct Payload {
     #[serde(default)]
     pub last_assistant_message: Option<String>,
     /// `SessionEnd`: clear | resume | logout | prompt_input_exit | other.
+    /// `PermissionDenied`: why the harness refused. One vendor key, two
+    /// vocabularies, told apart by `hook_event_name`.
     #[serde(default)]
     pub reason: Option<String>,
 }
@@ -149,6 +151,12 @@ pub fn normalize(json: &str) -> Result<Normalized, HookError> {
             tool: payload.tool_name.unwrap_or_default(),
             tool_use_id: payload.tool_use_id.map(VendorToolUseId::new),
             input: body_of(payload.tool_input),
+        },
+        "PermissionDenied" => Event::ToolDenied {
+            tool: payload.tool_name.unwrap_or_default(),
+            tool_use_id: payload.tool_use_id.map(VendorToolUseId::new),
+            input: body_of(payload.tool_input),
+            reason: payload.reason.unwrap_or_default(),
         },
         "PostToolUse" => Event::ToolUse {
             tool: payload.tool_name.unwrap_or_default(),
@@ -456,6 +464,54 @@ mod tests {
                 input: Body::kept(r#"{"command":"cargo test"}"#),
             }
         );
+    }
+
+    #[test]
+    fn a_refused_tool_says_why_it_never_ran() {
+        // Its own event rather than a third `ToolOutcome`, because `tool_use`
+        // means the tool ran: a denied call in that set would skew any
+        // aggregation over executions unless every reader filtered it out.
+        let event = event_of(
+            r#"{"session_id":"abc123","hook_event_name":"PermissionDenied","tool_name":"Bash",
+                "tool_input":{"command":"rm -rf /"},"tool_use_id":"toolu_01ABC",
+                "reason":"User rejected the command"}"#,
+        );
+
+        assert_eq!(
+            event,
+            Event::ToolDenied {
+                tool: "Bash".into(),
+                tool_use_id: Some(VendorToolUseId::new("toolu_01ABC")),
+                input: Body::kept(r#"{"command":"rm -rf /"}"#),
+                reason: "User rejected the command".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_denial_resolves_the_request_it_answers() {
+        let requested = event_of(
+            r#"{"session_id":"abc123","hook_event_name":"PreToolUse","tool_name":"Bash",
+                "tool_input":{"command":"rm -rf /"},"tool_use_id":"toolu_01ABC"}"#,
+        );
+        let denied = event_of(
+            r#"{"session_id":"abc123","hook_event_name":"PermissionDenied","tool_name":"Bash",
+                "tool_input":{"command":"rm -rf /"},"tool_use_id":"toolu_01ABC","reason":"no"}"#,
+        );
+
+        let (
+            Event::ToolRequested {
+                tool_use_id: asked, ..
+            },
+            Event::ToolDenied {
+                tool_use_id: answered,
+                ..
+            },
+        ) = (&requested, &denied)
+        else {
+            panic!("expected a request and a denial");
+        };
+        assert_eq!(asked, answered);
     }
 
     #[test]

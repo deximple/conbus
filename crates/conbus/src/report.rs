@@ -38,6 +38,7 @@ fn summarise(record: &Record) -> String {
         }
         Event::TurnStarted { .. } => "turn-started".to_string(),
         Event::ToolRequested { tool, .. } => format!("tool {tool} requested"),
+        Event::ToolDenied { tool, reason, .. } => format!("tool {tool} denied ({reason})"),
         Event::ToolUse {
             tool,
             duration_ms,
@@ -65,14 +66,19 @@ fn summarise(record: &Record) -> String {
     };
     // Parallel calls of the same tool render identically without their id, and
     // the request-to-result join would be invisible in the view people read.
+    // Listed exhaustively rather than with a wildcard: a tool event added later
+    // would otherwise silently stop showing its join key.
     let call = match &record.event {
-        Event::ToolRequested { tool_use_id, .. } | Event::ToolUse { tool_use_id, .. } => {
-            tool_use_id
-                .as_ref()
-                .map(|id| format!(" #{}", id.as_str()))
-                .unwrap_or_default()
-        }
-        _ => String::new(),
+        Event::ToolRequested { tool_use_id, .. }
+        | Event::ToolDenied { tool_use_id, .. }
+        | Event::ToolUse { tool_use_id, .. } => tool_use_id
+            .as_ref()
+            .map(|id| format!(" #{}", id.as_str()))
+            .unwrap_or_default(),
+        Event::SessionCandidate { .. }
+        | Event::TurnStarted { .. }
+        | Event::TurnEnded { .. }
+        | Event::SessionEnded { .. } => String::new(),
     };
     // A subagent's events arrive under the parent's session id, so without
     // this marker the human view interleaves two agents with no sign of it.
@@ -217,6 +223,23 @@ mod tests {
         let line = summarise(&tool(None, Some(6)));
 
         assert!(!line.contains('#'), "{line}");
+    }
+
+    #[test]
+    fn a_denied_tool_says_why_in_the_human_view() {
+        let line = summarise(&record(Event::ToolDenied {
+            tool: "Bash".into(),
+            tool_use_id: Some(VendorToolUseId::new("toolu_01ABC")),
+            input: Body::kept("i"),
+            reason: "User rejected the command".into(),
+        }));
+
+        assert!(line.contains("denied"), "{line}");
+        assert!(
+            line.contains("User rejected the command"),
+            "an unresolved request with no reason is what this event exists to fix: {line}"
+        );
+        assert!(line.contains("toolu_01ABC"), "{line}");
     }
 
     #[test]

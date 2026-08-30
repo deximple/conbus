@@ -25,6 +25,17 @@ fn map_bodies(event: &Event, f: impl Fn(&Body) -> Body) -> Event {
             tool_use_id: tool_use_id.clone(),
             input: f(input),
         },
+        Event::ToolDenied {
+            tool,
+            tool_use_id,
+            input,
+            reason,
+        } => Event::ToolDenied {
+            tool: tool.clone(),
+            tool_use_id: tool_use_id.clone(),
+            input: f(input),
+            reason: reason.clone(),
+        },
         Event::ToolUse {
             tool,
             tool_use_id,
@@ -61,7 +72,7 @@ fn map_bodies(event: &Event, f: impl Fn(&Body) -> Body) -> Event {
 /// Replace tool result bodies with their size, leaving conversation alone.
 fn elide_tool_bodies(event: &Event) -> Event {
     match event {
-        Event::ToolRequested { .. } | Event::ToolUse { .. } => {
+        Event::ToolRequested { .. } | Event::ToolDenied { .. } | Event::ToolUse { .. } => {
             map_bodies(event, |body| Body::Elided {
                 bytes: body.original_bytes(),
             })
@@ -212,6 +223,38 @@ mod tests {
             "clip must not waste a whole character"
         );
         assert_eq!(*original_bytes, korean.len());
+    }
+
+    #[test]
+    fn a_denials_reason_survives_while_its_input_does_not() {
+        // The split this schema draws: tool bodies are withheld by default, and
+        // the harness explaining itself is kept — the same treatment a turn's
+        // interruption reason and a session's end reason get. Eliding the
+        // reason would delete the only account of why a request never resolved.
+        let record = Record {
+            event: Event::ToolDenied {
+                tool: "Bash".into(),
+                tool_use_id: Some(VendorToolUseId::new("toolu_01ABC")),
+                input: Body::kept(r#"{"command":"rm -rf /"}"#),
+                reason: "User rejected the command".into(),
+            },
+            ..tool_use(Body::kept(""), Body::kept(""))
+        };
+
+        for level in [Retention::Full, Retention::ConversationOnly] {
+            let redacted = level.redact(&record).expect("logged");
+
+            let Event::ToolDenied { input, reason, .. } = &redacted.event else {
+                panic!("the event kind must survive redaction");
+            };
+            assert_eq!(
+                reason, "User rejected the command",
+                "{level:?} dropped the reason"
+            );
+            if level == Retention::ConversationOnly {
+                assert_eq!(*input, Body::Elided { bytes: 22 }, "the input reached disk");
+            }
+        }
     }
 
     #[test]

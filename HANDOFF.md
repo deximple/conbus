@@ -8,7 +8,7 @@ Written for whoever picks this up next. The design phase is finished and the rec
 - The plan is the single source of truth: [`.cursor/plans/shared_workspace_context_3f7139b8.plan.md`](.cursor/plans/shared_workspace_context_3f7139b8.plan.md). The filename is a generated ID and no longer matches the content; leave it alone so the Cursor plan UI keeps its association. A reader-facing copy under `docs/` gets generated when the repo goes public.
 - `cargo 1.94.1` and `rustc 1.94.1` are installed on this machine, so edition 2024 is available.
 - A cargo workspace exists: `crates/conbus` (the binary) and `crates/conbus-core` (the lib). Edition 2024.
-  118 tests, `cargo clippy --all-targets -- -D warnings` clean. See "Next task" for what is built and what is not.
+  123 tests, `cargo clippy --all-targets -- -D warnings` clean. See "Next task" for what is built and what is not.
 
 ## What Conbus is, in one paragraph
 
@@ -144,6 +144,24 @@ A prompt mints on its own if the session start never arrived, so Desktop's `/cle
    real quota exhaustion. The quota fixture only arrives by actually hitting the limit, so treat the first dogfooding
    exhaustion as a recording opportunity rather than an interruption.
 
+**Every tool request now has an answer in the log.**
+
+The tool surface is mirrored end to end: `PreToolUse` → `tool_requested`, and then exactly one of
+`PostToolUse` → `tool_use` (succeeded), `PostToolUseFailure` → `tool_use` (failed), or `PermissionDenied` →
+`tool_denied`. So an unresolved `tool_requested` now means something specific — the call was still in flight when
+the session ended, or the daemon missed the event — rather than "we do not mirror the answer".
+
+`tool_denied` is its own event rather than a third `ToolOutcome`, and the reasoning is the mirror image of why the
+two post events *do* share one: `tool_use` means the tool **ran**. A call that never executed sitting in that set
+would skew every aggregation over executions — durations, failure rates — unless each reader remembered to filter it
+out. It also shares almost nothing with a result: no duration, no output, no error from the tool.
+
+**The retention split is now explicit across the whole tool surface.** Tool bodies — a request's input, a result's
+output, a failure's error text — are withheld at the default level, because that is where the sensitive material and
+the volume live. Reasons the *harness* generates are kept: a denial's reason, a turn's interruption reason, a
+session's end reason. Eliding a denial's reason would delete the only account of why a request never resolved, which
+is the entire point of recording it.
+
 **A tool call is now two records, and that is the point.**
 
 `PreToolUse` is mirrored as its own event, `tool_requested`. It is *not* a third `ToolOutcome`: a request and its
@@ -249,11 +267,9 @@ Take the lesson generally: **the adapter is only as good as the traffic it has b
   record already carries its own input and output. It becomes a join key when `PreToolUse` and
   `PostToolUseFailure` are mirrored.)
 
-- **`PermissionDenied` is not mirrored, and mirroring the request side is what makes that a hole.** A tool the user
-  refuses now leaves a `tool_requested` record with no result and nothing saying why. The vendor sends
-  `PermissionDenied` (`tool_name`, `tool_input`, `tool_use_id`, `reason`) for exactly that case; it is one match
-  arm. Until then, treat an unresolved request as "denied, interrupted, or the daemon missed it" — the log cannot
-  tell you which.
+- **`PostToolBatch` is not mirrored.** It carries the whole batch's `tool_calls`, which is the vendor's own
+  statement of what was issued together — cheaper than inferring batches from adjacency. Not needed for the join,
+  but it is the remaining tool-surface event.
 - **`MessageDisplay` is not mirrored**, and it is the only official channel carrying every assistant message rather
   than the last one. High volume, and it collides with the "conversation only" shipping default, so it is a retention
   decision before it is an adapter change.

@@ -315,6 +315,55 @@ fn parallel_tool_calls_can_be_paired_with_their_results() {
 }
 
 #[test]
+fn a_refused_tool_leaves_a_reason_rather_than_an_unanswered_request() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let daemon = start_daemon(home.path());
+
+    run_hook(
+        home.path(),
+        r#"{"session_id":"s-1","hook_event_name":"UserPromptSubmit","prompt":"clean up","prompt_id":"T-1"}"#,
+        &[],
+    );
+    run_hook(
+        home.path(),
+        r#"{"session_id":"s-1","hook_event_name":"PreToolUse","tool_name":"Bash",
+            "tool_input":{"command":"rm -rf /"},"tool_use_id":"toolu_01ABC","prompt_id":"T-1"}"#,
+        &[],
+    );
+    run_hook(
+        home.path(),
+        r#"{"session_id":"s-1","hook_event_name":"PermissionDenied","tool_name":"Bash",
+            "tool_input":{"command":"rm -rf /"},"tool_use_id":"toolu_01ABC",
+            "reason":"User rejected the command","prompt_id":"T-1"}"#,
+        &[],
+    );
+
+    let lines = log_lines(home.path());
+    let kinds: Vec<&str> = lines
+        .iter()
+        .map(|l| l["event"].as_str().expect("event"))
+        .collect();
+    assert_eq!(
+        kinds,
+        vec!["turn_started", "tool_requested", "tool_denied"],
+        "{lines:#?}"
+    );
+
+    let denial = &lines[2];
+    assert_eq!(
+        denial["tool_use_id"], lines[1]["tool_use_id"],
+        "the denial must answer the request"
+    );
+    assert_eq!(denial["reason"], "User rejected the command", "{denial:#?}");
+    assert_eq!(
+        denial["input"]["kind"], "elided",
+        "the refused input reached disk: {denial:#?}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
 fn a_tool_call_that_fails_reaches_the_log_too() {
     // Without this the log's tool history is the *successful* tool history:
     // the vendor sends PostToolUseFailure instead of PostToolUse, so a failed

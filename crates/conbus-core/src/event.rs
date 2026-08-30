@@ -197,6 +197,28 @@ pub enum Event {
         tool_use_id: Option<VendorToolUseId>,
         input: Body,
     },
+    /// A tool the harness refused to run.
+    ///
+    /// Its own event rather than a third `ToolOutcome`, because `ToolUse` means
+    /// the tool *ran*: a call that never executed sitting in that set would
+    /// skew any aggregation over executions — durations, failure rates — unless
+    /// every reader remembered to filter it out. It also shares almost nothing
+    /// with a result: no duration, no output, no error from the tool.
+    ///
+    /// Without it, mirroring the request side leaves a `tool_requested` with no
+    /// resolution and nothing saying why.
+    ToolDenied {
+        tool: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_use_id: Option<VendorToolUseId>,
+        input: Body,
+        /// Why the harness refused. A plain string, not a `Body`: retention
+        /// withholds tool *result* bodies, and this is the harness explaining
+        /// itself, the same as a turn's interruption reason or a session's end
+        /// reason. Eliding it would delete the only account of why a request
+        /// never resolved, which is the whole point of recording it.
+        reason: String,
+    },
     /// A tool ran.
     ToolUse {
         tool: String,

@@ -162,6 +162,12 @@ mod tests {
                 tool_use_id: Some(VendorToolUseId::new("toolu_01ABC")),
                 input: Body::kept("i"),
             },
+            Event::ToolDenied {
+                tool: "Bash".into(),
+                tool_use_id: Some(VendorToolUseId::new("toolu_01ABC")),
+                input: Body::kept("i"),
+                reason: "User rejected the command".into(),
+            },
             Event::SessionEnded {
                 reason: Some("other".into()),
             },
@@ -190,6 +196,7 @@ mod tests {
                 Event::SessionCandidate { .. }
                 | Event::TurnStarted { .. }
                 | Event::ToolRequested { .. }
+                | Event::ToolDenied { .. }
                 | Event::ToolUse { .. }
                 | Event::TurnEnded { .. }
                 | Event::SessionEnded { .. } => {}
