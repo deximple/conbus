@@ -238,6 +238,83 @@ fn the_correlators_cross_the_socket_and_stay_with_their_own_records() {
 }
 
 #[test]
+fn parallel_tool_calls_can_be_paired_with_their_results() {
+    // Two calls issued together and finishing in the other order. The log's
+    // sequence records arrival, so without a join key the results cannot be
+    // attributed to their requests — which is what mirroring the request side
+    // is for.
+    let home = tempfile::tempdir().expect("tempdir");
+    let daemon = start_daemon(home.path());
+
+    run_hook(
+        home.path(),
+        r#"{"session_id":"s-1","hook_event_name":"UserPromptSubmit","prompt":"read both","prompt_id":"T-1"}"#,
+        &[],
+    );
+    for id in ["toolu_A", "toolu_B"] {
+        run_hook(
+            home.path(),
+            &format!(
+                r#"{{"session_id":"s-1","hook_event_name":"PreToolUse","tool_name":"Read",
+                    "tool_input":{{"n":"{id}"}},"tool_use_id":"{id}","prompt_id":"T-1"}}"#
+            ),
+            &[],
+        );
+    }
+    // B finishes first.
+    for id in ["toolu_B", "toolu_A"] {
+        run_hook(
+            home.path(),
+            &format!(
+                r#"{{"session_id":"s-1","hook_event_name":"PostToolUse","tool_name":"Read",
+                    "tool_input":{{"n":"{id}"}},"tool_response":{{"ok":true}},
+                    "tool_use_id":"{id}","duration_ms":9,"prompt_id":"T-1"}}"#
+            ),
+            &[],
+        );
+    }
+
+    let lines = log_lines(home.path());
+    let kinds: Vec<&str> = lines
+        .iter()
+        .map(|l| l["event"].as_str().expect("event"))
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![
+            "turn_started",
+            "tool_requested",
+            "tool_requested",
+            "tool_use",
+            "tool_use"
+        ],
+        "{lines:#?}"
+    );
+
+    let issued: Vec<&str> = lines
+        .iter()
+        .filter(|l| l["event"] == "tool_requested")
+        .map(|l| l["tool_use_id"].as_str().expect("id"))
+        .collect();
+    let finished: Vec<&str> = lines
+        .iter()
+        .filter(|l| l["event"] == "tool_use")
+        .map(|l| l["tool_use_id"].as_str().expect("id"))
+        .collect();
+
+    assert_eq!(issued, vec!["toolu_A", "toolu_B"], "issue order");
+    assert_eq!(finished, vec!["toolu_B", "toolu_A"], "completion order");
+    for id in &issued {
+        assert!(
+            finished.contains(id),
+            "{id} was requested and never resolved"
+        );
+    }
+
+    daemon.stop();
+}
+
+#[test]
 fn a_tool_call_that_fails_reaches_the_log_too() {
     // Without this the log's tool history is the *successful* tool history:
     // the vendor sends PostToolUseFailure instead of PostToolUse, so a failed

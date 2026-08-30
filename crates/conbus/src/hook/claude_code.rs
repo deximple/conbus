@@ -145,6 +145,11 @@ pub fn normalize(json: &str) -> Result<Normalized, HookError> {
             author: payload.source.map(Author::new),
             prompt: Body::kept(payload.prompt.unwrap_or_default()),
         },
+        "PreToolUse" => Event::ToolRequested {
+            tool: payload.tool_name.unwrap_or_default(),
+            tool_use_id: payload.tool_use_id.map(VendorToolUseId::new),
+            input: body_of(payload.tool_input),
+        },
         "PostToolUse" => Event::ToolUse {
             tool: payload.tool_name.unwrap_or_default(),
             tool_use_id: payload.tool_use_id.map(VendorToolUseId::new),
@@ -434,6 +439,56 @@ mod tests {
     }
 
     #[test]
+    fn a_tool_request_is_recorded_before_the_tool_runs() {
+        // `PreToolUse` fires before execution, so it is a different moment
+        // rather than a different description of the same one — which is why
+        // it is its own event and not a third `ToolOutcome`.
+        let event = event_of(
+            r#"{"session_id":"abc123","hook_event_name":"PreToolUse","tool_name":"Bash",
+                "tool_input":{"command":"cargo test"},"tool_use_id":"toolu_01ABC"}"#,
+        );
+
+        assert_eq!(
+            event,
+            Event::ToolRequested {
+                tool: "Bash".into(),
+                tool_use_id: Some(VendorToolUseId::new("toolu_01ABC")),
+                input: Body::kept(r#"{"command":"cargo test"}"#),
+            }
+        );
+    }
+
+    #[test]
+    fn a_request_and_its_result_share_one_tool_use_id() {
+        // This is the join the id exists for, and it did not exist until the
+        // request side was mirrored: before this, a call produced exactly one
+        // record and there was nothing to join it to.
+        let requested = event_of(
+            r#"{"session_id":"abc123","hook_event_name":"PreToolUse","tool_name":"Bash",
+                "tool_input":{"command":"cargo test"},"tool_use_id":"toolu_01ABC"}"#,
+        );
+        let finished = event_of(
+            r#"{"session_id":"abc123","hook_event_name":"PostToolUse","tool_name":"Bash",
+                "tool_input":{"command":"cargo test"},"tool_response":{"ok":true},
+                "tool_use_id":"toolu_01ABC","duration_ms":4210}"#,
+        );
+
+        let (
+            Event::ToolRequested {
+                tool_use_id: asked, ..
+            },
+            Event::ToolUse {
+                tool_use_id: got, ..
+            },
+        ) = (&requested, &finished)
+        else {
+            panic!("expected a request and a result");
+        };
+        assert_eq!(asked, got);
+        assert!(asked.is_some(), "an unjoinable pair is the same as no pair");
+    }
+
+    #[test]
     fn a_tool_call_keeps_its_name_its_bodies_and_its_own_id() {
         let event = event_of(
             r#"{"session_id":"abc123","hook_event_name":"PostToolUse","tool_name":"Read",
@@ -695,15 +750,14 @@ mod tests {
 
     #[test]
     fn hook_events_the_recorder_does_not_mirror_are_named_not_swallowed() {
-        let normalized = normalize(
-            r#"{"session_id":"abc123","hook_event_name":"PreToolUse","tool_name":"Bash"}"#,
-        )
-        .expect("normalise");
+        let normalized =
+            normalize(r#"{"session_id":"abc123","hook_event_name":"PreCompact","trigger":"auto"}"#)
+                .expect("normalise");
 
         assert_eq!(
             normalized,
             Normalized::Ignored {
-                hook_event_name: "PreToolUse".into()
+                hook_event_name: "PreCompact".into()
             }
         );
     }

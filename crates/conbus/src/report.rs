@@ -37,6 +37,7 @@ fn summarise(record: &Record) -> String {
             format!("session-start {}", trigger.as_deref().unwrap_or("?"))
         }
         Event::TurnStarted { .. } => "turn-started".to_string(),
+        Event::ToolRequested { tool, .. } => format!("tool {tool} requested"),
         Event::ToolUse {
             tool,
             duration_ms,
@@ -62,6 +63,17 @@ fn summarise(record: &Record) -> String {
             format!("session-end {}", reason.as_deref().unwrap_or("?"))
         }
     };
+    // Parallel calls of the same tool render identically without their id, and
+    // the request-to-result join would be invisible in the view people read.
+    let call = match &record.event {
+        Event::ToolRequested { tool_use_id, .. } | Event::ToolUse { tool_use_id, .. } => {
+            tool_use_id
+                .as_ref()
+                .map(|id| format!(" #{}", id.as_str()))
+                .unwrap_or_default()
+        }
+        _ => String::new(),
+    };
     // A subagent's events arrive under the parent's session id, so without
     // this marker the human view interleaves two agents with no sign of it.
     let agent = record
@@ -70,7 +82,7 @@ fn summarise(record: &Record) -> String {
         .map(|id| format!(" [subagent {}]", id.as_str()))
         .unwrap_or_default();
     format!(
-        "{} {:>6} {} {} {what}{agent}",
+        "{} {:>6} {} {} {what}{call}{agent}",
         record.ts,
         record.seq,
         record.bus_id,
@@ -177,6 +189,47 @@ mod tests {
                 interrupted,
             },
         })
+    }
+
+    #[test]
+    fn parallel_calls_are_told_apart_by_their_id_in_the_human_view() {
+        // Two `Read`s requested together render identically without it, and the
+        // join this change exists to enable would be invisible in the view a
+        // person actually reads.
+        let first = summarise(&record(Event::ToolRequested {
+            tool: "Read".into(),
+            tool_use_id: Some(VendorToolUseId::new("toolu_A")),
+            input: Body::kept("i"),
+        }));
+        let second = summarise(&record(Event::ToolRequested {
+            tool: "Read".into(),
+            tool_use_id: Some(VendorToolUseId::new("toolu_B")),
+            input: Body::kept("i"),
+        }));
+
+        assert_ne!(first, second, "two parallel requests read identically");
+        assert!(first.contains("toolu_A"), "{first}");
+        assert!(summarise(&tool(Some("toolu_A"), Some(6))).contains("toolu_A"));
+    }
+
+    #[test]
+    fn a_call_with_no_id_carries_no_empty_marker() {
+        let line = summarise(&tool(None, Some(6)));
+
+        assert!(!line.contains('#'), "{line}");
+    }
+
+    #[test]
+    fn a_request_does_not_read_as_a_completed_call() {
+        let requested = summarise(&record(Event::ToolRequested {
+            tool: "Bash".into(),
+            tool_use_id: Some(VendorToolUseId::new("toolu_01ABC")),
+            input: Body::kept("i"),
+        }));
+        let finished = summarise(&tool(None, Some(12)));
+
+        assert!(requested.contains("requested"), "{requested}");
+        assert_ne!(requested, finished);
     }
 
     #[test]

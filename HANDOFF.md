@@ -8,7 +8,7 @@ Written for whoever picks this up next. The design phase is finished and the rec
 - The plan is the single source of truth: [`.cursor/plans/shared_workspace_context_3f7139b8.plan.md`](.cursor/plans/shared_workspace_context_3f7139b8.plan.md). The filename is a generated ID and no longer matches the content; leave it alone so the Cursor plan UI keeps its association. A reader-facing copy under `docs/` gets generated when the repo goes public.
 - `cargo 1.94.1` and `rustc 1.94.1` are installed on this machine, so edition 2024 is available.
 - A cargo workspace exists: `crates/conbus` (the binary) and `crates/conbus-core` (the lib). Edition 2024.
-  111 tests, `cargo clippy --all-targets -- -D warnings` clean. See "Next task" for what is built and what is not.
+  118 tests, `cargo clippy --all-targets -- -D warnings` clean. See "Next task" for what is built and what is not.
 
 ## What Conbus is, in one paragraph
 
@@ -144,6 +144,28 @@ A prompt mints on its own if the session start never arrived, so Desktop's `/cle
    real quota exhaustion. The quota fixture only arrives by actually hitting the limit, so treat the first dogfooding
    exhaustion as a recording opportunity rather than an interruption.
 
+**A tool call is now two records, and that is the point.**
+
+`PreToolUse` is mirrored as its own event, `tool_requested`. It is *not* a third `ToolOutcome`: a request and its
+result are two moments in time, and the log is append-only, so a later record cannot amend an earlier one. (The two
+post events are different — they are exclusive descriptions of the *same* moment, which is why those share one
+event with an outcome.)
+
+What it buys, and what it costs:
+
+- **`tool_use_id` is finally a join key.** Before this, a call produced exactly one record and there was nothing to
+  join it to; the claim that the id "orders parallel calls" was unsupported and this file said so. Now issue order
+  (`tool_requested`) and completion order (`tool_use`) are both on the log and differ visibly under parallelism.
+- **A request that never resolves is visible**, which is a new kind of fact the log could not previously hold.
+- **The input is recorded twice**, and deliberately: a `PreToolUse` hook is allowed to rewrite a tool's input, so
+  "what was asked for" and "what ran" are separate facts that can legitimately differ. At the default retention
+  level both are elided to a byte count, so the cost is small; at `Full` it is a real duplication for write-heavy
+  sessions.
+- **The log roughly doubles for tool-heavy turns.** That is the trade, taken deliberately.
+
+`conbus log` prints the id as `#toolu_…` on both, because two parallel `Read`s render identically without it and
+the join would be invisible in the view people actually read.
+
 **A failed tool call is a tool call.**
 
 The vendor sends `PostToolUse` **or** `PostToolUseFailure` for one call, never both, so a failure is not a second
@@ -227,9 +249,11 @@ Take the lesson generally: **the adapter is only as good as the traffic it has b
   record already carries its own input and output. It becomes a join key when `PreToolUse` and
   `PostToolUseFailure` are mirrored.)
 
-- **`PreToolUse` is still not mirrored**, so `tool_use_id` still joins nothing: a call produces one record either
-  way, and that record already carries its own input. It becomes a join key when the request side is mirrored, which
-  would also double the tool records — a decision, not an oversight.
+- **`PermissionDenied` is not mirrored, and mirroring the request side is what makes that a hole.** A tool the user
+  refuses now leaves a `tool_requested` record with no result and nothing saying why. The vendor sends
+  `PermissionDenied` (`tool_name`, `tool_input`, `tool_use_id`, `reason`) for exactly that case; it is one match
+  arm. Until then, treat an unresolved request as "denied, interrupted, or the daemon missed it" — the log cannot
+  tell you which.
 - **`MessageDisplay` is not mirrored**, and it is the only official channel carrying every assistant message rather
   than the last one. High volume, and it collides with the "conversation only" shipping default, so it is a retention
   decision before it is an adapter change.

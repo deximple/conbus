@@ -180,6 +180,23 @@ pub enum Event {
         author: Option<Author>,
         prompt: Body,
     },
+    /// The model asked for a tool, before it ran.
+    ///
+    /// Its own event rather than a third `ToolOutcome`, because this is a
+    /// different moment in time — a request and its result are two facts, and
+    /// the log is append-only, so a later record cannot amend an earlier one.
+    /// (`PostToolUse` and `PostToolUseFailure` are different: two exclusive
+    /// descriptions of the *same* moment, which is why those share one event.)
+    ///
+    /// The input is recorded here as well as on the result, and the two can
+    /// legitimately differ: a `PreToolUse` hook is allowed to rewrite a tool's
+    /// input, so "what was asked for" and "what ran" are separate facts.
+    ToolRequested {
+        tool: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_use_id: Option<VendorToolUseId>,
+        input: Body,
+    },
     /// A tool ran.
     ToolUse {
         tool: String,

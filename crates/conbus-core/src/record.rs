@@ -157,6 +157,11 @@ mod tests {
                 author: Some(Author::new(Author::SCHEDULE_WAKEUP)),
                 prompt: Body::kept("p"),
             },
+            Event::ToolRequested {
+                tool: "Bash".into(),
+                tool_use_id: Some(VendorToolUseId::new("toolu_01ABC")),
+                input: Body::kept("i"),
+            },
             Event::SessionEnded {
                 reason: Some("other".into()),
             },
@@ -184,6 +189,7 @@ mod tests {
             match event {
                 Event::SessionCandidate { .. }
                 | Event::TurnStarted { .. }
+                | Event::ToolRequested { .. }
                 | Event::ToolUse { .. }
                 | Event::TurnEnded { .. }
                 | Event::SessionEnded { .. } => {}

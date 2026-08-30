@@ -16,6 +16,15 @@ fn map_bodies(event: &Event, f: impl Fn(&Body) -> Body) -> Event {
         // Spelled out rather than `..`: retention withholds bodies, and
         // silencing this arm by dropping the identity or the timing would
         // withhold metadata at every level, including `Full`.
+        Event::ToolRequested {
+            tool,
+            tool_use_id,
+            input,
+        } => Event::ToolRequested {
+            tool: tool.clone(),
+            tool_use_id: tool_use_id.clone(),
+            input: f(input),
+        },
         Event::ToolUse {
             tool,
             tool_use_id,
@@ -52,9 +61,11 @@ fn map_bodies(event: &Event, f: impl Fn(&Body) -> Body) -> Event {
 /// Replace tool result bodies with their size, leaving conversation alone.
 fn elide_tool_bodies(event: &Event) -> Event {
     match event {
-        Event::ToolUse { .. } => map_bodies(event, |body| Body::Elided {
-            bytes: body.original_bytes(),
-        }),
+        Event::ToolRequested { .. } | Event::ToolUse { .. } => {
+            map_bodies(event, |body| Body::Elided {
+                bytes: body.original_bytes(),
+            })
+        }
         other => other.clone(),
     }
 }
@@ -201,6 +212,39 @@ mod tests {
             "clip must not waste a whole character"
         );
         assert_eq!(*original_bytes, korean.len());
+    }
+
+    #[test]
+    fn a_requested_tool_input_is_withheld_by_default_like_any_other_tool_body() {
+        // The request carries the same material as the result — a `Write`'s
+        // whole file body arrives here first. Mirroring the request must not
+        // become a way for tool bodies to reach disk at the level that
+        // promises they will not.
+        let record = Record {
+            event: Event::ToolRequested {
+                tool: "Write".into(),
+                tool_use_id: Some(VendorToolUseId::new("toolu_01ABC")),
+                input: Body::kept(r#"{"content":"a secret"}"#),
+            },
+            ..tool_use(Body::kept(""), Body::kept(""))
+        };
+
+        let default = Retention::default().redact(&record).expect("logged");
+        let full = Retention::Full.redact(&record).expect("logged");
+
+        let Event::ToolRequested {
+            input, tool_use_id, ..
+        } = &default.event
+        else {
+            panic!("the event kind must survive redaction");
+        };
+        assert_eq!(*input, Body::Elided { bytes: 22 });
+        assert_eq!(
+            tool_use_id.as_ref().map(VendorToolUseId::as_str),
+            Some("toolu_01ABC"),
+            "the join key is metadata and must survive"
+        );
+        assert_eq!(full.event, record.event, "full retention keeps it verbatim");
     }
 
     #[test]
