@@ -2,7 +2,7 @@
 
 A conversation bus for coding agents. One conversation keeps its identity while the harness underneath it changes.
 
-Design lives in `.cursor/plans/shared_workspace_context_3f7139b8.plan.md` and is the source of truth. Session state and the next task are in `HANDOFF.md`. Read both before proposing architecture; four review rounds already closed most of the open questions, and reopening them wastes turns.
+Design lives in `.cursor/plans/shared_workspace_context_3f7139b8.plan.md` and is the source of truth. Session state and the next task are in `HANDOFF.md`. Read both before proposing architecture; four review rounds already closed most of the open questions, and reopening them wastes turns. The Claude Code hook contract and the real payloads that pin it are in `crates/conbus/tests/fixtures/` — read those before changing an adapter, because field names taken from anything else have already been wrong once.
 
 ## Non-negotiable constraints
 
