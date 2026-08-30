@@ -7,7 +7,7 @@ Written for whoever picks this up next. The design phase is finished and nothing
 - Repo: `/Applications/conbus`, remote `deximple/conbus`, **private**, branch `main`.
 - The plan is the single source of truth: [`.cursor/plans/shared_workspace_context_3f7139b8.plan.md`](.cursor/plans/shared_workspace_context_3f7139b8.plan.md). The filename is a generated ID and no longer matches the content; leave it alone so the Cursor plan UI keeps its association. A reader-facing copy under `docs/` gets generated when the repo goes public.
 - Two commits. No code, no `Cargo.toml`, no scaffolding.
-- `cargo 1.94.1` is installed on this machine.
+- `cargo 1.94.1` and `rustc 1.94.1` are installed on this machine, so edition 2024 is available.
 
 ## What Conbus is, in one paragraph
 
