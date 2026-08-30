@@ -26,8 +26,11 @@ todos:
   - id: attach-two-modes
     content: 0단계 - Attach에 interactive+hooks / headless 두 모드 + capability descriptor. 없는 능력은 라우터가 열화
     status: pending
-  - id: install-doctor
-    content: 0단계 - bus install(감지·등록·복구)과 bus doctor(훅 발화·주입 inline·쿼터 신호 확인). bash/powershell 양쪽 등록
+  - id: doctor-diagnose
+    content: 0단계 - conbus doctor. 훅이 실제로 발화하는지, 주입이 inline인지, 쿼터 신호가 오는지 진단. install 전체는 1단계
+    status: pending
+  - id: codex-warm-leg
+    content: 0단계 - 비대칭 dual-warm. app-server 사이드카가 소유한 Codex 스레드를 매 턴 inject_items로 동기화. Claude는 인터랙티브 유지
     status: pending
   - id: hook-binary-multi
     content: 1단계 - 훅 바이너리 하나 + 등록 N개. Claude 포맷을 읽는 Cursor·Copilot CLI·Devin CLI는 등록만으로 편입
@@ -38,23 +41,26 @@ todos:
   - id: rolling-summary
     content: 0단계 - 기본 백엔드는 상대 벤더 저효력 모델, 라우터가 여유 레그로 재지정. 보호 중인 레그 금지. hop 경로 모델 호출 0
     status: pending
-  - id: lease-orphan
-    content: 0단계 - bus_id 리스, 공식 읽기 경로 갭 메우기, hop-back 부재중 요약
+  - id: lease-only
+    content: 0단계 - bus_id 단일 작가 리스와 hop-back 부재중 요약. 갭 메우기는 1단계(죽으면 갭을 기록만)
     status: pending
   - id: survival-meter
     content: 0단계 - 생존 카운터 + 라우팅/failover hop 분리 + 턴당 주입 토큰을 비용 항목으로 나란히
     status: pending
-  - id: control-plane
-    content: 0단계 - 채팅이 아닌 컨트롤 플레인. 라우팅 규칙, 쿼터, hop 히스토리, fact, 비용
-    status: pending
-  - id: fact-schema-contract
-    content: 0단계 - 스키마 기준선(타입·라이프사이클·supersedes/contradicts 사유·evidence·출처·앵커) + 메커니즘은 로그 도출 + 싱크는 export 어댑터
+  - id: fact-schema-doc
+    content: 0단계 - fact 스키마 계약을 문서로만 확정(타입·라이프사이클·evidence·출처·앵커·로그 도출 메커니즘). 구현은 workspace-arena
     status: pending
   - id: verify-dogfood
     content: 0단계 종료 - 4주 본인 도그푸딩 계측과 킬 크리테리아 판정
     status: pending
-  - id: dual-warm-enable
-    content: 1단계 - A 목적지. Codex warm 스레드는 우리가 app-server로 연 것만, 사용자 라이브 스레드 inject 금지. 턴 단위 라우팅, 권한 프록시
+  - id: dual-warm-symmetric
+    content: 1단계 - 대칭 dual-warm. Claude 레그도 warm(shouldQuery false, 헤드리스) + 권한 프록시. 정책 노출을 감수하는 지점
+    status: pending
+  - id: control-plane
+    content: 1단계 - 채팅이 아닌 컨트롤 플레인. 라우팅 규칙, 쿼터, hop 히스토리, fact, 비용
+    status: pending
+  - id: gap-fill
+    content: 1단계 - 공식 읽기 경로로 고아 턴 갭 메우기
     status: pending
   - id: secure-handles
     content: 실행 첫 단계 - GitHub 개인 계정 아래 conbus 저장소(비공개 시작), crates.io·npm 이름 확보 여부 결정
@@ -127,7 +133,23 @@ B를 0단계로 두는 이유는 정책이 아니라 **속도와 도그푸딩**�
 
 이 둘이면 **양쪽 세션을 동시에 살려 두고 동기화**할 수 있다. 턴은 한쪽으로 가고 결과는 다른 쪽에 주입된다. 그러면 hop이 아니라 **route**가 되고, 전환 시 콜드 스타트가 없다. “한 대화, 두 하네스”의 가장 강한 형태이고 A에서만 된다.
 
-이전 판은 이 원시를 갭 메우기 도구로만 적었다. 0단계의 로그·팩 스키마는 처음부터 **dual-warm을 전제로** 잡고, 1단계에서 켠다.
+이전 판은 이 원시를 갭 메우기 도구로만 적었다. 0단계의 로그·팩 스키마는 처음부터 **dual-warm을 전제로** 잡는다.
+
+### 결정: 0단계는 비대칭 dual-warm
+
+**Codex 레그만 warm으로 둔다. Claude는 인터랙티브 그대로다.**
+
+대칭 dual-warm에는 숨은 비용이 있다. Claude 쪽 원시인 `shouldQuery: false`는 Agent SDK 기능이고, 그건 곧 헤드리스 경로이며 **보류된 크레딧 분리 정책의 대상**이다. 아키텍처로 피해 둔 노출이 되돌아오고, `-p` 기본이 Manual이라 권한 프록시까지 딸려 온다. 0단계를 자르면서 이걸 넣는 것은 모순이다.
+
+비대칭이면 셋이 동시에 해결된다.
+
+- **정책 노출 0.** Claude는 인터랙티브 훅 경로에 남는다.
+- **필요한 방향만 덮는다.** 사람들이 실제로 치는 한도는 Claude 쪽이다. 그래서 온기가 필요한 방향은 Claude→Codex 하나이고, 그 방향은 Codex 레그만 warm이면 콜드 스타트가 없다. 반대 방향(Codex→Claude)은 콜드 hop으로 둔다.
+- **인프라 재활용.** 쿼터를 읽으려고 띄우는 `codex app-server` 사이드카가 warm 스레드를 유지할 연결과 같다. 프로브 1번과 겹친다.
+
+비용은 매 턴 `inject_items`로 동기화하는 것뿐이고, 그건 모델 호출이 없어 Codex가 실제로 턴을 돌릴 때까지 거의 무료다.
+
+**대칭 dual-warm은 1단계다.** 그때 Claude 레그를 headless로 올리고 권한 프록시를 붙이며, 정책 상태에 따라 모드를 고른다.
 
 **Codex 쪽에는 경계가 있다.** Codex에는 현재 스레드의 보존된 롤백 소스를 지우는 원시가 없다. 그래서 롤백한 프롬프트가 재시작 후 되살아나는 사고가 실제로 보고됐다. 결론은 셋이다.
 
@@ -466,8 +488,8 @@ Codex `/import`가 이미 Claude Code 세션을 가져온다. 이전 판은 그�
 
 ## 단계
 
-- **0단계 (증명, 4주 도그푸딩).** Claude Code ↔ Codex. **1주는 기록만이다** — 훅 미러, 로그, 백필. 주입은 포함하지 않는다. 인접 레코더가 두 벤더에서 레코더와 계승을 견고하게 만드는 데 288 커밋과 22 ADR과 4개월이 들었다. 1주에 되는 것은 기록 부분이고, 주입 견고화(유령 세션, 플러시 지연, 10k 열화, Desktop 예외)는 주 단위 작업이라 별도 항목으로 뺀다. 이어서 훅 사이드카, PTY 래퍼, `bus log`, 컨트롤 플레인, 작업별 라우팅, dual-warm 전제 스키마, fact 계약. Cursor는 제외한다 — `-p`에 승인 채널과 구조화 쿼터 신호가 없고 결제 스택에 없으면 도그푸딩이 안 된다.
-- **1단계 (목적지와 공개).** dual-warm으로 턴 단위 라우팅, 권한 프록시, Cursor ACP, 보안 하드닝, 아레나, 스펙·RFD 공개, 벤더 정렬. **런치 창은 다음 정책 이벤트 전이다.** 역사적 주기가 약 6주이므로 그 전에 저장소 공개와 hop 데모가 준비돼 있어야 한다.
+- **0단계 (증명, 4주 도그푸딩).** Claude Code ↔ Codex. **1주는 기록만이다** — 훅 미러, 로그, 백필. 주입은 포함하지 않는다. 인접 레코더가 두 벤더에서 레코더와 계승을 견고하게 만드는 데 288 커밋과 22 ADR과 4개월이 들었다. 1주에 되는 것은 기록 부분이고, 주입 견고화(유령 세션, 플러시 지연, 10k 열화, Desktop 예외)는 주 단위 작업이라 별도 항목이다. 이어서 팩·로그 스키마, `conbus log`, PTY 래퍼, **비대칭 warm(Codex 레그)**, 작업별 라우팅, 롤링 요약, 리스, 생존 카운터, `conbus doctor`, fact 계약 문서. Cursor는 제외한다 — 훅이 없어서가 아니라 **구조화된 쿼터 신호가 없어 자동 라우팅을 증명할 수 없기 때문**이다.
+- **1단계 (목적지와 공개).** 대칭 dual-warm과 권한 프록시, 컨트롤 플레인, 훅 바이너리 다중 등록(Cursor·Copilot·Devin), 3계층 어댑터, 아레나 구현, 갭 메우기, 보안 하드닝, 스펙·RFD 공개, 벤더 정렬. **런치 창은 다음 정책 이벤트 전이다.** 역사적 주기가 약 6주이므로 그 전에 저장소 공개와 hop 데모가 준비돼 있어야 한다.
 - **2단계 (과금).** 크로스플랫폼 KEK 후 봉투 암호화, Pro 동기화, Team 아레나.
 
 ## 킬 크리테리아
@@ -475,7 +497,7 @@ Codex `/import`가 이미 Claude Code 세션을 가져온다. 이전 판은 그�
 - 4주 도그푸딩에서 **라우팅 hop**이 주 3회 미만이면 웨지가 없다. failover hop은 따로 센다. 합쳐 세면 한도 도달 빈도에 판정을 맡기는 것이고 그건 통제 밖이다.
 - 쿼터 소진이 주 1회 미만이면 failover는 핵심 기능이 아니다. 라우팅으로 재정의한다.
 - Paseo #3778 머지 후 체감 차이가 없으면 대화 상태 레이어(아레나·코퍼스)로 상향한다.
-- Throughline·Stele를 나란히 써 보고 dual-warm 없이 우리가 더 나은 점을 한 문장으로 못 쓰면, 0단계를 dual-warm까지 확장하거나 접는다.
+- 인접 레코더·fact 제품을 나란히 써 보고 비대칭 warm이 주는 차이를 한 문장으로 못 쓰면 웨지가 없다. 0단계가 비대칭 warm을 포함하므로 이건 더 이상 “확장하거나 접는다”가 아니라 **직접 판정 항목**이다.
 - 크레딧 분리가 재개되고 우리가 헤드리스 경로에만 의존하고 있으면 Claude 레그를 interactive 모드로 전환한다. 전환이 불가하면 Claude 레그 경제성을 잃는다.
 - hop 후 재설명 토큰과 3턴 내 재질문이 0에 수렴하면 성공이다. **주입 토큰은 판정 지표가 아니라 비용 지표다.** dual-warm이 켜지면 주입 토큰은 설계상 0으로 수렴하므로, 그걸 실패 신호로 두면 성공을 실패로 읽는다.
 
@@ -483,8 +505,8 @@ Codex `/import`가 이미 Claude Code 세션을 가져온다. 이전 판은 그�
 
 프로즈에 흩어져 있던 것을 모았다. 넷 다 아직 안 닫혔다.
 
-1. **dual-warm을 0단계로 앞당기나.** 두 번 제기됐고 아직 미결이다. 0단계 B는 이미 남이 지었으므로 배관 증명일 뿐이고, 차별점 넷이 전부 1단계에 있다. 앞당기면 증명이 세지고 0단계가 길어진다.
-2. **0단계 범위가 4주에 안 맞는다.** 지금 0단계 todo가 열다섯이고 그중 1주 레코더와 주입 견고화만으로도 2~3주다. 컨트롤 플레인, 백필, fact 계약, 작업별 라우팅, 생존 카운터를 같은 4주에 넣을 수 없다. 잘라야 하고, 자를 후보는 컨트롤 플레인(1단계로)과 fact 계약(문서만 남기고 구현 1단계)이다.
+1. ~~dual-warm 시기~~ **닫혔다. 0단계는 비대칭(Codex 레그만 warm), 대칭은 1단계.** 근거는 route-not-hop 절에 있다.
+2. ~~0단계 범위~~ **닫혔다. 자른다. 4주 유지.** 1단계로 내린 것: 컨트롤 플레인, fact 계약 **구현**(문서는 0단계에 남김), `install` 전체(진단 `doctor`만 0단계), 갭 메우기(데몬이 죽으면 갭을 기록만 한다). 남긴 것: 레코더, 주입 견고화, 프로브, 팩·로그 스키마, 비대칭 warm, 라우터, 롤링 요약, 리스, 생존 카운터, `doctor`. **롤링 요약은 못 뺀다** — 추출식만으로는 목표·결정이 안 나오고 팩 품질이 나쁘면 “재설명 0”이 거짓 음성으로 측정된다. 6주로 늘리는 대안은 런치 창(정책 이벤트 주기 약 6주)을 놓치므로 버렸다.
 3. ~~제품명~~ **닫혔다. Conbus.** 어원은 conversation bus로 공표하고, 개발자가 기본으로 읽는 context bus는 덤으로 받는다. convict 해석은 뜻이 반대(갇혀 실려 감 vs 벤더 종속에서 벗어남)라 문서에 쓰지 않는다. 표기는 브랜드 **Conbus**, 바이너리 `conbus`, 대화 ID는 기존 `bus_id`를 그대로 유지한다. 그래서 문서의 `bus log`·`bus hop`은 `conbus log`·`conbus hop`으로만 읽으면 되고 치환 범위가 거의 없다.
 4. **보관 기본값.** (2) 유지 + 손실 명시로 두었다. (1.5)를 2단계가 아니라 1단계로 앞당길지는 열려 있다.
 
