@@ -348,6 +348,105 @@ fn hook_runs(command: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether Codex will actually run the hooks we registered with it.
+///
+/// A registered Codex hook does not run until a person approves it inside
+/// Codex. It is not executed-and-ignored — the process is never spawned — so
+/// the executability probe above says "runs" for a command Codex will never
+/// invoke. That is the same shape of lie as an empty drop log, and on this
+/// machine it is the live state: six conbus hooks registered, none trusted,
+/// none ever run.
+///
+/// Read, never written. Codex keeps the consent record as `trusted_hash` under
+/// `[hooks.state."<key>"]` in `config.toml`, and its own `hooks/list` hands out
+/// the very value that would forge it — so conbus detects and reports, and
+/// approving stays a person's act. A missing record proves untrusted; a present
+/// one proves trusted-or-modified, which this cannot tell apart without asking
+/// Codex, so it does not claim to.
+fn report_codex_trust(home: &Path) {
+    let Some((trusted, untrusted)) = codex_trust(home) else {
+        return;
+    };
+    if untrusted.is_empty() && trusted == 0 {
+        return;
+    }
+    if untrusted.is_empty() {
+        println!("codex     {trusted} hook(s) have a trust record");
+    } else {
+        println!(
+            "codex     {} of {} hook(s) NOT TRUSTED, so Codex never runs them: {} — approve them in Codex; conbus must not write its trust record",
+            untrusted.len(),
+            untrusted.len() + trusted,
+            untrusted.join(", ")
+        );
+    }
+}
+
+/// How many of our Codex hooks Codex has a trust record for, and which it does
+/// not, in the order Codex lists them.
+fn codex_trust(home: &Path) -> Option<(usize, Vec<String>)> {
+    let codex_home = std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".codex"));
+    let hooks_path = codex_home.join("hooks.json");
+    let text = std::fs::read_to_string(&hooks_path).ok()?;
+    let settings = serde_json::from_str::<serde_json::Value>(&text).ok()?;
+    let config = std::fs::read_to_string(codex_home.join("config.toml")).unwrap_or_default();
+
+    let mut untrusted = Vec::new();
+    let mut trusted = 0;
+    for (event, groups) in settings
+        .get("hooks")
+        .and_then(serde_json::Value::as_object)
+        .into_iter()
+        .flatten()
+    {
+        for (group, entry) in groups.as_array().into_iter().flatten().enumerate() {
+            for (index, hook) in entry
+                .get("hooks")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .enumerate()
+            {
+                let ours = hook
+                    .get("command")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(is_ours);
+                if !ours {
+                    continue;
+                }
+                let key = format!(
+                    "{}:{}:{group}:{index}",
+                    hooks_path.display(),
+                    snake_case(event)
+                );
+                if config.contains(&format!("[hooks.state.\"{key}\"]")) {
+                    trusted += 1;
+                } else {
+                    untrusted.push(event.clone());
+                }
+            }
+        }
+    }
+
+    untrusted.sort();
+    Some((trusted, untrusted))
+}
+
+/// Codex names its events in snake_case in the trust key, where its hook file
+/// names them in PascalCase.
+fn snake_case(event: &str) -> String {
+    let mut out = String::with_capacity(event.len() + 4);
+    for (index, character) in event.char_indices() {
+        if character.is_uppercase() && index > 0 {
+            out.push('_');
+        }
+        out.extend(character.to_lowercase());
+    }
+    out
+}
+
 /// One line per registered hook command, saying whether it can run.
 fn report_hooks(home: &Path) {
     let mut any = false;
@@ -387,6 +486,7 @@ fn report_hooks(home: &Path) {
     if !any {
         println!("hooks     nothing registered; run `conbus install --apply`");
     }
+    report_codex_trust(home);
 }
 
 pub fn doctor(paths: &Paths) -> io::Result<()> {
@@ -523,6 +623,65 @@ mod tests {
             saw.is_ok(),
             "the probe must mark the child internal: {saw:?}"
         );
+    }
+
+    #[test]
+    fn a_codex_hook_codex_will_never_run_is_reported_as_such() {
+        // The trap this exists for. A Codex hook that is registered but not
+        // trusted is never spawned at all, so the executability probe says
+        // "runs" about a command Codex will not invoke — and on the machine
+        // this was written on, that was the live state of all six.
+        let home = tempfile::tempdir().expect("tempdir");
+        let codex = home.path().join(".codex");
+        std::fs::create_dir_all(&codex).expect("mkdir");
+        let hooks = codex.join("hooks.json");
+        std::fs::write(
+            &hooks,
+            serde_json::json!({
+                "hooks": {
+                    "UserPromptSubmit": [
+                        {"hooks": [{"command": "/x/conbus hook --harness codex"}]}
+                    ],
+                    "PostToolUse": [
+                        {"hooks": [{"command": "paseo hooks codex PostToolUse"}]},
+                        {"hooks": [{"command": "/x/conbus hook --harness codex"}]}
+                    ]
+                }
+            })
+            .to_string(),
+        )
+        .expect("write");
+
+        let (trusted, untrusted) = codex_trust(home.path()).expect("read");
+        assert_eq!(trusted, 0);
+        assert_eq!(untrusted, vec!["PostToolUse", "UserPromptSubmit"]);
+
+        // Codex keys the record by file, snake-cased event, matcher-group index
+        // and position within the group — so the second group's index is what
+        // makes the PostToolUse entry a different hook from paseo's.
+        std::fs::write(
+            codex.join("config.toml"),
+            format!(
+                "[hooks.state.\"{}:post_tool_use:1:0\"]\ntrusted_hash = \"sha256:abc\"\n",
+                hooks.display()
+            ),
+        )
+        .expect("write");
+
+        let (trusted, untrusted) = codex_trust(home.path()).expect("read");
+        assert_eq!(trusted, 1);
+        assert_eq!(
+            untrusted,
+            vec!["UserPromptSubmit"],
+            "a record for one hook says nothing about another"
+        );
+    }
+
+    #[test]
+    fn the_trust_key_uses_codexs_own_spelling_of_an_event() {
+        assert_eq!(snake_case("UserPromptSubmit"), "user_prompt_submit");
+        assert_eq!(snake_case("PreToolUse"), "pre_tool_use");
+        assert_eq!(snake_case("Stop"), "stop");
     }
 
     #[test]
