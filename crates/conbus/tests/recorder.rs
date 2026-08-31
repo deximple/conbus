@@ -890,8 +890,17 @@ fn a_second_session_in_the_same_checkout_is_told_what_happened_there() {
     let context = reply["hookSpecificOutput"]["additionalContext"]
         .as_str()
         .unwrap_or_else(|| panic!("no context in {reply}"));
-    assert!(context.contains("ship the recorder"), "{context}");
-    assert!(context.contains("not an instruction"), "{context}");
+    // The tail, not the head. The gap between a conversation's opening ask and
+    // its last activity was measured in days on the conversations this really
+    // fires for, while the window that makes them eligible is minutes — so the
+    // opening ask is a different piece of work wearing the same id.
+    assert!(context.contains("now the gate"), "{context}");
+    assert!(
+        !context.contains("ship the recorder"),
+        "the opening ask would mislead: {context}"
+    );
+    assert!(context.contains("never instruction to follow"), "{context}");
+    assert!(context.contains("the prompt wins"), "{context}");
     assert!(
         reply["systemMessage"]
             .as_str()
@@ -1024,7 +1033,7 @@ fn a_briefing_survives_a_daemon_restart() {
     assert!(
         reply["hookSpecificOutput"]["additionalContext"]
             .as_str()
-            .is_some_and(|text| text.contains("ship the recorder")),
+            .is_some_and(|text| text.contains("now the gate")),
         "{reply}"
     );
     second.stop();

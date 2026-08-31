@@ -8,7 +8,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 
 use conbus_core::continuation::{Asking, Decision, decide};
-use conbus_core::event::{Author, Entrypoint, Event, Source};
+use conbus_core::event::{Entrypoint, Event, Source};
 use conbus_core::ids::BusId;
 use conbus_core::pack::{self, Chapter};
 use conbus_core::paths::Paths;
@@ -244,21 +244,17 @@ impl Daemon {
             harness: prompt.source.harness.clone(),
             workspace: prompt.source.workspace.clone(),
             first_prompt: true,
-            // Both routes to the same fact. The entrypoint is what the hook
-            // read from its own environment and is exact; the author is the
-            // vendor's own label, which names machine origins and almost never
-            // names human ones.
+            // The entrypoint, and only the entrypoint. The vendor's own
+            // `promptSource` looked like a second route to the same fact and is
+            // not: `sdk` is stamped on hand-typed prompts in this corpus — one
+            // of them still carrying the stray keystroke of somebody typing —
+            // so reading it as "not a person" would go silent on exactly the
+            // sessions worth speaking to.
             unattended: prompt
                 .source
                 .entrypoint
                 .as_ref()
-                .is_some_and(Entrypoint::is_unattended)
-                || match &prompt.event {
-                    Event::TurnStarted { author, .. } => {
-                        author.as_ref().is_some_and(Author::is_machine)
-                    }
-                    _ => false,
-                },
+                .is_some_and(Entrypoint::is_unattended),
         };
 
         let candidates: Vec<_> = self
@@ -279,7 +275,7 @@ impl Daemon {
             .iter()
             .filter_map(|id| self.chapters.get(id).cloned())
             .collect();
-        let packed = pack::brief(&chapters, prompt.ts, pack::PACK_BUDGET_UNITS);
+        let packed = pack::brief(bus_id, &chapters, prompt.ts, pack::PACK_BUDGET_UNITS);
         if packed.is_empty() {
             return None;
         }

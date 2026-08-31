@@ -35,7 +35,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::clock::Timestamp;
-use crate::event::{Author, Entrypoint, Event, Harness, TurnState};
+use crate::event::{Entrypoint, Event, Harness, TurnState};
 use crate::ids::BusId;
 use crate::record::Record;
 
@@ -338,23 +338,24 @@ pub fn replay(records: &[Record], home: Option<&str>) -> Replay {
 
 /// Whether the record's own session was a program, as the log recorded it.
 ///
-/// Two independent sources, because they arrive by different routes and cover
-/// different eras. The entrypoint is what the live hook reads from its own
-/// environment and what backfill recovers from a transcript, and it is exact.
-/// The author is the vendor's `promptSource`, which labels `sdk` and `system`
-/// explicitly — a weaker signal, but it is on records written before the
-/// entrypoint was recorded at all.
+/// The entrypoint, and nothing else. The vendor's `promptSource` looked like a
+/// second route to the same fact and turned out to be a trap: `sdk` is stamped
+/// on hand-typed prompts throughout this corpus — including one that still
+/// carries the stray leading keystroke of somebody typing — so a gate that read
+/// it as "not a person" would go silent on precisely the sessions worth
+/// speaking to. It is 9,354 of 12,053 turns, so the mistake would not have been
+/// a small one.
+///
+/// Records written before the entrypoint was recorded carry nothing, and an
+/// unknown is treated as a person. That is the safe direction: the cost of
+/// briefing a program is some tokens nobody reads, and the cost of staying
+/// silent on a person is the whole feature.
 fn unattended(record: &Record) -> bool {
-    let by_entrypoint = record
+    record
         .source
         .entrypoint
         .as_ref()
-        .is_some_and(Entrypoint::is_unattended);
-    let by_author = match &record.event {
-        Event::TurnStarted { author, .. } => author.as_ref().is_some_and(Author::is_machine),
-        _ => false,
-    };
-    by_entrypoint || by_author
+        .is_some_and(Entrypoint::is_unattended)
 }
 
 /// How a conversation stopped, as the briefing would put it.
@@ -806,42 +807,48 @@ mod tests {
     }
 
     #[test]
-    fn a_script_is_recognised_from_either_source() {
-        // Two routes to the same fact. The entrypoint is exact and is what the
-        // live hook reads; the author is weaker and is what old records carry.
+    fn only_the_entrypoint_decides_whether_anybody_is_there() {
         let attended = logged(BusId::mint(), ago(60), prompt());
-        assert!(!unattended(&attended));
+        assert!(!unattended(&attended), "an unknown is treated as a person");
 
-        let by_entrypoint = Record {
+        let script = Record {
             source: Source {
                 entrypoint: Some(Entrypoint::new(Entrypoint::SDK_CLI)),
                 ..attended.source.clone()
             },
             ..attended.clone()
         };
-        assert!(unattended(&by_entrypoint));
-
-        let by_author = Record {
-            event: Event::TurnStarted {
-                author: Some(Author::new(Author::SDK)),
-                prompt: Body::kept("p"),
-            },
-            ..attended.clone()
-        };
-        assert!(unattended(&by_author));
+        assert!(unattended(&script));
 
         let person = Record {
             source: Source {
                 entrypoint: Some(Entrypoint::new(Entrypoint::CLAUDE_DESKTOP)),
                 ..attended.source.clone()
             },
-            event: Event::TurnStarted {
-                author: Some(Author::new(Author::TYPED)),
-                prompt: Body::kept("p"),
-            },
-            ..attended
+            ..attended.clone()
         };
         assert!(!unattended(&person));
+    }
+
+    #[test]
+    fn the_vendors_own_authorship_label_is_not_consulted() {
+        // It looked like a second route to the same fact and is a trap. `sdk`
+        // is stamped on hand-typed prompts throughout the real corpus — 9,354
+        // of 12,053 turns — including one that still carries the stray leading
+        // keystroke of somebody typing. Reading it as "not a person" would go
+        // silent on exactly the sessions worth speaking to.
+        let by_hand_but_labelled_sdk = Record {
+            event: Event::TurnStarted {
+                author: Some(crate::event::Author::new(crate::event::Author::SDK)),
+                prompt: Body::kept("각 워크스페이스가 하고있는 역할 정리해줘"),
+            },
+            ..logged(BusId::mint(), ago(60), prompt())
+        };
+
+        assert!(
+            !unattended(&by_hand_but_labelled_sdk),
+            "a person typed this, whatever the vendor labelled it"
+        );
     }
 
     fn logged(bus_id: BusId, at: Timestamp, event: Event) -> Record {
