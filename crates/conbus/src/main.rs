@@ -2,6 +2,7 @@ mod cli;
 mod daemon;
 mod harden;
 mod hook;
+mod install;
 mod report;
 mod wire;
 
@@ -24,7 +25,8 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Command::Daemon => run(|paths| daemon::serve(paths, Retention::default())),
-        Command::Log { json } => run(|paths| report::log(paths, json)),
+        Command::Log { json, filter } => run(|paths| report::log(paths, json, &filter)),
+        Command::Install { apply } => run(|_| report::install(apply)),
         Command::Doctor => run(report::doctor),
         Command::Help => {
             print!("{}", cli::USAGE);

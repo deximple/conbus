@@ -5,12 +5,14 @@ use std::os::unix::net::UnixStream;
 
 use conbus_core::event::{Event, ToolOutcome};
 use conbus_core::paths::Paths;
+
+use crate::cli::LogFilter;
 use conbus_core::record::Record;
 use conbus_core::segment::SegmentLog;
 
-pub fn log(paths: &Paths, json: bool) -> io::Result<()> {
+pub fn log(paths: &Paths, json: bool, filter: &LogFilter) -> io::Result<()> {
     let scan = SegmentLog::scan(paths.log_dir())?;
-    for record in &scan.records {
+    for record in select(&scan.records, filter) {
         if json {
             println!(
                 "{}",
@@ -29,6 +31,35 @@ pub fn log(paths: &Paths, json: bool) -> io::Result<()> {
         );
     }
     Ok(())
+}
+
+/// The records a filter admits, in log order.
+///
+/// `bus_id` and `since` match by prefix so that a partial id or a bare date
+/// works — the id is a 36-character UUID and the timestamp is fixed-width, so a
+/// prefix is unambiguous in both.
+fn select<'a>(records: &'a [Record], filter: &LogFilter) -> Vec<&'a Record> {
+    let matching: Vec<&Record> = records
+        .iter()
+        .filter(|record| {
+            filter
+                .bus_id
+                .as_ref()
+                .is_none_or(|wanted| record.bus_id.to_string().starts_with(wanted))
+                && filter
+                    .since
+                    .as_ref()
+                    .is_none_or(|from| record.ts.to_string().as_str() >= from.as_str())
+                && filter
+                    .grep
+                    .as_ref()
+                    .is_none_or(|needle| summarise(record).contains(needle))
+        })
+        .collect();
+    match filter.tail {
+        Some(n) if n < matching.len() => matching[matching.len() - n..].to_vec(),
+        _ => matching,
+    }
 }
 
 fn summarise(record: &Record) -> String {
@@ -98,6 +129,66 @@ fn summarise(record: &Record) -> String {
         record.bus_id,
         record.source.harness.as_str()
     )
+}
+
+/// Register the hook with every harness that will call it.
+///
+/// Reports by default. `--apply` writes, and keeps a copy of whatever was there
+/// first: these are the user's own settings files and they usually already hold
+/// their own hooks.
+pub fn install(apply: bool) -> io::Result<()> {
+    let binary = std::env::current_exe()?;
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .ok_or_else(|| io::Error::other("no HOME to install into"))?;
+
+    for target in crate::install::targets(&binary, &home) {
+        let harness = target.harness;
+        let settings = target.settings.clone();
+        let plan = crate::install::plan(target)?;
+
+        if let Some(err) = &plan.unreadable {
+            println!("{harness:<12} {} — NOT TOUCHED: {err}", settings.display());
+            println!(
+                "{:<12} fix or move that file; conbus will not replace what it cannot read",
+                ""
+            );
+            continue;
+        }
+
+        let adding: Vec<&str> = plan
+            .changes
+            .iter()
+            .filter(|c| matches!(c, crate::install::Change::Add(_)))
+            .map(|c| c.event())
+            .collect();
+        if adding.is_empty() {
+            println!("{harness:<12} {} — already registered", settings.display());
+            continue;
+        }
+        println!(
+            "{harness:<12} {} — would register {}",
+            settings.display(),
+            adding.join(", ")
+        );
+        if apply {
+            let backup = crate::install::apply(&plan)?;
+            match backup {
+                Some(path) => println!("{:<12} written; previous copy at {}", "", path.display()),
+                None => println!("{:<12} written (the file did not exist)", ""),
+            }
+        }
+    }
+
+    if !apply {
+        println!("\nNothing was written. Re-run with --apply to register.");
+    }
+    println!(
+        "\nCodex will not run a hook until you trust it in Codex itself. conbus does not write\n\
+         that trust state: it is a consent gate, and the hash it wants is one we could trivially\n\
+         forge. Until you approve there, Codex hooks are registered and silently do not fire."
+    );
+    Ok(())
 }
 
 pub fn doctor(paths: &Paths) -> io::Result<()> {
@@ -172,6 +263,118 @@ mod tests {
                 output: Body::kept("o"),
             },
         })
+    }
+
+    fn at(seq: u64, ts: &str, bus: &str) -> Record {
+        Record {
+            seq,
+            ts: ts.parse().expect("ts"),
+            bus_id: bus.parse().expect("bus id"),
+            ..tool(None, None)
+        }
+    }
+
+    fn corpus() -> Vec<Record> {
+        let a = "01996b1e-2c4a-7c31-9d0e-4f2a6b8c1d3e";
+        let b = "01a05407-694a-7261-a9a4-d27a40bbcb20";
+        vec![
+            at(0, "2026-08-30T10:00:00.000Z", a),
+            at(1, "2026-08-30T11:00:00.000Z", b),
+            at(2, "2026-08-31T09:00:00.000Z", a),
+            at(3, "2026-08-31T10:00:00.000Z", b),
+        ]
+    }
+
+    #[test]
+    fn a_conversation_can_be_pulled_out_by_a_prefix_of_its_id() {
+        let filter = LogFilter {
+            bus_id: Some("01996b1e".into()),
+            ..LogFilter::default()
+        };
+
+        let records = corpus();
+        let selected = select(&records, &filter);
+
+        assert_eq!(
+            selected.iter().map(|r| r.seq).collect::<Vec<_>>(),
+            vec![0, 2]
+        );
+    }
+
+    #[test]
+    fn since_takes_a_bare_date_because_the_timestamp_is_fixed_width() {
+        let filter = LogFilter {
+            since: Some("2026-08-31".into()),
+            ..LogFilter::default()
+        };
+
+        let records = corpus();
+        let selected = select(&records, &filter);
+
+        assert_eq!(
+            selected.iter().map(|r| r.seq).collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+    }
+
+    #[test]
+    fn tail_keeps_the_last_matches_not_the_first() {
+        let filter = LogFilter {
+            tail: Some(2),
+            ..LogFilter::default()
+        };
+
+        let records = corpus();
+        let selected = select(&records, &filter);
+
+        assert_eq!(
+            selected.iter().map(|r| r.seq).collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+    }
+
+    #[test]
+    fn the_selectors_compose() {
+        let filter = LogFilter {
+            bus_id: Some("01996b1e".into()),
+            since: Some("2026-08-31".into()),
+            ..LogFilter::default()
+        };
+
+        let records = corpus();
+        let selected = select(&records, &filter);
+
+        assert_eq!(selected.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![2]);
+    }
+
+    #[test]
+    fn a_tail_larger_than_the_log_returns_the_whole_log() {
+        let filter = LogFilter {
+            tail: Some(99),
+            ..LogFilter::default()
+        };
+
+        let records = corpus();
+        assert_eq!(select(&records, &filter).len(), 4);
+    }
+
+    #[test]
+    fn grep_matches_the_rendered_line_not_the_raw_json() {
+        let mut records = corpus();
+        records[1].event = Event::TurnEnded {
+            state: conbus_core::event::TurnState::InterruptedQuota {
+                reason: "rate_limit".into(),
+            },
+            assistant_message: None,
+        };
+        let filter = LogFilter {
+            grep: Some("rate_limit".into()),
+            ..LogFilter::default()
+        };
+
+        let selected = select(&records, &filter);
+
+        assert_eq!(selected.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![1]);
     }
 
     #[test]

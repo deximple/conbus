@@ -8,7 +8,7 @@ Written for whoever picks this up next. The design phase is finished and the rec
 - The plan is the single source of truth: [`.cursor/plans/shared_workspace_context_3f7139b8.plan.md`](.cursor/plans/shared_workspace_context_3f7139b8.plan.md). The filename is a generated ID and no longer matches the content; leave it alone so the Cursor plan UI keeps its association. A reader-facing copy under `docs/` gets generated when the repo goes public.
 - `cargo 1.94.1` and `rustc 1.94.1` are installed on this machine, so edition 2024 is available.
 - A cargo workspace exists: `crates/conbus` (the binary) and `crates/conbus-core` (the lib). Edition 2024.
-  145 tests, `cargo clippy --all-targets -- -D warnings` clean. See "Next task" for what is built and what is not.
+  159 tests, `cargo clippy --all-targets -- -D warnings` clean. See "Next task" for what is built and what is not.
 
 ## What Conbus is, in one paragraph
 
@@ -133,6 +133,26 @@ Steps 1–4 of the suggested order are built; step 5 is not.
 `bus_id` minting follows the rule: `SessionStart` only registers a candidate, the first `UserPromptSubmit` mints and
 binds, and the remembered session start is then flushed into the log *behind* the prompt that proved the session real.
 A prompt mints on its own if the session start never arrived, so Desktop's `/clear` does not cost a conversation.
+
+**Installed, and queryable.**
+
+`conbus install` registers the hook with both harnesses — `~/.claude/settings.json` for Claude Code and
+`$CODEX_HOME/hooks.json` for Codex, which is **not** `settings.json`; that path exists in Codex only inside its
+one-shot import of Claude sessions. It merges rather than overwrites, backs up first, is idempotent, and registers
+by absolute path because a vendor's PATH is not ours. It reports by default and writes only with `--apply`.
+
+Two vendor facts it encodes, both measured against the running binaries and both contradicting the plan:
+
+- **A Codex hook marked `"async": true` is dropped**, with a warning, by 0.147.0 — `hooks/list` returns ten events
+  instead of eleven and `stop` is simply absent. The plan says Codex `Stop` hooks need `async: true`; following it
+  would have silently cost every Codex turn-end record. Nothing conbus writes is async.
+- **Codex has a trust gate that fails silently.** Registered-but-untrusted hooks do not fire and nothing is printed;
+  the state is only visible through `hooks/list`'s `trustStatus`. A human must approve in Codex itself.
+  `conbus install` says so and deliberately does not write the trust hash — `hooks/list` hands you the hash it
+  wants, so forging consent would be trivial, which is exactly why it must not be done.
+
+`conbus log` takes `--bus-id`, `--since`, `--tail` and `--grep`. Before this it printed the entire store, which
+stops being usable at the first backfill.
 
 **Not done, and next.**
 
