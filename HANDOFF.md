@@ -242,6 +242,49 @@ Three things the transcript has that the live hook path does not:
 Everything recovered is stamped `backfilled_from`, because a reconstructed record is a weaker fact than a
 mirrored one and a reader that cannot tell them apart will over-trust the log.
 
+**Two gaps in the design, not in the code.**
+
+These came out of a question the design could not answer: *the same workspace is open in Claude
+Code, Codex and Cursor at once, each with its own vendor session id and genuinely different
+content — how does a common conversation get made, and how does a session join it?*
+
+**1. There is no way for a session the user opened to join a conversation.** `bus_id` is minted per
+`(harness, vendor_session_id)`, so three concurrent sessions are three conversations. That part is
+correct and should stay: their content differs, and merging three trains of thought into one
+append-only log cannot be undone. But the design's answer to "how does the next harness continue
+the conversation" is *the bus opens that session itself* — `--session-id <uuid>` on Claude Code, an
+app-server thread the bus owns on Codex — and that only covers legs the bus spawns. A session the
+user opened has no route in. The plan never says so.
+
+**2. The bus has no authority over a vendor's desktop app.** It can spawn CLI and headless children
+and nothing else. There is no API by which it opens a workspace or starts a session in Claude
+Desktop or the Codex desktop app, and driving the GUI is not something this project will do. So
+"the bus owns the leg" holds for the automatic router path with a headless leg — which is exactly
+why the plan's stage-0 asymmetric warm works — and does not hold anywhere a person is actually
+sitting. For those surfaces the bus is a passenger.
+
+Three vendor facts that constrain any fix, all read off the installed binaries:
+
+- **The two vendors cannot share a session id.** Claude Code takes `--session-id <uuid>`; Codex's
+  `ThreadStartParams` has no `threadId` at all — Codex assigns them. So identity is carried by the
+  registry's alias map, which is what the code already does, and never by making the ids equal.
+- **A command run inside a Codex session cannot learn its own thread id.** Claude Code sets
+  `CLAUDE_CODE_SESSION_ID` in a child's environment; Codex sets no equivalent. Anything
+  user-invoked on the Codex side has to identify its session some other way — process ancestry is
+  the only exact one; cwd plus an open turn is ambiguous in precisely the concurrent case above.
+- **A pack delivered as ordinary tool output needs no vendor injection primitive.** If the agent
+  runs a command and the pack arrives on stdout, it is a tool result like any other: no
+  `inject_items`, no rollback-source hazard, no 10,000-character `additionalContext` cap. That is
+  worth knowing even though it must not become the primary path.
+
+**And a correction to what the answer should be.** The first design drawn from this put a manual
+`conbus resume <bus_id>` at the centre, because it is the cheapest thing that works everywhere. That
+is backwards. A design where a person types a command to continue their own conversation has no
+wedge — the vendor's own `/import` already does a worse version of that, by hand, and nobody uses
+it. **Manual has to be the last resort, and the automatic path has to be invisible enough that
+nobody thinks about it.** What that automation actually is, is being designed now; the entry below
+is the shape it has to fit.
+
 **Not done, and next.**
 
 5. **Codex backfill.** The Claude side is done; Codex is not, and it is harder than the plan assumes. Three things
