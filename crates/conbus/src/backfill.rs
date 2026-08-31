@@ -76,21 +76,23 @@ pub fn run(paths: &Paths, apply: bool) -> io::Result<()> {
         if recovered.entries.is_empty() {
             continue;
         }
-        // Already in the log, but recovered by a build that did not record the
-        // workspace. Append the session record alone: the turns are already
-        // there, and appending them again would put the conversation in the log
-        // twice, which an append-only log cannot take back.
+        // Already in the log, but recovered by a build that did not record
+        // everything the session stamp now holds. Append the session record
+        // alone: the turns are already there, and appending them again would
+        // put the conversation in the log twice, which an append-only log
+        // cannot take back.
         let completing = already.contains_key(&bus_id);
         if completing {
             recovered
                 .entries
                 .retain(|entry| matches!(entry.event, Event::SessionCandidate { .. }));
-            if recovered.entries.is_empty() || recovered.workspace.is_none() {
+            let nothing_new = recovered.workspace.is_none() && recovered.entrypoint.is_none();
+            if recovered.entries.is_empty() || nothing_new {
                 skipped_sessions += 1;
                 continue;
             }
             // Counted apart from `sessions`: nothing was recovered here, an
-            // existing conversation only learned where it happened, and
+            // existing conversation only learned something about itself, and
             // reporting the two as one would overstate what a re-run found.
             completed_sessions += 1;
         } else {
@@ -122,8 +124,8 @@ pub fn run(paths: &Paths, apply: bool) -> io::Result<()> {
     );
     if completed_sessions > 0 {
         println!(
-            "completed {completed_sessions} conversation(s) that were recovered before the \
-             workspace was recorded"
+            "completed {completed_sessions} conversation(s) recovered before the session \
+             stamp held everything it holds now"
         );
     }
     println!("not read  {}", summarise_unread(&unread));
@@ -147,11 +149,14 @@ fn already_backfilled(paths: &Paths) -> io::Result<HashMap<BusId, bool>> {
         if record.source.backfilled_from.as_deref() != Some(CLAUDE_TRANSCRIPT) {
             continue;
         }
-        let has_workspace = record.source.workspace.is_some();
+        // Complete means it knows both where it happened and what it ran
+        // under. Each arrived in its own release, so a log that has been
+        // through both holds conversations missing one, the other, or neither.
+        let complete = record.source.workspace.is_some() && record.source.entrypoint.is_some();
         known
             .entry(record.bus_id)
-            .and_modify(|seen| *seen |= has_workspace)
-            .or_insert(has_workspace);
+            .and_modify(|seen| *seen |= complete)
+            .or_insert(complete);
     }
     Ok(known)
 }

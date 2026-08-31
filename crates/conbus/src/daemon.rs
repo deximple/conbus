@@ -7,8 +7,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 
-use conbus_core::continuation::{Asking, Decision, decide};
-use conbus_core::event::{Entrypoint, Event, Source};
+use conbus_core::continuation::{Asking, Decision, decide, opening_units, unattended};
+use conbus_core::event::{Event, Source};
 use conbus_core::ids::BusId;
 use conbus_core::pack::{self, Chapter};
 use conbus_core::paths::Paths;
@@ -250,11 +250,11 @@ impl Daemon {
             // of them still carrying the stray keystroke of somebody typing —
             // so reading it as "not a person" would go silent on exactly the
             // sessions worth speaking to.
-            unattended: prompt
-                .source
-                .entrypoint
-                .as_ref()
-                .is_some_and(Entrypoint::is_unattended),
+            unattended: unattended(prompt.source.entrypoint.as_ref()),
+            prompt_units: match &prompt.event {
+                Event::TurnStarted { prompt, .. } => opening_units(prompt),
+                _ => 0,
+            },
         };
 
         let candidates: Vec<_> = self

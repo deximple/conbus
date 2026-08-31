@@ -60,6 +60,13 @@ pub struct Asking {
     /// somebody's script, and briefing a script is tokens spent on a reader
     /// that does not exist.
     pub unattended: bool,
+    /// How long this session's opening prompt is, in UTF-16 code units.
+    ///
+    /// A proxy for something there is no direct signal for: whether the session
+    /// arrived carrying its own context. A person asking for something types
+    /// tens or low hundreds of units; a scheduled task, a summariser or an
+    /// agent harness opens by pasting its whole brief.
+    pub prompt_units: usize,
 }
 
 /// A conversation that has happened in some checkout.
@@ -117,6 +124,9 @@ pub enum Silent {
     /// Nobody is reading. A briefing is for orientation, and a program does not
     /// need orienting.
     Unattended,
+    /// The session opened by supplying its own context, at length. Whatever is
+    /// driving it already knows what it is doing.
+    ArrivedWithContext,
 }
 
 /// What to tell a session opening here.
@@ -144,6 +154,21 @@ pub const BRIEF_WINDOW_SECS: i64 = 7 * 24 * 60 * 60;
 /// listing, and the reader learns to skip it — an ignored briefing is worse
 /// than none, because being noticed was the whole argument for it.
 pub const BRIEF_MAX: usize = 3;
+
+/// An opening prompt longer than this means the session brought its own brief.
+///
+/// The last gate, and the one that stops this being chrome. Measured on the
+/// sessions a briefing would actually reach: the median opening prompt among
+/// them is 2,273 units and the p75 is 3,142 — those are not questions, they are
+/// scheduled tasks, summarisers and agent harnesses pasting their whole
+/// instructions. Real typed asks in the same corpus run tens to low hundreds,
+/// and 38% of all prompts are 200 units or under.
+///
+/// A person who does paste something long has, by doing so, just supplied the
+/// context a briefing would have added — so the rule reads the same either way:
+/// a session that arrives carrying its own context does not need ours. Cutting
+/// here drops 70% of the briefings the earlier gates let through.
+pub const SELF_SUPPLIED_UNITS: usize = 1_200;
 
 /// The fewest turns a conversation must have to be worth mentioning.
 ///
@@ -279,9 +304,18 @@ pub fn replay(records: &[Record], home: Option<&str>) -> Replay {
     // with a much larger sequence number, so an incremental read puts it after
     // the prompt it belongs to and answers `no_workspace` for all 3,433 of them.
     let mut workspace_of: HashMap<BusId, String> = HashMap::new();
+    let mut entrypoint_of: HashMap<BusId, Entrypoint> = HashMap::new();
     for record in records {
         if let Some(workspace) = &record.source.workspace {
             workspace_of.insert(record.bus_id, workspace.clone());
+        }
+        // Same reasoning as the workspace, and the same reason it has to be
+        // read from the whole log: a conversation recovered before the session
+        // stamp held the entrypoint carries it only on a session record
+        // appended later, so an incremental read finds nothing on the prompt
+        // being judged.
+        if let Some(entrypoint) = &record.source.entrypoint {
+            entrypoint_of.insert(record.bus_id, entrypoint.clone());
         }
     }
 
@@ -314,7 +348,11 @@ pub fn replay(records: &[Record], home: Option<&str>) -> Replay {
                 harness: record.source.harness.clone(),
                 workspace,
                 first_prompt: true,
-                unattended: unattended(record),
+                unattended: unattended(entrypoint_of.get(&record.bus_id)),
+                prompt_units: match &record.event {
+                    Event::TurnStarted { prompt, .. } => opening_units(prompt),
+                    _ => 0,
+                },
             };
             let name = match decide(&asking, &candidates, home, record.ts) {
                 Decision::Brief { recent } => {
@@ -327,6 +365,7 @@ pub fn replay(records: &[Record], home: Option<&str>) -> Replay {
                     Silent::NotFirstPrompt => "silent/not_first_prompt",
                     Silent::NothingToSay => "silent/nothing_to_say",
                     Silent::Unattended => "silent/unattended",
+                    Silent::ArrivedWithContext => "silent/arrived_with_context",
                 },
             };
             *out.verdicts.entry(name).or_default() += 1;
@@ -336,7 +375,7 @@ pub fn replay(records: &[Record], home: Option<&str>) -> Replay {
     out
 }
 
-/// Whether the record's own session was a program, as the log recorded it.
+/// Whether an entrypoint means nobody is reading.
 ///
 /// The entrypoint, and nothing else. The vendor's `promptSource` looked like a
 /// second route to the same fact and turned out to be a trap: `sdk` is stamped
@@ -346,16 +385,28 @@ pub fn replay(records: &[Record], home: Option<&str>) -> Replay {
 /// speaking to. It is 9,354 of 12,053 turns, so the mistake would not have been
 /// a small one.
 ///
-/// Records written before the entrypoint was recorded carry nothing, and an
-/// unknown is treated as a person. That is the safe direction: the cost of
+/// An unknown is treated as a person. That is the safe direction: the cost of
 /// briefing a program is some tokens nobody reads, and the cost of staying
 /// silent on a person is the whole feature.
-fn unattended(record: &Record) -> bool {
-    record
-        .source
-        .entrypoint
-        .as_ref()
-        .is_some_and(Entrypoint::is_unattended)
+pub fn unattended(entrypoint: Option<&Entrypoint>) -> bool {
+    entrypoint.is_some_and(Entrypoint::is_unattended)
+}
+
+/// The size of an opening prompt, in the units everything else here counts in.
+///
+/// An elided body still counts: retention took the text, not the fact that it
+/// was long, and a session that opened with four kilobytes of its own brief is
+/// the same session whether or not we kept the words.
+pub fn opening_units(prompt: &crate::event::Body) -> usize {
+    match prompt {
+        crate::event::Body::Kept { text } => crate::pack::units(text),
+        // A clipped body knows what it was before clipping, in bytes. Bytes
+        // over-count non-ASCII, which errs towards silence — the safe side.
+        crate::event::Body::Clipped { original_bytes, .. }
+        | crate::event::Body::Elided {
+            bytes: original_bytes,
+        } => *original_bytes,
+    }
 }
 
 /// How a conversation stopped, as the briefing would put it.
@@ -382,6 +433,9 @@ pub fn decide(
     }
     if asking.unattended {
         return Decision::Silent(Silent::Unattended);
+    }
+    if asking.prompt_units > SELF_SUPPLIED_UNITS {
+        return Decision::Silent(Silent::ArrivedWithContext);
     }
     let Some(workspace) = asking.workspace.as_deref() else {
         return Decision::Silent(Silent::NoWorkspace);
@@ -474,6 +528,7 @@ mod tests {
             workspace: Some(WORKSPACE.into()),
             first_prompt: true,
             unattended: false,
+            prompt_units: 40,
         }
     }
 
@@ -713,6 +768,55 @@ mod tests {
     }
 
     #[test]
+    fn a_session_that_brought_its_own_brief_is_left_alone() {
+        // The gate that stops this being chrome. Among the sessions the earlier
+        // gates let through, the median opening prompt is 2,273 units — a
+        // scheduled task or a summariser pasting its whole instructions, not
+        // somebody asking for something. And a person who does paste something
+        // long has, by doing so, supplied the context a briefing would add.
+        assert_eq!(
+            decide(
+                &Asking {
+                    prompt_units: SELF_SUPPLIED_UNITS + 1,
+                    ..asking()
+                },
+                &[candidate()],
+                None,
+                now()
+            ),
+            Decision::Silent(Silent::ArrivedWithContext)
+        );
+        assert!(matches!(
+            decide(
+                &Asking {
+                    prompt_units: SELF_SUPPLIED_UNITS,
+                    ..asking()
+                },
+                &[candidate()],
+                None,
+                now()
+            ),
+            Decision::Brief { .. }
+        ));
+    }
+
+    #[test]
+    fn an_opening_that_was_withheld_is_still_sized() {
+        // Retention takes the text, not the fact that it was long. A session
+        // that opened with four kilobytes of its own brief is the same session
+        // whether or not the words were kept.
+        assert_eq!(opening_units(&Body::kept("hello")), 5);
+        assert_eq!(opening_units(&Body::Elided { bytes: 4_096 }), 4_096);
+        assert_eq!(
+            opening_units(&Body::Clipped {
+                text: "head".into(),
+                original_bytes: 9_000
+            }),
+            9_000
+        );
+    }
+
+    #[test]
     fn a_later_turn_is_never_briefed() {
         assert_eq!(
             decide(
@@ -808,26 +912,16 @@ mod tests {
 
     #[test]
     fn only_the_entrypoint_decides_whether_anybody_is_there() {
-        let attended = logged(BusId::mint(), ago(60), prompt());
-        assert!(!unattended(&attended), "an unknown is treated as a person");
-
-        let script = Record {
-            source: Source {
-                entrypoint: Some(Entrypoint::new(Entrypoint::SDK_CLI)),
-                ..attended.source.clone()
-            },
-            ..attended.clone()
-        };
-        assert!(unattended(&script));
-
-        let person = Record {
-            source: Source {
-                entrypoint: Some(Entrypoint::new(Entrypoint::CLAUDE_DESKTOP)),
-                ..attended.source.clone()
-            },
-            ..attended.clone()
-        };
-        assert!(!unattended(&person));
+        assert!(
+            !unattended(None),
+            "an unknown is treated as a person, because the cost of briefing a \
+             program is tokens and the cost of silencing a person is the feature"
+        );
+        assert!(unattended(Some(&Entrypoint::new(Entrypoint::SDK_CLI))));
+        assert!(!unattended(Some(&Entrypoint::new(
+            Entrypoint::CLAUDE_DESKTOP
+        ))));
+        assert!(!unattended(Some(&Entrypoint::new(Entrypoint::CLI))));
     }
 
     #[test]
@@ -845,8 +939,11 @@ mod tests {
             ..logged(BusId::mint(), ago(60), prompt())
         };
 
-        assert!(
-            !unattended(&by_hand_but_labelled_sdk),
+        let replayed = replay(std::slice::from_ref(&by_hand_but_labelled_sdk), None);
+
+        assert_eq!(
+            replayed.verdicts.get("silent/unattended"),
+            None,
             "a person typed this, whatever the vendor labelled it"
         );
     }
