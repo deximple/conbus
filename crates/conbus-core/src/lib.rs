@@ -3,6 +3,7 @@
 
 pub mod backfill;
 pub mod clock;
+pub mod continuation;
 pub mod event;
 pub mod ids;
 pub mod paths;

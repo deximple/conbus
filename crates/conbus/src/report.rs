@@ -428,6 +428,18 @@ pub fn doctor(paths: &Paths) -> io::Result<()> {
         Some(last) => println!("last      {}", summarise(last)),
         None => println!("last      nothing recorded yet"),
     }
+
+    // What the continuation gate would have done, replayed over the whole log.
+    // Nothing is injected yet; this is the measurement that has to come first,
+    // because "it fires this often and refuses for these reasons" is the only
+    // way to know whether the gate is too loose before it can be too loose in
+    // front of a person.
+    let home = std::env::var("HOME").ok();
+    let replay = conbus_core::continuation::replay(&scan.records, home.as_deref());
+    println!("gate      {} conversation(s) judged", replay.total());
+    for (verdict, count) in &replay.verdicts {
+        println!("          {count:>6}  {verdict}");
+    }
     Ok(())
 }
 

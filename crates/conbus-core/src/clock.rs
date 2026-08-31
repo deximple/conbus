@@ -41,6 +41,14 @@ impl Timestamp {
                 .unwrap_or(now),
         )
     }
+
+    /// Whole seconds from `earlier` to this instant. Negative when this one
+    /// came first, which is a real case rather than a bug: a backfilled record
+    /// carries the time it happened, so a conversation recovered today can be
+    /// months older than the session asking about it.
+    pub fn seconds_since(&self, earlier: Timestamp) -> i64 {
+        (self.0 - earlier.0).whole_seconds()
+    }
 }
 
 impl fmt::Display for Timestamp {
