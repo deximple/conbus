@@ -398,7 +398,31 @@ is contrasted with is worse than having none, and there is now a test that fails
    visible), `Notification` (the only hook-channel signal that a quota limit *lifted*), `MessageDisplay`. Each is
    argued under "Still open". `SubagentStop` was on this list and is mirrored now.
 7. **A real quota exhaustion.** The one fixture that cannot be manufactured. Now that the recorder is running, the
-   first exhaustion records itself — treat it as an opportunity rather than an interruption.
+   first exhaustion records itself — treat it as an opportunity rather than an interruption. It is also the only
+   thing that can produce a `continue/displaced` verdict: the counterfactual above found twelve `handed_off` and no
+   `displaced`, because backfill can only recover a turn that completed.
+8. **Delivery.** The gate decides; nothing yet acts on it. Next is the pack builder — pure, budgeted in UTF-16 code
+   units, well under the 10,000 cap — then the `Hydrated` event so an injection is a record rather than a belief,
+   then the hook client learning a second reply beside `SILENT_OK`. Note the hazard in the client's own reply
+   matching: it treats `Recorded | Deferred` as success and everything else as a defect, so a new response variant
+   with no arm becomes a per-turn stderr diagnostic.
+9. **The unknown fourth harness.** Something on this machine invokes the hook under Claude Code's name with camelCase
+   events — `beforeSubmitPrompt`, `preToolUse`, `postToolUse`, `stop` — which neither known vendor uses. Cursor,
+   Copilot CLI and Devin CLI all read Claude Code's settings file, so this is the third-harness surface arriving on
+   its own. The drop diagnostic now records the payload's field names, which is what identifies it; do not guess
+   before reading one.
+
+**Two live-machine failures worth not repeating.**
+
+The recorder went silent for two hours and every check said it was healthy. The binary had been
+overwritten in place while the launchd daemon held that inode mapped; macOS taints the vnode when a
+signed binary changes under a mapping, so the kernel killed every exec of that path before `main`
+ran — exit 137, no output, for `--help` as much as for `hook`. Claude Code kept firing hooks and
+each one died instantly. **Install atomically**: write beside the target and rename, so a running
+process keeps the old inode. And the drop log's emptiness proved nothing, because the drop log is
+written by the hook: a hook that cannot start writes no drops. `doctor` now runs the registered
+command, through a shell, marked internal, and insists on parseable JSON — and prints the most
+recent record by time, which is the line the outage was visible in the whole time.
 
 **Where the milestone stands against its own success criteria.** "Every turn from both harnesses lands in the log":
 half. Claude Code is confirmed on live traffic, including the `PostToolUse` this file spent three revisions calling
