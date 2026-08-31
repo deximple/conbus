@@ -28,6 +28,9 @@ use crate::wire::{Request, Response};
 /// taking the user's session down with it. See the quirk note in HANDOFF.md.
 pub const SILENT_OK: &str = r#"{"continue":true,"suppressOutput":true}"#;
 
+/// How long the hook will wait on the daemon before giving up on it.
+pub const REPLY_DEADLINE: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// The environment marker that tells a hook it is inside a session we started.
 pub const INTERNAL_MARKER: &str = "CONBUS_INTERNAL_SESSION";
 
@@ -161,6 +164,23 @@ pub fn run(harness: &str, stdin: &mut impl Read) -> Result<Reply, String> {
     let socket = paths.socket();
     let stream = UnixStream::connect(&socket)
         .map_err(|err| format!("no daemon on {}: {err}", socket.display()))?;
+    // A hook must never fail the turn, and it must not delay it either. Without
+    // these the read blocks forever on a daemon that is up but wedged, and the
+    // vendor's own timeout becomes the user's wait: 30 seconds on Claude Code's
+    // `UserPromptSubmit`, with the prompt stalled the whole time.
+    //
+    // Half a second, because the tightest vendor timeout observed is Codex's
+    // own default of **one second** on `SessionEnd` — not something conbus
+    // registers, something Codex imposes on session teardown. The daemon's work
+    // per request is a map lookup and an append, so anything approaching this
+    // is a fault rather than a slow path, and losing that record is cheaper
+    // than making somebody wait for it.
+    for limit in [
+        stream.set_read_timeout(Some(REPLY_DEADLINE)),
+        stream.set_write_timeout(Some(REPLY_DEADLINE)),
+    ] {
+        limit.map_err(|err| format!("could not bound the daemon call: {err}"))?;
+    }
 
     let request = Request {
         protocol_version: Some(crate::wire::PROTOCOL_VERSION),
