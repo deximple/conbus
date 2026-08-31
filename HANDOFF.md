@@ -53,11 +53,19 @@ All of these were argued through four review rounds. The reasoning is in the pla
 
 ### The one that cost a session — found by installing it, not by testing it
 
-**A hook that writes nothing to stdout can take the vendor session down.** Registered for real, `conbus hook`
-exited zero with zero bytes on stdout, and the client then failed with
+**A hook that writes nothing to stdout coincided with the vendor session going down.** Registered for real,
+`conbus hook` exited zero with zero bytes on stdout, and the client then failed with
 `400 messages.983.content.1.text: cache_control cannot be set for empty text blocks`. Reverting the registration
 fixed it; re-checking after the revert confirmed it. The recorder was breaking the conversation it exists to
 preserve — the single rule this whole client is built around.
+
+**The correlation is solid; the mechanism is not confirmed, and this file used to state it as though it were.** A
+later pass through 2.1.241's own bundle could not find the path that turns a zero-byte hook stdout into an empty
+text block: `parseHookOutput("")` yields a `hook_success` attachment with empty content, and three separate guards
+drop it — the prompt path (`if(!content) break`), the model-side renderer (`if(e.content==="") return []`) and a
+`"(no content)"` substitution. So the causal story is a hypothesis that fits the evidence, not a read fact. It
+changes nothing about the fix — printing well-formed JSON is free, correct, and now carries the briefing as well —
+but a confident wrong mechanism is exactly what this file exists to stop.
 
 Two things are worth carrying forward more than the fix itself.
 
@@ -187,15 +195,24 @@ Two vendor facts it encodes, both measured against the running binaries and both
 `conbus log` takes `--bus-id`, `--since`, `--tail` and `--grep`. Before this it printed the entire store, which
 stops being usable at the first backfill.
 
-**It was installed, and is currently reverted.**
+**It is installed, supervised, and recording. The paragraph that used to sit here was wrong.**
 
-Installing it broke the vendor session (see the first quirk below), so the registrations were restored from backup:
-both settings files are byte-identical to their pre-install state, no conbus entry remains in either, and the
-`launchd` agent is booted out and its plist removed. The corpus and the binary were deliberately kept —
-`~/.conbus` holds 23,340 records over 3,426 conversations and `conbus log` reads them without any hook installed.
+It said both settings files had been restored byte-identical and that no conbus entry remained in either. That was
+true of `~/.claude/settings.json` and **false of `$CODEX_HOME/hooks.json`**, where six conbus entries were left
+registered — `PreToolUse`, `PostToolUse`, `SessionStart`, `SessionEnd`, `UserPromptSubmit`, `Stop`. Both files
+carry conbus again now, deliberately.
 
-What installing it proved before it was reverted is below, and stands: the mechanics work. What it also proved is
-that they were never verified against a real session, which is how the hook that broke it shipped.
+**None of the six Codex hooks has ever run.** A Codex hook does not run until a person approves it inside Codex;
+it is not executed-and-ignored, the process is never spawned. Codex keeps the consent record as `trusted_hash`
+under `[hooks.state."<key>"]` in `config.toml` — keyed by hooks file, snake-cased event, matcher-group index and
+position within the group — and there is no record for any conbus entry. `conbus doctor` now says so, because the
+executability probe cheerfully reports "runs" about a command Codex will never invoke, which is the same shape of
+lie as an empty drop log. conbus reads that record and must never write it: `hooks/list` hands out the very value
+that would forge it.
+
+Two upgrade traps follow from the same hash. It covers more than the command string, so any edit to a conbus entry
+flips it from `trusted` to `modified` — and a modified hook silently stops running. And inserting a hook ahead of
+an existing one shifts its group index, changes its key, and orphans its trust record outright.
 
 **When it was installed, it was supervised and recording.**
 
@@ -384,6 +401,97 @@ A trap worth recording, because it nearly shipped: the first counterfactual lift
 reconstruction rule, which on a single-vendor corpus changes nothing. It printed numbers identical
 to the real gate and looked like a measurement. A counterfactual that silently equals the thing it
 is contrasted with is worse than having none, and there is now a test that fails if it does.
+
+**The briefing is built, and it reaches the model.**
+
+The whole path runs end to end through the real binary and a real socket: on the first `UserPromptSubmit` of a
+session the daemon decides, builds the pack, records that it did, and returns it; the hook frames it as the
+vendor's context channel and prints it. The person gets one `systemMessage` line, which costs no model tokens.
+
+**Six things about Claude Code 2.1.241's hook reply, read out of its bundle rather than assumed.** Each was
+extracted from emit and consume sites at known byte offsets; `strings` found none of them.
+
+- The shape is `{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"…"}}`.
+  `hookEventName` is **required and must equal the firing event**, or the entire hook result is thrown away —
+  non-blocking, so the turn is fine and the injection simply never happens. Worse, the same failure is reported
+  **once per session and then suppressed**, so a hardcoded name that drifted would show one error and go quiet
+  forever. The firing event is therefore carried from the payload through to the reply.
+- **`suppressOutput` does not suppress `additionalContext`.** In this build it suppresses nothing at all: its one
+  runtime read is unreachable for any hook that emits JSON. What actually keeps plain stdout out of the transcript
+  is emitting JSON in the first place.
+- Exactly three things block the user's prompt: `"continue": false`, `"decision": "block"`, and **exit code 2** —
+  the last regardless of what was printed. Every other non-zero exit, invalid JSON, a wrong event name, a timeout
+  and a spawn failure are non-blocking. And a blocked turn drops the pack, since the block returns before the
+  context is pushed.
+- The cap is `String.length <= 10_000`, **inclusive, in UTF-16 code units**, applied **per field** — so the
+  receipt does not spend the pack's budget. Past it the text is persisted and the model gets a `<persisted-output>`
+  block with a preview.
+- **The pack lands *after* the user's prompt, not before it.** This file used to say "before the first prompt is
+  answered", which is true of the request and false of the position: the vendor appends hook context to the
+  message list after the prompt message. Recency therefore favours our text over the user's own words, so
+  precedence has to be *stated* in the pack rather than inferred from where it sits.
+- `UserPromptSubmit`'s hook timeout is **30 seconds**, not the 10-minute global default, and a timed-out hook's
+  partial stdout is parsed by nothing.
+
+**And the marker is the right oracle but the wrong detector.** A hook cannot see the model's context, finding
+`<persisted-output>` means reading a transcript — banned on the live path — and ordinary large tool results
+produce the same marker. Assert the budget locally on every emit; use the marker only in a probe against a session
+we own.
+
+**Codex is narrower and its unit is different.** Five of its eleven events accept `additionalContext`
+(`SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `SubagentStart`); there is no `fork` source and
+no `Stop` or `PostCompact` injection at all, so `UserPromptSubmit` is its only per-turn channel. Its
+`additionalContextLimit` defaults to **2,500 tokens**, and a token there is `ceil(utf8_bytes/4)` — so the real
+inline budget is **10,000 UTF-8 *bytes***, the same number as Claude Code's in a different unit. A pack budgeted in
+UTF-16 units is not automatically inside it. Also worth having: `turn/start` takes `additionalContext` as a map of
+source id to `{kind, value}` with `kind` in `["untrusted", "application"]` — a native data-boundary marker, and
+neither `inject_items` nor `developerInstructions`, so it carries no rollback-source hazard. That is the right
+channel for a leg the bus spawns.
+
+One reading settled: the AGENTS.md rule against injecting into a Codex thread the user opened targets
+`thread/inject_items` on the app-server. Returning `additionalContext` from a hook does not violate it — the plan
+lists Codex `SessionStart additionalContext` as a sanctioned channel in the same breath. The rule's literal words
+are broader than its subject; that is a wording gap to close in the text, not a reason to stop.
+
+**How the design got from 3,445 conversations to 40 briefings, one measurement at a time.**
+
+| after | brief | why the previous number was wrong |
+|---|---|---|
+| choosing a predecessor | 12 | an identity claim can lie, so precision had to be absolute |
+| briefing a checkout instead | 3,259 | nothing is claimed, so nothing had to be refused — and it became chrome |
+| only where somebody is reading | 168 | 3,096 of 3,445 conversations here are explicitly a program |
+| only where they did not bring their own brief | **40** | the median opening prompt among the rest was 2,273 units |
+
+Forty of the 349 attended sessions — about one in nine — naming 1.6 conversations each. `conbus doctor` prints the
+whole distribution, replayed over the log, so the next person can move a constant on evidence rather than taste.
+
+**Three things the pack refuses to do, each for a reason that cost something to learn.**
+
+- **The fence is not forgeable.** The most dangerous field in a pack is not somebody's prompt, it is another
+  session's *model output* — that model can be steered by anything it read, and its closing message lands here, at
+  `isMeta`, positionally last. A static fence could be closed by quoted text, which would then continue in
+  conbus's own voice. The fence carries a nonce taken from the id of the session being told, minted after every
+  word the pack quotes was written, and quoted text is scrubbed of it and of any closing tag regardless.
+- **It never truncates the assembled string.** The thing at the end is the closing fence, so cutting the string is
+  how a quoting problem becomes an injection problem. Over budget it drops whole chapters, then refuses.
+- **It carries the tail, not the head.** On the conversations this really fires for, the gap between the opening
+  ask and the last activity was 9.5 days, 1.1 days and 10.4 days, while the window that makes them eligible is
+  minutes. The head is a different piece of work wearing the same id.
+
+**A vocabulary that was invented, and a gate built on it.** `Author` listed six values; four of them — `user`,
+`loop_wakeup`, `schedule_wakeup`, `poll_event` — appear nowhere in 5,501 transcripts, and `is_human` was written
+against the first, so it returned false for every turn ever recorded. What the vendor writes, over 61,899
+main-thread prompts: `sdk` 9,184, `system` 139, `typed` 23, `queued` 1, `suggestion_accepted` 1, and 52,551 with
+no `promptSource` at all. Then the correction to the correction: `sdk` is stamped on **hand-typed** prompts here —
+one still carries the stray leading keystroke of somebody typing — so reading it as "not a person" would have
+silenced exactly the sessions worth speaking to. Attendance is decided by `CLAUDE_CODE_ENTRYPOINT` alone, which
+the hook reads from its own environment and backfill recovers from the transcript, and an unknown counts as a
+person.
+
+**The fourth harness identified itself.** The camelCase events arriving under Claude Code's name are **Cursor**:
+the drop diagnostic now records a payload's field names, and one arrived carrying `cursor_version`,
+`conversation_id`, `generation_id`, `workspace_roots` and `user_email`. Names only, never values — a payload's keys
+are its schema, its values are somebody's conversation.
 
 **Not done, and next.**
 
