@@ -1,7 +1,10 @@
 //! `conbus log` and `conbus doctor`.
 
+use std::collections::BTreeSet;
 use std::io;
 use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use conbus_core::event::{Event, ToolOutcome};
 use conbus_core::paths::Paths;
@@ -238,6 +241,138 @@ pub fn install(apply: bool) -> io::Result<()> {
     Ok(())
 }
 
+/// The conbus hook commands a vendor settings file actually registers.
+///
+/// Read out of the file rather than composed from our own path, because what
+/// matters is the command the vendor will run. A registration left pointing at
+/// a binary that has moved, or been replaced, is exactly the failure worth
+/// finding, and composing the command ourselves would hide it.
+fn registered_hooks(settings: &serde_json::Value) -> BTreeSet<String> {
+    fn walk(value: &serde_json::Value, found: &mut BTreeSet<String>) {
+        match value {
+            serde_json::Value::Object(fields) => {
+                for (key, child) in fields {
+                    if key == "command"
+                        && let Some(command) = child.as_str()
+                        && is_ours(command)
+                    {
+                        found.insert(command.to_string());
+                    }
+                    walk(child, found);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    walk(item, found);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut found = BTreeSet::new();
+    walk(settings, &mut found);
+    found
+}
+
+/// Whether a registered command is one of ours, by the shape `install` writes:
+/// a path to a `conbus` binary followed by the `hook` subcommand.
+fn is_ours(command: &str) -> bool {
+    command
+        .split_once(" hook")
+        .map(|(program, _)| program.trim())
+        .and_then(|program| Path::new(program).file_name())
+        .is_some_and(|name| name == "conbus")
+}
+
+/// Can the vendor actually run this command?
+///
+/// The check that was missing when the recorder went silent for two hours on a
+/// real machine. The binary had been overwritten in place while a running
+/// daemon held it mapped, which taints the vnode: every exec of that path was
+/// killed by the kernel before `main` ran. Nothing recorded it and nothing
+/// could have — the drop log is written by the hook, so a hook that cannot
+/// start writes no drops, and an empty drop log was read as health.
+///
+/// Run through a shell, because that is how the vendor runs it, and marked
+/// internal so the probe returns before it can reach the log.
+fn hook_runs(command: &str) -> Result<(), String> {
+    let output = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(command)
+        .env(crate::hook::client::INTERNAL_MARKER, "1")
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|err| format!("could not run it: {err}"))?;
+
+    if !output.status.success() {
+        // A signal has no code, and the signal is the interesting case here:
+        // 137 is the kernel killing a tainted binary, not the program failing.
+        let how = match output.status.code() {
+            Some(code) => format!("exit {code}"),
+            None => "killed by a signal".to_string(),
+        };
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = stderr.trim();
+        return Err(if stderr.is_empty() {
+            how
+        } else {
+            format!("{how}: {stderr}")
+        });
+    }
+    // Exiting zero is not enough. Silence on stdout is what took a real session
+    // down with `cache_control cannot be set for empty text blocks`, so the
+    // probe insists on the well-formed answer too.
+    if serde_json::from_slice::<serde_json::Value>(&output.stdout).is_err() {
+        return Err(format!(
+            "ran, but said {:?} instead of hook JSON",
+            String::from_utf8_lossy(&output.stdout)
+        ));
+    }
+    Ok(())
+}
+
+/// One line per registered hook command, saying whether it can run.
+fn report_hooks(home: &Path) {
+    let mut any = false;
+    for target in crate::install::targets(Path::new("conbus"), home) {
+        let Ok(text) = std::fs::read_to_string(&target.settings) else {
+            println!(
+                "hooks     {:<12} {} — no settings file",
+                target.harness,
+                target.settings.display()
+            );
+            continue;
+        };
+        let Ok(settings) = serde_json::from_str::<serde_json::Value>(&text) else {
+            println!(
+                "hooks     {:<12} {} — unreadable json",
+                target.harness,
+                target.settings.display()
+            );
+            continue;
+        };
+        let commands = registered_hooks(&settings);
+        if commands.is_empty() {
+            println!("hooks     {:<12} not registered", target.harness);
+            continue;
+        }
+        for command in commands {
+            any = true;
+            match hook_runs(&command) {
+                Ok(()) => println!("hooks     {:<12} runs — {command}", target.harness),
+                Err(why) => println!(
+                    "hooks     {:<12} CANNOT RUN ({why}) — {command}",
+                    target.harness
+                ),
+            }
+        }
+    }
+    if !any {
+        println!("hooks     nothing registered; run `conbus install --apply`");
+    }
+}
+
 pub fn doctor(paths: &Paths) -> io::Result<()> {
     println!(
         "root      {} ({:?})",
@@ -267,6 +402,11 @@ pub fn doctor(paths: &Paths) -> io::Result<()> {
 
     println!("writable  {}", describe_appendable(&appendable(paths)));
 
+    match std::env::var_os("HOME").map(PathBuf::from) {
+        Some(home) => report_hooks(&home),
+        None => println!("hooks     no HOME to read registrations from"),
+    }
+
     println!(
         "drops     {}",
         crate::drops::describe(&crate::drops::summary(paths))
@@ -281,12 +421,99 @@ pub fn doctor(paths: &Paths) -> io::Result<()> {
         conversations.len(),
         scan.defects.len()
     );
+    // When the last record was written, because "the recorder is installed and
+    // the daemon is up" says nothing about whether anything is arriving. The
+    // two-hour outage this check exists for looked healthy on every other line.
+    match scan.records.last() {
+        Some(last) => println!("last      {}", summarise(last)),
+        None => println!("last      nothing recorded yet"),
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_hook_that_cannot_run_is_not_reported_as_healthy() {
+        // The two-hour outage: the binary was overwritten in place while a
+        // running daemon held it mapped, so the kernel killed every exec of
+        // that path before `main` ran. A killed process writes no drop record,
+        // so the drop log stayed empty and every other line of `doctor` said
+        // the recorder was fine.
+        assert!(
+            hook_runs("exit 137").is_err(),
+            "a killed hook must be caught"
+        );
+        assert!(
+            hook_runs("kill -9 $$").is_err(),
+            "a signalled hook must be caught"
+        );
+        assert!(
+            hook_runs("this-command-does-not-exist-anywhere").is_err(),
+            "a registration pointing at nothing must be caught"
+        );
+    }
+
+    #[test]
+    fn a_hook_that_exits_zero_in_silence_is_not_reported_as_healthy() {
+        // Exiting zero is not the contract. A hook that says nothing on stdout
+        // reached the API as an empty text block carrying `cache_control` and
+        // took a real session down with it, so silence has to fail here too.
+        assert!(hook_runs("true").is_err(), "empty stdout must be caught");
+        assert!(
+            hook_runs("echo not json").is_err(),
+            "junk stdout must be caught"
+        );
+        assert!(hook_runs("echo '{\"continue\":true}'").is_ok());
+    }
+
+    #[test]
+    fn the_probe_cannot_reach_the_log() {
+        // It runs the real registered command, so it has to be inert. The
+        // internal marker is what makes it so, and this is the only thing
+        // stopping `doctor` from writing a record every time it is run.
+        let saw = hook_runs(&format!(
+            "test -n \"${{{}}}\" && echo '{{\"continue\":true}}'",
+            crate::hook::client::INTERNAL_MARKER
+        ));
+
+        assert!(
+            saw.is_ok(),
+            "the probe must mark the child internal: {saw:?}"
+        );
+    }
+
+    #[test]
+    fn only_our_own_registrations_are_probed() {
+        // A settings file is shared. Probing a neighbour's hook would run
+        // someone else's command, and reporting it would blame them for our
+        // diagnosis.
+        let settings = serde_json::json!({
+            "hooks": {
+                "PostToolUse": [
+                    {"hooks": [{"command": "/Users/x/.local/bin/conbus hook", "type": "command"}]},
+                    {"hooks": [{"command": "paseo hooks codex PostToolUse", "type": "command"}]},
+                    {"hooks": [{"command": "python3 /Users/x/.codex/hooks/guard.py", "type": "command"}]}
+                ],
+                "SessionStart": [
+                    {"hooks": [{"command": "/opt/conbus hook --harness codex", "type": "command"}]}
+                ]
+            }
+        });
+
+        let found = registered_hooks(&settings);
+
+        assert_eq!(
+            found.into_iter().collect::<Vec<_>>(),
+            vec![
+                "/Users/x/.local/bin/conbus hook".to_string(),
+                "/opt/conbus hook --harness codex".to_string(),
+            ]
+        );
+    }
+
     use conbus_core::event::{
         Author, Body, Harness, Source, ToolOutcome, VendorAgentId, VendorToolUseId,
     };
