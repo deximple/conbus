@@ -15,6 +15,19 @@ use conbus_core::paths::Paths;
 use crate::hook::{self, Normalized};
 use crate::wire::{Request, Response};
 
+/// What the hook says on stdout when it has nothing to add.
+///
+/// The recorder never injects, so this is the whole of its output on every
+/// path, success or failure. It is JSON because the vendor's hook contract
+/// reads stdout as JSON control output; the two fields say "carry on" and
+/// "keep this out of the transcript".
+///
+/// It exists because writing *nothing* is not the same as saying nothing. A
+/// zero-byte stdout on a context-injecting event was observed to reach the API
+/// as an empty text block carrying `cache_control`, which the API rejects —
+/// taking the user's session down with it. See the quirk note in HANDOFF.md.
+pub const SILENT_OK: &str = r#"{"continue":true,"suppressOutput":true}"#;
+
 /// The environment marker that tells a hook it is inside a session we started.
 pub const INTERNAL_MARKER: &str = "CONBUS_INTERNAL_SESSION";
 

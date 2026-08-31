@@ -23,6 +23,16 @@ fn main() -> ExitCode {
             if let Err(err) = hook::client::run(&harness, &mut std::io::stdin()) {
                 eprintln!("conbus hook: record dropped: {err}");
             }
+            // Say something well-formed, always.
+            //
+            // Writing nothing looked safe and was not. Installed on a real
+            // machine, a hook that exits zero with no stdout produced
+            // `400 cache_control cannot be set for empty text blocks` and broke
+            // the session it was attached to — the exact rule this client is
+            // built around. The vendor's documented contract takes JSON on
+            // stdout; an explicit "carry on, and do not put my output in the
+            // transcript" cannot be mistaken for an empty context block.
+            println!("{}", hook::client::SILENT_OK);
             ExitCode::SUCCESS
         }
         Command::Daemon => run(|paths| daemon::serve(paths, Retention::default())),

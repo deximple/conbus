@@ -10,7 +10,7 @@ recording on this machine. Read this, then read the plan.
 - The plan is the single source of truth: [`.cursor/plans/shared_workspace_context_3f7139b8.plan.md`](.cursor/plans/shared_workspace_context_3f7139b8.plan.md). The filename is a generated ID and no longer matches the content; leave it alone so the Cursor plan UI keeps its association. A reader-facing copy under `docs/` gets generated when the repo goes public.
 - `cargo 1.94.1` and `rustc 1.94.1` are installed on this machine, so edition 2024 is available.
 - A cargo workspace exists: `crates/conbus` (the binary) and `crates/conbus-core` (the lib). Edition 2024.
-  172 tests, `cargo clippy --all-targets -- -D warnings` clean. See "Next task" for what is built and what is not.
+  173 tests, `cargo clippy --all-targets -- -D warnings` clean. See "Next task" for what is built and what is not.
 
 ## What Conbus is, in one paragraph
 
@@ -50,6 +50,32 @@ All of these were argued through four review rounds. The reasoning is in the pla
 - Codex hooks need **absolute** node paths because VS Code's app-server has a different PATH. `Stop` hooks need `async: true`.
 - Codex quota lives on `account/rateLimits` via app-server, and there is no `StopFailure` equivalent in Codex hooks. Rate limits are **account-scoped**, so a sidecar `codex app-server` polling `account/rateLimits/read` sees consumption regardless of which process burned it. **This is probe #1** — if it doesn't hold, stage 0 is one-directional failover only and the docs must say so.
 - Global hooks will mirror our own background `-p` sessions. Mark them with an env variable at spawn and have the hook exit immediately when it sees the marker.
+
+### The one that cost a session — found by installing it, not by testing it
+
+**A hook that writes nothing to stdout can take the vendor session down.** Registered for real, `conbus hook`
+exited zero with zero bytes on stdout, and the client then failed with
+`400 messages.983.content.1.text: cache_control cannot be set for empty text blocks`. Reverting the registration
+fixed it; re-checking after the revert confirmed it. The recorder was breaking the conversation it exists to
+preserve — the single rule this whole client is built around.
+
+Two things are worth carrying forward more than the fix itself.
+
+- **"The hook writes 0 bytes" and "the vendor receives nothing" are different claims, and only the first was
+  measured.** Every path was checked for empty stdout and exit zero, and that was reported as proof the hook was
+  harmless. It measured our side of the pipe. What the vendor does with a zero-byte stdout on a context-injecting
+  event was never measured, and it is the half that mattered.
+- **Nothing in the test suite could have caught it.** The tests drive the real binary against a real socket, and
+  they all passed. The failure needed a real vendor session, which is exactly what AGENTS.md says verification here
+  usually means, and it was skipped for the parts that looked obviously safe.
+
+The fix: every path now prints `{"continue":true,"suppressOutput":true}`, the vendor's own documented JSON control
+shape, which cannot be mistaken for an empty context block and injects nothing.
+`the_hook_always_says_something_well_formed_on_stdout` pins it across all six paths, including the failing ones.
+
+**This fix is not yet confirmed against a real session.** It is a hypothesis with a mechanism, in the same position
+the wrong conclusion above was. It is confirmed when the side chat that failed opens cleanly with the hooks
+reinstalled, and not before.
 
 ### Read off the installed CLI on 2026-08-30 (Claude Code 2.1.241)
 
@@ -156,7 +182,17 @@ Two vendor facts it encodes, both measured against the running binaries and both
 `conbus log` takes `--bus-id`, `--since`, `--tail` and `--grep`. Before this it printed the entire store, which
 stops being usable at the first backfill.
 
-**It is installed, supervised, and recording.**
+**It was installed, and is currently reverted.**
+
+Installing it broke the vendor session (see the first quirk below), so the registrations were restored from backup:
+both settings files are byte-identical to their pre-install state, no conbus entry remains in either, and the
+`launchd` agent is booted out and its plist removed. The corpus and the binary were deliberately kept —
+`~/.conbus` holds 23,340 records over 3,426 conversations and `conbus log` reads them without any hook installed.
+
+What installing it proved before it was reverted is below, and stands: the mechanics work. What it also proved is
+that they were never verified against a real session, which is how the hook that broke it shipped.
+
+**When it was installed, it was supervised and recording.**
 
 The binary lives at `~/.local/bin/conbus` — outside the worktree, so tidying a branch does not break the hooks.
 `conbus install --apply` registered ten events with Claude Code and six with Codex, merging into settings files

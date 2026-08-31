@@ -54,6 +54,12 @@ fn start_daemon(home: &Path) -> Daemon {
 
 /// Run `conbus hook` with a payload on stdin. Returns (exit code, stderr).
 fn run_hook(home: &Path, payload: &str, extra_env: &[(&str, &str)]) -> (i32, String) {
+    let (code, _stdout, stderr) = run_hook_full(home, payload, extra_env);
+    (code, stderr)
+}
+
+/// As `run_hook`, but keeping stdout — which the vendor reads.
+fn run_hook_full(home: &Path, payload: &str, extra_env: &[(&str, &str)]) -> (i32, String, String) {
     let mut command = Command::new(bin());
     command
         .arg("hook")
@@ -74,6 +80,7 @@ fn run_hook(home: &Path, payload: &str, extra_env: &[(&str, &str)]) -> (i32, Str
     let output = child.wait_with_output().expect("hook exit");
     (
         output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
         String::from_utf8_lossy(&output.stderr).into_owned(),
     )
 }
@@ -618,6 +625,72 @@ fn a_malformed_payload_is_reported_without_failing_the_session() {
     assert_eq!(code, 0, "the hook must not fail the turn");
     assert!(!stderr.is_empty(), "the failure must be visible on stderr");
     assert!(log_lines(home.path()).is_empty());
+
+    daemon.stop();
+}
+
+#[test]
+fn the_hook_always_says_something_well_formed_on_stdout() {
+    // Writing nothing is not the same as saying nothing, and the difference
+    // took a session down. Installed for real, a hook that exited zero with
+    // zero-byte stdout produced `400 cache_control cannot be set for empty text
+    // blocks` and broke the conversation it was attached to — the one thing
+    // this client exists to never do.
+    //
+    // Every path, including the ones that fail, now answers with the vendor's
+    // documented JSON control shape. No path may return an empty stdout.
+    let home = tempfile::tempdir().expect("tempdir");
+    let daemon = start_daemon(home.path());
+
+    /// What was tried, the payload, and any extra environment.
+    type Path<'a> = (&'a str, &'a str, &'a [(&'a str, &'a str)]);
+
+    let paths: [Path; 6] = [
+        (
+            "a recorded prompt",
+            r#"{"session_id":"s-1","hook_event_name":"UserPromptSubmit","prompt":"hi","prompt_id":"T"}"#,
+            &[],
+        ),
+        (
+            "a deferred session start",
+            r#"{"session_id":"s-2","hook_event_name":"SessionStart","source":"startup"}"#,
+            &[],
+        ),
+        (
+            "an event we decline",
+            r#"{"session_id":"s-1","hook_event_name":"PreCompact","trigger":"auto"}"#,
+            &[],
+        ),
+        (
+            "an event we have never seen",
+            r#"{"session_id":"s-1","hook_event_name":"SomethingNew"}"#,
+            &[],
+        ),
+        ("a payload we cannot read", "not json at all", &[]),
+        (
+            "one of our own sessions",
+            r#"{"session_id":"s-1","hook_event_name":"UserPromptSubmit","prompt":"x","prompt_id":"T"}"#,
+            &[("CONBUS_INTERNAL_SESSION", "1")],
+        ),
+    ];
+
+    for (what, payload, env) in paths {
+        let (code, stdout, _) = run_hook_full(home.path(), payload, env);
+
+        assert_eq!(code, 0, "{what}: the hook must never fail the turn");
+        assert!(
+            !stdout.trim().is_empty(),
+            "{what}: empty stdout is what broke a real session"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(stdout.trim())
+            .unwrap_or_else(|e| panic!("{what}: stdout is not json ({e}): {stdout:?}"));
+        assert_eq!(parsed["continue"], true, "{what}: {stdout}");
+        // Nothing is injected: the recorder records, it does not speak.
+        assert!(
+            parsed.get("hookSpecificOutput").is_none(),
+            "{what}: the recorder must not inject context: {stdout}"
+        );
+    }
 
     daemon.stop();
 }
