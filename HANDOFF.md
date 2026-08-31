@@ -285,6 +285,83 @@ it. **Manual has to be the last resort, and the automatic path has to be invisib
 nobody thinks about it.** What that automation actually is, is being designed now; the entry below
 is the shape it has to fit.
 
+**How both gaps close: lineage, not adoption; and a gate that refuses by default.**
+
+The question "which conversation does this session join" has no safe answer, and asking it was the
+mistake. `bus_id` answers *whose turns are these*; it should keep answering only that. What a
+continuation needs is a second, weaker relation — *what came before this* — and the two were
+conflated because only the first existed.
+
+- **Merging is dead.** Adopting an existing `bus_id` for a session the user opened cannot be
+  undone: identity *is* the write, so two trains of thought interleave under one id forever. The
+  concurrent case makes a wrong merge routine rather than rare — same checkout, all live, genuinely
+  different content. And it erases the project's own kill criterion: if sessions in a workspace
+  share an id there are no hops to count, so "routing hops per week" reads zero while the metric
+  still looks healthy.
+- **An edge is recorded, so it can be wrong.** A `continues` record under the *successor's* id
+  moves nothing and can be contradicted by a later line. Its evidence field is the plan's hop
+  taxonomy: `displaced` for a failover hop, `handed_off` for a routing hop, counted separately as
+  the plan asks.
+- **Two modes, sharing a pack builder and nothing else.** *Directed* is a leg the bus spawned —
+  identity is known because we started the process for that reason, so there is no gate and no
+  guessing. *Ambient* is a session the user opened — identity is unknown, the gate runs, and the
+  default answer is no. The invisible case never guesses; the guessing case is tuned so its visible
+  failure is "it did not help", never "it lied".
+
+**The gate is a refusal engine with one positive signal.** It runs on the session's *first*
+`UserPromptSubmit`, never on `SessionStart` — that event has no prompt to judge and fires several
+times per project, some of them ghosts, so paying a pack there is paying on ghosts. It requires all
+of: a single candidate in this exact workspace, a different harness, live-authored (an edge is a
+live-path fact, not a reconstruction), at least two turns, and a workspace that has gone quiet.
+Ties are never broken — two candidates means inject nothing and record `ambiguous`. The one strong
+positive signal on the whole surface is a predecessor that ended `interrupted_quota` or
+`interrupted_policy`: it *announced* it could not continue. Everything else is a short recency
+window. Refusals are recorded too, by name, because without them "it never fires" and "the gate is
+too tight" are the same observation.
+
+**The measurements that shape it, from the real log** (24,060 records, 3,434 conversations):
+
+- **92.6% of conversations are one turn** — 3,179 of 3,434. The 255 multi-turn ones hold 8,862 of
+  12,041 turns. Requiring two turns removes nine tenths of the candidates before any other test.
+- **Only 2 conversations carry a workspace.** The live path now stamps every record, but the 3,425
+  backfilled ones predate that and backfill emits no session record at all. Until that is fixed the
+  gate has no corpus to be tested against, which is the point of making it a pure function: it can
+  be replayed over the whole log offline, and "over 3,434 real conversations it fires N times and
+  picks wrong M times" is a claim available before a single hydration ships.
+
+**Delivery, with the vendor's real numbers.** For a session the bus did not spawn, hook
+`additionalContext` is the only automatic channel that exists. Claude Code 2.1.241 caps it at
+10,000 **UTF-16 code units** (`if (e.length <= 1e4) return e;`), inclusive, and past that persists
+the text and hands the model a `<persisted-output>` block with a 2,000-byte preview. That is a
+`String.length` test, so the local check is `encode_utf16().count()` — not `len()` (UTF-8 bytes),
+not `chars().count()`. `INLINE_CAP_BYTES` in `retention.rs` is a byte cap and reusing its idiom here
+would be wrong in both directions. The budget is set far below the cap so degradation is
+unreachable by construction rather than merely tested for.
+
+Claude Code awaits the `SessionStart` hooks while building the first message list, so a pack lands
+before the first prompt is answered. Twelve of its twenty hook outputs accept `additionalContext`;
+plain stdout is shown to the model on only three events and discarded everywhere else. Codex is
+much narrower — five of eleven events accept it, there is no `fork` source, and it has neither
+`Stop` nor `PostCompact` injection, so `UserPromptSubmit` is its only per-turn channel. Codex's
+`additionalContextLimit` is a real per-hook key but its default is **unverified**; the plan's
+"~2,500 tokens" stands unconfirmed, so the pack builder is budget-parameterised per leg rather than
+assuming the two vendors are symmetric.
+
+One correction to the note above: `<persisted-output>` is the right oracle but the wrong detector.
+A hook cannot see the model's context, finding the marker means reading a transcript — banned on the
+live path — and ordinary large tool results produce the same marker, so it is not specific. Assert
+the budget locally on every emit; use the marker only in a probe against a session we own.
+
+**What a person sees, and how they stop it.** One `systemMessage` line on the turn that was actually
+hydrated, naming the source id and the command to inspect it — a field both vendors have, separate
+from `additionalContext`, that costs no model tokens. No injection, no line, ever; silence is the
+default. `/clear` already means "forget this", so `SessionStart.source == "clear"` suppresses
+hydration for that session — a gesture the user already makes rather than one we invented, with the
+Desktop caveat above. The explicit off is a command, and a command is acceptable **only** here: a
+missed hydration costs one sentence of re-explanation, a wrong one costs credibility in every
+session opened afterwards, so the negative case gets a boring lever and the positive case must never
+need one.
+
 **Not done, and next.**
 
 5. **Codex backfill.** The Claude side is done; Codex is not, and it is harder than the plan assumes. Three things
