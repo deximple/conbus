@@ -462,7 +462,7 @@ mod tests {
         // The five-hour limit is the case the design was drawn for. A window
         // shorter than one would refuse exactly the hop the product exists to
         // make.
-        assert!(DISPLACED_WINDOW_SECS > 5 * 60 * 60);
+        const { assert!(DISPLACED_WINDOW_SECS > 5 * 60 * 60) };
         assert!(matches!(
             decide_one(Candidate {
                 last_activity: ago(5 * 60 * 60),
