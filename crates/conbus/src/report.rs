@@ -433,30 +433,24 @@ pub fn doctor(paths: &Paths) -> io::Result<()> {
         None => println!("last      nothing recorded yet"),
     }
 
-    // What the continuation gate would have done, replayed over the whole log.
-    // Nothing is injected yet; this is the measurement that has to come first,
-    // because "it fires this often and refuses for these reasons" is the only
-    // way to know whether the gate is too loose before it can be too loose in
-    // front of a person.
+    // What a session opening in each checkout would have been told, replayed
+    // over the whole log. Nothing is injected yet; this is the measurement that
+    // has to come first, because how often it speaks and how wide it speaks is
+    // the only way to know whether it is chrome before it is chrome in front of
+    // a person.
     let home = std::env::var("HOME").ok();
     let replay = conbus_core::continuation::replay(&scan.records, home.as_deref());
-    println!("gate      {} conversation(s) judged", replay.total());
+    println!("briefing  {} conversation(s) judged", replay.total());
     for (verdict, count) in &replay.verdicts {
         println!("          {count:>6}  {verdict}");
     }
-    // Every conversation recovered from a Claude Code transcript is Claude
-    // Code and is reconstructed, so on this corpus those two rules refuse
-    // everything before any other rule is consulted — the numbers above prove
-    // the gate never fires wrongly and say nothing about whether it
-    // discriminates. Lifting them asks what the corpus can answer. A
-    // counterfactual, and labelled as one.
-    let as_if =
-        conbus_core::continuation::replay_as_if_cross_vendor(&scan.records, home.as_deref());
-    println!(
-        "          — counterfactual: if every predecessor were live and from another vendor —"
-    );
-    for (verdict, count) in &as_if.verdicts {
-        println!("          {count:>6}  {verdict}");
+    let briefs = replay.verdicts.get("brief").copied().unwrap_or_default();
+    if briefs > 0 {
+        println!(
+            "          {:>6.1}  conversations named per briefing (cap {})",
+            replay.named as f64 / briefs as f64,
+            conbus_core::continuation::BRIEF_MAX
+        );
     }
     Ok(())
 }
@@ -754,11 +748,11 @@ mod tests {
             prompt: Body::kept("p"),
         }));
         let machine = summarise(&record(Event::TurnStarted {
-            author: Some(Author::new(Author::SCHEDULE_WAKEUP)),
+            author: Some(Author::new(Author::SDK)),
             prompt: Body::kept("p"),
         }));
 
-        assert!(machine.contains("schedule_wakeup"), "{machine}");
+        assert!(machine.contains("sdk"), "{machine}");
         assert_ne!(human, machine);
     }
 

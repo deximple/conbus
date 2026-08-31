@@ -383,7 +383,7 @@ mod tests {
         // `Full`, on the only path to disk, with every other test still green.
         let record = Record {
             event: Event::TurnStarted {
-                author: Some(Author::new(Author::SCHEDULE_WAKEUP)),
+                author: Some(Author::new(Author::SDK)),
                 prompt: Body::kept("wake up and check the deploy"),
             },
             ..turn_started(Body::kept(""))
@@ -397,7 +397,7 @@ mod tests {
             };
             assert_eq!(
                 author.as_ref().map(Author::as_str),
-                Some(Author::SCHEDULE_WAKEUP),
+                Some(Author::SDK),
                 "{level:?} dropped the author"
             );
         }

@@ -64,10 +64,12 @@ pub struct Payload {
     pub cwd: Option<String>,
     /// Two vocabularies under one vendor key, told apart by `hook_event_name`.
     /// On `SessionStart`: startup | resume | clear | compact | fork.
-    /// On `UserPromptSubmit`: user | sdk | system | loop_wakeup |
-    /// schedule_wakeup | poll_event — never emitted by 2.1.241, whose two emit
-    /// sites have it compiled out, but the schema says "payloads may omit it
-    /// while the field rolls out", so read it and never depend on it.
+    /// On `UserPromptSubmit`: the prompt's origin — never emitted by 2.1.241,
+    /// whose two emit sites have it compiled out, but the schema says "payloads
+    /// may omit it while the field rolls out", so read it and never depend on
+    /// it. The values the schema lists here were taken on trust once and were
+    /// wrong; the ones the vendor really writes are counted in `Author`, from
+    /// the `promptSource` of 61,899 real prompts.
     #[serde(default)]
     pub source: Option<String>,
     /// Common base. The turn correlator; see `EVENTS_WITH_A_LIVE_TURN_ID`.
@@ -440,16 +442,13 @@ mod tests {
     fn the_author_of_a_turn_is_recorded_when_the_vendor_sends_one() {
         let event = event_of(
             r#"{"session_id":"abc123","hook_event_name":"UserPromptSubmit","prompt":"hi",
-                "source":"schedule_wakeup"}"#,
+                "source":"sdk"}"#,
         );
 
         let Event::TurnStarted { author, .. } = event else {
             panic!("expected a started turn");
         };
-        assert_eq!(
-            author.as_ref().map(Author::as_str),
-            Some(Author::SCHEDULE_WAKEUP)
-        );
+        assert_eq!(author.as_ref().map(Author::as_str), Some(Author::SDK));
     }
 
     #[test]

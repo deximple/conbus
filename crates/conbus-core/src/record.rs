@@ -166,7 +166,7 @@ mod tests {
                 trigger: Some("compact".into()),
             },
             Event::TurnStarted {
-                author: Some(Author::new(Author::SCHEDULE_WAKEUP)),
+                author: Some(Author::new(Author::SDK)),
                 prompt: Body::kept("p"),
             },
             Event::ToolRequested {
@@ -269,7 +269,7 @@ mod tests {
         // really serialised. A `#[serde(skip)]` anywhere would make the
         // collision test vacuous and silently drop the field from the log.
         let line = serde_json::to_string(&fully_populated(Event::TurnStarted {
-            author: Some(Author::new(Author::SCHEDULE_WAKEUP)),
+            author: Some(Author::new(Author::SDK)),
             prompt: Body::kept("p"),
         }))
         .expect("serialise");
@@ -290,7 +290,7 @@ mod tests {
                 "{key} never reached the line: {line}"
             );
         }
-        assert!(line.contains(r#""author":"schedule_wakeup""#), "{line}");
+        assert!(line.contains(r#""author":"sdk""#), "{line}");
 
         // The same, for the fields that only exist on a tool call.
         let line = serde_json::to_string(&fully_populated(Event::ToolUse {

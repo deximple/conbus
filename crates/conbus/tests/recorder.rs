@@ -208,7 +208,7 @@ fn the_correlators_cross_the_socket_and_stay_with_their_own_records() {
     run_hook(
         home.path(),
         r#"{"session_id":"s-1","hook_event_name":"UserPromptSubmit","prompt":"review this",
-            "prompt_id":"TURN-1","source":"schedule_wakeup"}"#,
+            "prompt_id":"TURN-1","source":"sdk"}"#,
         &[],
     );
     run_hook(
@@ -231,7 +231,7 @@ fn the_correlators_cross_the_socket_and_stay_with_their_own_records() {
     );
     assert_eq!(lines[1]["vendor_turn_id"], "TURN-1");
     assert_eq!(
-        lines[1]["author"], "schedule_wakeup",
+        lines[1]["author"], "sdk",
         "the author did not cross the socket: {:#?}",
         lines[1]
     );

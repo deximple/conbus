@@ -6,6 +6,7 @@ pub mod clock;
 pub mod continuation;
 pub mod event;
 pub mod ids;
+pub mod pack;
 pub mod paths;
 pub mod record;
 pub mod registry;

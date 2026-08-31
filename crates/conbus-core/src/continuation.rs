@@ -1,22 +1,36 @@
-//! Whether a session the user opened is continuing a conversation.
+//! What the bus has to say to a session opening in a checkout.
 //!
-//! The question "which conversation does this session join" has no safe answer
-//! when three harnesses are open on one checkout, and asking it that way was
-//! the mistake. `bus_id` answers *whose turns are these* and keeps answering
-//! only that. What a continuation needs is a second, weaker relation — *what
-//! came before this* — recorded as an edge under the successor. An edge can be
-//! wrong and contradicted later; a merged identity cannot, because in an
-//! append-only log the identity *is* the write.
+//! An earlier version of this asked which conversation a new session was
+//! *joining*, and answered by choosing one. That was the wrong question twice
+//! over.
 //!
-//! Read honestly, what follows is a refusal engine with a single positive
-//! signal: a predecessor that ended on quota or policy *announced* that it
-//! could not continue. Everything else is a short recency window. That is what
-//! makes it safe to run without asking anyone anything — the failure the user
-//! sees is "it did not help", never "it lied".
+//! It was wrong because "you are continuing conversation X" is a claim about
+//! identity, and a claim can be a lie. Guarding against the lie forced the
+//! precision up until the thing became a refusal engine: replayed over 3,443
+//! real conversations it fired **twelve times**. A feature that reaches 0.35%
+//! of sessions is not invisible; it is absent.
 //!
-//! Pure on purpose. The whole log can be replayed through it offline, so "over
-//! N real conversations it fires this often and picks this one" is a
-//! measurement available before a single word is injected anywhere.
+//! And it was wrong because a session boundary is not a thing a person chose.
+//! Claude Code fires several session starts per project, `/clear` makes a new
+//! one, a crash makes a new one. What a person does not want to re-explain is
+//! the *work*, and the work lives in the checkout.
+//!
+//! So this decides what to *say*, not which conversation to *be*. A briefing
+//! narrates what has been happening in this checkout and never claims the
+//! session reading it is one of them. That difference is the whole design: a
+//! wrong identity claim is a lie that costs credibility in every session
+//! afterwards, while a briefing that is not useful is noise, marked with its
+//! own age, that the reader discounts. Precision stops being the binding
+//! constraint, and the same rules that briefed 91 of 112 workspaces would have
+//! continued twelve conversations.
+//!
+//! The strong claim — one conversation whose harness changed underneath it —
+//! survives only where the bus opened the leg itself, because there identity is
+//! known rather than inferred. That path does not come through here.
+//!
+//! Pure on purpose. The whole log can be replayed through it offline, so how
+//! often it speaks and what it refuses is a measurement available before a word
+//! is injected anywhere.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -25,19 +39,19 @@ use crate::event::{Event, Harness, TurnState};
 use crate::ids::BusId;
 use crate::record::Record;
 
-/// The session asking whether it is continuing something.
+/// The session asking what it should be told.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Asking {
     pub harness: Harness,
     /// From the payload's `cwd`, which both vendors put on every event.
     pub workspace: Option<String>,
     /// True only on the prompt that minted this conversation. A later turn is
-    /// never hydrated: the plan's per-prompt overhead is paid once at injection
-    /// and then carried in history for every turn after it.
+    /// never briefed: the per-prompt overhead is paid once at injection and
+    /// then carried in history for every turn after it.
     pub first_prompt: bool,
 }
 
-/// A conversation that might be the one being continued.
+/// A conversation that has happened in some checkout.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Candidate {
     pub bus_id: BusId,
@@ -46,71 +60,85 @@ pub struct Candidate {
     /// When anything was last recorded under it.
     pub last_activity: Timestamp,
     /// How the last turn ended, when the last thing that happened *was* a turn
-    /// ending. `None` covers a conversation stopped mid-turn or mid-tool-loop,
-    /// which is not a thing to continue from — it is a thing still happening.
+    /// ending. `None` means a turn was in flight.
     pub last_turn: Option<TurnState>,
     pub turns: u64,
     /// Reconstructed from the vendor's own history rather than mirrored live.
     pub backfilled: bool,
 }
 
-/// Why one conversation is believed to precede another.
+/// How a conversation came to a stop.
+///
+/// Description, not permission. Under the old design this was the gate's
+/// verdict and it decided whether anything happened at all; here it is
+/// something the briefing says, and every value of it is sayable.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Evidence {
-    /// The predecessor said it could not continue. The one strong signal.
+pub enum Stopped {
+    /// It said it could not continue — quota, policy, billing, auth. The one a
+    /// person most needs told, because it is the only stop that was not a
+    /// choice.
     Displaced,
-    /// The predecessor finished and the user moved harness. A recency guess.
-    HandedOff,
+    /// It finished.
+    Finished,
+    /// The user stopped it.
+    Abandoned,
+    /// A turn was in flight when the log last heard from it.
+    InFlight,
 }
 
-/// Why no edge was drawn. Every reason is named, because without them "it never
-/// fires" and "the gate is too tight" are the same observation.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub enum Declined {
+/// Why nothing is said.
+///
+/// Named individually so that "it never speaks" and "the window is too tight"
+/// stay different observations.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Silent {
     /// The payload carried no `cwd`. Nothing can be looked up without it.
     NoWorkspace,
-    /// A workspace so broad that everything would match it — `/` or the home
-    /// directory, which is where a session started from a login shell reports.
+    /// A checkout so broad that everything on the machine is in it — `/` or the
+    /// home directory, which is where a session started from a login shell
+    /// reports.
     WorkspaceTooBroad,
     /// Not the prompt that started this conversation.
     NotFirstPrompt,
-    /// Nothing in this workspace survived the filters.
-    NoCandidate,
-    /// More than one did. Never broken by recency: a confidently wrong edge is
-    /// the cross-vendor injection path the threat model calls T4.
-    Ambiguous { candidates: usize },
-    /// Someone else is working in this checkout right now.
-    WorkspaceBusy,
+    /// This checkout has nothing recent enough, or long enough, to be worth
+    /// the tokens.
+    NothingToSay,
 }
 
-/// What the gate decided.
+/// What to tell a session opening here.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Decision {
-    Continue { bus_id: BusId, evidence: Evidence },
-    Declined(Declined),
+    Silent(Silent),
+    /// Conversations to narrate, most recent first. Facts about the checkout.
+    Brief {
+        recent: Vec<BusId>,
+    },
 }
 
-/// How long a predecessor that announced it could not continue stays eligible.
+/// How long ago a conversation can have stopped and still be worth mentioning.
 ///
-/// Generous because the signal is strong and the situation is the product: a
-/// five-hour vendor limit is the case the whole design was drawn for, and a
-/// person who hits one at lunch comes back after it.
-pub const DISPLACED_WINDOW_SECS: i64 = 8 * 60 * 60;
-
-/// How long a predecessor that simply finished stays eligible.
+/// A month. A checkout touched within one is a checkout a person half
+/// remembers, which is exactly when being reminded helps and exactly when
+/// re-explaining is most annoying. Older than that and the briefing is
+/// archaeology: it still would not be *wrong* — every line carries its own age
+/// — but it stops paying for its tokens.
 ///
-/// Short because the signal is weak. "I finished in Claude and opened Codex" is
-/// only a continuation while the work is still in the person's head.
-pub const HANDED_OFF_WINDOW_SECS: i64 = 20 * 60;
+/// On the real log this speaks for 48 of 91 checkouts that have anything at
+/// all. Seven days would speak for 8. The number is meant to be moved on
+/// evidence, and `conbus doctor` prints the evidence.
+pub const BRIEF_WINDOW_SECS: i64 = 30 * 24 * 60 * 60;
 
-/// How recently another conversation must have moved for this checkout to count
-/// as somebody else's right now.
-pub const BUSY_WINDOW_SECS: i64 = 90;
-
-/// The fewest turns a conversation must have before it is worth continuing.
+/// The most conversations one briefing names.
 ///
-/// Two, and it removes nine tenths of the candidates on its own: 3,179 of the
-/// 3,434 conversations in the real log are a single turn with nothing to carry.
+/// Three. Past that it stops being orientation and becomes a directory
+/// listing, and the reader learns to skip it — an ignored briefing is worse
+/// than none, because being noticed was the whole argument for it.
+pub const BRIEF_MAX: usize = 3;
+
+/// The fewest turns a conversation must have to be worth mentioning.
+///
+/// Two, and it removes nine tenths of everything on its own: 3,179 of the 3,434
+/// conversations in the real log are a single turn with nothing to carry.
 pub const MIN_TURNS: u64 = 2;
 
 impl Candidate {
@@ -183,66 +211,15 @@ impl Candidate {
     }
 }
 
-/// Decide whether this session continues one of these conversations.
-pub fn decide(
-    asking: &Asking,
-    candidates: &[Candidate],
-    home: Option<&str>,
-    now: Timestamp,
-) -> Decision {
-    if !asking.first_prompt {
-        return Decision::Declined(Declined::NotFirstPrompt);
-    }
-    let Some(workspace) = asking.workspace.as_deref() else {
-        return Decision::Declined(Declined::NoWorkspace);
-    };
-    if workspace == "/" || Some(workspace) == home {
-        return Decision::Declined(Declined::WorkspaceTooBroad);
-    }
-
-    let here: Vec<&Candidate> = candidates
-        .iter()
-        .filter(|c| c.workspace.as_deref() == Some(workspace))
-        .collect();
-
-    let eligible: Vec<(&Candidate, Evidence)> = here
-        .iter()
-        .filter_map(|candidate| eligibility(asking, candidate, now).map(|why| (*candidate, why)))
-        .collect();
-
-    let chosen = match eligible.as_slice() {
-        [] => return Decision::Declined(Declined::NoCandidate),
-        [(candidate, evidence)] => (*candidate, *evidence),
-        many => {
-            return Decision::Declined(Declined::Ambiguous {
-                candidates: many.len(),
-            });
-        }
-    };
-
-    // Everything else in this checkout, including conversations that were never
-    // candidates. A one-turn session or a same-harness one cannot be chosen
-    // wrongly, but it can still mean a person is sitting in this repo working on
-    // something else, and claiming a continuation over their shoulder is the
-    // failure that costs credibility rather than tokens.
-    let busy = here.iter().any(|other| {
-        other.bus_id != chosen.0.bus_id && now.seconds_since(other.last_activity) < BUSY_WINDOW_SECS
-    });
-    if busy {
-        return Decision::Declined(Declined::WorkspaceBusy);
-    }
-
-    Decision::Continue {
-        bus_id: chosen.0.bus_id,
-        evidence: chosen.1,
-    }
-}
-
-/// What the gate would have done, replayed over a log.
+/// What the briefing would have said, replayed over a log.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct Replay {
-    /// One count per verdict, named the way the log would name it.
+    /// One count per outcome, named the way the log names it.
     pub verdicts: BTreeMap<&'static str, u64>,
+    /// How many conversations a briefing named, summed. Divided by the number
+    /// of briefings it is the average width, which is what says whether
+    /// `BRIEF_MAX` is doing anything.
+    pub named: u64,
 }
 
 impl Replay {
@@ -251,60 +228,42 @@ impl Replay {
     }
 }
 
-/// Ask the gate what it would have done at every conversation's first prompt.
+/// Ask, at every conversation's first prompt, what it would have been told.
 ///
-/// The point of a pure gate: this runs over the whole log offline, so "it fires
-/// this often and refuses for these reasons" is a measurement rather than a
-/// hope, available before a single word is injected anywhere. Faithful to the
-/// moment — each conversation is judged against only what had already happened
-/// when its first prompt arrived.
+/// The point of a pure decision: this runs over the whole log offline, so "it
+/// speaks this often, about this many conversations, and stays quiet for these
+/// reasons" is a measurement rather than a hope — available before a word is
+/// injected anywhere. Faithful to the moment: each conversation is judged
+/// against only what had already happened when its first prompt arrived.
 ///
 /// Records are read in timestamp order, not append order. Backfill appends
-/// months-old conversations to the end of the log, so the two are not the same.
+/// months-old conversations to the end of the log, so the two are not the same;
+/// in append order the older conversation would be briefed about the newer one.
+///
+/// The counterfactual that used to sit beside this is gone with the rules it
+/// existed for. It was there because the same-harness and live-authored rules
+/// refused a single-vendor corpus outright, leaving the real replay unable to
+/// say anything. Neither rule survives — a briefing about another Claude
+/// session in this checkout is as useful as one about a Codex session, and a
+/// reconstructed conversation is a fine thing to narrate as long as it is
+/// marked — so the measurement is now informative on its own.
 pub fn replay(records: &[Record], home: Option<&str>) -> Replay {
-    replay_inner(records, home, false)
-}
-
-/// The same replay with the two rules a single-vendor corpus cannot exercise
-/// lifted. A measurement only.
-///
-/// Every conversation in a log built from Claude Code transcripts is Claude
-/// Code, and every one of them is reconstructed. Those two rules therefore
-/// refuse all of it before any other rule is consulted, so the shipped replay
-/// proves there are no false positives and says nothing about whether the rest
-/// of the gate discriminates.
-///
-/// Lifting them asks the question the corpus can answer: given these
-/// workspaces, these turn counts, these endings and these times, how often
-/// would the gate have fired, and how often would it have had to choose between
-/// conversations? That matters here more than anywhere, because one workspace
-/// in this corpus holds 3,031 conversations — if the ambiguity refusal did not
-/// work, this is where it would show.
-///
-/// It is a counterfactual and must be labelled as one wherever it is shown. It
-/// is not the gate.
-pub fn replay_as_if_cross_vendor(records: &[Record], home: Option<&str>) -> Replay {
-    replay_inner(records, home, true)
-}
-
-fn replay_inner(records: &[Record], home: Option<&str>, counterfactual: bool) -> Replay {
     let mut by_time: Vec<&Record> = records.iter().collect();
     by_time.sort_by_key(|record| (record.ts, record.seq));
 
     // Which checkout each conversation happened in, read from the whole log
     // rather than incrementally.
     //
-    // This is the one place the replay looks ahead, and it is looking ahead at
-    // a fact the live path never had to guess: `cwd` is on every hook payload,
-    // so a running daemon knows the workspace of the session in front of it and
-    // of every session it has already seen. What it does *not* reconstruct is
-    // the conversation's state — turn count, how the last turn ended, when it
-    // last moved — which stays strictly as-of, because that is what the gate
-    // actually judges. Records written before the workspace was recorded carry
-    // it only on a session record appended later, at the conversation's own
-    // opening time but with a much larger sequence number, so an incremental
-    // read puts it after the prompt it belongs to and answers `no_workspace`
-    // for all 3,433 of them.
+    // This is the one place the replay looks ahead, and it looks ahead at a
+    // fact the live path never had to guess: `cwd` is on every hook payload, so
+    // a running daemon knows the workspace of the session in front of it and of
+    // every session it has already seen. What it does *not* reconstruct is a
+    // conversation's state — turn count, how the last turn ended, when it last
+    // moved — which stays strictly as-of, because that is what is being judged.
+    // Records written before the workspace was recorded carry it only on a
+    // session record appended later, at the conversation's own opening time but
+    // with a much larger sequence number, so an incremental read puts it after
+    // the prompt it belongs to and answers `no_workspace` for all 3,433 of them.
     let mut workspace_of: HashMap<BusId, String> = HashMap::new();
     for record in records {
         if let Some(workspace) = &record.source.workspace {
@@ -318,10 +277,9 @@ fn replay_inner(records: &[Record], home: Option<&str>, counterfactual: bool) ->
 
     for record in by_time {
         if matches!(record.event, Event::TurnStarted { .. }) && asked.insert(record.bus_id) {
-            // The workspace of the *conversation*, not of this one record.
             let workspace = workspace_of.get(&record.bus_id).cloned();
-            // Only this checkout. The gate would reject the rest anyway, and
-            // handing it every conversation on the machine is what turns a
+            // Only this checkout. Everything else would be filtered anyway, and
+            // handing over every conversation on the machine is what turns a
             // replay into a quadratic one.
             let candidates: Vec<Candidate> = match workspace.as_deref() {
                 Some(workspace) => live
@@ -333,12 +291,6 @@ fn replay_inner(records: &[Record], home: Option<&str>, counterfactual: bool) ->
                     })
                     .map(|candidate| Candidate {
                         workspace: Some(workspace.to_string()),
-                        backfilled: candidate.backfilled && !counterfactual,
-                        harness: if counterfactual {
-                            Harness::new("other")
-                        } else {
-                            candidate.harness.clone()
-                        },
                         ..candidate.clone()
                     })
                     .collect(),
@@ -350,21 +302,15 @@ fn replay_inner(records: &[Record], home: Option<&str>, counterfactual: bool) ->
                 first_prompt: true,
             };
             let name = match decide(&asking, &candidates, home, record.ts) {
-                Decision::Continue {
-                    evidence: Evidence::Displaced,
-                    ..
-                } => "continue/displaced",
-                Decision::Continue {
-                    evidence: Evidence::HandedOff,
-                    ..
-                } => "continue/handed_off",
-                Decision::Declined(reason) => match reason {
-                    Declined::NoWorkspace => "declined/no_workspace",
-                    Declined::WorkspaceTooBroad => "declined/workspace_too_broad",
-                    Declined::NotFirstPrompt => "declined/not_first_prompt",
-                    Declined::NoCandidate => "declined/no_candidate",
-                    Declined::Ambiguous { .. } => "declined/ambiguous",
-                    Declined::WorkspaceBusy => "declined/workspace_busy",
+                Decision::Brief { recent } => {
+                    out.named += recent.len() as u64;
+                    "brief"
+                }
+                Decision::Silent(reason) => match reason {
+                    Silent::NoWorkspace => "silent/no_workspace",
+                    Silent::WorkspaceTooBroad => "silent/workspace_too_broad",
+                    Silent::NotFirstPrompt => "silent/not_first_prompt",
+                    Silent::NothingToSay => "silent/nothing_to_say",
                 },
             };
             *out.verdicts.entry(name).or_default() += 1;
@@ -374,45 +320,94 @@ fn replay_inner(records: &[Record], home: Option<&str>, counterfactual: bool) ->
     out
 }
 
-/// Why this one conversation could be continued, if it could.
-fn eligibility(asking: &Asking, candidate: &Candidate, now: Timestamp) -> Option<Evidence> {
-    // Same harness is already covered by the vendor's own session id plus its
-    // resume, compact and fork sources. And `/clear` is a deliberate "forget
-    // this", so declining to cross it is the correct answer, not a gap.
-    if candidate.harness == asking.harness {
-        return None;
-    }
-    // An edge is a live-path fact. A backfilled conversation is whatever a
-    // one-shot parser could recover from a format the vendor calls internal,
-    // and hydrating a live session from one would inject a reconstruction.
-    if candidate.backfilled {
-        return None;
-    }
-    if candidate.turns < MIN_TURNS {
-        return None;
-    }
-    let age = now.seconds_since(candidate.last_activity);
-    if age < 0 {
-        return None;
-    }
-    match candidate.last_turn.as_ref()? {
-        TurnState::InterruptedQuota { .. } | TurnState::InterruptedPolicy { .. } => {
-            (age <= DISPLACED_WINDOW_SECS).then_some(Evidence::Displaced)
+/// How a conversation stopped, as the briefing would put it.
+pub fn stopped(candidate: &Candidate) -> Stopped {
+    match candidate.last_turn.as_ref() {
+        None => Stopped::InFlight,
+        Some(TurnState::InterruptedQuota { .. } | TurnState::InterruptedPolicy { .. }) => {
+            Stopped::Displaced
         }
-        TurnState::Complete => (age <= HANDED_OFF_WINDOW_SECS).then_some(Evidence::HandedOff),
-        // The user stopped it themselves. That is a decision to abandon the
-        // turn, and reading it as an invitation to carry the work elsewhere
-        // would be putting words in their mouth.
-        TurnState::InterruptedUser => None,
+        Some(TurnState::Complete) => Stopped::Finished,
+        Some(TurnState::InterruptedUser) => Stopped::Abandoned,
+    }
+}
+
+/// Decide what this session should be told about its checkout.
+pub fn decide(
+    asking: &Asking,
+    candidates: &[Candidate],
+    home: Option<&str>,
+    now: Timestamp,
+) -> Decision {
+    if !asking.first_prompt {
+        return Decision::Silent(Silent::NotFirstPrompt);
+    }
+    let Some(workspace) = asking.workspace.as_deref() else {
+        return Decision::Silent(Silent::NoWorkspace);
+    };
+    if workspace == "/" || Some(workspace) == home {
+        return Decision::Silent(Silent::WorkspaceTooBroad);
+    }
+
+    let mut worth: Vec<&Candidate> = candidates
+        .iter()
+        .filter(|candidate| {
+            // This checkout only. Worktrees of one repository stay distinct,
+            // deliberately: the branch in one is not the branch in another, and
+            // this project is being written in one.
+            candidate.workspace.as_deref() == Some(workspace) && candidate.turns >= MIN_TURNS && {
+                let age = now.seconds_since(candidate.last_activity);
+                // Negative means the record is stamped later than the
+                // question, which happens: backfilled records carry the
+                // time they happened and a wall clock can step backwards.
+                // Read as "very recent" it would make the stalest candidate
+                // the most attractive one.
+                (0..=BRIEF_WINDOW_SECS).contains(&age)
+            }
+        })
+        .collect();
+
+    if worth.is_empty() {
+        return Decision::Silent(Silent::NothingToSay);
+    }
+
+    // Most recent first, and a stable tie-break so the same log always briefs
+    // the same way — a briefing that reorders itself between runs cannot be
+    // tested and cannot be trusted.
+    worth.sort_by(|a, b| {
+        b.last_activity
+            .cmp(&a.last_activity)
+            .then_with(|| a.bus_id.cmp(&b.bus_id))
+    });
+    // A conversation that stopped because it could not continue goes first
+    // whatever its age within the window. It is the only stop that was not
+    // somebody's choice, and it is the one a person opening another harness is
+    // most likely to be here about.
+    if let Some(displaced) = worth
+        .iter()
+        .position(|candidate| stopped(candidate) == Stopped::Displaced)
+    {
+        let first = worth.remove(displaced);
+        worth.insert(0, first);
+    }
+
+    Decision::Brief {
+        recent: worth
+            .iter()
+            .take(BRIEF_MAX)
+            .map(|candidate| candidate.bus_id)
+            .collect(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event::{Body, Source};
 
     const WORKSPACE: &str = "/Applications/conbus";
-    const NOW: &str = "2026-08-31T12:00:00.000Z";
+    const NOW: &str = "2026-09-01T12:00:00.000Z";
+    const DAY: i64 = 24 * 60 * 60;
 
     fn now() -> Timestamp {
         NOW.parse().expect("ts")
@@ -446,119 +441,141 @@ mod tests {
             harness: Harness::new(Harness::CLAUDE_CODE),
             workspace: Some(WORKSPACE.into()),
             last_activity: ago(120),
-            last_turn: Some(TurnState::InterruptedQuota {
-                reason: "rate_limit".into(),
-            }),
+            last_turn: Some(TurnState::Complete),
             turns: 6,
             backfilled: false,
         }
     }
 
-    fn decide_one(candidate: Candidate) -> Decision {
-        decide(&asking(), &[candidate], Some("/Users/someone"), now())
+    fn brief(candidates: &[Candidate]) -> Decision {
+        decide(&asking(), candidates, Some("/Users/someone"), now())
+    }
+
+    fn named(decision: &Decision) -> Vec<BusId> {
+        match decision {
+            Decision::Brief { recent } => recent.clone(),
+            Decision::Silent(reason) => panic!("expected a briefing, got {reason:?}"),
+        }
     }
 
     #[test]
-    fn a_predecessor_that_ran_out_of_quota_is_the_one_strong_signal() {
+    fn a_checkout_with_recent_work_gets_told_about_it() {
         let subject = candidate();
-        let bus_id = subject.bus_id;
+
+        assert_eq!(named(&brief(&[subject.clone()])), vec![subject.bus_id]);
+    }
+
+    #[test]
+    fn the_same_harness_is_briefed_about_too() {
+        // The old design refused this, on the argument that the vendor's own
+        // resume covers it. It does not: resume covers *that session*, not the
+        // other three the same person left open in this repo yesterday.
+        let same = Candidate {
+            harness: Harness::new(Harness::CODEX),
+            ..candidate()
+        };
+
+        assert_eq!(named(&brief(&[same.clone()])), vec![same.bus_id]);
+    }
+
+    #[test]
+    fn a_reconstructed_conversation_is_briefed_about_too() {
+        // Also refused before, because an *edge* is a live-path fact. A
+        // briefing makes no such claim — it narrates, and a narration can carry
+        // its own provenance.
+        let recovered = Candidate {
+            backfilled: true,
+            ..candidate()
+        };
+
+        assert_eq!(named(&brief(&[recovered.clone()])), vec![recovered.bus_id]);
+    }
+
+    #[test]
+    fn several_conversations_are_a_briefing_and_not_a_refusal() {
+        // The case that killed the previous design outright. Three threads in
+        // one checkout was `Ambiguous`, and the answer was silence. It is not
+        // ambiguous at all once nothing is being claimed: it is three facts.
+        let old = Candidate {
+            last_activity: ago(3 * DAY),
+            ..candidate()
+        };
+        let middle = Candidate {
+            bus_id: BusId::mint(),
+            last_activity: ago(2 * DAY),
+            ..candidate()
+        };
+        let recent = Candidate {
+            bus_id: BusId::mint(),
+            last_activity: ago(60),
+            ..candidate()
+        };
 
         assert_eq!(
-            decide_one(subject),
-            Decision::Continue {
-                bus_id,
-                evidence: Evidence::Displaced
-            }
+            named(&brief(&[old.clone(), recent.clone(), middle.clone()])),
+            vec![recent.bus_id, middle.bus_id, old.bus_id],
+            "most recent first"
         );
     }
 
     #[test]
-    fn a_policy_refusal_counts_the_same_because_it_says_the_same_thing() {
-        let subject = Candidate {
-            last_turn: Some(TurnState::InterruptedPolicy {
-                reason: "billing_error".into(),
+    fn a_conversation_that_could_not_continue_is_named_first() {
+        // The only stop that was not somebody's choice, and the likeliest
+        // reason a person is opening another harness at all — so it leads,
+        // whatever its age inside the window.
+        let displaced = Candidate {
+            bus_id: BusId::mint(),
+            last_activity: ago(4 * DAY),
+            last_turn: Some(TurnState::InterruptedQuota {
+                reason: "rate_limit".into(),
             }),
             ..candidate()
         };
-        let bus_id = subject.bus_id;
-
-        assert_eq!(
-            decide_one(subject),
-            Decision::Continue {
-                bus_id,
-                evidence: Evidence::Displaced
-            }
-        );
-    }
-
-    #[test]
-    fn a_finished_conversation_is_a_weaker_signal_on_a_much_shorter_window() {
-        let finished = Candidate {
-            last_turn: Some(TurnState::Complete),
+        let newer = Candidate {
+            bus_id: BusId::mint(),
+            last_activity: ago(60),
             ..candidate()
         };
-        let bus_id = finished.bus_id;
 
         assert_eq!(
-            decide_one(finished.clone()),
-            Decision::Continue {
-                bus_id,
-                evidence: Evidence::HandedOff
-            }
-        );
-        assert_eq!(
-            decide_one(Candidate {
-                last_activity: ago(HANDED_OFF_WINDOW_SECS + 1),
-                ..finished
-            }),
-            Decision::Declined(Declined::NoCandidate),
-            "a finished conversation goes cold long before a displaced one"
+            named(&brief(&[newer.clone(), displaced.clone()])),
+            vec![displaced.bus_id, newer.bus_id]
         );
     }
 
     #[test]
-    fn a_displaced_conversation_stays_eligible_across_a_vendor_limit() {
-        // The five-hour limit is the case the design was drawn for. A window
-        // shorter than one would refuse exactly the hop the product exists to
-        // make.
-        const { assert!(DISPLACED_WINDOW_SECS > 5 * 60 * 60) };
-        assert!(matches!(
-            decide_one(Candidate {
-                last_activity: ago(5 * 60 * 60),
+    fn a_briefing_is_capped_so_it_stays_orientation() {
+        let many: Vec<Candidate> = (0..10)
+            .map(|n| Candidate {
+                bus_id: BusId::mint(),
+                last_activity: ago(60 * (n + 1)),
                 ..candidate()
-            }),
-            Decision::Continue { .. }
-        ));
+            })
+            .collect();
+
         assert_eq!(
-            decide_one(Candidate {
-                last_activity: ago(DISPLACED_WINDOW_SECS + 1),
-                ..candidate()
-            }),
-            Decision::Declined(Declined::NoCandidate)
+            named(&brief(&many)).len(),
+            BRIEF_MAX,
+            "past a few names it is a directory listing, and gets skipped"
         );
     }
 
     #[test]
-    fn a_turn_the_user_stopped_is_not_an_invitation() {
-        assert_eq!(
-            decide_one(Candidate {
-                last_turn: Some(TurnState::InterruptedUser),
-                ..candidate()
-            }),
-            Decision::Declined(Declined::NoCandidate),
-            "the user stopping a turn is a decision to abandon it"
-        );
-    }
+    fn the_order_does_not_depend_on_the_order_it_was_handed() {
+        // A briefing that reorders itself between runs cannot be tested and
+        // cannot be trusted. Two conversations stopped in the same millisecond
+        // is the case a naive sort leaves to chance.
+        let tie = |bus_id| Candidate {
+            bus_id,
+            last_activity: ago(60),
+            ..candidate()
+        };
+        let a = tie(BusId::mint());
+        let b = tie(BusId::mint());
 
-    #[test]
-    fn a_conversation_still_mid_turn_is_not_a_thing_to_continue_from() {
         assert_eq!(
-            decide_one(Candidate {
-                last_turn: None,
-                ..candidate()
-            }),
-            Decision::Declined(Declined::NoCandidate),
-            "it is still happening"
+            named(&brief(&[a.clone(), b.clone()])),
+            named(&brief(&[b, a]))
         );
     }
 
@@ -566,34 +583,29 @@ mod tests {
     fn one_turn_conversations_are_removed_before_anything_else_is_asked() {
         // On the real log this single condition removes 3,179 of 3,434.
         assert_eq!(
-            decide_one(Candidate {
+            brief(&[Candidate {
                 turns: 1,
                 ..candidate()
-            }),
-            Decision::Declined(Declined::NoCandidate)
+            }]),
+            Decision::Silent(Silent::NothingToSay)
         );
     }
 
     #[test]
-    fn the_same_harness_is_the_vendors_own_resume_and_not_ours() {
-        assert_eq!(
-            decide_one(Candidate {
-                harness: Harness::new(Harness::CODEX),
+    fn work_older_than_the_window_stops_paying_for_its_tokens() {
+        assert!(matches!(
+            brief(&[Candidate {
+                last_activity: ago(BRIEF_WINDOW_SECS - 60),
                 ..candidate()
-            }),
-            Decision::Declined(Declined::NoCandidate)
-        );
-    }
-
-    #[test]
-    fn a_reconstructed_conversation_is_not_evidence_of_a_hop() {
+            }]),
+            Decision::Brief { .. }
+        ));
         assert_eq!(
-            decide_one(Candidate {
-                backfilled: true,
+            brief(&[Candidate {
+                last_activity: ago(BRIEF_WINDOW_SECS + 60),
                 ..candidate()
-            }),
-            Decision::Declined(Declined::NoCandidate),
-            "an edge is a live-path fact"
+            }]),
+            Decision::Silent(Silent::NothingToSay)
         );
     }
 
@@ -603,90 +615,16 @@ mod tests {
         // is being written in one, and the branch in it is not the branch in
         // the main checkout.
         assert_eq!(
-            decide_one(Candidate {
+            brief(&[Candidate {
                 workspace: Some(format!("{WORKSPACE}/.claude/worktrees/other")),
                 ..candidate()
-            }),
-            Decision::Declined(Declined::NoCandidate)
+            }]),
+            Decision::Silent(Silent::NothingToSay)
         );
     }
 
     #[test]
-    fn two_candidates_are_never_broken_by_recency() {
-        // The case that killed the previous design: one checkout, several
-        // harnesses, genuinely different content. A confidently wrong edge is
-        // worse than none, so the tie is simply refused.
-        let older = candidate();
-        let newer = Candidate {
-            bus_id: BusId::mint(),
-            harness: Harness::new(Harness::CLAUDE_CODE),
-            last_activity: ago(100),
-            ..candidate()
-        };
-
-        assert_eq!(
-            decide(&asking(), &[older, newer], None, now()),
-            Decision::Declined(Declined::Ambiguous { candidates: 2 })
-        );
-    }
-
-    #[test]
-    fn a_checkout_somebody_is_working_in_right_now_is_left_alone() {
-        let chosen = candidate();
-        // Not a candidate itself — one turn, and the same harness as the asking
-        // session — but a sign that a person is in this repo doing something
-        // else, which is the failure that costs credibility rather than tokens.
-        let busy = Candidate {
-            bus_id: BusId::mint(),
-            harness: Harness::new(Harness::CODEX),
-            last_activity: ago(BUSY_WINDOW_SECS - 1),
-            turns: 1,
-            last_turn: None,
-            ..candidate()
-        };
-
-        assert_eq!(
-            decide(&asking(), &[chosen.clone(), busy.clone()], None, now()),
-            Decision::Declined(Declined::WorkspaceBusy)
-        );
-        assert!(
-            matches!(
-                decide(
-                    &asking(),
-                    &[
-                        chosen,
-                        Candidate {
-                            last_activity: ago(BUSY_WINDOW_SECS + 1),
-                            ..busy
-                        }
-                    ],
-                    None,
-                    now()
-                ),
-                Decision::Continue { .. }
-            ),
-            "once it goes quiet the hop is allowed again"
-        );
-    }
-
-    #[test]
-    fn the_conversation_being_continued_does_not_make_the_checkout_busy() {
-        // The hop the product is for takes seconds: the limit lands, the user
-        // opens the other harness. Counting the predecessor's own last breath
-        // as somebody working here would refuse precisely that.
-        let just_stopped = Candidate {
-            last_activity: ago(5),
-            ..candidate()
-        };
-
-        assert!(matches!(
-            decide_one(just_stopped),
-            Decision::Continue { .. }
-        ));
-    }
-
-    #[test]
-    fn a_later_turn_is_never_hydrated() {
+    fn a_later_turn_is_never_briefed() {
         assert_eq!(
             decide(
                 &Asking {
@@ -697,12 +635,12 @@ mod tests {
                 None,
                 now()
             ),
-            Decision::Declined(Declined::NotFirstPrompt)
+            Decision::Silent(Silent::NotFirstPrompt)
         );
     }
 
     #[test]
-    fn a_workspace_broad_enough_to_match_everything_is_refused() {
+    fn a_checkout_broad_enough_to_hold_everything_is_refused() {
         for broad in ["/", "/Users/someone"] {
             assert_eq!(
                 decide(
@@ -714,7 +652,7 @@ mod tests {
                     Some("/Users/someone"),
                     now()
                 ),
-                Decision::Declined(Declined::WorkspaceTooBroad),
+                Decision::Silent(Silent::WorkspaceTooBroad),
                 "{broad} would collect every conversation on the machine"
             );
         }
@@ -732,8 +670,51 @@ mod tests {
                 None,
                 now()
             ),
-            Decision::Declined(Declined::NoWorkspace)
+            Decision::Silent(Silent::NoWorkspace)
         );
+    }
+
+    #[test]
+    fn a_conversation_stamped_after_the_question_is_not_read_as_fresh() {
+        // Backfilled records carry the time they happened and a wall clock can
+        // step backwards. A negative age read as "very recent" would put the
+        // stalest thing in the log at the top of the briefing.
+        assert_eq!(
+            brief(&[Candidate {
+                last_activity: ago(-60),
+                ..candidate()
+            }]),
+            Decision::Silent(Silent::NothingToSay)
+        );
+    }
+
+    #[test]
+    fn how_a_conversation_stopped_is_described_rather_than_judged() {
+        // Every value is sayable. Under the old design two of these four were
+        // silence.
+        let with = |last_turn| Candidate {
+            last_turn,
+            ..candidate()
+        };
+
+        assert_eq!(
+            stopped(&with(Some(TurnState::InterruptedQuota {
+                reason: "rate_limit".into()
+            }))),
+            Stopped::Displaced
+        );
+        assert_eq!(
+            stopped(&with(Some(TurnState::InterruptedPolicy {
+                reason: "billing_error".into()
+            }))),
+            Stopped::Displaced
+        );
+        assert_eq!(stopped(&with(Some(TurnState::Complete))), Stopped::Finished);
+        assert_eq!(
+            stopped(&with(Some(TurnState::InterruptedUser))),
+            Stopped::Abandoned
+        );
+        assert_eq!(stopped(&with(None)), Stopped::InFlight);
     }
 
     fn logged(bus_id: BusId, at: Timestamp, event: Event) -> Record {
@@ -744,7 +725,7 @@ mod tests {
             bus_id,
             vendor_turn_id: None,
             vendor_agent_id: None,
-            source: crate::event::Source {
+            source: Source {
                 harness: Harness::new(Harness::CLAUDE_CODE),
                 harness_version: None,
                 vendor_session_id: Some("s".into()),
@@ -758,7 +739,14 @@ mod tests {
     fn prompt() -> Event {
         Event::TurnStarted {
             author: None,
-            prompt: crate::event::Body::kept("p"),
+            prompt: Body::kept("p"),
+        }
+    }
+
+    fn ended(state: TurnState) -> Event {
+        Event::TurnEnded {
+            state,
+            assistant_message: None,
         }
     }
 
@@ -768,24 +756,14 @@ mod tests {
         let records = vec![
             logged(bus_id, ago(300), Event::SessionCandidate { trigger: None }),
             logged(bus_id, ago(280), prompt()),
-            logged(
-                bus_id,
-                ago(260),
-                Event::TurnEnded {
-                    state: TurnState::Complete,
-                    assistant_message: None,
-                },
-            ),
+            logged(bus_id, ago(260), ended(TurnState::Complete)),
             logged(bus_id, ago(200), prompt()),
             logged(
                 bus_id,
                 ago(120),
-                Event::TurnEnded {
-                    state: TurnState::InterruptedQuota {
-                        reason: "rate_limit".into(),
-                    },
-                    assistant_message: None,
-                },
+                ended(TurnState::InterruptedQuota {
+                    reason: "rate_limit".into(),
+                }),
             ),
             logged(
                 bus_id,
@@ -804,10 +782,8 @@ mod tests {
         assert_eq!(only.workspace.as_deref(), Some(WORKSPACE));
         assert_eq!(only.last_activity, ago(100), "activity, not the last turn");
         assert_eq!(
-            only.last_turn,
-            Some(TurnState::InterruptedQuota {
-                reason: "rate_limit".into()
-            }),
+            stopped(only),
+            Stopped::Displaced,
             "closing the window does not undo how the conversation ended"
         );
         assert!(!only.backfilled);
@@ -815,20 +791,10 @@ mod tests {
 
     #[test]
     fn a_conversation_in_flight_is_indexed_as_in_flight() {
-        // The distinction the gate turns on: a tool call after the last turn
-        // ending means work is still happening, and a conversation still
-        // happening is not one to continue from.
         let bus_id = BusId::mint();
         let records = vec![
             logged(bus_id, ago(300), prompt()),
-            logged(
-                bus_id,
-                ago(280),
-                Event::TurnEnded {
-                    state: TurnState::Complete,
-                    assistant_message: None,
-                },
-            ),
+            logged(bus_id, ago(280), ended(TurnState::Complete)),
             logged(bus_id, ago(200), prompt()),
             logged(
                 bus_id,
@@ -836,58 +802,39 @@ mod tests {
                 Event::ToolRequested {
                     tool: "Read".into(),
                     tool_use_id: None,
-                    input: crate::event::Body::kept("i"),
+                    input: Body::kept("i"),
                 },
             ),
         ];
 
-        assert_eq!(Candidate::index(&records)[0].last_turn, None);
+        assert_eq!(stopped(&Candidate::index(&records)[0]), Stopped::InFlight);
     }
 
     #[test]
     fn the_replay_judges_each_conversation_against_only_what_came_before_it() {
-        // The measurement the gate exists to make possible. Two conversations
-        // in one checkout: the first runs out of quota, the second starts in
-        // the other harness two minutes later. Replayed, that is one hop.
         let first = BusId::mint();
         let second = BusId::mint();
-        let codex = |record: Record| Record {
-            source: crate::event::Source {
-                harness: Harness::new(Harness::CODEX),
-                ..record.source
-            },
-            ..record
-        };
         let records = vec![
             logged(first, ago(600), prompt()),
-            logged(
-                first,
-                ago(500),
-                Event::TurnEnded {
-                    state: TurnState::Complete,
-                    assistant_message: None,
-                },
-            ),
+            logged(first, ago(500), ended(TurnState::Complete)),
             logged(first, ago(400), prompt()),
             logged(
                 first,
                 ago(300),
-                Event::TurnEnded {
-                    state: TurnState::InterruptedQuota {
-                        reason: "rate_limit".into(),
-                    },
-                    assistant_message: None,
-                },
+                ended(TurnState::InterruptedQuota {
+                    reason: "rate_limit".into(),
+                }),
             ),
-            codex(logged(second, ago(180), prompt())),
+            logged(second, ago(180), prompt()),
         ];
 
         let replay = replay(&records, None);
 
         assert_eq!(replay.total(), 2, "one verdict per conversation");
-        assert_eq!(replay.verdicts.get("continue/displaced"), Some(&1));
+        assert_eq!(replay.verdicts.get("brief"), Some(&1));
+        assert_eq!(replay.named, 1);
         assert_eq!(
-            replay.verdicts.get("declined/no_candidate"),
+            replay.verdicts.get("silent/nothing_to_say"),
             Some(&1),
             "the first conversation had nothing before it"
         );
@@ -897,12 +844,16 @@ mod tests {
     fn the_replay_reads_the_log_by_time_and_not_by_append_order() {
         // Backfill appends months-old conversations to the end of the log, so
         // append order and chronology disagree. Judged in append order, the
-        // older conversation would be asked to continue the newer one.
+        // older conversation would be briefed about the newer one.
         let old = BusId::mint();
         let new = BusId::mint();
         let mut records = vec![
             logged(new, ago(100), prompt()),
+            logged(new, ago(90), ended(TurnState::Complete)),
+            logged(new, ago(80), prompt()),
             logged(old, ago(10_000), prompt()),
+            logged(old, ago(9_900), ended(TurnState::Complete)),
+            logged(old, ago(9_800), prompt()),
         ];
         for (seq, record) in records.iter_mut().enumerate() {
             record.seq = seq as u64;
@@ -910,74 +861,13 @@ mod tests {
 
         let replay = replay(&records, None);
 
-        assert_eq!(replay.verdicts.get("declined/no_candidate"), Some(&2));
-    }
-
-    #[test]
-    fn the_counterfactual_actually_lifts_the_rules_it_claims_to() {
-        // The first version of it lifted only the reconstruction rule, which on
-        // a single-vendor corpus changes nothing — it printed numbers identical
-        // to the real gate and looked like a measurement. A counterfactual that
-        // silently equals the thing it is contrasted with is worse than none.
-        let first = BusId::mint();
-        let second = BusId::mint();
-        let backfilled = |record: Record| Record {
-            source: crate::event::Source {
-                backfilled_from: Some("claude_transcript".into()),
-                ..record.source
-            },
-            ..record
-        };
-        let records = vec![
-            backfilled(logged(first, ago(600), prompt())),
-            backfilled(logged(
-                first,
-                ago(500),
-                Event::TurnEnded {
-                    state: TurnState::Complete,
-                    assistant_message: None,
-                },
-            )),
-            backfilled(logged(first, ago(400), prompt())),
-            backfilled(logged(
-                first,
-                ago(300),
-                Event::TurnEnded {
-                    state: TurnState::Complete,
-                    assistant_message: None,
-                },
-            )),
-            // Same harness as the one before it, and reconstructed: refused
-            // twice over by the real gate.
-            backfilled(logged(second, ago(120), prompt())),
-        ];
-
-        assert_eq!(
-            replay(&records, None).verdicts.get("continue/handed_off"),
-            None,
-            "the shipped gate refuses a same-harness, reconstructed predecessor"
-        );
-        assert_eq!(
-            replay_as_if_cross_vendor(&records, None)
-                .verdicts
-                .get("continue/handed_off"),
-            Some(&1),
-            "and the counterfactual has to actually lift both rules, or it is \
-             measuring the same thing twice"
-        );
-    }
-
-    #[test]
-    fn a_conversation_from_the_future_is_refused_rather_than_treated_as_fresh() {
-        // Backfilled records carry the time they happened, and a wall clock can
-        // step backwards. A negative age read as "very recent" would make the
-        // stalest possible candidate the most attractive one.
-        assert_eq!(
-            decide_one(Candidate {
-                last_activity: ago(-60),
-                ..candidate()
-            }),
-            Decision::Declined(Declined::NoCandidate)
-        );
+        // Read by time: the older conversation had nothing before it, the newer
+        // one is briefed about it. Read in append order the newer one comes
+        // first and finds nothing, and the older one then sees a conversation
+        // stamped *after* the question it is answering — a negative age, which
+        // is filtered — so both would be silent. One brief and one silence is
+        // the shape only chronology produces.
+        assert_eq!(replay.verdicts.get("brief"), Some(&1));
+        assert_eq!(replay.verdicts.get("silent/nothing_to_say"), Some(&1));
     }
 }
