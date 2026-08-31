@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::ids::BusId;
+
 /// The harness that produced a record.
 ///
 /// Deliberately open rather than a closed enum: the plan's leg list changes with
@@ -396,6 +398,25 @@ pub enum Event {
         /// text blocks only, and absent when that message is pure tool use.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         assistant_message: Option<Body>,
+    },
+    /// A briefing about this checkout was built and handed to the hook.
+    ///
+    /// Recorded for what is actually known. The daemon built this text and
+    /// returned it; whether a model ever read it happens outside the log, in a
+    /// process the daemon does not watch, so the record says "handed over" and
+    /// not "delivered". Claiming delivery would put an unfalsifiable line in an
+    /// append-only file.
+    ///
+    /// It carries no briefing text. Every word was quoted from records already
+    /// here, and writing them again would double the log to say nothing new.
+    Briefed {
+        /// The conversations it narrated, in the order it named them.
+        about: Vec<BusId>,
+        /// How long it was, in the units the vendor's cap is measured in.
+        units: usize,
+        /// Conversations the budget would not fit.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        dropped: usize,
     },
     SessionEnded {
         #[serde(default, skip_serializing_if = "Option::is_none")]

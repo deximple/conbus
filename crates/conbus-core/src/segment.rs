@@ -201,7 +201,12 @@ impl SegmentLog {
 
     /// Append one event. Returns the sequence number it was written under, or
     /// `None` when retention withheld it.
-    pub fn append(&mut self, entry: Entry) -> io::Result<Option<u64>> {
+    /// Returns the record as it reached disk — redacted, sequenced and stamped
+    /// — so a caller can fold what was actually written rather than what it
+    /// meant to write. Retention can change a body on the way through, and
+    /// derived state built from the pre-retention value would disagree with the
+    /// log it claims to summarise.
+    pub fn append(&mut self, entry: Entry) -> io::Result<Option<Record>> {
         let record = Record {
             schema_version: SCHEMA_VERSION,
             seq: self.next_seq,
@@ -235,7 +240,7 @@ impl SegmentLog {
         }
         current.bytes += line.len() as u64;
         self.next_seq += 1;
-        Ok(Some(record.seq))
+        Ok(Some(record))
     }
 
     /// The segment that should receive `incoming` bytes, rolling over first if
@@ -391,7 +396,7 @@ mod tests {
             ))
             .expect("append");
 
-        assert_eq!(seq, Some(12));
+        assert_eq!(seq.map(|record| record.seq), Some(12));
     }
 
     #[test]
@@ -423,7 +428,7 @@ mod tests {
             .expect("append");
 
         assert_eq!(
-            seq,
+            seq.map(|record| record.seq),
             Some(42),
             "resumed on top of a sequence already on disk"
         );
@@ -511,7 +516,9 @@ mod tests {
         // covers that.)
         let mut log = SegmentLog::open(dir.path(), Retention::default()).expect("reopen");
         assert_eq!(
-            log.append(entry(bus_id, prompt("after"))).expect("append"),
+            log.append(entry(bus_id, prompt("after")))
+                .expect("append")
+                .map(|record| record.seq),
             Some(1),
             "the log stopped being appendable after a torn character"
         );
@@ -534,7 +541,8 @@ mod tests {
 
         assert_eq!(
             log.append(entry(BusId::mint(), prompt("next")))
-                .expect("append"),
+                .expect("append")
+                .map(|record| record.seq),
             Some(8),
             "resuming stopped at the line it could not decode and reused a sequence"
         );
@@ -580,7 +588,7 @@ mod tests {
                 },
             ))
             .expect("append");
-        assert_eq!(seq, Some(1));
+        assert_eq!(seq.map(|record| record.seq), Some(1));
 
         // The record written after the tear must be readable. Without healing
         // the missing newline it would be glued onto the torn line and lost.
@@ -614,7 +622,11 @@ mod tests {
         let mut log = SegmentLog::open(dir.path(), Retention::default()).expect("reopen");
         let seq = log.append(entry(bus_id, prompt("after"))).expect("append");
 
-        assert_eq!(seq, Some(2), "the sequence must not restart at zero");
+        assert_eq!(
+            seq.map(|record| record.seq),
+            Some(2),
+            "the sequence must not restart at zero"
+        );
         let scan = SegmentLog::scan(dir.path()).expect("scan");
         assert_eq!(scan.defects, vec![]);
         assert_eq!(

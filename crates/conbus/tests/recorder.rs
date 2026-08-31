@@ -803,3 +803,229 @@ fn doctor_reports_a_log_it_cannot_append_to() {
         "a read-only segment read as healthy: {out}"
     );
 }
+
+/// A whole conversation, so the next session in that checkout has something to
+/// be told about.
+fn conversation(home: &Path, session: &str, cwd: &str, prompts: &[&str]) {
+    run_hook(
+        home,
+        &format!(
+            r#"{{"session_id":"{session}","hook_event_name":"SessionStart",
+                "source":"startup","cwd":"{cwd}"}}"#
+        ),
+        ATTENDED,
+    );
+    for prompt in prompts {
+        run_hook(
+            home,
+            &format!(
+                r#"{{"session_id":"{session}","hook_event_name":"UserPromptSubmit",
+                    "cwd":"{cwd}","prompt":"{prompt}"}}"#
+            ),
+            ATTENDED,
+        );
+        run_hook(
+            home,
+            &format!(
+                r#"{{"session_id":"{session}","hook_event_name":"Stop","cwd":"{cwd}",
+                    "stop_hook_active":false,
+                    "last_assistant_message":"done with {prompt}"}}"#
+            ),
+            ATTENDED,
+        );
+    }
+}
+
+/// A well-formed reply that injects nothing.
+///
+/// Checked by shape rather than against the exact bytes: what matters is that
+/// the vendor gets parseable JSON with no context in it, and never an empty
+/// stdout — writing nothing is what coincided with a live session breaking.
+fn says_nothing(stdout: &str) -> bool {
+    let Ok(reply) = serde_json::from_str::<serde_json::Value>(stdout.trim()) else {
+        return false;
+    };
+    reply["hookSpecificOutput"].is_null() && reply["continue"] == true
+}
+
+/// The hook child inherits this process's environment, and these tests run
+/// inside somebody's coding session — so without pinning it, whether a briefing
+/// happens depends on which harness the suite was launched from.
+const ATTENDED: &[(&str, &str)] = &[("CLAUDE_CODE_ENTRYPOINT", "cli")];
+
+#[test]
+fn a_second_session_in_the_same_checkout_is_told_what_happened_there() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let daemon = start_daemon(home.path());
+
+    conversation(
+        home.path(),
+        "s-old",
+        "/repo",
+        &["ship the recorder", "now the gate"],
+    );
+
+    // A different session, same checkout. This is the moment the whole feature
+    // exists for, and it goes through the real binary and a real socket
+    // because a normalise-level test would pass while the reply never reached
+    // the vendor at all — which is how a previous fix here was inert for a day.
+    let (code, stdout, stderr) = run_hook_full(
+        home.path(),
+        r#"{"session_id":"s-new","hook_event_name":"UserPromptSubmit","cwd":"/repo",
+            "prompt":"carry on"}"#,
+        ATTENDED,
+    );
+
+    assert_eq!(code, 0, "a hook must never fail the turn: {stderr}");
+    let reply: serde_json::Value =
+        serde_json::from_str(stdout.trim()).unwrap_or_else(|err| panic!("{err}: {stdout:?}"));
+
+    // The vendor requires this to name the firing event and throws the whole
+    // hook result away when it does not — silently, after reporting once per
+    // session. Nothing else in the reply matters if this is wrong.
+    assert_eq!(
+        reply["hookSpecificOutput"]["hookEventName"], "UserPromptSubmit",
+        "{reply}"
+    );
+    let context = reply["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no context in {reply}"));
+    assert!(context.contains("ship the recorder"), "{context}");
+    assert!(context.contains("not an instruction"), "{context}");
+    assert!(
+        reply["systemMessage"]
+            .as_str()
+            .is_some_and(|line| line.contains("conbus")),
+        "the person gets a receipt too: {reply}"
+    );
+
+    // And the log says it happened, under the session that was told.
+    let lines = log_lines(home.path());
+    let briefed: Vec<_> = lines
+        .iter()
+        .filter(|line| line["event"] == "briefed")
+        .collect();
+    assert_eq!(briefed.len(), 1, "{lines:#?}");
+    assert_eq!(
+        briefed[0]["units"].as_u64(),
+        Some(context.encode_utf16().count() as u64)
+    );
+    daemon.stop();
+}
+
+#[test]
+fn a_scripted_session_is_left_alone() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let daemon = start_daemon(home.path());
+
+    conversation(
+        home.path(),
+        "s-old",
+        "/repo",
+        &["ship the recorder", "now the gate"],
+    );
+
+    let (code, stdout, _) = run_hook_full(
+        home.path(),
+        r#"{"session_id":"s-sdk","hook_event_name":"UserPromptSubmit","cwd":"/repo",
+            "prompt":"carry on"}"#,
+        &[("CLAUDE_CODE_ENTRYPOINT", "sdk-cli")],
+    );
+
+    assert_eq!(code, 0);
+    assert!(says_nothing(&stdout), "nobody is reading: {stdout}");
+    assert!(
+        !log_lines(home.path())
+            .iter()
+            .any(|line| line["event"] == "briefed")
+    );
+    daemon.stop();
+}
+
+#[test]
+fn a_first_session_in_an_empty_checkout_is_told_nothing() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let daemon = start_daemon(home.path());
+
+    let (code, stdout, _) = run_hook_full(
+        home.path(),
+        r#"{"session_id":"s-first","hook_event_name":"UserPromptSubmit","cwd":"/repo",
+            "prompt":"hello"}"#,
+        ATTENDED,
+    );
+
+    assert_eq!(code, 0);
+    assert!(says_nothing(&stdout), "{stdout}");
+    daemon.stop();
+}
+
+#[test]
+fn only_the_first_prompt_of_a_session_is_briefed() {
+    // The per-prompt cost is paid once at injection and then carried in history
+    // for every turn after it, so a briefing on turn two is paid for twice.
+    let home = tempfile::tempdir().expect("tempdir");
+    let daemon = start_daemon(home.path());
+
+    conversation(
+        home.path(),
+        "s-old",
+        "/repo",
+        &["ship the recorder", "now the gate"],
+    );
+    run_hook(
+        home.path(),
+        r#"{"session_id":"s-new","hook_event_name":"UserPromptSubmit","cwd":"/repo",
+            "prompt":"first"}"#,
+        ATTENDED,
+    );
+
+    let (_, stdout, _) = run_hook_full(
+        home.path(),
+        r#"{"session_id":"s-new","hook_event_name":"UserPromptSubmit","cwd":"/repo",
+            "prompt":"second"}"#,
+        ATTENDED,
+    );
+
+    assert!(says_nothing(&stdout), "{stdout}");
+    assert_eq!(
+        log_lines(home.path())
+            .iter()
+            .filter(|line| line["event"] == "briefed")
+            .count(),
+        1
+    );
+    daemon.stop();
+}
+
+#[test]
+fn a_briefing_survives_a_daemon_restart() {
+    // The chapter index is derived state, and derived state that does not come
+    // back is how a restarted daemon tells the next session that its checkout
+    // has never been worked in.
+    let home = tempfile::tempdir().expect("tempdir");
+    let first = start_daemon(home.path());
+    conversation(
+        home.path(),
+        "s-old",
+        "/repo",
+        &["ship the recorder", "now the gate"],
+    );
+    first.stop();
+
+    let second = start_daemon(home.path());
+    let (_, stdout, _) = run_hook_full(
+        home.path(),
+        r#"{"session_id":"s-new","hook_event_name":"UserPromptSubmit","cwd":"/repo",
+            "prompt":"carry on"}"#,
+        ATTENDED,
+    );
+
+    let reply: serde_json::Value = serde_json::from_str(stdout.trim()).expect("json");
+    assert!(
+        reply["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .is_some_and(|text| text.contains("ship the recorder")),
+        "{reply}"
+    );
+    second.stop();
+}

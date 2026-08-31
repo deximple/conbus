@@ -82,11 +82,48 @@ fn entrypoint(harness: &str) -> Option<Entrypoint> {
         .map(Entrypoint::new)
 }
 
-/// Mirror one hook payload. Returns a diagnostic when the record did not land;
-/// the caller reports it and still exits zero.
-pub fn run(harness: &str, stdin: &mut impl Read) -> Result<(), String> {
+/// The line to print on stdout, and whether it carries anything.
+///
+/// A hook always says something well-formed; the only question is whether it
+/// also hands the model a briefing.
+pub type Reply = String;
+
+/// Build the reply that carries a briefing.
+///
+/// Serialised rather than formatted, because the context is arbitrary text from
+/// somebody's conversation: a quote mark or a newline written by hand would
+/// otherwise produce stdout the vendor cannot parse, and unparseable stdout on
+/// `UserPromptSubmit` is not dropped — it is injected verbatim as plain hook
+/// output, which is a silently different payload rather than a failure.
+///
+/// `hookEventName` is the firing event, carried from the payload rather than
+/// written here. The vendor throws away the whole hook result when it does not
+/// match, without blocking the turn, and reports that failure only once per
+/// session — so a name that drifts would be invisible after its first turn.
+pub fn briefing_reply(hook_event_name: &str, context: &str, message: &str) -> Reply {
+    let reply = serde_json::json!({
+        "continue": true,
+        // Kept even though it is inert in 2.1.241 — its single runtime read is
+        // unreachable for a hook that emits JSON — because it is the
+        // documented way to say "keep this out of the transcript" and costs
+        // nothing if a later build wires it up. It does not suppress the
+        // injection: nothing on that path reads it.
+        "suppressOutput": true,
+        "systemMessage": message,
+        "hookSpecificOutput": {
+            "hookEventName": hook_event_name,
+            "additionalContext": context,
+        },
+    });
+    reply.to_string()
+}
+
+/// Mirror one hook payload. Returns the line to print, or a diagnostic when the
+/// record did not land; the caller reports it, prints the silent reply, and
+/// still exits zero.
+pub fn run(harness: &str, stdin: &mut impl Read) -> Result<Reply, String> {
     if std::env::var_os(INTERNAL_MARKER).is_some_and(|value| !value.is_empty()) {
-        return Ok(());
+        return Ok(SILENT_OK.to_string());
     }
 
     let mut payload = String::new();
@@ -97,16 +134,19 @@ pub fn run(harness: &str, stdin: &mut impl Read) -> Result<(), String> {
     let normalized = hook::normalize(&Harness::new(harness), &payload).map_err(|err| err.0)?;
     let key;
     let observed;
+    let hook_event_name;
     match normalized {
         Normalized::Event {
             key: k,
+            hook_event_name: name,
             observed: o,
         } => {
             key = k;
+            hook_event_name = name;
             observed = *o;
         }
         // A decision, so nothing to say.
-        Normalized::Ignored { .. } => return Ok(()),
+        Normalized::Ignored { .. } => return Ok(SILENT_OK.to_string()),
         // A surprise. The vendor grew an event this adapter has never seen, and
         // it is being dropped — which is the right thing to do and the wrong
         // thing to do quietly.
@@ -133,10 +173,10 @@ pub fn run(harness: &str, stdin: &mut impl Read) -> Result<(), String> {
         entrypoint: entrypoint(harness),
         event: observed.event,
     };
-    send(stream, &request)
+    send(stream, &request, &hook_event_name)
 }
 
-fn send(mut stream: UnixStream, request: &Request) -> Result<(), String> {
+fn send(mut stream: UnixStream, request: &Request, hook_event_name: &str) -> Result<Reply, String> {
     let line = serde_json::to_string(request).map_err(|err| err.to_string())?;
     writeln!(stream, "{line}").map_err(|err| format!("could not send the record: {err}"))?;
     stream
@@ -149,7 +189,10 @@ fn send(mut stream: UnixStream, request: &Request) -> Result<(), String> {
         .map_err(|err| format!("no reply from the daemon: {err}"))?;
 
     match serde_json::from_str::<Response>(reply.trim()) {
-        Ok(Response::Recorded { .. } | Response::Deferred) => Ok(()),
+        Ok(Response::Recorded { .. } | Response::Deferred) => Ok(SILENT_OK.to_string()),
+        Ok(Response::Briefed {
+            context, message, ..
+        }) => Ok(briefing_reply(hook_event_name, &context, &message)),
         Ok(Response::Failed { error }) => Err(format!("the daemon refused the record: {error}")),
         // Not written, and the caller has to hear about it. An orphan is the
         // normal shape of a daemon restart mid-turn: the session is unbound, so

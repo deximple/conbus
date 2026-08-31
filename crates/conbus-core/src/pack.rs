@@ -62,12 +62,17 @@ mod tests {
 
     fn chapter() -> Chapter {
         Chapter {
-            bus_id: BusId::mint(),
-            harness: Harness::new(Harness::CLAUDE_CODE),
-            last_activity: ago(7200),
-            turns: 14,
-            stopped: Stopped::Displaced,
-            backfilled: false,
+            about: Candidate {
+                bus_id: BusId::mint(),
+                harness: Harness::new(Harness::CLAUDE_CODE),
+                workspace: Some("/repo".into()),
+                last_activity: ago(7200),
+                last_turn: Some(TurnState::InterruptedQuota {
+                    reason: "rate_limit".into(),
+                }),
+                turns: 14,
+                backfilled: false,
+            },
             goal: Some("ship the recorder".into()),
             last_said: Some("the segment reader now reads bytes".into()),
             last_tools: vec!["Bash".into(), "Edit".into()],
@@ -138,7 +143,10 @@ mod tests {
         // allowed to be wrong, reading a format the vendor calls internal.
         let pack = brief(
             &[Chapter {
-                backfilled: true,
+                about: Candidate {
+                    backfilled: true,
+                    ..chapter().about
+                },
                 ..chapter()
             }],
             now(),
@@ -348,7 +356,7 @@ mod tests {
         let chapter = Chapter::read(&borrowed).expect("a chapter");
 
         assert_eq!(chapter.last_tools, vec!["Edit".to_string()]);
-        assert_eq!(chapter.stopped, Stopped::InFlight);
+        assert_eq!(chapter.stopped(), Stopped::InFlight);
     }
 
     #[test]
@@ -375,9 +383,11 @@ mod tests {
     }
 }
 
+use std::collections::HashMap;
+
 use crate::clock::Timestamp;
-use crate::continuation::{Stopped, stopped};
-use crate::event::{Author, Body, Event, Harness};
+use crate::continuation::{Candidate, Stopped, stopped};
+use crate::event::{Author, Body, Event};
 use crate::ids::BusId;
 use crate::record::Record;
 
@@ -390,14 +400,9 @@ use crate::record::Record;
 /// tool work — and that turns out to be most of what nobody wants to repeat.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Chapter {
-    pub bus_id: BusId,
-    pub harness: Harness,
-    pub last_activity: Timestamp,
-    pub turns: u64,
-    pub stopped: Stopped,
-    /// Reconstructed from the vendor's own history rather than mirrored live.
-    /// Said out loud in the briefing, because it is a weaker fact.
-    pub backfilled: bool,
+    /// The conversation's state, folded by the same code the briefing decision
+    /// reads, so a chapter and the decision that chose it cannot disagree.
+    pub about: Candidate,
     /// The opening prompt, verbatim. The goal in whoever's own words, which is
     /// the cheapest and least replaceable thing in the whole pack.
     pub goal: Option<String>,
@@ -409,65 +414,79 @@ pub struct Chapter {
 }
 
 impl Chapter {
-    /// Read one conversation's records, in log order.
+    /// Fold one record into a running set of chapters.
     ///
-    /// The conversation's own state comes from the same fold the briefing
-    /// decision uses, so there is one definition of what a record does to a
-    /// conversation and the two cannot drift apart.
-    pub fn read(records: &[&Record]) -> Option<Chapter> {
-        let mut folded = std::collections::HashMap::new();
-        for record in records {
-            crate::continuation::Candidate::apply(&mut folded, record);
+    /// The daemon keeps this set in memory and updates it as records are
+    /// written, because the alternative is reading the log on every prompt a
+    /// person types. A briefing that adds visible delay between pressing enter
+    /// and anything happening has already failed, whatever it says.
+    pub fn apply(chapters: &mut HashMap<BusId, Chapter>, record: &Record) {
+        let chapter = chapters.entry(record.bus_id).or_insert_with(|| Chapter {
+            about: Candidate {
+                bus_id: record.bus_id,
+                harness: record.source.harness.clone(),
+                workspace: None,
+                last_activity: record.ts,
+                last_turn: None,
+                turns: 0,
+                backfilled: false,
+            },
+            goal: None,
+            last_said: None,
+            last_tools: Vec::new(),
+        });
+
+        let mut one = HashMap::from([(record.bus_id, chapter.about.clone())]);
+        Candidate::apply(&mut one, record);
+        if let Some(updated) = one.remove(&record.bus_id) {
+            chapter.about = updated;
         }
-        let candidate = folded.into_values().next()?;
 
-        let mut goal = None;
-        let mut last_said = None;
-        let mut last_tools: Vec<String> = Vec::new();
-
-        for record in records {
-            match &record.event {
-                Event::TurnStarted { author, prompt } => {
-                    // A machine-authored opening is not the goal — it is the
-                    // scaffolding around one — so keep looking for a person's.
-                    let machine = author.as_ref().is_some_and(Author::is_machine);
-                    if goal.is_none() && !machine {
-                        goal = readable(prompt);
-                    }
-                    // Each turn's tools belong to that turn; the briefing wants
-                    // the last one's.
-                    last_tools.clear();
+        match &record.event {
+            Event::TurnStarted { author, prompt } => {
+                // A machine-authored opening is not the goal — it is the
+                // scaffolding around one — so keep looking for a person's.
+                let machine = author.as_ref().is_some_and(Author::is_machine);
+                if chapter.goal.is_none() && !machine {
+                    chapter.goal = readable(prompt);
                 }
-                Event::TurnEnded {
-                    assistant_message, ..
-                } => {
-                    if let Some(said) = assistant_message.as_ref().and_then(readable) {
-                        last_said = Some(said);
-                    }
-                }
-                Event::ToolRequested { tool, .. } | Event::ToolUse { tool, .. } => {
-                    if !tool.is_empty() && !last_tools.iter().any(|seen| seen == tool) {
-                        last_tools.push(tool.clone());
-                    }
-                }
-                Event::ToolDenied { .. }
-                | Event::ToolBatchEnded { .. }
-                | Event::SessionCandidate { .. }
-                | Event::SessionEnded { .. } => {}
+                // Each turn's tools belong to that turn; the briefing wants the
+                // last one's.
+                chapter.last_tools.clear();
             }
+            Event::TurnEnded {
+                assistant_message, ..
+            } => {
+                if let Some(said) = assistant_message.as_ref().and_then(readable) {
+                    chapter.last_said = Some(said);
+                }
+            }
+            Event::ToolRequested { tool, .. } | Event::ToolUse { tool, .. } => {
+                if !tool.is_empty() && !chapter.last_tools.iter().any(|seen| seen == tool) {
+                    chapter.last_tools.push(tool.clone());
+                }
+            }
+            Event::ToolDenied { .. }
+            | Event::ToolBatchEnded { .. }
+            | Event::SessionCandidate { .. }
+            | Event::SessionEnded { .. }
+            // Never quoted back. A briefing is our own words, and a chapter
+            // built from one would be the bus reading itself aloud.
+            | Event::Briefed { .. } => {}
         }
+    }
 
-        Some(Chapter {
-            bus_id: candidate.bus_id,
-            harness: candidate.harness.clone(),
-            last_activity: candidate.last_activity,
-            turns: candidate.turns,
-            stopped: stopped(&candidate),
-            backfilled: candidate.backfilled,
-            goal,
-            last_said,
-            last_tools,
-        })
+    /// Read one conversation's records, in log order.
+    pub fn read(records: &[&Record]) -> Option<Chapter> {
+        let mut chapters = HashMap::new();
+        for record in records {
+            Chapter::apply(&mut chapters, record);
+        }
+        chapters.into_values().next()
+    }
+
+    pub fn stopped(&self) -> Stopped {
+        stopped(&self.about)
     }
 }
 
@@ -580,13 +599,13 @@ pub fn brief(chapters: &[Chapter], now: Timestamp, budget: usize) -> Pack {
 fn render(chapter: &Chapter, now: Timestamp) -> String {
     let mut block = format!(
         "\n· {} — {}, {} turn{}, {}",
-        age(now.seconds_since(chapter.last_activity)),
-        chapter.harness.as_str(),
-        chapter.turns,
-        if chapter.turns == 1 { "" } else { "s" },
-        describe(chapter.stopped),
+        age(now.seconds_since(chapter.about.last_activity)),
+        chapter.about.harness.as_str(),
+        chapter.about.turns,
+        if chapter.about.turns == 1 { "" } else { "s" },
+        describe(chapter.stopped()),
     );
-    if chapter.backfilled {
+    if chapter.about.backfilled {
         // Said out loud because it is a weaker fact: recovered afterwards from
         // the vendor's own history by a parser that is allowed to be wrong,
         // rather than mirrored as it happened.

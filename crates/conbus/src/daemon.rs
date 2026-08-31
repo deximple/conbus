@@ -1,14 +1,18 @@
 //! The recorder daemon: one socket, one registry, one append-only log.
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 
-use conbus_core::event::Source;
+use conbus_core::continuation::{Asking, Decision, decide};
+use conbus_core::event::{Author, Entrypoint, Event, Source};
+use conbus_core::ids::BusId;
+use conbus_core::pack::{self, Chapter};
 use conbus_core::paths::Paths;
-use conbus_core::record::Entry;
+use conbus_core::record::{Entry, Record};
 use conbus_core::registry::{Disposition, Observed, Registry, SessionKey};
 use conbus_core::retention::Retention;
 use conbus_core::segment::{Scan, SegmentLog};
@@ -22,6 +26,17 @@ use crate::wire::{Request, Response};
 pub struct Daemon {
     registry: Registry,
     log: SegmentLog,
+    /// One entry per conversation, folded as records are written.
+    ///
+    /// Kept in memory rather than read back per prompt. The briefing decision
+    /// runs on `UserPromptSubmit`, which is the hook standing between a person
+    /// pressing enter and anything happening, and re-reading a log that only
+    /// grows would put a visible and worsening delay there. A feature meant to
+    /// be invisible cannot be the thing that makes typing feel slow.
+    chapters: HashMap<BusId, Chapter>,
+    /// The home directory, so a session started from it is not treated as a
+    /// checkout containing every conversation on the machine.
+    home: Option<String>,
 }
 
 impl Daemon {
@@ -32,8 +47,26 @@ impl Daemon {
     /// conversation: the vendor session keeps its id, the bus forgets which
     /// conversation it was, and its next prompt mints a second `bus_id`.
     /// `serve` restores it from the segments.
-    pub fn new(log: SegmentLog, registry: Registry) -> Self {
-        Daemon { registry, log }
+    pub fn new(log: SegmentLog, registry: Registry, chapters: HashMap<BusId, Chapter>) -> Self {
+        Daemon {
+            registry,
+            log,
+            chapters,
+            home: std::env::var("HOME").ok(),
+        }
+    }
+
+    /// Fold the log into the per-conversation state the briefing reads.
+    ///
+    /// Derived, so it is rebuilt at start for the same reason the registry's
+    /// bindings are: a daemon that woke up knowing nothing would tell the next
+    /// session that its checkout had never been worked in.
+    pub fn chapters(records: &[Record]) -> HashMap<BusId, Chapter> {
+        let mut chapters = HashMap::new();
+        for record in records {
+            Chapter::apply(&mut chapters, record);
+        }
+        chapters
     }
 
     /// Record one observed event.
@@ -88,7 +121,12 @@ impl Daemon {
                     workspace: None,
                     backfilled_from: None,
                 };
+                // A conversation nothing has ever been folded for is one
+                // whose first prompt this is — the registry mints on exactly
+                // that event, so the two agree without either asking the other.
+                let first_prompt = !self.chapters.contains_key(&bus_id);
                 let mut seqs = Vec::with_capacity(observed.len());
+                let mut written: Vec<Record> = Vec::with_capacity(observed.len());
                 let mut errors = Vec::new();
                 // Each observation keeps the correlators its own payload had.
                 // A deferred session start carried none; borrowing the minting
@@ -106,7 +144,10 @@ impl Daemon {
                         event: one.event,
                     };
                     match self.log.append(entry) {
-                        Ok(Some(seq)) => seqs.push(seq),
+                        Ok(Some(record)) => {
+                            seqs.push(record.seq);
+                            written.push(record);
+                        }
                         Ok(None) => {}
                         // Keep going. Returning here would abandon the events
                         // behind this one untried and report two losses as one,
@@ -134,12 +175,127 @@ impl Daemon {
                     };
                 }
                 if seqs.is_empty() {
-                    Response::Withheld
-                } else {
-                    Response::Recorded { bus_id, seqs }
+                    return Response::Withheld;
+                }
+                let briefing = first_prompt.then(|| self.brief(bus_id, &written)).flatten();
+                match briefing {
+                    Some((context, message, event)) => {
+                        // Appended after the turn it belongs to, so the log
+                        // reads in the order things happened. If this write
+                        // fails the briefing still goes out — the person is
+                        // better served by the context than by our bookkeeping
+                        // — and the daemon says so on the channel launchd
+                        // keeps.
+                        match self.log.append(Entry {
+                            bus_id,
+                            observed_at: None,
+                            source: source.clone(),
+                            vendor_turn_id: None,
+                            vendor_agent_id: None,
+                            event,
+                        }) {
+                            Ok(Some(record)) => {
+                                seqs.push(record.seq);
+                                written.push(record);
+                            }
+                            Ok(None) => {}
+                            Err(err) => {
+                                eprintln!("conbus daemon: briefing sent but not recorded: {err}")
+                            }
+                        }
+                        self.remember(&written);
+                        Response::Briefed {
+                            bus_id,
+                            seqs,
+                            context,
+                            message,
+                        }
+                    }
+                    None => {
+                        self.remember(&written);
+                        Response::Recorded { bus_id, seqs }
+                    }
                 }
             }
         }
+    }
+}
+
+impl Daemon {
+    /// Fold what was written into the state the next briefing reads.
+    fn remember(&mut self, written: &[Record]) {
+        for record in written {
+            Chapter::apply(&mut self.chapters, record);
+        }
+    }
+
+    /// What this session should be told about its checkout, if anything.
+    ///
+    /// Consulted before the conversation is folded in, so it cannot be briefed
+    /// about itself, and only on the prompt that minted it: the per-prompt cost
+    /// is paid once at injection and then carried in history for every turn
+    /// after it.
+    fn brief(&self, bus_id: BusId, written: &[Record]) -> Option<(String, String, Event)> {
+        let prompt = written
+            .iter()
+            .find(|record| matches!(record.event, Event::TurnStarted { .. }))?;
+
+        let asking = Asking {
+            harness: prompt.source.harness.clone(),
+            workspace: prompt.source.workspace.clone(),
+            first_prompt: true,
+            // Both routes to the same fact. The entrypoint is what the hook
+            // read from its own environment and is exact; the author is the
+            // vendor's own label, which names machine origins and almost never
+            // names human ones.
+            unattended: prompt
+                .source
+                .entrypoint
+                .as_ref()
+                .is_some_and(Entrypoint::is_unattended)
+                || match &prompt.event {
+                    Event::TurnStarted { author, .. } => {
+                        author.as_ref().is_some_and(Author::is_machine)
+                    }
+                    _ => false,
+                },
+        };
+
+        let candidates: Vec<_> = self
+            .chapters
+            .values()
+            .map(|chapter| chapter.about.clone())
+            .collect();
+        let Decision::Brief { recent } =
+            decide(&asking, &candidates, self.home.as_deref(), prompt.ts)
+        else {
+            return None;
+        };
+
+        // In the order the decision named them. A briefing that reorders itself
+        // is one whose leading item — the conversation that could not continue
+        // — stops leading.
+        let chapters: Vec<Chapter> = recent
+            .iter()
+            .filter_map(|id| self.chapters.get(id).cloned())
+            .collect();
+        let packed = pack::brief(&chapters, prompt.ts, pack::PACK_BUDGET_UNITS);
+        if packed.is_empty() {
+            return None;
+        }
+
+        let message = format!(
+            "conbus · {} earlier session{} in this checkout · conbus log --bus-id {}",
+            chapters.len(),
+            if chapters.len() == 1 { "" } else { "s" },
+            &bus_id.to_string()[..8],
+        );
+        let event = Event::Briefed {
+            about: chapters.iter().map(|c| c.about.bus_id).collect(),
+            units: packed.units,
+            dropped: packed.dropped,
+        };
+        Some((packed.text, message, event))
     }
 }
 
@@ -184,8 +340,9 @@ pub fn serve(paths: &Paths, retention: Retention) -> io::Result<()> {
         Scan::default()
     });
     let registry = Registry::restore(&scan.records);
+    let chapters = Daemon::chapters(&scan.records);
     let log = SegmentLog::open(paths.log_dir(), retention)?;
-    let mut daemon = Daemon::new(log, registry);
+    let mut daemon = Daemon::new(log, registry, chapters);
 
     eprintln!(
         "conbus daemon: socket {} log {} ({} record(s), {} unreadable) core_dumps_disabled={} memory_locked={}{}",
@@ -263,7 +420,7 @@ mod tests {
     fn a_daemon_older_than_the_hook_refuses_instead_of_dropping_what_it_cannot_read() {
         let dir = tempfile::tempdir().expect("tempdir");
         let log = SegmentLog::open(dir.path(), Retention::default()).expect("open");
-        let mut daemon = Daemon::new(log, Registry::new());
+        let mut daemon = Daemon::new(log, Registry::new(), HashMap::new());
 
         let response = daemon.handle(Request {
             protocol_version: Some(crate::wire::PROTOCOL_VERSION + 1),
@@ -284,7 +441,7 @@ mod tests {
     fn a_hook_too_old_to_name_a_version_is_still_served() {
         let dir = tempfile::tempdir().expect("tempdir");
         let log = SegmentLog::open(dir.path(), Retention::default()).expect("open");
-        let mut daemon = Daemon::new(log, Registry::new());
+        let mut daemon = Daemon::new(log, Registry::new(), HashMap::new());
 
         let response = daemon.handle(Request {
             protocol_version: None,
@@ -304,7 +461,7 @@ mod tests {
     fn a_ghost_session_start_writes_nothing() {
         let dir = tempfile::tempdir().expect("tempdir");
         let log = SegmentLog::open(dir.path(), Retention::default()).expect("open");
-        let mut daemon = Daemon::new(log, Registry::new());
+        let mut daemon = Daemon::new(log, Registry::new(), HashMap::new());
 
         let response = daemon.handle(request(Event::SessionCandidate {
             trigger: Some("startup".into()),
@@ -318,7 +475,7 @@ mod tests {
     fn the_first_prompt_writes_the_session_start_and_the_turn_under_one_conversation() {
         let dir = tempfile::tempdir().expect("tempdir");
         let log = SegmentLog::open(dir.path(), Retention::default()).expect("open");
-        let mut daemon = Daemon::new(log, Registry::new());
+        let mut daemon = Daemon::new(log, Registry::new(), HashMap::new());
         daemon.handle(request(Event::SessionCandidate {
             trigger: Some("startup".into()),
         }));
@@ -353,7 +510,7 @@ mod tests {
         // with nothing on the line to show it was invented.
         let dir = tempfile::tempdir().expect("tempdir");
         let log = SegmentLog::open(dir.path(), Retention::default()).expect("open");
-        let mut daemon = Daemon::new(log, Registry::new());
+        let mut daemon = Daemon::new(log, Registry::new(), HashMap::new());
         daemon.handle(Request {
             vendor_turn_id: None,
             ..request(Event::SessionCandidate {
@@ -389,7 +546,7 @@ mod tests {
     fn a_stop_without_a_prompt_is_reported_as_an_orphan() {
         let dir = tempfile::tempdir().expect("tempdir");
         let log = SegmentLog::open(dir.path(), Retention::default()).expect("open");
-        let mut daemon = Daemon::new(log, Registry::new());
+        let mut daemon = Daemon::new(log, Registry::new(), HashMap::new());
 
         let response = daemon.handle(request(Event::TurnEnded {
             state: TurnState::Complete,

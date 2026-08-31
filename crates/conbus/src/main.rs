@@ -21,24 +21,34 @@ fn main() -> ExitCode {
         // A hook must never fail the turn it is attached to, so every failure
         // below leaves on stderr and exits zero.
         Command::Hook { harness } => {
-            if let Err(err) = hook::client::run(&harness, &mut std::io::stdin()) {
-                // Durable, because the vendor swallows stderr; throttled,
-                // because a stopped daemon would otherwise write one of these
-                // per hook per turn straight into the transcript.
-                if drops::record(&err) {
-                    eprintln!("conbus hook: record dropped: {err}");
-                }
-            }
-            // Say something well-formed, always.
+            // Say something well-formed, always — and say it whatever went
+            // wrong, which is why the failure path falls back to the silent
+            // reply rather than to nothing.
             //
             // Writing nothing looked safe and was not. Installed on a real
-            // machine, a hook that exits zero with no stdout produced
-            // `400 cache_control cannot be set for empty text blocks` and broke
-            // the session it was attached to — the exact rule this client is
-            // built around. The vendor's documented contract takes JSON on
-            // stdout; an explicit "carry on, and do not put my output in the
-            // transcript" cannot be mistaken for an empty context block.
-            println!("{}", hook::client::SILENT_OK);
+            // machine, a hook that exited zero with no stdout coincided with
+            // `400 cache_control cannot be set for empty text blocks` breaking
+            // the session it was attached to, and reverting the hook stopped
+            // it. The vendor's documented contract takes JSON on stdout, so an
+            // explicit "carry on" costs nothing and cannot be mistaken for an
+            // empty context block.
+            let reply = match hook::client::run(&harness, &mut std::io::stdin()) {
+                Ok(reply) => reply,
+                Err(err) => {
+                    // Durable, because the vendor swallows stderr; throttled,
+                    // because a stopped daemon would otherwise write one of
+                    // these per hook per turn straight into the transcript.
+                    if drops::record(&err) {
+                        eprintln!("conbus hook: record dropped: {err}");
+                    }
+                    hook::client::SILENT_OK.to_string()
+                }
+            };
+            // One JSON object and nothing else. The vendor's parser runs
+            // `JSON.parse` on the whole of stdout, so a stray line anywhere
+            // turns a reply into plain text — which on `UserPromptSubmit` is
+            // injected verbatim rather than ignored.
+            println!("{reply}");
             ExitCode::SUCCESS
         }
         Command::Daemon => run(|paths| daemon::serve(paths, Retention::default())),

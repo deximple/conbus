@@ -12,6 +12,16 @@ use conbus_core::registry::{Observed, SessionKey};
 pub enum Normalized {
     Event {
         key: SessionKey,
+        /// The vendor's own name for the event that fired, carried through
+        /// because a reply that injects has to name it back.
+        ///
+        /// Claude Code requires `hookSpecificOutput.hookEventName` to equal the
+        /// firing event and throws away the entire hook result when it does
+        /// not — non-blocking, so the turn is fine and the injection simply
+        /// never happens. Worse, the same failure is reported once per session
+        /// and then suppressed, so a hardcoded name that drifts would show one
+        /// error and go quiet forever.
+        hook_event_name: String,
         /// Boxed only to keep the two variants a similar size; one of these is
         /// built per hook process and consumed immediately.
         observed: Box<Observed>,

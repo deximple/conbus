@@ -69,6 +69,19 @@ pub enum Response {
     Orphaned,
     /// Retention withheld it from disk.
     Withheld,
+    /// Written, and this session should be told what has been happening in its
+    /// checkout.
+    ///
+    /// The text is already budgeted to the vendor's cap by the daemon, which is
+    /// where the log lives; the hook only frames and prints it.
+    Briefed {
+        bus_id: BusId,
+        seqs: Vec<u64>,
+        /// Goes to the model, inside the vendor's context channel.
+        context: String,
+        /// Goes to the person, and costs no model tokens.
+        message: String,
+    },
     Failed {
         error: String,
     },

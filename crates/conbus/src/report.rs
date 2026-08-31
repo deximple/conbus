@@ -147,6 +147,21 @@ fn summarise(record: &Record) -> String {
         Event::SessionEnded { reason } => {
             format!("session-end {}", reason.as_deref().unwrap_or("?"))
         }
+        // The conversations are named the way a tool call names its join key,
+        // so that "what was this session told about" is one glance rather than
+        // a second query.
+        Event::Briefed {
+            about,
+            units,
+            dropped,
+        } => {
+            let named: Vec<String> = about.iter().map(|id| id.to_string()).collect();
+            let short = match *dropped {
+                0 => String::new(),
+                n => format!(", {n} did not fit"),
+            };
+            format!("briefed about {} ({units} units{short})", named.join(" "))
+        }
     };
     // Parallel calls of the same tool render identically without their id, and
     // the request-to-result join would be invisible in the view people read.
@@ -163,7 +178,8 @@ fn summarise(record: &Record) -> String {
         | Event::SessionCandidate { .. }
         | Event::TurnStarted { .. }
         | Event::TurnEnded { .. }
-        | Event::SessionEnded { .. } => String::new(),
+        | Event::SessionEnded { .. }
+        | Event::Briefed { .. } => String::new(),
     };
     // A subagent's events arrive under the parent's session id, so without
     // this marker the human view interleaves two agents with no sign of it.

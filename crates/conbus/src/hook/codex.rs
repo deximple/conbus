@@ -117,6 +117,7 @@ pub fn normalize(harness: &Harness, json: &str) -> Result<Normalized, HookError>
 
     Ok(Normalized::Event {
         key: SessionKey::new(harness.clone(), payload.session_id),
+        hook_event_name: payload.hook_event_name,
         observed: Box::new(Observed {
             vendor_turn_id,
             vendor_agent_id,
@@ -136,7 +137,7 @@ mod tests {
 
     fn observed_of(json: &str) -> Observed {
         match normalize(&Harness::new(Harness::CODEX), json).expect("normalise") {
-            Normalized::Event { key, observed } => {
+            Normalized::Event { key, observed, .. } => {
                 assert_eq!(key.harness.as_str(), Harness::CODEX);
                 assert_eq!(key.vendor_session_id, "cx-1");
                 *observed

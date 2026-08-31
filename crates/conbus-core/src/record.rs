@@ -188,6 +188,14 @@ mod tests {
             Event::SessionEnded {
                 reason: Some("other".into()),
             },
+            Event::Briefed {
+                about: vec![
+                    "01996b1e-2c4a-7c31-9d0e-4f2a6b8c1d3e".parse().expect("id"),
+                    "01996b1e-2c4a-7c31-9d0e-4f2a6b8c1d3f".parse().expect("id"),
+                ],
+                units: 1_204,
+                dropped: 2,
+            },
         ];
         all.extend(
             every_turn_state()
@@ -217,7 +225,8 @@ mod tests {
                 | Event::ToolDenied { .. }
                 | Event::ToolUse { .. }
                 | Event::TurnEnded { .. }
-                | Event::SessionEnded { .. } => {}
+                | Event::SessionEnded { .. }
+                | Event::Briefed { .. } => {}
             }
         }
         all

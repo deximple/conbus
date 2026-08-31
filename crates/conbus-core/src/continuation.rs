@@ -210,8 +210,12 @@ impl Candidate {
             Event::TurnEnded { state, .. } => candidate.last_turn = Some(state.clone()),
             // A session opening or closing does not disturb how the last turn
             // ended: a conversation that finished and then had its window
-            // closed is still a finished conversation.
-            Event::SessionCandidate { .. } | Event::SessionEnded { .. } => {}
+            // closed is still a finished conversation. Neither does a briefing,
+            // which is something the bus did rather than something the
+            // conversation did — and reading our own output back as activity is
+            // how a feature starts feeding on itself.
+            Event::SessionCandidate { .. } | Event::SessionEnded { .. } | Event::Briefed { .. } => {
+            }
             // Tool traffic means a turn is in flight, whatever came before.
             Event::ToolRequested { .. }
             | Event::ToolDenied { .. }

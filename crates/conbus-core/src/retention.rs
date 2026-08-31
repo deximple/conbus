@@ -84,7 +84,11 @@ fn elide_tool_bodies(event: &Event) -> Event {
         | Event::TurnEnded { .. }
         | Event::SessionCandidate { .. }
         | Event::ToolBatchEnded { .. }
-        | Event::SessionEnded { .. } => event.clone(),
+        | Event::SessionEnded { .. }
+        // Carries ids and counts, never text: every word of a briefing was
+        // quoted from records that already passed through here at whatever
+        // level applied to them.
+        | Event::Briefed { .. } => event.clone(),
     }
 }
 
