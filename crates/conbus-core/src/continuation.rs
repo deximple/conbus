@@ -262,8 +262,55 @@ impl Replay {
 /// Records are read in timestamp order, not append order. Backfill appends
 /// months-old conversations to the end of the log, so the two are not the same.
 pub fn replay(records: &[Record], home: Option<&str>) -> Replay {
+    replay_inner(records, home, false)
+}
+
+/// The same replay with the two rules a single-vendor corpus cannot exercise
+/// lifted. A measurement only.
+///
+/// Every conversation in a log built from Claude Code transcripts is Claude
+/// Code, and every one of them is reconstructed. Those two rules therefore
+/// refuse all of it before any other rule is consulted, so the shipped replay
+/// proves there are no false positives and says nothing about whether the rest
+/// of the gate discriminates.
+///
+/// Lifting them asks the question the corpus can answer: given these
+/// workspaces, these turn counts, these endings and these times, how often
+/// would the gate have fired, and how often would it have had to choose between
+/// conversations? That matters here more than anywhere, because one workspace
+/// in this corpus holds 3,031 conversations — if the ambiguity refusal did not
+/// work, this is where it would show.
+///
+/// It is a counterfactual and must be labelled as one wherever it is shown. It
+/// is not the gate.
+pub fn replay_as_if_cross_vendor(records: &[Record], home: Option<&str>) -> Replay {
+    replay_inner(records, home, true)
+}
+
+fn replay_inner(records: &[Record], home: Option<&str>, counterfactual: bool) -> Replay {
     let mut by_time: Vec<&Record> = records.iter().collect();
     by_time.sort_by_key(|record| (record.ts, record.seq));
+
+    // Which checkout each conversation happened in, read from the whole log
+    // rather than incrementally.
+    //
+    // This is the one place the replay looks ahead, and it is looking ahead at
+    // a fact the live path never had to guess: `cwd` is on every hook payload,
+    // so a running daemon knows the workspace of the session in front of it and
+    // of every session it has already seen. What it does *not* reconstruct is
+    // the conversation's state — turn count, how the last turn ended, when it
+    // last moved — which stays strictly as-of, because that is what the gate
+    // actually judges. Records written before the workspace was recorded carry
+    // it only on a session record appended later, at the conversation's own
+    // opening time but with a much larger sequence number, so an incremental
+    // read puts it after the prompt it belongs to and answers `no_workspace`
+    // for all 3,433 of them.
+    let mut workspace_of: HashMap<BusId, String> = HashMap::new();
+    for record in records {
+        if let Some(workspace) = &record.source.workspace {
+            workspace_of.insert(record.bus_id, workspace.clone());
+        }
+    }
 
     let mut out = Replay::default();
     let mut live: HashMap<BusId, Candidate> = HashMap::new();
@@ -271,23 +318,35 @@ pub fn replay(records: &[Record], home: Option<&str>) -> Replay {
 
     for record in by_time {
         if matches!(record.event, Event::TurnStarted { .. }) && asked.insert(record.bus_id) {
+            // The workspace of the *conversation*, not of this one record.
+            let workspace = workspace_of.get(&record.bus_id).cloned();
             // Only this checkout. The gate would reject the rest anyway, and
             // handing it every conversation on the machine is what turns a
             // replay into a quadratic one.
-            let candidates: Vec<Candidate> = match record.source.workspace.as_deref() {
+            let candidates: Vec<Candidate> = match workspace.as_deref() {
                 Some(workspace) => live
                     .values()
                     .filter(|candidate| {
                         candidate.bus_id != record.bus_id
-                            && candidate.workspace.as_deref() == Some(workspace)
+                            && workspace_of.get(&candidate.bus_id).map(String::as_str)
+                                == Some(workspace)
                     })
-                    .cloned()
+                    .map(|candidate| Candidate {
+                        workspace: Some(workspace.to_string()),
+                        backfilled: candidate.backfilled && !counterfactual,
+                        harness: if counterfactual {
+                            Harness::new("other")
+                        } else {
+                            candidate.harness.clone()
+                        },
+                        ..candidate.clone()
+                    })
                     .collect(),
                 None => Vec::new(),
             };
             let asking = Asking {
                 harness: record.source.harness.clone(),
-                workspace: record.source.workspace.clone(),
+                workspace,
                 first_prompt: true,
             };
             let name = match decide(&asking, &candidates, home, record.ts) {
@@ -852,6 +911,60 @@ mod tests {
         let replay = replay(&records, None);
 
         assert_eq!(replay.verdicts.get("declined/no_candidate"), Some(&2));
+    }
+
+    #[test]
+    fn the_counterfactual_actually_lifts_the_rules_it_claims_to() {
+        // The first version of it lifted only the reconstruction rule, which on
+        // a single-vendor corpus changes nothing — it printed numbers identical
+        // to the real gate and looked like a measurement. A counterfactual that
+        // silently equals the thing it is contrasted with is worse than none.
+        let first = BusId::mint();
+        let second = BusId::mint();
+        let backfilled = |record: Record| Record {
+            source: crate::event::Source {
+                backfilled_from: Some("claude_transcript".into()),
+                ..record.source
+            },
+            ..record
+        };
+        let records = vec![
+            backfilled(logged(first, ago(600), prompt())),
+            backfilled(logged(
+                first,
+                ago(500),
+                Event::TurnEnded {
+                    state: TurnState::Complete,
+                    assistant_message: None,
+                },
+            )),
+            backfilled(logged(first, ago(400), prompt())),
+            backfilled(logged(
+                first,
+                ago(300),
+                Event::TurnEnded {
+                    state: TurnState::Complete,
+                    assistant_message: None,
+                },
+            )),
+            // Same harness as the one before it, and reconstructed: refused
+            // twice over by the real gate.
+            backfilled(logged(second, ago(120), prompt())),
+        ];
+
+        assert_eq!(
+            replay(&records, None).verdicts.get("continue/handed_off"),
+            None,
+            "the shipped gate refuses a same-harness, reconstructed predecessor"
+        );
+        assert_eq!(
+            replay_as_if_cross_vendor(&records, None)
+                .verdicts
+                .get("continue/handed_off"),
+            Some(&1),
+            "and the counterfactual has to actually lift both rules, or it is \
+             measuring the same thing twice"
+        );
     }
 
     #[test]

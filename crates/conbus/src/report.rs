@@ -424,7 +424,11 @@ pub fn doctor(paths: &Paths) -> io::Result<()> {
     // When the last record was written, because "the recorder is installed and
     // the daemon is up" says nothing about whether anything is arriving. The
     // two-hour outage this check exists for looked healthy on every other line.
-    match scan.records.last() {
+    // The most recent by time, not the last appended. Backfill appends
+    // months-old conversations to the end, so append order answers a different
+    // question than the one being asked here, which is whether anything is
+    // still arriving.
+    match scan.records.iter().max_by_key(|record| record.ts) {
         Some(last) => println!("last      {}", summarise(last)),
         None => println!("last      nothing recorded yet"),
     }
@@ -438,6 +442,20 @@ pub fn doctor(paths: &Paths) -> io::Result<()> {
     let replay = conbus_core::continuation::replay(&scan.records, home.as_deref());
     println!("gate      {} conversation(s) judged", replay.total());
     for (verdict, count) in &replay.verdicts {
+        println!("          {count:>6}  {verdict}");
+    }
+    // Every conversation recovered from a Claude Code transcript is Claude
+    // Code and is reconstructed, so on this corpus those two rules refuse
+    // everything before any other rule is consulted — the numbers above prove
+    // the gate never fires wrongly and say nothing about whether it
+    // discriminates. Lifting them asks what the corpus can answer. A
+    // counterfactual, and labelled as one.
+    let as_if =
+        conbus_core::continuation::replay_as_if_cross_vendor(&scan.records, home.as_deref());
+    println!(
+        "          — counterfactual: if every predecessor were live and from another vendor —"
+    );
+    for (verdict, count) in &as_if.verdicts {
         println!("          {count:>6}  {verdict}");
     }
     Ok(())

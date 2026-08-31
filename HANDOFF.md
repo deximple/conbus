@@ -362,6 +362,29 @@ missed hydration costs one sentence of re-explanation, a wrong one costs credibi
 session opened afterwards, so the negative case gets a boring lever and the positive case must never
 need one.
 
+**What the gate does on the real log, measured before anything is injected.**
+
+`conbus doctor` replays the gate over every conversation, judging each one against only what had
+already happened when its first prompt arrived. On this machine's 3,443 conversations it fires
+**zero** times and refuses 3,413 for `no_candidate`, 28 for `no_workspace`, 2 for
+`workspace_too_broad`. Zero is the correct answer and also an uninformative one: every conversation
+recovered from a Claude Code transcript is Claude Code and is a reconstruction, so the
+different-harness and live-authored rules refuse the whole corpus before any other rule is
+consulted. It proves there are no false positives and says nothing about discrimination.
+
+So `doctor` prints a second, clearly labelled counterfactual with those two rules lifted — the
+question this corpus *can* answer. There it fires **12 times out of 3,443**, refuses 3 for
+`workspace_busy`, and — the result worth keeping — is **never ambiguous**, in a corpus whose largest
+workspace holds 3,031 conversations. The recency windows, not the tie-breaker, are doing the
+discrimination; the ambiguity refusal is a backstop that real data rarely reaches. No
+`continue/displaced` appears at all, because a transcript carries no `StopFailure` and backfill can
+only ever recover a turn that completed.
+
+A trap worth recording, because it nearly shipped: the first counterfactual lifted only the
+reconstruction rule, which on a single-vendor corpus changes nothing. It printed numbers identical
+to the real gate and looked like a measurement. A counterfactual that silently equals the thing it
+is contrasted with is worse than having none, and there is now a test that fails if it does.
+
 **Not done, and next.**
 
 5. **Codex backfill.** The Claude side is done; Codex is not, and it is harder than the plan assumes. Three things
