@@ -37,6 +37,9 @@ fn summarise(record: &Record) -> String {
             format!("session-start {}", trigger.as_deref().unwrap_or("?"))
         }
         Event::TurnStarted { .. } => "turn-started".to_string(),
+        Event::ToolBatchEnded { tool_calls } => {
+            format!("tool-batch of {} resolved", tool_calls.len())
+        }
         Event::ToolRequested { tool, .. } => format!("tool {tool} requested"),
         Event::ToolDenied { tool, reason, .. } => format!("tool {tool} denied ({reason})"),
         Event::ToolUse {
@@ -75,7 +78,8 @@ fn summarise(record: &Record) -> String {
             .as_ref()
             .map(|id| format!(" #{}", id.as_str()))
             .unwrap_or_default(),
-        Event::SessionCandidate { .. }
+        Event::ToolBatchEnded { .. }
+        | Event::SessionCandidate { .. }
         | Event::TurnStarted { .. }
         | Event::TurnEnded { .. }
         | Event::SessionEnded { .. } => String::new(),
@@ -223,6 +227,18 @@ mod tests {
         let line = summarise(&tool(None, Some(6)));
 
         assert!(!line.contains('#'), "{line}");
+    }
+
+    #[test]
+    fn a_batch_boundary_says_how_many_calls_it_closed() {
+        let line = summarise(&record(Event::ToolBatchEnded {
+            tool_calls: vec![
+                VendorToolUseId::new("toolu_A"),
+                VendorToolUseId::new("toolu_B"),
+            ],
+        }));
+
+        assert!(line.contains("tool-batch of 2"), "{line}");
     }
 
     #[test]

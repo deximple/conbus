@@ -77,7 +77,14 @@ fn elide_tool_bodies(event: &Event) -> Event {
                 bytes: body.original_bytes(),
             })
         }
-        other => other.clone(),
+        // Exhaustive for the same reason as `map_bodies`: a new event carrying
+        // tool output must not reach disk at the default level just because
+        // nobody remembered to add it here.
+        Event::TurnStarted { .. }
+        | Event::TurnEnded { .. }
+        | Event::SessionCandidate { .. }
+        | Event::ToolBatchEnded { .. }
+        | Event::SessionEnded { .. } => event.clone(),
     }
 }
 

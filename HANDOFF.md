@@ -8,7 +8,7 @@ Written for whoever picks this up next. The design phase is finished and the rec
 - The plan is the single source of truth: [`.cursor/plans/shared_workspace_context_3f7139b8.plan.md`](.cursor/plans/shared_workspace_context_3f7139b8.plan.md). The filename is a generated ID and no longer matches the content; leave it alone so the Cursor plan UI keeps its association. A reader-facing copy under `docs/` gets generated when the repo goes public.
 - `cargo 1.94.1` and `rustc 1.94.1` are installed on this machine, so edition 2024 is available.
 - A cargo workspace exists: `crates/conbus` (the binary) and `crates/conbus-core` (the lib). Edition 2024.
-  123 tests, `cargo clippy --all-targets -- -D warnings` clean. See "Next task" for what is built and what is not.
+  128 tests, `cargo clippy --all-targets -- -D warnings` clean. See "Next task" for what is built and what is not.
 
 ## What Conbus is, in one paragraph
 
@@ -144,7 +144,13 @@ A prompt mints on its own if the session start never arrived, so Desktop's `/cle
    real quota exhaustion. The quota fixture only arrives by actually hitting the limit, so treat the first dogfooding
    exhaustion as a recording opportunity rather than an interruption.
 
-**Every tool request now has an answer in the log.**
+**Every tool request now has an answer in the log, and batches are marked.**
+
+`PostToolBatch` fires once after every call in a batch resolves, "before the next model request". Its payload
+repeats each call's name, input and response — all already on disk from the per-call events — so mirroring it
+wholesale would put every body there a third time. What the log does *not* otherwise hold is which calls were issued
+together and where the model's next request begins, so `tool_batch_ended` records **only the ids**, joinable to the
+records that carry the substance. A batch line is about 200 bytes regardless of how much the tools moved.
 
 The tool surface is mirrored end to end: `PreToolUse` → `tool_requested`, and then exactly one of
 `PostToolUse` → `tool_use` (succeeded), `PostToolUseFailure` → `tool_use` (failed), or `PermissionDenied` →
@@ -267,9 +273,8 @@ Take the lesson generally: **the adapter is only as good as the traffic it has b
   record already carries its own input and output. It becomes a join key when `PreToolUse` and
   `PostToolUseFailure` are mirrored.)
 
-- **`PostToolBatch` is not mirrored.** It carries the whole batch's `tool_calls`, which is the vendor's own
-  statement of what was issued together — cheaper than inferring batches from adjacency. Not needed for the join,
-  but it is the remaining tool-surface event.
+- **The whole tool surface is mirrored.** `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `PermissionDenied`,
+  `PostToolBatch`. Nothing on it is dropped.
 - **`MessageDisplay` is not mirrored**, and it is the only official channel carrying every assistant message rather
   than the last one. High volume, and it collides with the "conversation only" shipping default, so it is a retention
   decision before it is an adapter change.

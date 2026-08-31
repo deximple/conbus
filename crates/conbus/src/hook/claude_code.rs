@@ -79,6 +79,9 @@ pub struct Payload {
     pub tool_name: Option<String>,
     #[serde(default)]
     pub tool_input: Option<Value>,
+    /// `PostToolBatch`: every call in the batch that just resolved.
+    #[serde(default)]
+    pub tool_calls: Option<Vec<BatchCall>>,
     /// `PostToolUse`, `PreToolUse`, `PostToolUseFailure`. Required by the
     /// schema on all three, so an absent one means the vendor changed — but
     /// nothing here detects that, and the record is written without it rather
@@ -110,6 +113,14 @@ pub struct Payload {
     /// vocabularies, told apart by `hook_event_name`.
     #[serde(default)]
     pub reason: Option<String>,
+}
+
+/// One entry of a `PostToolBatch`. Only the id is read: the name, input and
+/// response are already recorded by the per-call events.
+#[derive(Debug, Deserialize)]
+pub struct BatchCall {
+    #[serde(default)]
+    pub tool_use_id: Option<String>,
 }
 
 /// The result of reading a hook payload.
@@ -151,6 +162,15 @@ pub fn normalize(json: &str) -> Result<Normalized, HookError> {
             tool: payload.tool_name.unwrap_or_default(),
             tool_use_id: payload.tool_use_id.map(VendorToolUseId::new),
             input: body_of(payload.tool_input),
+        },
+        "PostToolBatch" => Event::ToolBatchEnded {
+            tool_calls: payload
+                .tool_calls
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|call| call.tool_use_id)
+                .map(VendorToolUseId::new)
+                .collect(),
         },
         "PermissionDenied" => Event::ToolDenied {
             tool: payload.tool_name.unwrap_or_default(),
@@ -462,6 +482,57 @@ mod tests {
                 tool: "Bash".into(),
                 tool_use_id: Some(VendorToolUseId::new("toolu_01ABC")),
                 input: Body::kept(r#"{"command":"cargo test"}"#),
+            }
+        );
+    }
+
+    #[test]
+    fn a_batch_records_which_calls_were_issued_together_and_nothing_else() {
+        // The payload repeats every call's name, input and response — all of
+        // which are already on disk from the per-call events. Mirroring those
+        // would put each body on disk a third time. What is *not* already in
+        // the log is the grouping and the boundary, so that is what is kept.
+        let event = event_of(
+            r#"{"session_id":"abc123","hook_event_name":"PostToolBatch","tool_calls":[
+                {"tool_name":"Read","tool_input":{"p":"a"},"tool_use_id":"toolu_A",
+                 "tool_response":{"ok":true}},
+                {"tool_name":"Bash","tool_input":{"command":"false"},"tool_use_id":"toolu_B"}]}"#,
+        );
+
+        assert_eq!(
+            event,
+            Event::ToolBatchEnded {
+                tool_calls: vec![
+                    VendorToolUseId::new("toolu_A"),
+                    VendorToolUseId::new("toolu_B"),
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn an_empty_batch_is_still_a_boundary() {
+        // The event fires before the next model request, so it marks where a
+        // turn's tool work stopped even when it names nothing.
+        let event = event_of(
+            r#"{"session_id":"abc123","hook_event_name":"PostToolBatch","tool_calls":[]}"#,
+        );
+
+        assert_eq!(event, Event::ToolBatchEnded { tool_calls: vec![] });
+    }
+
+    #[test]
+    fn a_batch_entry_the_vendor_sends_without_an_id_does_not_cost_the_others() {
+        let event = event_of(
+            r#"{"session_id":"abc123","hook_event_name":"PostToolBatch","tool_calls":[
+                {"tool_name":"Read","tool_input":{}},
+                {"tool_name":"Bash","tool_input":{},"tool_use_id":"toolu_B"}]}"#,
+        );
+
+        assert_eq!(
+            event,
+            Event::ToolBatchEnded {
+                tool_calls: vec![VendorToolUseId::new("toolu_B")],
             }
         );
     }

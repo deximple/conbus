@@ -315,6 +315,43 @@ fn parallel_tool_calls_can_be_paired_with_their_results() {
 }
 
 #[test]
+fn a_batch_boundary_names_the_calls_it_closed_without_repeating_them() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let daemon = start_daemon(home.path());
+
+    run_hook(
+        home.path(),
+        r#"{"session_id":"s-1","hook_event_name":"UserPromptSubmit","prompt":"read both","prompt_id":"T-1"}"#,
+        &[],
+    );
+    run_hook(
+        home.path(),
+        r#"{"session_id":"s-1","hook_event_name":"PostToolBatch","prompt_id":"T-1","tool_calls":[
+            {"tool_name":"Read","tool_input":{"p":"a"},"tool_use_id":"toolu_A","tool_response":{"ok":true}},
+            {"tool_name":"Read","tool_input":{"p":"b"},"tool_use_id":"toolu_B","tool_response":{"ok":true}}]}"#,
+        &[],
+    );
+
+    let lines = log_lines(home.path());
+    assert_eq!(lines.len(), 2, "{lines:#?}");
+
+    let batch = &lines[1];
+    assert_eq!(batch["event"], "tool_batch_ended");
+    assert_eq!(
+        batch["tool_calls"],
+        serde_json::json!(["toolu_A", "toolu_B"])
+    );
+    // The bodies belong to the per-call records; repeating them here would put
+    // each on disk a third time.
+    let line = serde_json::to_string(batch).expect("serialise");
+    assert!(!line.contains("tool_input"), "{line}");
+    assert!(!line.contains("tool_response"), "{line}");
+    assert!(!line.contains("\"p\""), "{line}");
+
+    daemon.stop();
+}
+
+#[test]
 fn a_refused_tool_leaves_a_reason_rather_than_an_unanswered_request() {
     let home = tempfile::tempdir().expect("tempdir");
     let daemon = start_daemon(home.path());

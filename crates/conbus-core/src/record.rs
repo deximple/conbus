@@ -162,6 +162,9 @@ mod tests {
                 tool_use_id: Some(VendorToolUseId::new("toolu_01ABC")),
                 input: Body::kept("i"),
             },
+            Event::ToolBatchEnded {
+                tool_calls: vec![VendorToolUseId::new("toolu_01ABC")],
+            },
             Event::ToolDenied {
                 tool: "Bash".into(),
                 tool_use_id: Some(VendorToolUseId::new("toolu_01ABC")),
@@ -196,6 +199,7 @@ mod tests {
                 Event::SessionCandidate { .. }
                 | Event::TurnStarted { .. }
                 | Event::ToolRequested { .. }
+                | Event::ToolBatchEnded { .. }
                 | Event::ToolDenied { .. }
                 | Event::ToolUse { .. }
                 | Event::TurnEnded { .. }

@@ -197,6 +197,22 @@ pub enum Event {
         tool_use_id: Option<VendorToolUseId>,
         input: Body,
     },
+    /// A batch of tool calls all resolved, and the model is about to be asked
+    /// again.
+    ///
+    /// Records the grouping and the boundary, not the calls. The vendor's
+    /// payload repeats every call's name, input and response, and all of those
+    /// are already on disk from the per-call events — mirroring them would put
+    /// each body there a third time. What the log does *not* otherwise hold is
+    /// which calls were issued together, and where the model's next request
+    /// begins. So this is a list of ids, joinable to the records that carry the
+    /// substance.
+    ToolBatchEnded {
+        /// In the order the vendor listed them. An entry the vendor sends
+        /// without an id cannot be named here and is skipped; the schema marks
+        /// the field required, so that would mean the vendor changed.
+        tool_calls: Vec<VendorToolUseId>,
+    },
     /// A tool the harness refused to run.
     ///
     /// Its own event rather than a third `ToolOutcome`, because `ToolUse` means
