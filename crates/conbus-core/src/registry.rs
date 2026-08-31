@@ -40,6 +40,11 @@ impl SessionKey {
 pub struct Observed {
     pub vendor_turn_id: Option<VendorTurnId>,
     pub vendor_agent_id: Option<VendorAgentId>,
+    /// The checkout the harness reported for this event. Travels per
+    /// observation for the same reason the correlators do: a session start and
+    /// the prompt that flushes it are written in one batch but were observed at
+    /// different moments, and a checkout can change in between.
+    pub workspace: Option<String>,
     pub event: Event,
 }
 
@@ -49,6 +54,7 @@ impl Observed {
         Observed {
             vendor_turn_id: None,
             vendor_agent_id: None,
+            workspace: None,
             event,
         }
     }
@@ -200,7 +206,6 @@ mod tests {
     fn session_start() -> Event {
         Event::SessionCandidate {
             trigger: Some("startup".into()),
-            cwd: Some("/Applications/conbus".into()),
         }
     }
 
@@ -229,6 +234,7 @@ mod tests {
                 harness: Harness::new(Harness::CLAUDE_CODE),
                 harness_version: None,
                 vendor_session_id: Some("vendor-abc".into()),
+                workspace: None,
                 backfilled_from: None,
             },
             event: prompt("before the restart"),
@@ -374,7 +380,6 @@ mod tests {
         };
         let resumed = Event::SessionCandidate {
             trigger: Some("resume".into()),
-            cwd: Some("/Applications/conbus".into()),
         };
 
         let disposition = registry.observe(&key(), Observed::bare(resumed.clone()));

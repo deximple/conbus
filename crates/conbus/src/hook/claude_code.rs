@@ -191,7 +191,6 @@ pub fn normalize(harness: &Harness, json: &str) -> Result<Normalized, HookError>
     let event = match payload.hook_event_name.as_str() {
         "SessionStart" => Event::SessionCandidate {
             trigger: payload.source,
-            cwd: payload.cwd,
         },
         "UserPromptSubmit" => Event::TurnStarted {
             author: payload.source.map(Author::new),
@@ -276,6 +275,7 @@ pub fn normalize(harness: &Harness, json: &str) -> Result<Normalized, HookError>
         observed: Box::new(Observed {
             vendor_turn_id,
             vendor_agent_id,
+            workspace: payload.cwd,
             event,
         }),
     })
@@ -514,7 +514,6 @@ mod tests {
             event,
             Event::SessionCandidate {
                 trigger: Some("resume".into()),
-                cwd: Some("/repo".into()),
             }
         );
     }

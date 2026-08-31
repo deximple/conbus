@@ -30,6 +30,8 @@ pub const CLAUDE_TRANSCRIPT: &str = "claude_transcript";
 pub struct Recovered {
     /// The vendor's session id, from the lines themselves.
     pub vendor_session_id: Option<String>,
+    /// The checkout the conversation happened in, from the lines themselves.
+    pub workspace: Option<String>,
     pub entries: Vec<Entry>,
     /// Lines the parser did not read, counted by why. A histogram rather than a
     /// list: a transcript is mostly tool traffic and attachments, and a
@@ -60,6 +62,8 @@ struct Line {
     prompt_source: Option<String>,
     #[serde(rename = "isSidechain", default)]
     is_sidechain: Option<bool>,
+    #[serde(default)]
+    cwd: Option<String>,
     #[serde(default)]
     message: Option<Message>,
 }
@@ -126,6 +130,12 @@ pub fn parse_claude_transcript(text: &str, bus_id: BusId) -> Recovered {
         if out.vendor_session_id.is_none() {
             out.vendor_session_id.clone_from(&line.session_id);
         }
+        // Kept as the last one seen rather than the first: a transcript's
+        // opening lines are bookkeeping that carries no `cwd`, and a session
+        // that moved should be remembered where it ended up.
+        if line.cwd.is_some() {
+            out.workspace.clone_from(&line.cwd);
+        }
         let at = line
             .timestamp
             .as_deref()
@@ -136,6 +146,7 @@ pub fn parse_claude_transcript(text: &str, bus_id: BusId) -> Recovered {
             // which the live hook path never sees.
             harness_version: line.version.clone(),
             vendor_session_id: out.vendor_session_id.clone(),
+            workspace: out.workspace.clone(),
             backfilled_from: Some(CLAUDE_TRANSCRIPT.to_string()),
         };
         let kind = line.r#type.as_deref().unwrap_or("(none)");
@@ -218,7 +229,7 @@ mod tests {
     /// carries a block list and no `promptId` at all.
     const TRANSCRIPT: &str = r#"
 {"type":"queue-operation","sessionId":"S1","timestamp":"2026-07-28T15:36:40.000Z"}
-{"type":"user","sessionId":"S1","timestamp":"2026-07-28T15:36:42.867Z","version":"2.1.229","promptId":"P1","message":{"role":"user","content":"first question"}}
+{"type":"user","sessionId":"S1","timestamp":"2026-07-28T15:36:42.867Z","version":"2.1.229","cwd":"/Applications/conbus","promptId":"P1","message":{"role":"user","content":"first question"}}
 {"type":"attachment","sessionId":"S1","subtype":"hook_success"}
 {"type":"assistant","sessionId":"S1","timestamp":"2026-07-28T15:36:50.000Z","version":"2.1.229","message":{"role":"assistant","content":[{"type":"text","text":"thinking about it"}]}}
 {"type":"assistant","sessionId":"S1","timestamp":"2026-07-28T15:36:56.388Z","version":"2.1.229","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Read","input":{}}]}}
@@ -301,6 +312,26 @@ mod tests {
         assert_eq!(
             out.entries[0].observed_at.map(|t| t.to_string()).as_deref(),
             Some("2026-07-28T15:36:42.867Z")
+        );
+    }
+
+    #[test]
+    fn the_workspace_is_recovered_so_backfilled_conversations_can_be_found_again() {
+        // The workspace is how a second harness finds the conversation it is
+        // continuing, and backfill is where nearly all the conversations are:
+        // 3,425 of 3,433 in a real log. Recovering everything else and leaving
+        // them workspace-less makes them invisible to that lookup.
+        //
+        // The first lines of a transcript are bookkeeping and carry no `cwd`,
+        // so a parser that only read line one would recover nothing.
+        let out = parsed();
+
+        assert_eq!(out.workspace.as_deref(), Some("/Applications/conbus"));
+        assert!(
+            out.entries
+                .iter()
+                .all(|entry| entry.source.workspace.as_deref() == Some("/Applications/conbus")),
+            "a recovered record without its workspace cannot be found again"
         );
     }
 

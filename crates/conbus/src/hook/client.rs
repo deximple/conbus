@@ -91,6 +91,7 @@ pub fn run(harness: &str, stdin: &mut impl Read) -> Result<(), String> {
         vendor_session_id: key.vendor_session_id,
         vendor_turn_id: observed.vendor_turn_id,
         vendor_agent_id: observed.vendor_agent_id,
+        workspace: observed.workspace,
         event: observed.event,
     };
     send(stream, &request)

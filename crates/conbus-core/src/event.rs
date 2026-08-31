@@ -135,6 +135,17 @@ pub struct Source {
     /// The vendor's own session id, which is an alias of the `bus_id`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vendor_session_id: Option<String>,
+    /// The working directory the harness reported for this event.
+    ///
+    /// On the session stamp rather than on one event because both vendors put
+    /// `cwd` on the common base of *every* hook payload, and because the thing
+    /// it identifies — which checkout this conversation is happening in — is
+    /// what a second harness needs in order to find the conversation it is
+    /// continuing. Reading it only at the session start recorded it for the
+    /// conversations whose start we happened to still be holding, which in a
+    /// real log was 7 out of 3,433.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
     /// Set when the record was reconstructed from the vendor's own history
     /// rather than mirrored as it happened.
     ///
@@ -171,8 +182,6 @@ pub enum Event {
     SessionCandidate {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         trigger: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        cwd: Option<String>,
     },
     /// The user submitted a prompt. This is where a `bus_id` is minted,
     /// whatever the author turns out to be.

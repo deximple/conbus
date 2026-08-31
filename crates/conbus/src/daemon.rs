@@ -6,6 +6,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 
+use conbus_core::event::Source;
 use conbus_core::paths::Paths;
 use conbus_core::record::Entry;
 use conbus_core::registry::{Disposition, Observed, Registry, SessionKey};
@@ -65,6 +66,7 @@ impl Daemon {
         let observed = Observed {
             vendor_turn_id: request.vendor_turn_id,
             vendor_agent_id: request.vendor_agent_id,
+            workspace: request.workspace,
             event: request.event,
         };
         match self.registry.observe(&key, observed) {
@@ -75,6 +77,10 @@ impl Daemon {
                     harness: request.harness,
                     harness_version: request.harness_version,
                     vendor_session_id: Some(key.vendor_session_id.clone()),
+                    // Filled per observation below: a flushed session start
+                    // carried its own, and a checkout can change between the
+                    // start and the prompt that proves the session real.
+                    workspace: None,
                     backfilled_from: None,
                 };
                 let mut seqs = Vec::with_capacity(observed.len());
@@ -86,7 +92,10 @@ impl Daemon {
                     let entry = Entry {
                         bus_id,
                         observed_at: None,
-                        source: source.clone(),
+                        source: Source {
+                            workspace: one.workspace,
+                            ..source.clone()
+                        },
                         vendor_turn_id: one.vendor_turn_id,
                         vendor_agent_id: one.vendor_agent_id,
                         event: one.event,
@@ -239,6 +248,7 @@ mod tests {
             vendor_session_id: "abc123".into(),
             vendor_turn_id: None,
             vendor_agent_id: None,
+            workspace: Some("/repo".into()),
             event,
         }
     }
@@ -292,7 +302,6 @@ mod tests {
 
         let response = daemon.handle(request(Event::SessionCandidate {
             trigger: Some("startup".into()),
-            cwd: None,
         }));
 
         assert_eq!(response, Response::Deferred);
@@ -306,7 +315,6 @@ mod tests {
         let mut daemon = Daemon::new(log, Registry::new());
         daemon.handle(request(Event::SessionCandidate {
             trigger: Some("startup".into()),
-            cwd: Some("/repo".into()),
         }));
 
         let response = daemon.handle(request(Event::TurnStarted {
@@ -344,7 +352,6 @@ mod tests {
             vendor_turn_id: None,
             ..request(Event::SessionCandidate {
                 trigger: Some("startup".into()),
-                cwd: Some("/repo".into()),
             })
         });
 

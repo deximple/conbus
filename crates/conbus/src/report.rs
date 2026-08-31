@@ -304,6 +304,7 @@ mod tests {
                 harness: Harness::new(Harness::CLAUDE_CODE),
                 harness_version: None,
                 vendor_session_id: None,
+                workspace: None,
                 backfilled_from: None,
             },
             event,

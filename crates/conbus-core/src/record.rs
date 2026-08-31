@@ -25,7 +25,7 @@ use crate::ids::BusId;
 /// `no_event_body_shadows_an_envelope_key` below. A vendor field whose name
 /// matches one of ours is renamed at the adapter, the way `SessionStart.source`
 /// becomes `trigger`.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// One line of the append-only log.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -85,6 +85,7 @@ mod tests {
             harness: Harness::new(Harness::CLAUDE_CODE),
             harness_version: Some("2.1.0".into()),
             vendor_session_id: Some("f0e1d2c3".into()),
+            workspace: Some("/Applications/conbus".into()),
             backfilled_from: None,
         }
     }
@@ -163,7 +164,6 @@ mod tests {
         let mut all = vec![
             Event::SessionCandidate {
                 trigger: Some("compact".into()),
-                cwd: Some("/repo".into()),
             },
             Event::TurnStarted {
                 author: Some(Author::new(Author::SCHEDULE_WAKEUP)),
@@ -223,10 +223,19 @@ mod tests {
     }
 
     /// A record with every envelope field populated, for the same reason.
+    ///
+    /// `backfilled_from` is set here and not in `source()`, which most tests
+    /// want unset. It has to be set *somewhere*: an optional field left `None`
+    /// is skipped on serialise, so the round-trip below never sees its key and
+    /// the guard is silently vacuous for it — which it was.
     fn fully_populated(event: Event) -> Record {
         Record {
             vendor_turn_id: Some(VendorTurnId::new("ed06c859-f62e-418f-96f0-556d61fa97d5")),
             vendor_agent_id: Some(VendorAgentId::new("agent-7")),
+            source: Source {
+                backfilled_from: Some(crate::backfill::CLAUDE_TRANSCRIPT.to_string()),
+                ..source()
+            },
             event,
             ..sample()
         }
@@ -271,6 +280,8 @@ mod tests {
             "author",
             "harness",
             "vendor_session_id",
+            "workspace",
+            "backfilled_from",
             "event",
             "prompt",
         ] {
@@ -430,7 +441,7 @@ mod tests {
         assert!(!line.contains('\n'), "a record must be one line");
         assert_eq!(
             line,
-            r#"{"v":1,"ts":"2026-08-30T07:41:02.481Z","seq":7,"bus_id":"01996b1e-2c4a-7c31-9d0e-4f2a6b8c1d3e","harness":"claude_code","harness_version":"2.1.0","vendor_session_id":"f0e1d2c3","event":"turn_started","prompt":{"kind":"kept","text":"ship the recorder"}}"#
+            r#"{"v":2,"ts":"2026-08-30T07:41:02.481Z","seq":7,"bus_id":"01996b1e-2c4a-7c31-9d0e-4f2a6b8c1d3e","harness":"claude_code","harness_version":"2.1.0","vendor_session_id":"f0e1d2c3","workspace":"/Applications/conbus","event":"turn_started","prompt":{"kind":"kept","text":"ship the recorder"}}"#
         );
         assert_eq!(
             serde_json::from_str::<Record>(&line).expect("round trip"),

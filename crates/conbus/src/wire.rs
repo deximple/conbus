@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 /// this field existed ignores it, so the first deploy still needs the daemon
 /// restarted by hand. `the_wire_shape_is_pinned_to_the_protocol_version` below
 /// is what stops the constant falling behind the struct.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// One observed vendor event, on its way to the log.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -38,6 +38,11 @@ pub struct Request {
     pub vendor_turn_id: Option<VendorTurnId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vendor_agent_id: Option<VendorAgentId>,
+    /// The checkout the harness reported. Both vendors put it on the common
+    /// base of every payload; it is the key a second harness needs to find the
+    /// conversation it is continuing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
     pub event: Event,
 }
 
@@ -81,6 +86,7 @@ mod tests {
             vendor_session_id: "s".into(),
             vendor_turn_id: Some(conbus_core::event::VendorTurnId::new("T")),
             vendor_agent_id: Some(conbus_core::event::VendorAgentId::new("A")),
+            workspace: Some("/repo".into()),
             event: Event::TurnStarted {
                 author: None,
                 prompt: Body::kept("p"),
@@ -106,9 +112,10 @@ mod tests {
                 "vendor_agent_id",
                 "vendor_session_id",
                 "vendor_turn_id",
+                "workspace",
             ],
             "the wire shape changed; bump PROTOCOL_VERSION (now {PROTOCOL_VERSION})"
         );
-        assert_eq!(PROTOCOL_VERSION, 1);
+        assert_eq!(PROTOCOL_VERSION, 2);
     }
 }

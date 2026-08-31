@@ -122,18 +122,19 @@ fn a_whole_turn_reaches_the_log_through_the_real_binary() {
 
     run_hook(
         home.path(),
-        r#"{"session_id":"s-1","hook_event_name":"UserPromptSubmit","prompt":"ship the recorder"}"#,
+        r#"{"session_id":"s-1","hook_event_name":"UserPromptSubmit","cwd":"/repo",
+            "prompt":"ship the recorder"}"#,
         &[],
     );
     run_hook(
         home.path(),
-        r#"{"session_id":"s-1","hook_event_name":"PostToolUse","tool_name":"Read",
+        r#"{"session_id":"s-1","hook_event_name":"PostToolUse","cwd":"/repo","tool_name":"Read",
             "tool_input":{"file_path":"/etc/hosts"},"tool_response":{"ok":true}}"#,
         &[],
     );
     run_hook(
         home.path(),
-        r#"{"session_id":"s-1","hook_event_name":"Stop","stop_hook_active":false}"#,
+        r#"{"session_id":"s-1","hook_event_name":"Stop","cwd":"/repo","stop_hook_active":false}"#,
         &[],
     );
 
@@ -162,12 +163,18 @@ fn a_whole_turn_reaches_the_log_through_the_real_binary() {
         "one session must be one conversation: {bus_ids:?}"
     );
     assert!(
-        lines.iter().all(|l| l["v"] == 1),
+        lines
+            .iter()
+            .all(|l| l["v"] == conbus_core::record::SCHEMA_VERSION),
         "every record carries a schema version"
     );
     assert!(
         lines.iter().all(|l| l["harness"] == "claude_code"),
         "every record carries a vendor stamp"
+    );
+    assert!(
+        lines.iter().all(|l| l["workspace"] == "/repo"),
+        "every record carries the workspace it happened in: {lines:?}"
     );
 
     // Default retention: the tool body must not be on disk.

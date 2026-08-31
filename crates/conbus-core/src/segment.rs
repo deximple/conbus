@@ -312,6 +312,7 @@ mod tests {
             harness: Harness::new(Harness::CLAUDE_CODE),
             harness_version: None,
             vendor_session_id: None,
+            workspace: None,
             backfilled_from: None,
         }
     }
@@ -439,7 +440,10 @@ mod tests {
         let segment = dir.path().join("segment-00000000.jsonl");
         let future = std::fs::read_to_string(&segment)
             .expect("read")
-            .replace("\"v\":1", "\"v\":99");
+            // Against the constant, not a literal: a schema bump would
+            // otherwise leave this replacing nothing, and a test that mutates
+            // nothing passes for the wrong reason.
+            .replace(&format!("\"v\":{SCHEMA_VERSION}"), "\"v\":99");
         std::fs::write(&segment, future).expect("write");
 
         let scan = SegmentLog::scan(dir.path()).expect("scan");

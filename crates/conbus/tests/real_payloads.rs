@@ -121,7 +121,26 @@ fn a_real_session_start_and_prompt_still_normalise() {
 
     assert_eq!(record["event"], "session_candidate");
     assert_eq!(record["trigger"], "startup");
-    assert_eq!(record["cwd"], "/private/tmp/conbus-probe.TRKEF4");
+}
+
+#[test]
+fn every_real_payload_carries_the_workspace_it_happened_in() {
+    // `cwd` is on the common base of every Claude Code hook payload, not on
+    // the session start alone. Reading it only there recorded the workspace
+    // for 7 of 3,433 conversations in a real log — the rest were backfilled or
+    // had their candidate evicted — and the workspace is the key by which a
+    // second harness finds the conversation it is continuing.
+    //
+    // The subject here is deliberately not `SessionStart`: that one would pass
+    // under the old behaviour too.
+    for hook_event_name in ["UserPromptSubmit", "StopFailure", "SessionEnd"] {
+        let record = record_for(&payload(hook_event_name));
+
+        assert_eq!(
+            record["workspace"], "/private/tmp/conbus-probe.TRKEF4",
+            "{hook_event_name} lost the workspace: {record}"
+        );
+    }
 }
 
 #[test]
