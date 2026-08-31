@@ -18,6 +18,22 @@ use crate::wire::{Request, Response};
 /// The environment marker that tells a hook it is inside a session we started.
 pub const INTERNAL_MARKER: &str = "CONBUS_INTERNAL_SESSION";
 
+/// The vendor's version, if it exposes one to its hook children.
+///
+/// `CLAUDE_CODE_VERSION` exists as a name inside the Claude Code binary but is
+/// not exported to a hook child on 2.1.241, and Codex has no equivalent at all,
+/// so this is `None` in practice today. It is read anyway: the moment a vendor
+/// starts setting it the log gains a version stamp with no further work, and
+/// reading an absent variable costs nothing.
+fn vendor_version(harness: &str) -> Option<String> {
+    let name = match harness {
+        Harness::CLAUDE_CODE => "CLAUDE_CODE_VERSION",
+        Harness::CODEX => "CODEX_VERSION",
+        _ => return None,
+    };
+    std::env::var(name).ok().filter(|value| !value.is_empty())
+}
+
 /// Mirror one hook payload. Returns a diagnostic when the record did not land;
 /// the caller reports it and still exits zero.
 pub fn run(harness: &str, stdin: &mut impl Read) -> Result<(), String> {
@@ -31,11 +47,25 @@ pub fn run(harness: &str, stdin: &mut impl Read) -> Result<(), String> {
         .map_err(|err| format!("could not read the hook payload: {err}"))?;
 
     let normalized = hook::normalize(&Harness::new(harness), &payload).map_err(|err| err.0)?;
-    let Normalized::Event { key, observed } = normalized else {
-        return Ok(());
-    };
-    let observed = *observed;
-
+    let key;
+    let observed;
+    match normalized {
+        Normalized::Event {
+            key: k,
+            observed: o,
+        } => {
+            key = k;
+            observed = *o;
+        }
+        // A decision, so nothing to say.
+        Normalized::Ignored { .. } => return Ok(()),
+        // A surprise. The vendor grew an event this adapter has never seen, and
+        // it is being dropped — which is the right thing to do and the wrong
+        // thing to do quietly.
+        Normalized::Unknown { hook_event_name } => {
+            return Err(format!("no mapping for hook event {hook_event_name:?}"));
+        }
+    }
     let paths = Paths::resolve().map_err(|_| "no home directory to resolve".to_string())?;
     let socket = paths.socket();
     let stream = UnixStream::connect(&socket)
@@ -43,6 +73,7 @@ pub fn run(harness: &str, stdin: &mut impl Read) -> Result<(), String> {
 
     let request = Request {
         harness: key.harness,
+        harness_version: vendor_version(harness),
         vendor_session_id: key.vendor_session_id,
         vendor_turn_id: observed.vendor_turn_id,
         vendor_agent_id: observed.vendor_agent_id,

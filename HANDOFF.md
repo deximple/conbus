@@ -8,7 +8,7 @@ Written for whoever picks this up next. The design phase is finished and the rec
 - The plan is the single source of truth: [`.cursor/plans/shared_workspace_context_3f7139b8.plan.md`](.cursor/plans/shared_workspace_context_3f7139b8.plan.md). The filename is a generated ID and no longer matches the content; leave it alone so the Cursor plan UI keeps its association. A reader-facing copy under `docs/` gets generated when the repo goes public.
 - `cargo 1.94.1` and `rustc 1.94.1` are installed on this machine, so edition 2024 is available.
 - A cargo workspace exists: `crates/conbus` (the binary) and `crates/conbus-core` (the lib). Edition 2024.
-  128 tests, `cargo clippy --all-targets -- -D warnings` clean. See "Next task" for what is built and what is not.
+  145 tests, `cargo clippy --all-targets -- -D warnings` clean. See "Next task" for what is built and what is not.
 
 ## What Conbus is, in one paragraph
 
@@ -152,10 +152,16 @@ wholesale would put every body there a third time. What the log does *not* other
 together and where the model's next request begins, so `tool_batch_ended` records **only the ids**, joinable to the
 records that carry the substance. A batch line is about 200 bytes regardless of how much the tools moved.
 
-The tool surface is mirrored end to end: `PreToolUse` → `tool_requested`, and then exactly one of
-`PostToolUse` → `tool_use` (succeeded), `PostToolUseFailure` → `tool_use` (failed), or `PermissionDenied` →
-`tool_denied`. So an unresolved `tool_requested` now means something specific — the call was still in flight when
-the session ended, or the daemon missed the event — rather than "we do not mirror the answer".
+The tool surface is mirrored end to end: `PreToolUse` → `tool_requested`, and then `PostToolUse` → `tool_use`
+(succeeded), `PostToolUseFailure` → `tool_use` (failed), or `PermissionDenied` → `tool_denied`.
+
+**But do not read that as "every request has an answer", which an earlier version of this file did.**
+`PermissionDenied` has exactly one call site in the bundle and it is guarded by
+`decisionReason.type === "classifier" && decisionReason.classifier === "auto-mode"` — so it fires for auto-mode
+classifier refusals and **not** when a person simply answers no at the prompt. An ordinary user denial leaves a
+`tool_requested` with no resolution. Neither is `PermissionRequest` mirrored, which is the pre-decision event and
+the only place an ordinary refusal is visible at all. So an unresolved request today means: denied by a person,
+still in flight when the session ended, or missed by the daemon — and the log cannot yet tell you which.
 
 `tool_denied` is its own event rather than a third `ToolOutcome`, and the reasoning is the mirror image of why the
 two post events *do* share one: `tool_use` means the tool **ran**. A call that never executed sitting in that set
@@ -273,8 +279,18 @@ Take the lesson generally: **the adapter is only as good as the traffic it has b
   record already carries its own input and output. It becomes a join key when `PreToolUse` and
   `PostToolUseFailure` are mirrored.)
 
-- **The whole tool surface is mirrored.** `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `PermissionDenied`,
-  `PostToolBatch`. Nothing on it is dropped.
+- **`PermissionRequest` is not mirrored**, and it is where an ordinary user refusal is visible — `PermissionDenied`
+  covers only auto-mode classifier denials. It fires before the decision and carries no `tool_use_id` (the emitter
+  passes the id to the hook runner but not into the payload), so it joins by tool name plus adjacency rather than by
+  key. Mirroring it is what would make "every request has an answer" true.
+- **Still dropped from payloads already parsed**: `agent_type` and `transcript_path` (both on the common base of
+  every payload), `session_title`, `model`, `permission_mode`, `effort.level`.
+- **`SubagentStart` / `SubagentStop` are not mirrored**, so a subagent's turn has no boundary in the log and its
+  closing text never reaches disk at any retention level — while the main thread's identical text is kept.
+  `SubagentStop` carries `agent_id` and `last_assistant_message`; it is two lines per subagent turn.
+- **`Notification` is not mirrored**, and it carries the only hook-channel signal that a quota limit has *lifted*.
+  For a product whose stated reason to exist is routing on quota, that is the cheapest signal on the surface: the
+  hook can be registered with a matcher on the notification type, so the volume cost is near zero.
 - **`MessageDisplay` is not mirrored**, and it is the only official channel carrying every assistant message rather
   than the last one. High volume, and it collides with the "conversation only" shipping default, so it is a retention
   decision before it is an adapter change.

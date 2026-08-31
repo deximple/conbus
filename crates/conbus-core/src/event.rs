@@ -74,15 +74,9 @@ impl VendorAgentId {
 
 /// The vendor's identifier for one tool call.
 ///
-/// Recorded because it is the call's identity, not because anything joins on it
-/// yet. Today the log holds one record per *successful* call, already carrying
-/// its own input and output on the same line, so nothing here needs the id to
-/// attribute a result to a request.
-///
-/// It becomes a join key when `PreToolUse` and `PostToolUseFailure` are
-/// mirrored, which they are not. Note what that costs meanwhile: a tool call
-/// that **fails** emits `PostToolUseFailure`, not `PostToolUse`, so it produces
-/// no record at all.
+/// The join key between a `tool_requested` and the `tool_use` or `tool_denied`
+/// that answers it. Both sides are mirrored, so issue order and completion
+/// order both reach the log and differ visibly under parallelism.
 #[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct VendorToolUseId(String);
@@ -257,9 +251,10 @@ pub enum Event {
         #[serde(flatten)]
         state: TurnState,
         /// The assistant's closing text. Claude Code puts it on the payload
-        /// itself precisely so a hook does not have to read the transcript,
-        /// which is what lets the log hold the conversation without breaking
-        /// the live-path rule.
+        /// itself precisely so a hook does not have to read the transcript —
+        /// which is what removes the need for a flush barrier, not what lets
+        /// the log hold the whole conversation. It is the *last* message's
+        /// text blocks only, and absent when that message is pure tool use.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         assistant_message: Option<Body>,
     },

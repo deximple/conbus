@@ -16,8 +16,14 @@ pub enum Normalized {
         /// built per hook process and consumed immediately.
         observed: Box<Observed>,
     },
-    /// A hook event the recorder deliberately does not mirror.
+    /// A hook event the recorder has seen and deliberately does not mirror.
     Ignored { hook_event_name: String },
+    /// A hook event this adapter has never heard of.
+    ///
+    /// Distinct from `Ignored` on purpose: a decision and a surprise are
+    /// different facts, and collapsing them means a vendor adds an event, the
+    /// recorder drops it, and nothing anywhere says so.
+    Unknown { hook_event_name: String },
 }
 
 /// A payload we could not read at all.

@@ -17,6 +17,11 @@ const FORMAT: &[BorrowedFormatItem<'_>] =
 
 /// A UTC instant, rendered fixed-width so that log lines sort lexicographically
 /// in the same order they were appended.
+///
+/// Fixed width is only half of it: the timestamp is also declared before `seq`
+/// on the record, because `seq` is variable-width and a text sort would
+/// otherwise put 10 before 2. Both halves are needed for the claim to hold, and
+/// it holds up to a wall clock that steps backwards.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Timestamp(OffsetDateTime);
 

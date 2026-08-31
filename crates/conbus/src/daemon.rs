@@ -10,7 +10,7 @@ use conbus_core::paths::Paths;
 use conbus_core::record::Entry;
 use conbus_core::registry::{Disposition, Observed, Registry, SessionKey};
 use conbus_core::retention::Retention;
-use conbus_core::segment::SegmentLog;
+use conbus_core::segment::{Scan, SegmentLog};
 
 use crate::harden;
 use crate::wire::{Request, Response};
@@ -49,10 +49,11 @@ impl Daemon {
             Disposition::Write { bus_id, observed } => {
                 let source = conbus_core::event::Source {
                     harness: request.harness,
-                    harness_version: None,
+                    harness_version: request.harness_version,
                     vendor_session_id: Some(key.vendor_session_id.clone()),
                 };
                 let mut seqs = Vec::with_capacity(observed.len());
+                let mut errors = Vec::new();
                 // Each observation keeps the correlators its own payload had.
                 // A deferred session start carried none; borrowing the minting
                 // prompt's would fabricate a correlation the vendor did not send.
@@ -67,12 +68,30 @@ impl Daemon {
                     match self.log.append(entry) {
                         Ok(Some(seq)) => seqs.push(seq),
                         Ok(None) => {}
-                        Err(err) => {
-                            return Response::Failed {
-                                error: err.to_string(),
-                            };
-                        }
+                        // Keep going. Returning here would abandon the events
+                        // behind this one untried and report two losses as one,
+                        // and the prompt that minted the conversation is often
+                        // the one behind a flushed session start.
+                        Err(err) => errors.push(err.to_string()),
                     }
+                }
+                if !errors.is_empty() {
+                    // The daemon's own stderr, because the hook's goes to a
+                    // vendor that swallows it.
+                    eprintln!(
+                        "conbus daemon: {} of {} record(s) refused by the log: {}",
+                        errors.len(),
+                        errors.len() + seqs.len(),
+                        errors.join("; ")
+                    );
+                    return Response::Failed {
+                        error: format!(
+                            "{} record(s) written, {} lost: {}",
+                            seqs.len(),
+                            errors.len(),
+                            errors.join("; ")
+                        ),
+                    };
                 }
                 if seqs.is_empty() {
                     Response::Withheld
@@ -113,7 +132,17 @@ pub fn serve(paths: &Paths, retention: Retention) -> io::Result<()> {
     let listener = bind(&paths.socket())?;
     // The registry is derived state, so it is rebuilt from the segments rather
     // than starting empty — otherwise a restart forks every live conversation.
-    let scan = SegmentLog::scan(paths.log_dir())?;
+    // But a log we cannot read must not stop us recording: an empty registry
+    // costs a forked conversation, which the vendor session id on every record
+    // still makes recoverable, while refusing to start costs every future turn.
+    let scan = SegmentLog::scan(paths.log_dir()).unwrap_or_else(|err| {
+        eprintln!(
+            "conbus daemon: could not read {} ({err}); starting with no bindings, \
+             so a session that outlived the last daemon will get a second bus_id",
+            paths.log_dir().display()
+        );
+        Scan::default()
+    });
     let registry = Registry::restore(&scan.records);
     let log = SegmentLog::open(paths.log_dir(), retention)?;
     let mut daemon = Daemon::new(log, registry);
@@ -179,6 +208,7 @@ mod tests {
     fn request(event: Event) -> Request {
         Request {
             harness: Harness::new(Harness::CLAUDE_CODE),
+            harness_version: None,
             vendor_session_id: "abc123".into(),
             vendor_turn_id: None,
             vendor_agent_id: None,

@@ -7,13 +7,15 @@
 //! that way produced a `StopFailure` adapter that silently replaced the vendor's
 //! reason with `"unspecified"` while every test passed.
 //!
-//! Which fields are pinned by which: `session_id`, `hook_event_name`, `cwd`,
-//! `prompt`, `prompt_id`, `error`, `last_assistant_message`, and `reason` all
-//! appear in the captures. `agent_id`, `tool_name`, `tool_input`,
-//! `tool_response`, `tool_use_id`, `duration_ms`, and `error_details` are from
-//! the schema and the emit sites only — **no capture contains a `PostToolUse`
-//! at all**, and none has exercised a subagent. Treat those as unverified until
-//! a capture covers them, and keep this list exhaustive when adding a field.
+//! Which fields are pinned by which. Keep this exhaustive over `Payload` when
+//! adding one — a field in neither list reads as verified and is not.
+//!
+//! Captured: `session_id`, `hook_event_name`, `cwd`, `source`, `prompt`,
+//! `prompt_id`, `error`, `last_assistant_message`, `reason`.
+//! Schema and emit site only: `agent_id`, `tool_name`, `tool_input`,
+//! `tool_response`, `tool_use_id`, `duration_ms`, `is_interrupt`,
+//! `error_details`, `tool_calls`. **No capture contains a `PostToolUse` at
+//! all**, and none has exercised a subagent or a batch.
 
 use conbus_core::event::{
     Author, Body, Event, Harness, ToolOutcome, TurnState, VendorAgentId, VendorToolUseId,
@@ -81,9 +83,12 @@ pub struct Payload {
     pub tool_name: Option<String>,
     #[serde(default)]
     pub tool_input: Option<Value>,
-    /// `PostToolBatch`: every call in the batch that just resolved.
+    /// `PostToolBatch`: every call in the batch that just resolved. A raw
+    /// `Value` like the other vendor-shaped fields — a typed `Vec` here would
+    /// make an unfamiliar shape cost the whole record, on every event, because
+    /// this struct is shared by all of them.
     #[serde(default)]
-    pub tool_calls: Option<Vec<BatchCall>>,
+    pub tool_calls: Option<Value>,
     /// `PostToolUse`, `PreToolUse`, `PostToolUseFailure`. Required by the
     /// schema on all three, so an absent one means the vendor changed — but
     /// nothing here detects that, and the record is written without it rather
@@ -94,9 +99,11 @@ pub struct Payload {
     /// failing on its own.
     #[serde(default)]
     pub is_interrupt: Option<bool>,
-    /// `PostToolUse`, `PostToolUseFailure`. The schema marks it optional, and
-    /// 2.1.241 in fact measures on every path, so an absent one today means the
-    /// vendor changed rather than that it declined to measure.
+    /// `PostToolUse`, `PostToolUseFailure`. Every `PostToolUse` path in 2.1.241
+    /// passes a measurement; `PostToolUseFailure` does not always — a call that
+    /// fails before it starts carries none. So an absent duration on a success
+    /// means the vendor changed or the value arrived unreadable, and on a
+    /// failure it may simply mean the call never ran.
     #[serde(default, deserialize_with = "lenient_millis")]
     pub duration_ms: Option<u64>,
     #[serde(default)]
@@ -117,12 +124,51 @@ pub struct Payload {
     pub reason: Option<String>,
 }
 
-/// One entry of a `PostToolBatch`. Only the id is read: the name, input and
-/// response are already recorded by the per-call events.
-#[derive(Debug, Deserialize)]
-pub struct BatchCall {
-    #[serde(default)]
-    pub tool_use_id: Option<String>,
+/// Hook events this adapter has seen and decided not to mirror.
+///
+/// Spelled out so that an event which is *not* here is reported as unknown
+/// rather than silently dropped. Read off the vendor's own event list in
+/// `tests/fixtures/claude_code_2.1.241_contract.md`.
+const DECLINED: [&str; 20] = [
+    "PermissionRequest",
+    "Notification",
+    "UserPromptExpansion",
+    "Setup",
+    "SubagentStart",
+    "SubagentStop",
+    "PreCompact",
+    "PostCompact",
+    "TeammateIdle",
+    "TaskCreated",
+    "TaskCompleted",
+    "Elicitation",
+    "ElicitationResult",
+    "ConfigChange",
+    "InstructionsLoaded",
+    "WorktreeCreate",
+    "WorktreeRemove",
+    "CwdChanged",
+    "FileChanged",
+    "MessageDisplay",
+];
+
+/// Pull tool-call ids out of whatever shape the vendor sent.
+///
+/// Accepts the documented array of objects and a bare array of ids, and yields
+/// nothing rather than failing for anything else. Reading the grouping is worth
+/// having; it is not worth the record.
+fn batch_ids(value: Option<Value>) -> Vec<VendorToolUseId> {
+    value
+        .as_ref()
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|call| match call {
+            Value::String(id) => Some(id.as_str()),
+            other => other.get("tool_use_id")?.as_str(),
+        })
+        .map(VendorToolUseId::new)
+        .collect()
 }
 
 /// Read a hook payload into a bus event.
@@ -149,13 +195,7 @@ pub fn normalize(harness: &Harness, json: &str) -> Result<Normalized, HookError>
             input: body_of(payload.tool_input),
         },
         "PostToolBatch" => Event::ToolBatchEnded {
-            tool_calls: payload
-                .tool_calls
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|call| call.tool_use_id)
-                .map(VendorToolUseId::new)
-                .collect(),
+            tool_calls: batch_ids(payload.tool_calls),
         },
         "PermissionDenied" => Event::ToolDenied {
             tool: payload.tool_name.unwrap_or_default(),
@@ -196,8 +236,13 @@ pub fn normalize(harness: &Harness, json: &str) -> Result<Normalized, HookError>
         "SessionEnd" => Event::SessionEnded {
             reason: payload.reason,
         },
-        other => {
+        other if DECLINED.contains(&other) => {
             return Ok(Normalized::Ignored {
+                hook_event_name: other.to_string(),
+            });
+        }
+        other => {
+            return Ok(Normalized::Unknown {
                 hook_event_name: other.to_string(),
             });
         }
@@ -491,6 +536,68 @@ mod tests {
                     VendorToolUseId::new("toolu_A"),
                     VendorToolUseId::new("toolu_B"),
                 ],
+            }
+        );
+    }
+
+    #[test]
+    fn a_tool_calls_shape_we_do_not_expect_costs_the_batch_not_the_record() {
+        // `Payload` is one struct for every hook event and every other field is
+        // a string or a raw `Value`, precisely so an unfamiliar shape costs one
+        // field. A strictly typed `Vec` here brought that back: `"tool_calls":3`
+        // on a `Stop` payload dropped the turn-end record entirely.
+        let event = event_of(
+            r#"{"session_id":"abc123","hook_event_name":"Stop","stop_hook_active":false,
+                "last_assistant_message":"done","tool_calls":3}"#,
+        );
+        assert_eq!(
+            event,
+            Event::TurnEnded {
+                state: TurnState::Complete,
+                assistant_message: Some(Body::kept("done")),
+            }
+        );
+
+        // And a batch whose entries the vendor simplifies to bare ids still
+        // yields the grouping rather than nothing.
+        let event = event_of(
+            r#"{"session_id":"abc123","hook_event_name":"PostToolBatch",
+                "tool_calls":["toolu_A","toolu_B"]}"#,
+        );
+        assert_eq!(
+            event,
+            Event::ToolBatchEnded {
+                tool_calls: vec![
+                    VendorToolUseId::new("toolu_A"),
+                    VendorToolUseId::new("toolu_B"),
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn a_hook_event_we_have_never_seen_is_named_as_unknown() {
+        // A vendor event the adapter declined on purpose and one it has never
+        // heard of are different facts. Treating both as "ignored" means a new
+        // event arrives, is dropped, and nothing anywhere says so.
+        assert_eq!(
+            normalize(
+                &Harness::new(Harness::CLAUDE_CODE),
+                r#"{"session_id":"abc123","hook_event_name":"PreCompact","trigger":"auto"}"#
+            )
+            .expect("normalise"),
+            Normalized::Ignored {
+                hook_event_name: "PreCompact".into()
+            }
+        );
+        assert_eq!(
+            normalize(
+                &Harness::new(Harness::CLAUDE_CODE),
+                r#"{"session_id":"abc123","hook_event_name":"SomethingNewInTwoPointTwo"}"#
+            )
+            .expect("normalise"),
+            Normalized::Unknown {
+                hook_event_name: "SomethingNewInTwoPointTwo".into()
             }
         );
     }

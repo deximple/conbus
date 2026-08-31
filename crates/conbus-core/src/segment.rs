@@ -77,17 +77,44 @@ struct SequenceOnly {
     seq: u64,
 }
 
+/// Read a segment as byte lines.
+///
+/// Bytes, not `String` lines. A crash does not aim for a character boundary, so
+/// any non-ASCII text in the log — a Korean prompt, an emoji, box drawing in a
+/// tool body — can be cut mid-character. `BufRead::lines` turns that into an
+/// `io::Error` for the whole file, and every caller here treats an error as
+/// fatal: `scan` gives up on the entire log directory and the daemon refuses to
+/// start, so recording ends permanently over one damaged line. Decoding is a
+/// per-line concern, and a line that fails it is a defect like any other.
+fn byte_lines(path: &Path) -> io::Result<Vec<Vec<u8>>> {
+    let mut reader = BufReader::new(File::open(path)?);
+    let mut lines = Vec::new();
+    loop {
+        let mut buf = Vec::new();
+        if reader.read_until(b'\n', &mut buf)? == 0 {
+            break;
+        }
+        while matches!(buf.last(), Some(b'\n' | b'\r')) {
+            buf.pop();
+        }
+        lines.push(buf);
+    }
+    Ok(lines)
+}
+
 /// The highest sequence number already on disk.
 ///
 /// Walks segments newest-first and stops at the first one holding a numbered
-/// line, so a restart costs one segment rather than the whole log.
+/// line, so a restart costs one segment rather than the whole log. A line this
+/// build cannot read — whether its event is unfamiliar or its bytes are not
+/// valid UTF-8 — is skipped rather than ending the walk, because a sequence
+/// number after it is still a sequence number, and missing it means handing out
+/// one that is already on disk.
 fn last_sequence(segments: &[PathBuf]) -> io::Result<Option<u64>> {
     for segment in segments.iter().rev() {
-        let reader = BufReader::new(File::open(segment)?);
-        let highest = reader
-            .lines()
-            .map_while(Result::ok)
-            .filter_map(|line| serde_json::from_str::<SequenceOnly>(&line).ok())
+        let highest = byte_lines(segment)?
+            .iter()
+            .filter_map(|line| serde_json::from_slice::<SequenceOnly>(line).ok())
             .map(|numbered| numbered.seq)
             .max();
         if highest.is_some() {
@@ -183,7 +210,16 @@ impl SegmentLog {
         line.push('\n');
 
         let current = self.segment_for(line.len() as u64)?;
-        current.file.write_all(line.as_bytes())?;
+        if let Err(err) = current.file.write_all(line.as_bytes()) {
+            // A short write — a full disk is the ordinary cause — leaves part
+            // of the line on disk with no newline. Appending onto that glues
+            // the next record to the wreck and loses both. Drop the handle so
+            // the next append reopens the segment, which heals the tail and
+            // recomputes the size from the file rather than from what we meant
+            // to write.
+            self.current = None;
+            return Err(err);
+        }
         current.bytes += line.len() as u64;
         self.next_seq += 1;
         Ok(Some(record.seq))
@@ -219,13 +255,14 @@ impl SegmentLog {
     pub fn scan(dir: impl AsRef<Path>) -> io::Result<Scan> {
         let mut scan = Scan::default();
         for segment in segment_paths(dir.as_ref())? {
-            let reader = BufReader::new(File::open(&segment)?);
-            for (index, line) in reader.lines().enumerate() {
-                let line = line?;
+            for (index, line) in byte_lines(&segment)?.into_iter().enumerate() {
                 if line.is_empty() {
                     continue;
                 }
-                match serde_json::from_str::<Record>(&line) {
+                // `from_slice` validates UTF-8 as part of parsing, so a line
+                // whose bytes are damaged and a line whose JSON is damaged take
+                // the same path: one defect, and the rest of the log survives.
+                match serde_json::from_slice::<Record>(&line) {
                     // A newer writer may have changed what a field means. Reading
                     // it as though we understood it is worse than reporting it.
                     Ok(record) if record.schema_version > SCHEMA_VERSION => {
@@ -414,6 +451,72 @@ mod tests {
             std::fs::read_dir(dir.path()).expect("read dir").count(),
             0,
             "ephemeral retention must not even create a segment"
+        );
+    }
+
+    #[test]
+    fn a_tear_inside_a_character_is_a_defect_not_the_end_of_the_log() {
+        // The existing torn-line test cuts at an ASCII boundary. A real crash
+        // does not aim: any non-ASCII text — a Korean prompt, an emoji, a box
+        // drawing in a tool body — can be cut mid-character. Reading the log as
+        // UTF-8 lines turns that into an `io::Error` for the WHOLE directory,
+        // which stops `conbus log`, `doctor`, and the daemon itself, so
+        // recording ends permanently and nothing says why.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bus_id = BusId::mint();
+        let mut log = SegmentLog::open(dir.path(), Retention::default()).expect("open");
+        log.append(entry(bus_id, prompt("핸드오프 읽고 recorder-first부터")))
+            .expect("append");
+        let segment = dir.path().join("segment-00000000.jsonl");
+        let mut torn = OpenOptions::new()
+            .append(true)
+            .open(&segment)
+            .expect("open segment");
+        // The first byte of a three-byte character, and then the power goes.
+        torn.write_all(br#"{"v":1,"seq":1,"ts":"2026-08-31T04:12:00.000Z","prompt":""#)
+            .expect("tear");
+        torn.write_all(&[0xEC]).expect("tear");
+        drop(torn);
+
+        let scan = SegmentLog::scan(dir.path()).expect("a torn character must not fail the scan");
+
+        assert_eq!(scan.records.len(), 1, "the intact record must survive");
+        assert_eq!(scan.defects.len(), 1, "the torn line must be reported");
+
+        // And the log must still be appendable afterwards. The torn record's
+        // own number is free again: a tear at the tail means that record never
+        // finished being written, so nothing on disk claims it. (A damaged line
+        // in the *middle* is different — the numbers after it are readable and
+        // must still be seen; `sequences_after_an_undecodable_line_are_still_seen`
+        // covers that.)
+        let mut log = SegmentLog::open(dir.path(), Retention::default()).expect("reopen");
+        assert_eq!(
+            log.append(entry(bus_id, prompt("after"))).expect("append"),
+            Some(1),
+            "the log stopped being appendable after a torn character"
+        );
+    }
+
+    #[test]
+    fn sequences_after_an_undecodable_line_are_still_seen() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let segment = dir.path().join("segment-00000000.jsonl");
+        std::fs::create_dir_all(dir.path()).expect("dir");
+        let mut file = std::fs::File::create(&segment).expect("create");
+        file.write_all(br#"{"v":1,"seq":0,"ts":"2026-08-31T04:12:00.000Z","bus_id":"01996b1e-2c4a-7c31-9d0e-4f2a6b8c1d3e","harness":"claude_code","event":"session_ended"}"#).expect("w");
+        file.write_all(b"\n").expect("w");
+        file.write_all(&[0x7b, 0xEC, 0x0a]).expect("w"); // an undecodable line
+        file.write_all(br#"{"v":1,"seq":7,"ts":"2026-08-31T04:12:00.000Z","bus_id":"01996b1e-2c4a-7c31-9d0e-4f2a6b8c1d3e","harness":"claude_code","event":"session_ended"}"#).expect("w");
+        file.write_all(b"\n").expect("w");
+        drop(file);
+
+        let mut log = SegmentLog::open(dir.path(), Retention::default()).expect("open");
+
+        assert_eq!(
+            log.append(entry(BusId::mint(), prompt("next")))
+                .expect("append"),
+            Some(8),
+            "resuming stopped at the line it could not decode and reused a sequence"
         );
     }
 

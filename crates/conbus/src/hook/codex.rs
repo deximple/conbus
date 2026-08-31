@@ -52,6 +52,16 @@ pub struct Payload {
     pub reason: Option<String>,
 }
 
+/// Hook events this adapter has seen and decided not to mirror. Anything not
+/// here is reported as unknown rather than dropped in silence.
+const DECLINED: [&str; 5] = [
+    "PermissionRequest",
+    "PreCompact",
+    "PostCompact",
+    "SubagentStart",
+    "SubagentStop",
+];
+
 /// Read a Codex hook payload into a bus event.
 pub fn normalize(harness: &Harness, json: &str) -> Result<Normalized, HookError> {
     let payload: Payload = serde_json::from_str(json).map_err(|err| HookError(err.to_string()))?;
@@ -94,8 +104,13 @@ pub fn normalize(harness: &Harness, json: &str) -> Result<Normalized, HookError>
         "SessionEnd" => Event::SessionEnded {
             reason: payload.reason,
         },
-        other => {
+        other if DECLINED.contains(&other) => {
             return Ok(Normalized::Ignored {
+                hook_event_name: other.to_string(),
+            });
+        }
+        other => {
+            return Ok(Normalized::Unknown {
                 hook_event_name: other.to_string(),
             });
         }

@@ -32,8 +32,12 @@ pub const SCHEMA_VERSION: u32 = 1;
 pub struct Record {
     #[serde(rename = "v")]
     pub schema_version: u32,
-    pub seq: u64,
+    /// Declared before `seq` on purpose. `seq` is variable-width, so with it
+    /// first a text sort orders 10 before 2; with the fixed-width timestamp
+    /// first, sorting a segment as text really does give append order — which
+    /// is the claim `clock.rs` makes and the reason the format is fixed-width.
     pub ts: Timestamp,
+    pub seq: u64,
     pub bus_id: BusId,
     /// The vendor's turn correlator. `bus_id` says which conversation, this
     /// says which turn inside it. Absent before a session's first prompt, and
@@ -381,13 +385,43 @@ mod tests {
     }
 
     #[test]
+    fn sorting_a_segment_as_text_gives_append_order() {
+        // The whole reason the timestamp is fixed-width. It only works if the
+        // variable-width `seq` comes after it: with `seq` first, "10" sorts
+        // before "2" and a grep-ed segment reads out of order.
+        let mut lines: Vec<String> = [2u64, 9, 10]
+            .into_iter()
+            .map(|seq| {
+                let ts = format!("2026-08-31T04:12:{:02}.000Z", seq);
+                serde_json::to_string(&Record {
+                    seq,
+                    ts: ts.parse().expect("ts"),
+                    ..sample()
+                })
+                .expect("serialise")
+            })
+            .collect();
+        lines.sort();
+
+        let seqs: Vec<u64> = lines
+            .iter()
+            .map(|l| serde_json::from_str::<Record>(l).expect("read back").seq)
+            .collect();
+        assert_eq!(
+            seqs,
+            vec![2, 9, 10],
+            "a text sort did not give append order"
+        );
+    }
+
+    #[test]
     fn a_record_is_one_flat_greppable_json_line() {
         let line = serde_json::to_string(&sample()).expect("serialise");
 
         assert!(!line.contains('\n'), "a record must be one line");
         assert_eq!(
             line,
-            r#"{"v":1,"seq":7,"ts":"2026-08-30T07:41:02.481Z","bus_id":"01996b1e-2c4a-7c31-9d0e-4f2a6b8c1d3e","harness":"claude_code","harness_version":"2.1.0","vendor_session_id":"f0e1d2c3","event":"turn_started","prompt":{"kind":"kept","text":"ship the recorder"}}"#
+            r#"{"v":1,"ts":"2026-08-30T07:41:02.481Z","seq":7,"bus_id":"01996b1e-2c4a-7c31-9d0e-4f2a6b8c1d3e","harness":"claude_code","harness_version":"2.1.0","vendor_session_id":"f0e1d2c3","event":"turn_started","prompt":{"kind":"kept","text":"ship the recorder"}}"#
         );
         assert_eq!(
             serde_json::from_str::<Record>(&line).expect("round trip"),

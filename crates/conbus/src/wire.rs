@@ -8,6 +8,11 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct Request {
     pub harness: Harness,
+    /// The vendor's own version, when it tells us. Absent is the normal case
+    /// today: neither Claude Code nor Codex puts its version in a hook payload
+    /// or in the hook child's environment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness_version: Option<String>,
     pub vendor_session_id: String,
     /// Optional so a newer hook and an older daemon still understand each other.
     #[serde(default, skip_serializing_if = "Option::is_none")]
