@@ -51,6 +51,7 @@ impl Daemon {
                     harness: request.harness,
                     harness_version: request.harness_version,
                     vendor_session_id: Some(key.vendor_session_id.clone()),
+                    backfilled_from: None,
                 };
                 let mut seqs = Vec::with_capacity(observed.len());
                 let mut errors = Vec::new();
@@ -60,6 +61,7 @@ impl Daemon {
                 for one in observed {
                     let entry = Entry {
                         bus_id,
+                        observed_at: None,
                         source: source.clone(),
                         vendor_turn_id: one.vendor_turn_id,
                         vendor_agent_id: one.vendor_agent_id,

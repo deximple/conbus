@@ -60,6 +60,11 @@ the line unreadable on scan.
     source: enum["user","sdk","system","loop_wakeup","schedule_wakeup","poll_event"]?
             "...Payloads may omit it while the field rolls out."
 
+**And the transcript's vocabulary is larger than the hook schema's.** Backfilling 3,425 real sessions
+turned up `typed`, `queued` and `suggestion_accepted` in the transcript's `promptSource` field —
+none of which are among the six the hook schema declares. Whatever the relationship between the two
+fields, it is not identity, and it is the reason `Author` is an open string rather than an enum.
+
 Both emit sites have the spread constant-folded out in 2.1.241. Confirmed empirically: a `claude -p`
 run, which must be `sdk`, produced a `UserPromptSubmit` with no `source` key. Parse it if it
 appears; never gate behaviour on it, and never read its absence as `user`.

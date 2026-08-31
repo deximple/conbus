@@ -18,6 +18,10 @@ pub enum Command {
     Install {
         apply: bool,
     },
+    /// Recover history from before the recorder was installed.
+    Backfill {
+        apply: bool,
+    },
     Doctor,
     Help,
     Unknown(String),
@@ -69,6 +73,9 @@ where
         "install" => Command::Install {
             apply: args.iter().any(|a| a == "--apply"),
         },
+        "backfill" => Command::Backfill {
+            apply: args.iter().any(|a| a == "--apply"),
+        },
         "log" => Command::Log {
             json: args.iter().any(|a| a == "--json"),
             filter: LogFilter {
@@ -98,6 +105,7 @@ USAGE:
     conbus log [--json] [--bus-id ID] [--since TS] [--tail N] [--grep TEXT]
                                   read the conversation log back
     conbus install [--apply]      register the hook with Claude Code and Codex
+    conbus backfill [--apply]     recover history from before the recorder ran
     conbus doctor                 report what is and is not wired up
 ";
 

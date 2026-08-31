@@ -1,3 +1,4 @@
+mod backfill;
 mod cli;
 mod daemon;
 mod harden;
@@ -27,6 +28,7 @@ fn main() -> ExitCode {
         Command::Daemon => run(|paths| daemon::serve(paths, Retention::default())),
         Command::Log { json, filter } => run(|paths| report::log(paths, json, &filter)),
         Command::Install { apply } => run(|_| report::install(apply)),
+        Command::Backfill { apply } => run(|paths| backfill::run(paths, apply)),
         Command::Doctor => run(report::doctor),
         Command::Help => {
             print!("{}", cli::USAGE);

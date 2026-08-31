@@ -8,7 +8,7 @@ Written for whoever picks this up next. The design phase is finished and the rec
 - The plan is the single source of truth: [`.cursor/plans/shared_workspace_context_3f7139b8.plan.md`](.cursor/plans/shared_workspace_context_3f7139b8.plan.md). The filename is a generated ID and no longer matches the content; leave it alone so the Cursor plan UI keeps its association. A reader-facing copy under `docs/` gets generated when the repo goes public.
 - `cargo 1.94.1` and `rustc 1.94.1` are installed on this machine, so edition 2024 is available.
 - A cargo workspace exists: `crates/conbus` (the binary) and `crates/conbus-core` (the lib). Edition 2024.
-  159 tests, `cargo clippy --all-targets -- -D warnings` clean. See "Next task" for what is built and what is not.
+  172 tests, `cargo clippy --all-targets -- -D warnings` clean. See "Next task" for what is built and what is not.
 
 ## What Conbus is, in one paragraph
 
@@ -153,6 +153,32 @@ Two vendor facts it encodes, both measured against the running binaries and both
 
 `conbus log` takes `--bus-id`, `--since`, `--tail` and `--grep`. Before this it printed the entire store, which
 stops being usable at the first backfill.
+
+**History is recovered.**
+
+`conbus backfill` reads Claude Code's own transcripts — the one place the plan permits a vendor session
+file to be parsed, because a backfill failure thins the corpus while a live-path failure loses the
+conversation happening now. On this machine it recovered **3,425 conversations, 12,025 turns and 23,280
+records from 5.24 GB in four seconds**, into a 78 MB log. It is idempotent: the session file's own name is
+a UUID, so it *becomes* the `bus_id`, and a second run recovers nothing rather than a second copy.
+
+It reads three line shapes and counts everything else by reason — 515k attachments, 88k tool-only
+assistant replies, 54k tool-result user lines. Tool traffic is deliberately not recovered: it is 90-97% of
+the bytes and the default retention level would elide it anyway.
+
+Three things the transcript has that the live hook path does not:
+
+- **The vendor version**, on every message line. 39 distinct builds across this corpus. The hook payload
+  carries none and no environment variable exposes one, so backfilled records are the only ones with a
+  version stamp.
+- **`promptSource`**, the author field the hook has compiled out. And its vocabulary is *larger* than the
+  hook schema's six values — the corpus contains `typed`, `queued` and `suggestion_accepted`. Whatever
+  the two fields' relationship is, it is not identity. This is why `Author` is an open string.
+- **When it happened.** `Entry` now carries `observed_at`, and a record that knows its own time keeps it
+  rather than being stamped with the moment it was read.
+
+Everything recovered is stamped `backfilled_from`, because a reconstructed record is a weaker fact than a
+mirrored one and a reader that cannot tell them apart will over-trust the log.
 
 **Not done, and next.**
 

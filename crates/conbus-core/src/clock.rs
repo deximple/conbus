@@ -26,9 +26,20 @@ const FORMAT: &[BorrowedFormatItem<'_>] =
 pub struct Timestamp(OffsetDateTime);
 
 impl Timestamp {
-    /// The current instant.
+    /// The current instant, truncated to the precision it is written at.
+    ///
+    /// Truncating here rather than at serialisation keeps one invariant that
+    /// would otherwise be quietly false: a timestamp compares the same before
+    /// and after a round trip through the log. Without it an in-memory value
+    /// carries nanoseconds the format drops, so a record read back from disk
+    /// can sort before a value taken earlier in the same millisecond.
     pub fn now() -> Self {
-        Timestamp(OffsetDateTime::now_utc())
+        let now = OffsetDateTime::now_utc();
+        let millis = now.millisecond();
+        Timestamp(
+            now.replace_nanosecond(u32::from(millis) * 1_000_000)
+                .unwrap_or(now),
+        )
     }
 }
 
@@ -83,6 +94,19 @@ impl<'de> serde::Deserialize<'de> for Timestamp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_timestamp_compares_the_same_before_and_after_the_log() {
+        // The format writes milliseconds. If `now()` kept nanoseconds, a value
+        // read back would sort before one taken earlier in the same
+        // millisecond, and every comparison across the log boundary would be
+        // subtly wrong.
+        let taken = Timestamp::now();
+
+        let round_tripped: Timestamp = taken.to_string().parse().expect("parse");
+
+        assert_eq!(round_tripped, taken);
+    }
 
     #[test]
     fn serialises_as_a_bare_string() {

@@ -186,6 +186,7 @@ mod tests {
                 harness: Harness::new(Harness::CLAUDE_CODE),
                 harness_version: None,
                 vendor_session_id: Some("vendor-abc".into()),
+                backfilled_from: None,
             },
             event: prompt("before the restart"),
         };

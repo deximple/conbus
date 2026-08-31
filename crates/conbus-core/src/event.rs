@@ -135,6 +135,15 @@ pub struct Source {
     /// The vendor's own session id, which is an alias of the `bus_id`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vendor_session_id: Option<String>,
+    /// Set when the record was reconstructed from the vendor's own history
+    /// rather than mirrored as it happened.
+    ///
+    /// A backfilled record is a weaker fact than a live one — it is whatever a
+    /// one-shot parser could recover from a format the vendor calls internal —
+    /// and a reader that cannot tell the two apart will draw conclusions the
+    /// log does not support. Names the source, e.g. `claude_transcript`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backfilled_from: Option<String>,
 }
 
 /// How a turn ended.

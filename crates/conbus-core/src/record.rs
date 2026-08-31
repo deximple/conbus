@@ -62,6 +62,13 @@ pub struct Record {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Entry {
     pub bus_id: BusId,
+    /// When the thing happened, if that is known to be different from now.
+    ///
+    /// Live mirroring leaves this `None` and the log stamps the moment it
+    /// wrote. Backfill sets it, because a conversation from April is not a
+    /// conversation from today and a log that says otherwise is worse than one
+    /// that does not have it.
+    pub observed_at: Option<Timestamp>,
     pub source: Source,
     pub vendor_turn_id: Option<VendorTurnId>,
     pub vendor_agent_id: Option<VendorAgentId>,
@@ -78,6 +85,7 @@ mod tests {
             harness: Harness::new(Harness::CLAUDE_CODE),
             harness_version: Some("2.1.0".into()),
             vendor_session_id: Some("f0e1d2c3".into()),
+            backfilled_from: None,
         }
     }
 

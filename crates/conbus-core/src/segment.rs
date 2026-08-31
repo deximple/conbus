@@ -194,7 +194,9 @@ impl SegmentLog {
         let record = Record {
             schema_version: SCHEMA_VERSION,
             seq: self.next_seq,
-            ts: Timestamp::now(),
+            // Backfill knows when the thing actually happened; live mirroring
+            // does not need to, and the write time is the truth for it.
+            ts: entry.observed_at.unwrap_or_else(Timestamp::now),
             bus_id: entry.bus_id,
             vendor_turn_id: entry.vendor_turn_id,
             vendor_agent_id: entry.vendor_agent_id,
@@ -299,12 +301,14 @@ mod tests {
             harness: Harness::new(Harness::CLAUDE_CODE),
             harness_version: None,
             vendor_session_id: None,
+            backfilled_from: None,
         }
     }
 
     fn entry(bus_id: BusId, event: Event) -> Entry {
         Entry {
             bus_id,
+            observed_at: None,
             source: source(),
             vendor_turn_id: None,
             vendor_agent_id: None,
@@ -601,6 +605,38 @@ mod tests {
             scan.records.iter().map(|r| r.seq).collect::<Vec<_>>(),
             vec![0, 1, 2]
         );
+    }
+
+    #[test]
+    fn a_record_that_knows_when_it_happened_keeps_that_time() {
+        // Backfilled history is not today's history. A log that stamps a
+        // conversation from April with today's date is worse than one that
+        // never recovered it, because it looks right.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut log = SegmentLog::open(dir.path(), Retention::default()).expect("open");
+        let happened: crate::clock::Timestamp = "2026-04-02T09:15:00.000Z".parse().expect("ts");
+
+        log.append(Entry {
+            observed_at: Some(happened),
+            ..entry(BusId::mint(), prompt("from april"))
+        })
+        .expect("append");
+
+        let scan = SegmentLog::scan(dir.path()).expect("scan");
+        assert_eq!(scan.records[0].ts, happened);
+    }
+
+    #[test]
+    fn a_record_that_does_not_know_is_stamped_with_the_write_time() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let before = crate::clock::Timestamp::now();
+        let mut log = SegmentLog::open(dir.path(), Retention::default()).expect("open");
+
+        log.append(entry(BusId::mint(), prompt("now")))
+            .expect("append");
+
+        let scan = SegmentLog::scan(dir.path()).expect("scan");
+        assert!(scan.records[0].ts >= before);
     }
 
     #[test]

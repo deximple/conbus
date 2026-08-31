@@ -160,6 +160,7 @@ mod tests {
                 harness: Harness::new(Harness::CLAUDE_CODE),
                 harness_version: None,
                 vendor_session_id: None,
+                backfilled_from: None,
             },
             vendor_turn_id: None,
             vendor_agent_id: None,
