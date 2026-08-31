@@ -47,6 +47,24 @@ fn vendor_version(harness: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
 }
 
+/// The top-level field names of a payload, for a diagnostic about one we could
+/// not read.
+///
+/// Names only, never values. A payload's keys are its schema and say who sent
+/// it — which is the question an unmapped event raises, since Cursor, Copilot
+/// CLI and Devin CLI all read Claude Code's settings file and will invoke this
+/// hook under Claude Code's name. Its values are somebody's conversation, and
+/// the drop log is not a place to put one.
+fn field_names(payload: &str) -> String {
+    let Ok(serde_json::Value::Object(fields)) = serde_json::from_str::<serde_json::Value>(payload)
+    else {
+        return "unreadable".to_string();
+    };
+    let mut names: Vec<&str> = fields.keys().map(String::as_str).collect();
+    names.sort_unstable();
+    names.join(",")
+}
+
 /// Mirror one hook payload. Returns a diagnostic when the record did not land;
 /// the caller reports it and still exits zero.
 pub fn run(harness: &str, stdin: &mut impl Read) -> Result<(), String> {
@@ -76,7 +94,10 @@ pub fn run(harness: &str, stdin: &mut impl Read) -> Result<(), String> {
         // it is being dropped — which is the right thing to do and the wrong
         // thing to do quietly.
         Normalized::Unknown { hook_event_name } => {
-            return Err(format!("no mapping for hook event {hook_event_name:?}"));
+            return Err(format!(
+                "no mapping for hook event {hook_event_name:?} (as {harness}, fields: {})",
+                field_names(&payload)
+            ));
         }
     }
     let paths = Paths::resolve().map_err(|_| "no home directory to resolve".to_string())?;
@@ -124,5 +145,30 @@ fn send(mut stream: UnixStream, request: &Request) -> Result<(), String> {
             Err("retention withheld this record from disk".to_string())
         }
         Err(err) => Err(format!("unreadable reply {reply:?}: {err}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_unmapped_payload_is_described_by_its_schema_and_never_its_content() {
+        // The diagnostic has to be enough to identify the sender — three
+        // products read Claude Code's settings file and will call this hook
+        // under Claude Code's name — and it goes into a durable drop log, so it
+        // must not carry a line of anybody's conversation.
+        let described = field_names(
+            r#"{"hook_event_name":"beforeSubmitPrompt","prompt":"the secret plan","cwd":"/repo"}"#,
+        );
+
+        assert_eq!(described, "cwd,hook_event_name,prompt");
+        assert!(!described.contains("secret"));
+    }
+
+    #[test]
+    fn a_payload_that_is_not_an_object_says_so_rather_than_guessing() {
+        assert_eq!(field_names("[1,2,3]"), "unreadable");
+        assert_eq!(field_names("not json"), "unreadable");
     }
 }
