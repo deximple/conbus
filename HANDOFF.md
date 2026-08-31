@@ -1,10 +1,12 @@
-# Handoff — 2026-08-30
+# Handoff — 2026-08-31
 
-Written for whoever picks this up next. The design phase is finished and the recorder is started. Read this, then read the plan.
+Written for whoever picks this up next. The design phase is finished, the recorder is built, and it is installed and
+recording on this machine. Read this, then read the plan.
 
 ## Where things are
 
-- Repo: `/Applications/conbus`, remote `deximple/conbus`, **private**, branch `main`.
+- Repo: `/Applications/conbus`, remote `deximple/conbus`, **private**. The recorder work is on
+  `claude/conbus-handoff-docs-f9187a`, 13 commits ahead of `main` and unpushed.
 - The plan is the single source of truth: [`.cursor/plans/shared_workspace_context_3f7139b8.plan.md`](.cursor/plans/shared_workspace_context_3f7139b8.plan.md). The filename is a generated ID and no longer matches the content; leave it alone so the Cursor plan UI keeps its association. A reader-facing copy under `docs/` gets generated when the repo goes public.
 - `cargo 1.94.1` and `rustc 1.94.1` are installed on this machine, so edition 2024 is available.
 - A cargo workspace exists: `crates/conbus` (the binary) and `crates/conbus-core` (the lib). Edition 2024.
@@ -154,6 +156,25 @@ Two vendor facts it encodes, both measured against the running binaries and both
 `conbus log` takes `--bus-id`, `--since`, `--tail` and `--grep`. Before this it printed the entire store, which
 stops being usable at the first backfill.
 
+**It is installed, supervised, and recording.**
+
+The binary lives at `~/.local/bin/conbus` — outside the worktree, so tidying a branch does not break the hooks.
+`conbus install --apply` registered ten events with Claude Code and six with Codex, merging into settings files
+that already held fourteen and five of the user's own hook events respectively; every pre-existing key and hook came
+back byte-for-byte and still first. A `launchd` agent (`sh.conbus.daemon`, `RunAtLoad` + `KeepAlive`) supervises
+the daemon; killing it `-9` gets it restarted, which was checked rather than assumed.
+
+**The corpus is 23,286 backfilled records over 3,425 conversations, spanning 2026-04 to 2026-08, plus live traffic
+from the session that installed it.** Bootstrapping the agent requires stopping a manually started daemon first —
+otherwise the agent's daemon hits the "already listening" refusal and `KeepAlive` turns that into a restart loop.
+
+One consequence worth knowing, and it is the design working: backfill adopts a session file's own UUID as the
+`bus_id`, so when the daemon restores bindings it recognises a *live* session whose history was backfilled and
+continues the same conversation. A resumed session's past and present are one `bus_id`, not two.
+
+**Codex is registered and silent.** Its hooks do not run until a human trusts them in Codex itself, and an untrusted
+hook fails without printing anything.
+
 **History is recovered.**
 
 `conbus backfill` reads Claude Code's own transcripts — the one place the plan permits a vendor session
@@ -182,13 +203,25 @@ mirrored one and a reader that cannot tell them apart will over-trust the log.
 
 **Not done, and next.**
 
-5. Backfill from Codex `thread/list` / `thread/read` and OpenCode `export`. Claude needs the fixture-protected parser
-   because its official read paths are JS/Python SDK only.
-6. **The Codex adapter.** Only `claude_code` is wired. The event model and the wire protocol are already
-   harness-agnostic, so this is an adapter plus a hook registration, not a redesign.
-7. **More real traffic.** Four payloads are captured; `Stop` and `PostToolUse` are not among them, and neither is a
-   real quota exhaustion. The quota fixture only arrives by actually hitting the limit, so treat the first dogfooding
-   exhaustion as a recording opportunity rather than an interruption.
+5. **Codex backfill.** The Claude side is done; Codex is not, and it is harder than the plan assumes. Three things
+   were measured on this machine: `thread/read` returns metadata with `turns: []`, so content needs
+   `thread/turns/list` or `thread/items/list` chosen per thread by a `historyMode` field and both gated behind
+   `capabilities: {experimentalApi: true}`; `thread/list` sees 360 of the 1,335 rollouts actually on disk, i.e. 27%;
+   and the official path has **the same version-skew failure the plan attributes only to file parsing** — 0.147.0
+   returned `-32603 unknown variant` reading a thread a 0.150.0-alpha wrote. The plan's reasoning for treating the
+   official path as safe and file parsing as risky does not survive that. OpenCode `export` is untouched.
+6. **The unmirrored events**, in the order they are worth having: `PermissionRequest` (where an ordinary refusal is
+   visible), `Notification` (the only hook-channel signal that a quota limit *lifted*), `SubagentStop`,
+   `MessageDisplay`. Each is argued under "Still open".
+7. **A real quota exhaustion.** The one fixture that cannot be manufactured. Now that the recorder is running, the
+   first exhaustion records itself — treat it as an opportunity rather than an interruption.
+
+**Where the milestone stands against its own success criteria.** "Every turn from both harnesses lands in the log":
+half. Claude Code is confirmed on live traffic, including the `PostToolUse` this file spent three revisions calling
+the most valuable missing capture. Codex is registered and correct as far as the schema goes, but its hooks do not
+fire until a human trusts them, so nothing has been seen on the wire. "The log survives a daemon restart":
+yes, and now proven at 78 MB rather than argued. "Installed history is queryable": yes — 3,425 conversations back to
+April, with `--bus-id`, `--since`, `--tail` and `--grep`.
 
 **Every tool request now has an answer in the log, and batches are marked.**
 
@@ -317,14 +350,6 @@ Take the lesson generally: **the adapter is only as good as the traffic it has b
   `error` has eleven values, collapsing account and request faults into `interrupted_quota` would make the failover
   counter lie, so there is now `interrupted_policy`. Both interrupted variants keep the vendor string verbatim.
   Nothing currently produces `interrupted_user` — Claude Code does not appear to distinguish it.
-- **Still dropped from payloads we already parse**: `SessionStart.session_title` and `.model`, `permission_mode`,
-  and `effort.level`. Each is a field on a `Payload` we already deserialise.
-  (`tool_use_id` and `duration_ms` are recorded now, both verified at the emit site and not only in the schema —
-  the object literal carries them, unlike `UserPromptSubmit.source`, whose spread is compiled out. But do not
-  oversell `tool_use_id`: nothing joins on it yet, because the log holds one record per *successful* call and that
-  record already carries its own input and output. It becomes a join key when `PreToolUse` and
-  `PostToolUseFailure` are mirrored.)
-
 - **`PermissionRequest` is not mirrored**, and it is where an ordinary user refusal is visible — `PermissionDenied`
   covers only auto-mode classifier denials. It fires before the decision and carries no `tool_use_id` (the emitter
   passes the id to the hook runner but not into the payload), so it joins by tool name plus adjacency rather than by
@@ -340,15 +365,23 @@ Take the lesson generally: **the adapter is only as good as the traffic it has b
 - **`MessageDisplay` is not mirrored**, and it is the only official channel carrying every assistant message rather
   than the last one. High volume, and it collides with the "conversation only" shipping default, so it is a retention
   decision before it is an adapter change.
-- **Only `claude_code` is wired.** The event model and wire protocol are already harness-agnostic.
-- **`agent_id` is recorded but unverified against traffic.** No capture has exercised a subagent yet. The schema says
-  a subagent's hooks arrive under the parent's `session_id` with `agent_id` set; if that is wrong in the other
-  direction — subagents getting their own `session_id` — the recorder has a bogus-session problem instead, which is
-  worse. Same for `tool_use_id`, `duration_ms`, `tool_input`, `tool_response` and `error_details`: read off the
-  schema and the emit sites, but **no capture has ever contained a `PostToolUse`** — neither probe session got past
-  authentication. That is the single most valuable capture still missing.
-- **`Registry::restore` reads the whole log at daemon start.** Correct, and cheap while the log is small. Once
-  backfill lands it is a full scan on every start, and that is what the derived SQLite index is for.
+- ~~No capture has ever contained a `PostToolUse`; that is the most valuable one still missing.~~ **Installing it
+  fixed that.** Live traffic has now confirmed `PreToolUse`, `PostToolUse` and `PostToolBatch`, and with them
+  `tool_use_id`, `duration_ms`, `tool_calls` and `prompt_id` — all four had been read off the schema and the
+  emit sites and never seen on the wire.
+- **Still unverified against traffic**: `agent_id` (no subagent has run under the recorder yet),
+  `PostToolUseFailure`, `PermissionDenied`, and `StopFailure`. The `agent_id` one carries the most risk: the
+  schema says a subagent's hooks arrive under the *parent's* `session_id`, and if that is wrong in the other
+  direction — subagents getting their own — the recorder has a bogus-session problem instead, which is worse than
+  interleaving. `StopFailure` only arrives by actually exhausting a limit, so the first exhaustion is a recording
+  opportunity rather than an interruption.
+- ~~`Registry::restore` reads the whole log at daemon start, and that will hurt once backfill lands.~~ **Measured
+  after backfill and it does not.** 23,286 records across 78 MB and ten segments: a kill-and-restart is served
+  again in under 10 ms, which is below what the probe could resolve. Note the correct way to measure it —
+  `connect()` succeeding proves nothing, because `serve` binds the socket *before* it scans, so the kernel
+  accepts into the backlog while the daemon is still reading. Time a full request/response round trip instead.
+  That ordering is also why the restore window loses nothing: a hook that arrives mid-scan waits rather than
+  failing. The derived SQLite index stays deferred until a measurement says otherwise.
 - **An older `v` is still read as if it were current.** `scan` rejects a record from a *newer* build; it has no
   opinion about an older one. That is consistent with the bump rule written at `SCHEMA_VERSION` — a bump means an
   older reader would be wrong, not a newer one — but it is an assumption, not an enforcement.
