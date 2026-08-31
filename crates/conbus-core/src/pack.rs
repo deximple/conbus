@@ -221,7 +221,7 @@ mod tests {
         // An SDK harness opens with its own scaffolding. Quoting that as "what
         // this conversation was about" is worse than saying nothing.
         let bus_id = BusId::mint();
-        let records = vec![
+        let records = [
             logged(
                 bus_id,
                 ago(600),
@@ -249,7 +249,7 @@ mod tests {
         ];
         let borrowed: Vec<&Record> = records.iter().collect();
 
-        let chapter = Chapter::read(bus_id, &borrowed).expect("a chapter");
+        let chapter = Chapter::read(&borrowed).expect("a chapter");
 
         assert_eq!(
             chapter.goal.as_deref(),
@@ -263,7 +263,7 @@ mod tests {
         // prompt can be elided too. Inventing a paraphrase for one is exactly
         // the compression loss the plan calls the quietest failure.
         let bus_id = BusId::mint();
-        let records = vec![
+        let records = [
             logged(
                 bus_id,
                 ago(600),
@@ -283,7 +283,7 @@ mod tests {
         ];
         let borrowed: Vec<&Record> = records.iter().collect();
 
-        let chapter = Chapter::read(bus_id, &borrowed).expect("a chapter");
+        let chapter = Chapter::read(&borrowed).expect("a chapter");
 
         assert_eq!(chapter.goal, None);
         let pack = brief(&[chapter], now(), PACK_BUDGET_UNITS);
@@ -295,7 +295,7 @@ mod tests {
         // "What it was doing when it stopped" is the useful fact. The whole
         // conversation's tool history is a different and much longer thing.
         let bus_id = BusId::mint();
-        let records = vec![
+        let records = [
             logged(
                 bus_id,
                 ago(600),
@@ -345,7 +345,7 @@ mod tests {
         ];
         let borrowed: Vec<&Record> = records.iter().collect();
 
-        let chapter = Chapter::read(bus_id, &borrowed).expect("a chapter");
+        let chapter = Chapter::read(&borrowed).expect("a chapter");
 
         assert_eq!(chapter.last_tools, vec!["Edit".to_string()]);
         assert_eq!(chapter.stopped, Stopped::InFlight);
@@ -377,7 +377,7 @@ mod tests {
 
 use crate::clock::Timestamp;
 use crate::continuation::{Stopped, stopped};
-use crate::event::{Author, Body, Event, Harness, TurnState};
+use crate::event::{Author, Body, Event, Harness};
 use crate::ids::BusId;
 use crate::record::Record;
 
@@ -410,12 +410,16 @@ pub struct Chapter {
 
 impl Chapter {
     /// Read one conversation's records, in log order.
-    pub fn read(bus_id: BusId, records: &[&Record]) -> Option<Chapter> {
-        let candidate = crate::continuation::Candidate::index(
-            &records.iter().map(|r| (*r).clone()).collect::<Vec<_>>(),
-        )
-        .into_iter()
-        .next()?;
+    ///
+    /// The conversation's own state comes from the same fold the briefing
+    /// decision uses, so there is one definition of what a record does to a
+    /// conversation and the two cannot drift apart.
+    pub fn read(records: &[&Record]) -> Option<Chapter> {
+        let mut folded = std::collections::HashMap::new();
+        for record in records {
+            crate::continuation::Candidate::apply(&mut folded, record);
+        }
+        let candidate = folded.into_values().next()?;
 
         let mut goal = None;
         let mut last_said = None;
