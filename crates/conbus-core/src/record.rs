@@ -25,7 +25,7 @@ use crate::ids::BusId;
 /// `no_event_body_shadows_an_envelope_key` below. A vendor field whose name
 /// matches one of ours is renamed at the adapter, the way `SessionStart.source`
 /// becomes `trigger`.
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// One line of the append-only log.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -86,6 +86,7 @@ mod tests {
             harness_version: Some("2.1.0".into()),
             vendor_session_id: Some("f0e1d2c3".into()),
             workspace: Some("/Applications/conbus".into()),
+            entrypoint: Some(crate::event::Entrypoint::new(crate::event::Entrypoint::CLI)),
             backfilled_from: None,
         }
     }
@@ -281,6 +282,7 @@ mod tests {
             "harness",
             "vendor_session_id",
             "workspace",
+            "entrypoint",
             "backfilled_from",
             "event",
             "prompt",
@@ -441,7 +443,7 @@ mod tests {
         assert!(!line.contains('\n'), "a record must be one line");
         assert_eq!(
             line,
-            r#"{"v":2,"ts":"2026-08-30T07:41:02.481Z","seq":7,"bus_id":"01996b1e-2c4a-7c31-9d0e-4f2a6b8c1d3e","harness":"claude_code","harness_version":"2.1.0","vendor_session_id":"f0e1d2c3","workspace":"/Applications/conbus","event":"turn_started","prompt":{"kind":"kept","text":"ship the recorder"}}"#
+            r#"{"v":3,"ts":"2026-08-30T07:41:02.481Z","seq":7,"bus_id":"01996b1e-2c4a-7c31-9d0e-4f2a6b8c1d3e","harness":"claude_code","harness_version":"2.1.0","vendor_session_id":"f0e1d2c3","workspace":"/Applications/conbus","entrypoint":"cli","event":"turn_started","prompt":{"kind":"kept","text":"ship the recorder"}}"#
         );
         assert_eq!(
             serde_json::from_str::<Record>(&line).expect("round trip"),

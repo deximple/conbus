@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 use serde::Deserialize;
 
 use crate::clock::Timestamp;
-use crate::event::{Author, Body, Event, Harness, Source, TurnState, VendorTurnId};
+use crate::event::{Author, Body, Entrypoint, Event, Harness, Source, TurnState, VendorTurnId};
 use crate::ids::BusId;
 use crate::record::Entry;
 
@@ -32,6 +32,10 @@ pub struct Recovered {
     pub vendor_session_id: Option<String>,
     /// The checkout the conversation happened in, from the lines themselves.
     pub workspace: Option<String>,
+    /// The front end it ran under, from the lines themselves. The live hook
+    /// path reads this from the environment; the transcript writes it on every
+    /// line, so history gets it too.
+    pub entrypoint: Option<Entrypoint>,
     pub entries: Vec<Entry>,
     /// Lines the parser did not read, counted by why. A histogram rather than a
     /// list: a transcript is mostly tool traffic and attachments, and a
@@ -64,6 +68,8 @@ struct Line {
     is_sidechain: Option<bool>,
     #[serde(default)]
     cwd: Option<String>,
+    #[serde(default)]
+    entrypoint: Option<String>,
     #[serde(default)]
     message: Option<Message>,
 }
@@ -137,6 +143,9 @@ pub fn parse_claude_transcript(text: &str, bus_id: BusId) -> Recovered {
         if line.cwd.is_some() {
             out.workspace.clone_from(&line.cwd);
         }
+        if let Some(entrypoint) = &line.entrypoint {
+            out.entrypoint = Some(Entrypoint::new(entrypoint.clone()));
+        }
         let at = line
             .timestamp
             .as_deref()
@@ -148,6 +157,7 @@ pub fn parse_claude_transcript(text: &str, bus_id: BusId) -> Recovered {
             harness_version: line.version.clone(),
             vendor_session_id: out.vendor_session_id.clone(),
             workspace: out.workspace.clone(),
+            entrypoint: out.entrypoint.clone(),
             backfilled_from: Some(CLAUDE_TRANSCRIPT.to_string()),
         };
         if harness_version.is_none() {
@@ -230,6 +240,7 @@ fn prepend_session_candidate(out: &mut Recovered, bus_id: BusId, harness_version
                 harness_version,
                 vendor_session_id: out.vendor_session_id.clone(),
                 workspace: out.workspace.clone(),
+                entrypoint: out.entrypoint.clone(),
                 backfilled_from: Some(CLAUDE_TRANSCRIPT.to_string()),
             },
             vendor_turn_id: None,

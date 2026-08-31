@@ -190,6 +190,50 @@ mod author_tests {
     }
 }
 
+/// Which front end a session is running under.
+///
+/// Open, like the other vendor vocabularies here. The values seen on a real
+/// machine, counted over its transcripts: `claude-desktop` 634,363, `sdk-cli`
+/// 75,906, `cli` 6,446. The binary also carries `vscode`, `jetbrains`,
+/// `sdk-ts`, `sdk-py`, `mcp`, `github-action` and `remote`.
+///
+/// It answers a question nothing else on this surface can: whether a person is
+/// sitting there. `Author` cannot — the vendor leaves 85% of prompts
+/// unlabelled — and the hook payload carries no origin at all, but
+/// `CLAUDE_CODE_ENTRYPOINT` is in every hook child's environment and the
+/// transcript writes it on every line.
+#[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Entrypoint(String);
+
+impl Entrypoint {
+    pub const CLI: &'static str = "cli";
+    pub const CLAUDE_DESKTOP: &'static str = "claude-desktop";
+    pub const SDK_CLI: &'static str = "sdk-cli";
+
+    pub fn new(entrypoint: impl Into<String>) -> Self {
+        Entrypoint(entrypoint.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// True when nobody is watching this session.
+    ///
+    /// Named for the reliable direction. An SDK driver, an MCP server and a CI
+    /// runner are programs, and a value this does not recognise is not
+    /// evidence of a person — it is an unknown, and the caller has to say what
+    /// it does with one.
+    ///
+    /// `remote` is deliberately not here. A session driven from another device
+    /// still has somebody at the other end of it, and calling that unattended
+    /// would silence the one case where being re-oriented matters most.
+    pub fn is_unattended(&self) -> bool {
+        self.0.starts_with("sdk-") || matches!(self.0.as_str(), "mcp" | "github-action")
+    }
+}
+
 /// Where a record came from: the vendor stamp every record carries.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct Source {
@@ -211,6 +255,12 @@ pub struct Source {
     /// real log was 7 out of 3,433.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<String>,
+    /// The front end this session runs under, when the harness says. On the
+    /// session stamp because it is a property of the session and because it is
+    /// the only durable answer to "was a person there" — the question every
+    /// relevance decision and the whole survival meter rest on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entrypoint: Option<Entrypoint>,
     /// Set when the record was reconstructed from the vendor's own history
     /// rather than mirrored as it happened.
     ///

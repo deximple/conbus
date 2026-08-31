@@ -161,6 +161,7 @@ mod tests {
                 harness_version: None,
                 vendor_session_id: None,
                 workspace: None,
+                entrypoint: None,
                 backfilled_from: None,
             },
             vendor_turn_id: None,

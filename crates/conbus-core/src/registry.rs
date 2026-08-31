@@ -235,6 +235,7 @@ mod tests {
                 harness_version: None,
                 vendor_session_id: Some("vendor-abc".into()),
                 workspace: None,
+                entrypoint: None,
                 backfilled_from: None,
             },
             event: prompt("before the restart"),

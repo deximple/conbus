@@ -1,6 +1,6 @@
 //! The newline-delimited JSON protocol between `conbus hook` and the daemon.
 
-use conbus_core::event::{Event, Harness, VendorAgentId, VendorTurnId};
+use conbus_core::event::{Entrypoint, Event, Harness, VendorAgentId, VendorTurnId};
 use conbus_core::ids::BusId;
 use serde::{Deserialize, Serialize};
 
@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 /// this field existed ignores it, so the first deploy still needs the daemon
 /// restarted by hand. `the_wire_shape_is_pinned_to_the_protocol_version` below
 /// is what stops the constant falling behind the struct.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// One observed vendor event, on its way to the log.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -43,6 +43,11 @@ pub struct Request {
     /// conversation it is continuing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<String>,
+    /// The front end the session runs under, from the hook child's own
+    /// environment rather than from the payload, which carries no origin at
+    /// all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entrypoint: Option<Entrypoint>,
     pub event: Event,
 }
 
@@ -87,6 +92,7 @@ mod tests {
             vendor_turn_id: Some(conbus_core::event::VendorTurnId::new("T")),
             vendor_agent_id: Some(conbus_core::event::VendorAgentId::new("A")),
             workspace: Some("/repo".into()),
+            entrypoint: Some(Entrypoint::new(Entrypoint::CLI)),
             event: Event::TurnStarted {
                 author: None,
                 prompt: Body::kept("p"),
@@ -105,6 +111,7 @@ mod tests {
         assert_eq!(
             keys,
             vec![
+                "entrypoint",
                 "event",
                 "harness",
                 "harness_version",
@@ -116,6 +123,6 @@ mod tests {
             ],
             "the wire shape changed; bump PROTOCOL_VERSION (now {PROTOCOL_VERSION})"
         );
-        assert_eq!(PROTOCOL_VERSION, 2);
+        assert_eq!(PROTOCOL_VERSION, 3);
     }
 }

@@ -59,10 +59,8 @@ mod tests {
 
     #[test]
     fn the_pack_budget_leaves_the_degradation_path_out_of_reach() {
-        assert!(
-            PACK_BUDGET_UNITS * 2 < VENDOR_CAP_UNITS,
-            "a budget close to the cap makes the silent failure one added \
-             section away"
-        );
+        // A budget close to the cap makes the silent failure one added section
+        // away.
+        const { assert!(PACK_BUDGET_UNITS * 2 < VENDOR_CAP_UNITS) };
     }
 }

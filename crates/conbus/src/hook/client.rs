@@ -9,7 +9,7 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 
-use conbus_core::event::Harness;
+use conbus_core::event::{Entrypoint, Harness};
 use conbus_core::paths::Paths;
 
 use crate::hook::{self, Normalized};
@@ -65,6 +65,23 @@ fn field_names(payload: &str) -> String {
     names.join(",")
 }
 
+/// The front end this session runs under, when the harness tells its children.
+///
+/// Read from the environment because the payload has no field for it: Claude
+/// Code sets `CLAUDE_CODE_ENTRYPOINT` in every hook child, and it is the only
+/// durable answer to whether a person is sitting there. Codex sets no
+/// equivalent, so its sessions are an honest unknown.
+fn entrypoint(harness: &str) -> Option<Entrypoint> {
+    let name = match harness {
+        Harness::CLAUDE_CODE => "CLAUDE_CODE_ENTRYPOINT",
+        _ => return None,
+    };
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(Entrypoint::new)
+}
+
 /// Mirror one hook payload. Returns a diagnostic when the record did not land;
 /// the caller reports it and still exits zero.
 pub fn run(harness: &str, stdin: &mut impl Read) -> Result<(), String> {
@@ -113,6 +130,7 @@ pub fn run(harness: &str, stdin: &mut impl Read) -> Result<(), String> {
         vendor_turn_id: observed.vendor_turn_id,
         vendor_agent_id: observed.vendor_agent_id,
         workspace: observed.workspace,
+        entrypoint: entrypoint(harness),
         event: observed.event,
     };
     send(stream, &request)

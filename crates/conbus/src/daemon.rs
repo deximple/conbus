@@ -77,6 +77,11 @@ impl Daemon {
                     harness: request.harness,
                     harness_version: request.harness_version,
                     vendor_session_id: Some(key.vendor_session_id.clone()),
+                    // One per request, not per observation: the front end a
+                    // session runs under does not change while it runs, and
+                    // the hook reads it from its own environment rather than
+                    // from the payload.
+                    entrypoint: request.entrypoint.clone(),
                     // Filled per observation below: a flushed session start
                     // carried its own, and a checkout can change between the
                     // start and the prompt that proves the session real.
@@ -249,6 +254,7 @@ mod tests {
             vendor_turn_id: None,
             vendor_agent_id: None,
             workspace: Some("/repo".into()),
+            entrypoint: None,
             event,
         }
     }

@@ -35,7 +35,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::clock::Timestamp;
-use crate::event::{Event, Harness, TurnState};
+use crate::event::{Author, Entrypoint, Event, Harness, TurnState};
 use crate::ids::BusId;
 use crate::record::Record;
 
@@ -49,6 +49,17 @@ pub struct Asking {
     /// never briefed: the per-prompt overhead is paid once at injection and
     /// then carried in history for every turn after it.
     pub first_prompt: bool,
+    /// The harness said this session is a program, not a person — an SDK
+    /// driver, an MCP server, a CI runner.
+    ///
+    /// Named for the direction that is knowable. The vendor labels machine
+    /// origins and almost never labels human ones, so this is set only when it
+    /// said so, and an unlabelled session is briefed. On the real log this one
+    /// condition is the difference between speaking to 3,259 sessions and
+    /// speaking to 15: all but 78 of 3,443 conversations there are explicitly
+    /// somebody's script, and briefing a script is tokens spent on a reader
+    /// that does not exist.
+    pub unattended: bool,
 }
 
 /// A conversation that has happened in some checkout.
@@ -103,6 +114,9 @@ pub enum Silent {
     /// This checkout has nothing recent enough, or long enough, to be worth
     /// the tokens.
     NothingToSay,
+    /// Nobody is reading. A briefing is for orientation, and a program does not
+    /// need orienting.
+    Unattended,
 }
 
 /// What to tell a session opening here.
@@ -117,16 +131,12 @@ pub enum Decision {
 
 /// How long ago a conversation can have stopped and still be worth mentioning.
 ///
-/// A month. A checkout touched within one is a checkout a person half
-/// remembers, which is exactly when being reminded helps and exactly when
-/// re-explaining is most annoying. Older than that and the briefing is
-/// archaeology: it still would not be *wrong* — every line carries its own age
-/// — but it stops paying for its tokens.
-///
-/// On the real log this speaks for 48 of 91 checkouts that have anything at
-/// all. Seven days would speak for 8. The number is meant to be moved on
-/// evidence, and `conbus doctor` prints the evidence.
-pub const BRIEF_WINDOW_SECS: i64 = 30 * 24 * 60 * 60;
+/// A week, chosen off the measurement rather than from taste. On the real log,
+/// counting only the sessions a person was actually at, a week briefs 13 of 78
+/// and a month briefs 15 — four times the window for two more briefings. The
+/// knee is inside the first week, and a week is also the span a person can
+/// reason about: "what I was doing here recently" rather than archaeology.
+pub const BRIEF_WINDOW_SECS: i64 = 7 * 24 * 60 * 60;
 
 /// The most conversations one briefing names.
 ///
@@ -300,6 +310,7 @@ pub fn replay(records: &[Record], home: Option<&str>) -> Replay {
                 harness: record.source.harness.clone(),
                 workspace,
                 first_prompt: true,
+                unattended: unattended(record),
             };
             let name = match decide(&asking, &candidates, home, record.ts) {
                 Decision::Brief { recent } => {
@@ -311,6 +322,7 @@ pub fn replay(records: &[Record], home: Option<&str>) -> Replay {
                     Silent::WorkspaceTooBroad => "silent/workspace_too_broad",
                     Silent::NotFirstPrompt => "silent/not_first_prompt",
                     Silent::NothingToSay => "silent/nothing_to_say",
+                    Silent::Unattended => "silent/unattended",
                 },
             };
             *out.verdicts.entry(name).or_default() += 1;
@@ -318,6 +330,27 @@ pub fn replay(records: &[Record], home: Option<&str>) -> Replay {
         Candidate::apply(&mut live, record);
     }
     out
+}
+
+/// Whether the record's own session was a program, as the log recorded it.
+///
+/// Two independent sources, because they arrive by different routes and cover
+/// different eras. The entrypoint is what the live hook reads from its own
+/// environment and what backfill recovers from a transcript, and it is exact.
+/// The author is the vendor's `promptSource`, which labels `sdk` and `system`
+/// explicitly — a weaker signal, but it is on records written before the
+/// entrypoint was recorded at all.
+fn unattended(record: &Record) -> bool {
+    let by_entrypoint = record
+        .source
+        .entrypoint
+        .as_ref()
+        .is_some_and(Entrypoint::is_unattended);
+    let by_author = match &record.event {
+        Event::TurnStarted { author, .. } => author.as_ref().is_some_and(Author::is_machine),
+        _ => false,
+    };
+    by_entrypoint || by_author
 }
 
 /// How a conversation stopped, as the briefing would put it.
@@ -341,6 +374,9 @@ pub fn decide(
 ) -> Decision {
     if !asking.first_prompt {
         return Decision::Silent(Silent::NotFirstPrompt);
+    }
+    if asking.unattended {
+        return Decision::Silent(Silent::Unattended);
     }
     let Some(workspace) = asking.workspace.as_deref() else {
         return Decision::Silent(Silent::NoWorkspace);
@@ -432,6 +468,7 @@ mod tests {
             harness: Harness::new(Harness::CODEX),
             workspace: Some(WORKSPACE.into()),
             first_prompt: true,
+            unattended: false,
         }
     }
 
@@ -462,7 +499,10 @@ mod tests {
     fn a_checkout_with_recent_work_gets_told_about_it() {
         let subject = candidate();
 
-        assert_eq!(named(&brief(&[subject.clone()])), vec![subject.bus_id]);
+        assert_eq!(
+            named(&brief(std::slice::from_ref(&subject))),
+            vec![subject.bus_id]
+        );
     }
 
     #[test]
@@ -475,7 +515,10 @@ mod tests {
             ..candidate()
         };
 
-        assert_eq!(named(&brief(&[same.clone()])), vec![same.bus_id]);
+        assert_eq!(
+            named(&brief(std::slice::from_ref(&same))),
+            vec![same.bus_id]
+        );
     }
 
     #[test]
@@ -488,7 +531,10 @@ mod tests {
             ..candidate()
         };
 
-        assert_eq!(named(&brief(&[recovered.clone()])), vec![recovered.bus_id]);
+        assert_eq!(
+            named(&brief(std::slice::from_ref(&recovered))),
+            vec![recovered.bus_id]
+        );
     }
 
     #[test]
@@ -624,6 +670,44 @@ mod tests {
     }
 
     #[test]
+    fn nobody_is_briefed_when_nobody_is_reading() {
+        // The single condition that separates a feature from chrome. On the
+        // real log all but 78 of 3,443 conversations are explicitly somebody's
+        // script; briefing those is 3,244 injections nobody reads.
+        assert_eq!(
+            decide(
+                &Asking {
+                    unattended: true,
+                    ..asking()
+                },
+                &[candidate()],
+                None,
+                now()
+            ),
+            Decision::Silent(Silent::Unattended)
+        );
+    }
+
+    #[test]
+    fn an_unlabelled_session_is_briefed_rather_than_assumed_to_be_a_script() {
+        // The vendor labels machine origins and almost never labels human
+        // ones, so treating "unlabelled" as unattended would silence nearly
+        // every real person.
+        assert!(matches!(
+            decide(
+                &Asking {
+                    unattended: false,
+                    ..asking()
+                },
+                &[candidate()],
+                None,
+                now()
+            ),
+            Decision::Brief { .. }
+        ));
+    }
+
+    #[test]
     fn a_later_turn_is_never_briefed() {
         assert_eq!(
             decide(
@@ -717,6 +801,45 @@ mod tests {
         assert_eq!(stopped(&with(None)), Stopped::InFlight);
     }
 
+    #[test]
+    fn a_script_is_recognised_from_either_source() {
+        // Two routes to the same fact. The entrypoint is exact and is what the
+        // live hook reads; the author is weaker and is what old records carry.
+        let attended = logged(BusId::mint(), ago(60), prompt());
+        assert!(!unattended(&attended));
+
+        let by_entrypoint = Record {
+            source: Source {
+                entrypoint: Some(Entrypoint::new(Entrypoint::SDK_CLI)),
+                ..attended.source.clone()
+            },
+            ..attended.clone()
+        };
+        assert!(unattended(&by_entrypoint));
+
+        let by_author = Record {
+            event: Event::TurnStarted {
+                author: Some(Author::new(Author::SDK)),
+                prompt: Body::kept("p"),
+            },
+            ..attended.clone()
+        };
+        assert!(unattended(&by_author));
+
+        let person = Record {
+            source: Source {
+                entrypoint: Some(Entrypoint::new(Entrypoint::CLAUDE_DESKTOP)),
+                ..attended.source.clone()
+            },
+            event: Event::TurnStarted {
+                author: Some(Author::new(Author::TYPED)),
+                prompt: Body::kept("p"),
+            },
+            ..attended
+        };
+        assert!(!unattended(&person));
+    }
+
     fn logged(bus_id: BusId, at: Timestamp, event: Event) -> Record {
         Record {
             schema_version: crate::record::SCHEMA_VERSION,
@@ -730,6 +853,7 @@ mod tests {
                 harness_version: None,
                 vendor_session_id: Some("s".into()),
                 workspace: Some(WORKSPACE.into()),
+                entrypoint: None,
                 backfilled_from: None,
             },
             event,
