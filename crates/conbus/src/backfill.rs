@@ -5,12 +5,13 @@
 //! clock only starts when the recorder is running. Backfill is how the months
 //! already on disk join it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
 use conbus_core::backfill::{CLAUDE_TRANSCRIPT, parse_claude_transcript};
+use conbus_core::event::Event;
 use conbus_core::ids::BusId;
 use conbus_core::paths::Paths;
 use conbus_core::retention::Retention;
@@ -39,6 +40,7 @@ pub fn run(paths: &Paths, apply: bool) -> io::Result<()> {
 
     let mut sessions = 0u64;
     let mut skipped_sessions = 0u64;
+    let mut completed_sessions = 0u64;
     let mut turns = 0u64;
     let mut records = 0u64;
     let mut unread: BTreeMap<String, u64> = BTreeMap::new();
@@ -57,7 +59,8 @@ pub fn run(paths: &Paths, apply: bool) -> io::Result<()> {
                 .or_default() += 1;
             continue;
         };
-        if already.contains(&bus_id) {
+        // Already complete: it is in the log and it knows where it happened.
+        if already.get(&bus_id) == Some(&true) {
             skipped_sessions += 1;
             continue;
         }
@@ -66,14 +69,33 @@ pub fn run(paths: &Paths, apply: bool) -> io::Result<()> {
             continue;
         };
 
-        let recovered = parse_claude_transcript(&text, bus_id);
+        let mut recovered = parse_claude_transcript(&text, bus_id);
         for (reason, count) in &recovered.skipped {
             *unread.entry(reason.clone()).or_default() += count;
         }
         if recovered.entries.is_empty() {
             continue;
         }
-        sessions += 1;
+        // Already in the log, but recovered by a build that did not record the
+        // workspace. Append the session record alone: the turns are already
+        // there, and appending them again would put the conversation in the log
+        // twice, which an append-only log cannot take back.
+        let completing = already.contains_key(&bus_id);
+        if completing {
+            recovered
+                .entries
+                .retain(|entry| matches!(entry.event, Event::SessionCandidate { .. }));
+            if recovered.entries.is_empty() || recovered.workspace.is_none() {
+                skipped_sessions += 1;
+                continue;
+            }
+            // Counted apart from `sessions`: nothing was recovered here, an
+            // existing conversation only learned where it happened, and
+            // reporting the two as one would overstate what a re-run found.
+            completed_sessions += 1;
+        } else {
+            sessions += 1;
+        }
         turns += recovered
             .entries
             .iter()
@@ -98,6 +120,12 @@ pub fn run(paths: &Paths, apply: bool) -> io::Result<()> {
             String::new()
         }
     );
+    if completed_sessions > 0 {
+        println!(
+            "completed {completed_sessions} conversation(s) that were recovered before the \
+             workspace was recorded"
+        );
+    }
     println!("not read  {}", summarise_unread(&unread));
     if apply {
         println!("written to {}", paths.log_dir().display());
@@ -107,14 +135,25 @@ pub fn run(paths: &Paths, apply: bool) -> io::Result<()> {
     Ok(())
 }
 
-/// Conversations already recovered, so a second run does not double them.
-fn already_backfilled(paths: &Paths) -> io::Result<std::collections::HashSet<BusId>> {
-    Ok(SegmentLog::scan(paths.log_dir())?
-        .records
-        .iter()
-        .filter(|record| record.source.backfilled_from.as_deref() == Some(CLAUDE_TRANSCRIPT))
-        .map(|record| record.bus_id)
-        .collect())
+/// Conversations already recovered, and whether each one knows its workspace.
+///
+/// Two answers rather than one because a second run has two jobs. It must not
+/// double a conversation it already has — that is what the set was for — and it
+/// must be able to finish a conversation recovered by a build that did not
+/// record the workspace, which is every conversation on disk before this one.
+fn already_backfilled(paths: &Paths) -> io::Result<HashMap<BusId, bool>> {
+    let mut known: HashMap<BusId, bool> = HashMap::new();
+    for record in SegmentLog::scan(paths.log_dir())?.records {
+        if record.source.backfilled_from.as_deref() != Some(CLAUDE_TRANSCRIPT) {
+            continue;
+        }
+        let has_workspace = record.source.workspace.is_some();
+        known
+            .entry(record.bus_id)
+            .and_modify(|seen| *seen |= has_workspace)
+            .or_insert(has_workspace);
+    }
+    Ok(known)
 }
 
 /// Top-level session files only.

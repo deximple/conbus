@@ -114,6 +114,7 @@ fn text_of(content: &serde_json::Value) -> Option<String> {
 pub fn parse_claude_transcript(text: &str, bus_id: BusId) -> Recovered {
     let mut out = Recovered::default();
     let mut open: Option<OpenTurn> = None;
+    let mut harness_version: Option<String> = None;
 
     for raw in text.lines() {
         if raw.trim().is_empty() {
@@ -149,6 +150,9 @@ pub fn parse_claude_transcript(text: &str, bus_id: BusId) -> Recovered {
             workspace: out.workspace.clone(),
             backfilled_from: Some(CLAUDE_TRANSCRIPT.to_string()),
         };
+        if harness_version.is_none() {
+            harness_version.clone_from(&line.version);
+        }
         let kind = line.r#type.as_deref().unwrap_or("(none)");
 
         match kind {
@@ -195,7 +199,44 @@ pub fn parse_claude_transcript(text: &str, bus_id: BusId) -> Recovered {
         }
     }
     close(&mut out, bus_id, open.take());
+    prepend_session_candidate(&mut out, bus_id, harness_version);
     out
+}
+
+/// Put a session record at the head of a recovered conversation.
+///
+/// Backfill used to emit turns and nothing else, so a recovered conversation
+/// had no record of the session it happened in and therefore no workspace. That
+/// is not a cosmetic gap: the workspace is the key a continuation is looked up
+/// by, and it left 3,425 of 3,433 conversations invisible to that lookup.
+///
+/// It carries no `trigger`, because the transcript does not say how the session
+/// began and inventing `startup` would be a guess in a record whose whole
+/// purpose is to be a weaker, clearly-labelled fact. It is stamped with the
+/// first line's time, not with now, so a reader sorting by `ts` still sees the
+/// session open before its first turn.
+fn prepend_session_candidate(out: &mut Recovered, bus_id: BusId, harness_version: Option<String>) {
+    if out.entries.is_empty() {
+        return;
+    }
+    let observed_at = out.entries[0].observed_at;
+    out.entries.insert(
+        0,
+        Entry {
+            bus_id,
+            observed_at,
+            source: Source {
+                harness: Harness::new(Harness::CLAUDE_CODE),
+                harness_version,
+                vendor_session_id: out.vendor_session_id.clone(),
+                workspace: out.workspace.clone(),
+                backfilled_from: Some(CLAUDE_TRANSCRIPT.to_string()),
+            },
+            vendor_turn_id: None,
+            vendor_agent_id: None,
+            event: Event::SessionCandidate { trigger: None },
+        },
+    );
 }
 
 /// End a turn with the last reply it received. A prompt that was never answered
@@ -242,6 +283,16 @@ mod tests {
         parse_claude_transcript(TRANSCRIPT, BusId::mint())
     }
 
+    /// The turn records, without the session record that now heads a recovered
+    /// conversation. The tests below are about turns and should not move every
+    /// time something else joins the head of the list.
+    fn turns(out: &Recovered) -> Vec<&Entry> {
+        out.entries
+            .iter()
+            .filter(|entry| !matches!(entry.event, Event::SessionCandidate { .. }))
+            .collect()
+    }
+
     #[test]
     fn a_transcript_yields_its_turns_and_nothing_else() {
         let out = parsed();
@@ -250,12 +301,16 @@ mod tests {
             .entries
             .iter()
             .map(|e| match &e.event {
+                Event::SessionCandidate { .. } => "session",
                 Event::TurnStarted { .. } => "started",
                 Event::TurnEnded { .. } => "ended",
                 other => panic!("backfill produced {other:?}"),
             })
             .collect();
-        assert_eq!(kinds, vec!["started", "ended", "started", "ended"]);
+        assert_eq!(
+            kinds,
+            vec!["session", "started", "ended", "started", "ended"]
+        );
         assert_eq!(out.vendor_session_id.as_deref(), Some("S1"));
     }
 
@@ -266,12 +321,13 @@ mod tests {
         // text — the same thing `Stop.last_assistant_message` carries live.
         let out = parsed();
 
+        let turns = turns(&out);
         let Event::TurnEnded {
             assistant_message: Some(message),
             ..
-        } = &out.entries[1].event
+        } = &turns[1].event
         else {
-            panic!("expected an ended turn, got {:?}", out.entries[1].event);
+            panic!("expected an ended turn, got {:?}", turns[1].event);
         };
         assert_eq!(*message, Body::kept("the answer"));
     }
@@ -283,11 +339,12 @@ mod tests {
         // recorded at all. Absent stays absent — never read as human.
         let out = parsed();
 
-        let Event::TurnStarted { author, .. } = &out.entries[0].event else {
+        let turns = turns(&out);
+        let Event::TurnStarted { author, .. } = &turns[0].event else {
             panic!("expected a started turn");
         };
         assert_eq!(*author, None);
-        let Event::TurnStarted { author, .. } = &out.entries[2].event else {
+        let Event::TurnStarted { author, .. } = &turns[2].event else {
             panic!("expected a started turn");
         };
         assert_eq!(author.as_ref().map(Author::as_str), Some("sdk"));
@@ -336,32 +393,71 @@ mod tests {
     }
 
     #[test]
+    fn a_recovered_conversation_says_where_it_happened() {
+        // Backfill used to emit turns and nothing else, so a recovered
+        // conversation had no session record and therefore no workspace — which
+        // is the key a continuation is looked up by. It left 3,425 of 3,433
+        // conversations in a real log invisible to that lookup.
+        let out = parsed();
+
+        let head = &out.entries[0];
+        let Event::SessionCandidate { trigger } = &head.event else {
+            panic!("a recovered conversation must open with its session");
+        };
+        assert_eq!(
+            *trigger, None,
+            "the transcript does not say how the session began, and guessing \
+             `startup` would put a fabrication in the weakest record we write"
+        );
+        assert_eq!(
+            head.source.workspace.as_deref(),
+            Some("/Applications/conbus")
+        );
+        assert_eq!(
+            head.observed_at, out.entries[1].observed_at,
+            "the session must be stamped with its own conversation's time, so a \
+             reader sorting by ts still sees it open before the first turn"
+        );
+        assert!(
+            out.entries
+                .iter()
+                .all(|entry| entry.source.workspace.as_deref() == Some("/Applications/conbus")),
+        );
+    }
+
+    #[test]
+    fn a_conversation_that_recovered_nothing_gets_no_session_record_either() {
+        // An empty recovery is not a conversation. Emitting a bare session for
+        // it would put ghosts in the log, which is the thing the live path's
+        // whole deferral design exists to avoid.
+        let out = parse_claude_transcript(
+            r#"{"type":"queue-operation","sessionId":"S9","cwd":"/tmp"}"#,
+            BusId::mint(),
+        );
+
+        assert!(out.entries.is_empty());
+    }
+
+    #[test]
     fn the_vendor_version_the_hook_never_sends_is_recovered_here() {
         let out = parsed();
 
-        assert_eq!(
-            out.entries[0].source.harness_version.as_deref(),
-            Some("2.1.229")
-        );
-        assert_eq!(
-            out.entries[3].source.harness_version.as_deref(),
-            Some("2.1.247")
-        );
+        let turns = turns(&out);
+        assert_eq!(turns[0].source.harness_version.as_deref(), Some("2.1.229"));
+        assert_eq!(turns[3].source.harness_version.as_deref(), Some("2.1.247"));
     }
 
     #[test]
     fn the_prompt_correlator_is_recovered_and_replies_carry_none() {
         let out = parsed();
 
+        let turns = turns(&out);
         assert_eq!(
-            out.entries[0]
-                .vendor_turn_id
-                .as_ref()
-                .map(VendorTurnId::as_str),
+            turns[0].vendor_turn_id.as_ref().map(VendorTurnId::as_str),
             Some("P1")
         );
         assert_eq!(
-            out.entries[1].vendor_turn_id, None,
+            turns[1].vendor_turn_id, None,
             "an assistant line has no promptId, so inventing one would be a fabrication"
         );
     }
@@ -391,7 +487,7 @@ mod tests {
 
         let out = parse_claude_transcript(&damaged, BusId::mint());
 
-        assert_eq!(out.entries.len(), 4, "the conversation must survive");
+        assert_eq!(turns(&out).len(), 4, "the conversation must survive");
         assert_eq!(out.skipped.get("unreadable json"), Some(&1));
     }
 
@@ -404,7 +500,7 @@ mod tests {
 
         let out = parse_claude_transcript(&with_sidechain, BusId::mint());
 
-        assert_eq!(out.entries.len(), 4);
+        assert_eq!(turns(&out).len(), 4);
         assert_eq!(out.skipped.get("sidechain"), Some(&1));
     }
 }
