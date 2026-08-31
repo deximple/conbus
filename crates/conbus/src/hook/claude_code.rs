@@ -23,6 +23,8 @@ use conbus_core::registry::{Observed, SessionKey};
 use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 
+use crate::hook::{HookError, Normalized};
+
 /// Whether the payload's `prompt_id` names a turn of *this* conversation.
 ///
 /// `prompt_id` is one slot on a process-global request journal rather than a
@@ -123,25 +125,8 @@ pub struct BatchCall {
     pub tool_use_id: Option<String>,
 }
 
-/// The result of reading a hook payload.
-#[derive(Debug, PartialEq, Eq)]
-pub enum Normalized {
-    Event {
-        key: SessionKey,
-        /// Boxed only to keep the two variants a similar size; one of these is
-        /// built per hook process and consumed immediately.
-        observed: Box<Observed>,
-    },
-    /// A hook event the recorder deliberately does not mirror.
-    Ignored { hook_event_name: String },
-}
-
-/// A payload we could not read at all.
-#[derive(Debug, PartialEq, Eq)]
-pub struct HookError(pub String);
-
 /// Read a hook payload into a bus event.
-pub fn normalize(json: &str) -> Result<Normalized, HookError> {
+pub fn normalize(harness: &Harness, json: &str) -> Result<Normalized, HookError> {
     let payload: Payload = serde_json::from_str(json).map_err(|err| HookError(err.to_string()))?;
 
     let vendor_turn_id = turn_id_belongs_to_this_conversation(&payload)
@@ -219,7 +204,7 @@ pub fn normalize(json: &str) -> Result<Normalized, HookError> {
     };
 
     Ok(Normalized::Event {
-        key: SessionKey::new(Harness::new(Harness::CLAUDE_CODE), payload.session_id),
+        key: SessionKey::new(harness.clone(), payload.session_id),
         observed: Box::new(Observed {
             vendor_turn_id,
             vendor_agent_id,
@@ -287,7 +272,7 @@ mod tests {
     }
 
     fn observed_of(json: &str) -> Observed {
-        match normalize(json).expect("normalise") {
+        match normalize(&Harness::new(Harness::CLAUDE_CODE), json).expect("normalise") {
             Normalized::Event { key: got, observed } => {
                 assert_eq!(got, key());
                 *observed
@@ -877,9 +862,11 @@ mod tests {
 
     #[test]
     fn hook_events_the_recorder_does_not_mirror_are_named_not_swallowed() {
-        let normalized =
-            normalize(r#"{"session_id":"abc123","hook_event_name":"PreCompact","trigger":"auto"}"#)
-                .expect("normalise");
+        let normalized = normalize(
+            &Harness::new(Harness::CLAUDE_CODE),
+            r#"{"session_id":"abc123","hook_event_name":"PreCompact","trigger":"auto"}"#,
+        )
+        .expect("normalise");
 
         assert_eq!(
             normalized,
@@ -891,7 +878,11 @@ mod tests {
 
     #[test]
     fn a_payload_without_a_session_id_is_an_error_not_a_guess() {
-        let err = normalize(r#"{"hook_event_name":"Stop"}"#).expect_err("must fail");
+        let err = normalize(
+            &Harness::new(Harness::CLAUDE_CODE),
+            r#"{"hook_event_name":"Stop"}"#,
+        )
+        .expect_err("must fail");
 
         assert!(err.0.contains("session_id"), "unhelpful error: {}", err.0);
     }

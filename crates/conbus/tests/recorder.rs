@@ -442,6 +442,69 @@ fn a_tool_call_that_fails_reaches_the_log_too() {
 }
 
 #[test]
+fn a_codex_session_is_read_by_the_codex_adapter_not_merely_labelled_codex() {
+    // `--harness codex` used to stamp the label and still parse with the Claude
+    // adapter. Codex's correlator is `turn_id`, not `prompt_id`, so every Codex
+    // record came out with no correlator at all and every test stayed green —
+    // the `failure_reason` bug a second time, one layer up.
+    let home = tempfile::tempdir().expect("tempdir");
+    let daemon = start_daemon(home.path());
+
+    let codex = |json: &str| {
+        let mut command = Command::new(bin());
+        command
+            .arg("hook")
+            .arg("--harness")
+            .arg("codex")
+            .env("CONBUS_HOME", home.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().expect("spawn hook");
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin")
+            .write_all(json.as_bytes())
+            .expect("write");
+        let out = child.wait_with_output().expect("hook exit");
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+
+    codex(
+        r#"{"session_id":"cx-1","hook_event_name":"UserPromptSubmit","cwd":"/repo",
+            "model":"gpt-5-codex","permission_mode":"default","prompt":"port the adapter",
+            "transcript_path":null,"turn_id":"CX-TURN-1"}"#,
+    );
+    codex(
+        r#"{"session_id":"cx-1","hook_event_name":"PostToolUse","cwd":"/repo","model":"gpt-5-codex",
+            "permission_mode":"default","tool_name":"shell","tool_input":{"cmd":"ls"},
+            "tool_response":{"ok":true},"tool_use_id":"call_1","transcript_path":null,
+            "turn_id":"CX-TURN-1"}"#,
+    );
+
+    let lines = log_lines(home.path());
+    assert_eq!(lines.len(), 2, "{lines:#?}");
+    assert!(lines.iter().all(|l| l["harness"] == "codex"), "{lines:#?}");
+    assert_eq!(
+        lines[0]["vendor_turn_id"], "CX-TURN-1",
+        "the Codex correlator was dropped, so the adapter did not read this payload: {:#?}",
+        lines[0]
+    );
+    assert_eq!(lines[1]["event"], "tool_use");
+    assert_eq!(lines[1]["tool"], "shell");
+    assert_eq!(lines[1]["tool_use_id"], "call_1");
+    assert_eq!(lines[1]["vendor_turn_id"], "CX-TURN-1");
+
+    daemon.stop();
+}
+
+#[test]
 fn the_log_survives_a_daemon_restart_and_the_conversation_continues() {
     let home = tempfile::tempdir().expect("tempdir");
 

@@ -12,7 +12,7 @@ use std::os::unix::net::UnixStream;
 use conbus_core::event::Harness;
 use conbus_core::paths::Paths;
 
-use crate::hook::claude_code::{self, Normalized};
+use crate::hook::{self, Normalized};
 use crate::wire::{Request, Response};
 
 /// The environment marker that tells a hook it is inside a session we started.
@@ -30,7 +30,7 @@ pub fn run(harness: &str, stdin: &mut impl Read) -> Result<(), String> {
         .read_to_string(&mut payload)
         .map_err(|err| format!("could not read the hook payload: {err}"))?;
 
-    let normalized = claude_code::normalize(&payload).map_err(|err| err.0)?;
+    let normalized = hook::normalize(&Harness::new(harness), &payload).map_err(|err| err.0)?;
     let Normalized::Event { key, observed } = normalized else {
         return Ok(());
     };
@@ -42,7 +42,7 @@ pub fn run(harness: &str, stdin: &mut impl Read) -> Result<(), String> {
         .map_err(|err| format!("no daemon on {}: {err}", socket.display()))?;
 
     let request = Request {
-        harness: Harness::new(harness),
+        harness: key.harness,
         vendor_session_id: key.vendor_session_id,
         vendor_turn_id: observed.vendor_turn_id,
         vendor_agent_id: observed.vendor_agent_id,
