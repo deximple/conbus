@@ -694,3 +694,105 @@ fn the_hook_always_says_something_well_formed_on_stdout() {
 
     daemon.stop();
 }
+
+#[test]
+fn concurrent_hooks_do_not_shred_the_drop_log() {
+    // Every hook is its own process, and the vendor's own contract says tool
+    // hooks "may run concurrently for parallel tool calls", so simultaneous
+    // appends are the normal case. Formatting straight into an unbuffered file
+    // issues a syscall per fragment and interleaves at JSON-token granularity —
+    // the durable record destroyed by exactly the fault it exists to record.
+    //
+    // They have to be released together to prove anything: spawned one at a
+    // time they simply finish one at a time, and a shredding implementation
+    // passes. So every child is started and parked on a read, and only then are
+    // all the pipes closed.
+    let home = tempfile::tempdir().expect("tempdir");
+    // Deliberately no daemon: every one of these drops.
+    let payload = r#"{"session_id":"s","hook_event_name":"UserPromptSubmit","prompt":"x"}"#;
+    const HOOKS: usize = 32;
+
+    let mut children: Vec<Child> = Vec::with_capacity(HOOKS);
+    let mut pipes: Vec<std::process::ChildStdin> = Vec::with_capacity(HOOKS);
+    for _ in 0..HOOKS {
+        let mut child = Command::new(bin())
+            .arg("hook")
+            .env("CONBUS_HOME", home.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn hook");
+        let mut pipe = child.stdin.take().expect("stdin");
+        // Parked here: the hook blocks reading stdin until the pipe closes.
+        pipe.write_all(payload.as_bytes()).expect("write");
+        children.push(child);
+        pipes.push(pipe);
+    }
+    // Released together.
+    drop(pipes);
+    for mut child in children {
+        child.wait().expect("hook exit");
+    }
+
+    let text = std::fs::read_to_string(home.path().join("drops.jsonl")).expect("drops file");
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert_eq!(lines.len(), HOOKS, "lines were lost or merged");
+    for line in &lines {
+        serde_json::from_str::<serde_json::Value>(line)
+            .unwrap_or_else(|e| panic!("shredded line ({e}): {line:?}"));
+    }
+}
+
+#[test]
+fn a_drop_is_recorded_where_doctor_can_find_it() {
+    let home = tempfile::tempdir().expect("tempdir");
+
+    let (code, _stdout, _stderr) = run_hook_full(
+        home.path(),
+        r#"{"session_id":"s","hook_event_name":"UserPromptSubmit","prompt":"x"}"#,
+        &[],
+    );
+    assert_eq!(code, 0);
+
+    let doctor = Command::new(bin())
+        .arg("doctor")
+        .env("CONBUS_HOME", home.path())
+        .output()
+        .expect("doctor");
+    let out = String::from_utf8_lossy(&doctor.stdout);
+    assert!(out.contains("drops     1 recorded"), "{out}");
+    assert!(out.contains("no daemon"), "{out}");
+}
+
+#[test]
+fn doctor_reports_a_log_it_cannot_append_to() {
+    // The failure the check exists for: a daemon that answers and cannot write
+    // looks identical to a healthy one. Probing the directory instead of the
+    // segment misses it, because POSIX checks different rights for the two.
+    let home = tempfile::tempdir().expect("tempdir");
+    let daemon = start_daemon(home.path());
+    run_hook(
+        home.path(),
+        r#"{"session_id":"s","hook_event_name":"UserPromptSubmit","prompt":"x","prompt_id":"T"}"#,
+        &[],
+    );
+    daemon.stop();
+
+    let segment = home.path().join("log").join("segment-00000000.jsonl");
+    let mut readonly = std::fs::metadata(&segment).expect("meta").permissions();
+    readonly.set_readonly(true);
+    std::fs::set_permissions(&segment, readonly).expect("chmod");
+
+    let doctor = Command::new(bin())
+        .arg("doctor")
+        .env("CONBUS_HOME", home.path())
+        .output()
+        .expect("doctor");
+    let out = String::from_utf8_lossy(&doctor.stdout);
+
+    assert!(
+        out.contains("NOT APPENDABLE"),
+        "a read-only segment read as healthy: {out}"
+    );
+}

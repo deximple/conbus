@@ -54,7 +54,7 @@ pub struct Payload {
 
 /// Hook events this adapter has seen and decided not to mirror. Anything not
 /// here is reported as unknown rather than dropped in silence.
-const DECLINED: [&str; 5] = [
+pub const DECLINED: [&str; 5] = [
     "PermissionRequest",
     "PreCompact",
     "PostCompact",

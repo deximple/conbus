@@ -129,13 +129,12 @@ pub struct Payload {
 /// Spelled out so that an event which is *not* here is reported as unknown
 /// rather than silently dropped. Read off the vendor's own event list in
 /// `tests/fixtures/claude_code_2.1.241_contract.md`.
-const DECLINED: [&str; 20] = [
+pub const DECLINED: [&str; 20] = [
     "PermissionRequest",
     "Notification",
     "UserPromptExpansion",
     "Setup",
     "SubagentStart",
-    "SubagentStop",
     "PreCompact",
     "PostCompact",
     "TeammateIdle",
@@ -148,27 +147,36 @@ const DECLINED: [&str; 20] = [
     "WorktreeCreate",
     "WorktreeRemove",
     "CwdChanged",
+    "DirectoryAdded",
     "FileChanged",
     "MessageDisplay",
 ];
 
-/// Pull tool-call ids out of whatever shape the vendor sent.
+/// Pull tool-call ids out of whatever shape the vendor sent, and count what it
+/// could not name.
 ///
 /// Accepts the documented array of objects and a bare array of ids, and yields
 /// nothing rather than failing for anything else. Reading the grouping is worth
-/// having; it is not worth the record.
-fn batch_ids(value: Option<Value>) -> Vec<VendorToolUseId> {
-    value
+/// having; it is not worth the record. The count is what keeps "no calls" and
+/// "calls we could not read" from rendering as the same line.
+fn batch_ids(value: Option<Value>) -> (Vec<VendorToolUseId>, usize) {
+    let mut ids = Vec::new();
+    let mut unreadable = 0;
+    for call in value
         .as_ref()
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(|call| match call {
-            Value::String(id) => Some(id.as_str()),
-            other => other.get("tool_use_id")?.as_str(),
-        })
-        .map(VendorToolUseId::new)
-        .collect()
+    {
+        match call {
+            Value::String(id) => ids.push(VendorToolUseId::new(id.as_str())),
+            other => match other.get("tool_use_id").and_then(Value::as_str) {
+                Some(id) => ids.push(VendorToolUseId::new(id)),
+                None => unreadable += 1,
+            },
+        }
+    }
+    (ids, unreadable)
 }
 
 /// Read a hook payload into a bus event.
@@ -194,9 +202,13 @@ pub fn normalize(harness: &Harness, json: &str) -> Result<Normalized, HookError>
             tool_use_id: payload.tool_use_id.map(VendorToolUseId::new),
             input: body_of(payload.tool_input),
         },
-        "PostToolBatch" => Event::ToolBatchEnded {
-            tool_calls: batch_ids(payload.tool_calls),
-        },
+        "PostToolBatch" => {
+            let (tool_calls, unreadable) = batch_ids(payload.tool_calls);
+            Event::ToolBatchEnded {
+                tool_calls,
+                unreadable,
+            }
+        }
         "PermissionDenied" => Event::ToolDenied {
             tool: payload.tool_name.unwrap_or_default(),
             tool_use_id: payload.tool_use_id.map(VendorToolUseId::new),
@@ -231,6 +243,17 @@ pub fn normalize(harness: &Harness, json: &str) -> Result<Normalized, HookError>
         },
         "StopFailure" => Event::TurnEnded {
             state: failure_state(payload.error, payload.error_details),
+            assistant_message: payload.last_assistant_message.map(Body::kept),
+        },
+        // A subagent's closing text was reaching no retention level at all,
+        // while the main thread's identical text was kept. Its `agent_id` is
+        // already on the envelope, so the record says whose turn ended.
+        //
+        // There is no matching `tool_requested`-style start: `SubagentStart`
+        // carries no prompt, so mirroring it would write a turn that began with
+        // nothing. The asymmetry is the vendor's, not ours.
+        "SubagentStop" => Event::TurnEnded {
+            state: TurnState::Complete,
             assistant_message: payload.last_assistant_message.map(Body::kept),
         },
         "SessionEnd" => Event::SessionEnded {
@@ -536,6 +559,7 @@ mod tests {
                     VendorToolUseId::new("toolu_A"),
                     VendorToolUseId::new("toolu_B"),
                 ],
+                unreadable: 0,
             }
         );
     }
@@ -571,6 +595,7 @@ mod tests {
                     VendorToolUseId::new("toolu_A"),
                     VendorToolUseId::new("toolu_B"),
                 ],
+                unreadable: 0,
             }
         );
     }
@@ -610,11 +635,20 @@ mod tests {
             r#"{"session_id":"abc123","hook_event_name":"PostToolBatch","tool_calls":[]}"#,
         );
 
-        assert_eq!(event, Event::ToolBatchEnded { tool_calls: vec![] });
+        assert_eq!(
+            event,
+            Event::ToolBatchEnded {
+                tool_calls: vec![],
+                unreadable: 0,
+            }
+        );
     }
 
     #[test]
-    fn a_batch_entry_the_vendor_sends_without_an_id_does_not_cost_the_others() {
+    fn a_batch_entry_the_vendor_sends_without_an_id_is_counted_not_ignored() {
+        // "the batch held one call" and "the batch held two, one of which we
+        // could not read" must not render as the same line: the second means
+        // the vendor's shape moved.
         let event = event_of(
             r#"{"session_id":"abc123","hook_event_name":"PostToolBatch","tool_calls":[
                 {"tool_name":"Read","tool_input":{}},
@@ -625,6 +659,7 @@ mod tests {
             event,
             Event::ToolBatchEnded {
                 tool_calls: vec![VendorToolUseId::new("toolu_B")],
+                unreadable: 1,
             }
         );
     }
@@ -951,6 +986,28 @@ mod tests {
                 assistant_message: None,
             },
             "an unrecognised reason must survive in the log so it can be reclassified later"
+        );
+    }
+
+    #[test]
+    fn a_subagents_closing_text_reaches_the_log_like_the_main_thread_s() {
+        let observed = observed_of(
+            r#"{"session_id":"abc123","hook_event_name":"SubagentStop","stop_hook_active":false,
+                "agent_id":"agent-7","agent_type":"code-reviewer",
+                "agent_transcript_path":"/t.jsonl","last_assistant_message":"reviewed."}"#,
+        );
+
+        assert_eq!(
+            observed.event,
+            Event::TurnEnded {
+                state: TurnState::Complete,
+                assistant_message: Some(Body::kept("reviewed.")),
+            }
+        );
+        assert_eq!(
+            observed.vendor_agent_id.as_ref().map(VendorAgentId::as_str),
+            Some("agent-7"),
+            "without the agent id the record reads as the main thread's turn ending"
         );
     }
 

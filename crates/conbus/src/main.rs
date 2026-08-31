@@ -1,6 +1,7 @@
 mod backfill;
 mod cli;
 mod daemon;
+mod drops;
 mod harden;
 mod hook;
 mod install;
@@ -21,7 +22,12 @@ fn main() -> ExitCode {
         // below leaves on stderr and exits zero.
         Command::Hook { harness } => {
             if let Err(err) = hook::client::run(&harness, &mut std::io::stdin()) {
-                eprintln!("conbus hook: record dropped: {err}");
+                // Durable, because the vendor swallows stderr; throttled,
+                // because a stopped daemon would otherwise write one of these
+                // per hook per turn straight into the transcript.
+                if drops::record(&err) {
+                    eprintln!("conbus hook: record dropped: {err}");
+                }
             }
             // Say something well-formed, always.
             //

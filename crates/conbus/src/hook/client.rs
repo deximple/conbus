@@ -85,6 +85,7 @@ pub fn run(harness: &str, stdin: &mut impl Read) -> Result<(), String> {
         .map_err(|err| format!("no daemon on {}: {err}", socket.display()))?;
 
     let request = Request {
+        protocol_version: Some(crate::wire::PROTOCOL_VERSION),
         harness: key.harness,
         harness_version: vendor_version(harness),
         vendor_session_id: key.vendor_session_id,

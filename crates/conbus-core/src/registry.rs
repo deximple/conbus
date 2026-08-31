@@ -75,7 +75,19 @@ pub struct Registry {
     bound: HashMap<SessionKey, BusId>,
     /// Session starts seen but not yet proven real, kept so that a conversation
     /// can log where it began once its first prompt arrives.
-    candidates: HashMap<SessionKey, Observed>,
+    ///
+    /// Bounded. Most of what lands here never mints — Claude Code fires several
+    /// `SessionStart`s per project within a few hundred milliseconds and some
+    /// are ghosts with no transcript — so an unbounded map grows for the life
+    /// of the daemon, which is now supervised and meant to run for weeks.
+    /// Ordered by an insertion counter. The map holds no clock value of its
+    /// own, so a counter is the only ordering available without adding one —
+    /// and adding a timestamp would not work anyway: they are truncated to
+    /// milliseconds, and a burst of session starts lands inside a single one,
+    /// which makes eviction order arbitrary. That was not a guess; it turned a
+    /// test red.
+    candidates: HashMap<SessionKey, (u64, Observed)>,
+    remembered: u64,
 }
 
 impl Registry {
@@ -112,6 +124,36 @@ impl Registry {
         self.bound.get(key).copied()
     }
 
+    /// The most session starts held at once before the oldest is forgotten.
+    ///
+    /// Forgetting one costs the retroactive `session_candidate` record for that
+    /// session, not the conversation: a prompt mints whether or not its start
+    /// was remembered.
+    pub const REMEMBERED_STARTS: usize = 1024;
+
+    fn remember(&mut self, key: SessionKey, observed: Observed) {
+        let full =
+            self.candidates.len() >= Self::REMEMBERED_STARTS && !self.candidates.contains_key(&key);
+        if let Some(oldest) = full
+            .then(|| {
+                self.candidates
+                    .iter()
+                    .min_by_key(|(_, (seen, _))| *seen)
+                    .map(|(key, _)| key.clone())
+            })
+            .flatten()
+        {
+            self.candidates.remove(&oldest);
+        }
+        self.remembered += 1;
+        self.candidates.insert(key, (self.remembered, observed));
+    }
+
+    /// How many session starts are being held. Ghosts never leave on their own.
+    pub fn remembered_starts(&self) -> usize {
+        self.candidates.len()
+    }
+
     /// Record an event and say what should reach the log.
     pub fn observe(&mut self, key: &SessionKey, observed: Observed) -> Disposition {
         // A bound session is already proven real, so nothing about it is
@@ -124,7 +166,7 @@ impl Registry {
             };
         }
         if matches!(observed.event, Event::SessionCandidate { .. }) {
-            self.candidates.insert(key.clone(), observed);
+            self.remember(key.clone(), observed);
             return Disposition::Deferred;
         }
         // Unbound. Only a prompt proves a session is real enough to mint, and
@@ -138,6 +180,7 @@ impl Registry {
         let observed = self
             .candidates
             .remove(key)
+            .map(|(_, remembered)| remembered)
             .into_iter()
             .chain(std::iter::once(observed))
             .collect();
@@ -202,6 +245,50 @@ mod tests {
             },
             "a restored session must not mint a second conversation"
         );
+    }
+
+    #[test]
+    fn the_bound_is_large_enough_to_be_useless_to_hit_by_accident() {
+        // Asserted as a literal because every other test here is written
+        // against the constant and would pass at any value, including two.
+        // Claude Code fires several session starts per project within a few
+        // hundred milliseconds; a thousand is far past a real burst and still
+        // a few hundred kilobytes at worst.
+        assert_eq!(Registry::REMEMBERED_STARTS, 1024);
+    }
+
+    #[test]
+    fn ghost_session_starts_do_not_accumulate_without_bound() {
+        // Most session starts never mint — several fire per project within a
+        // few hundred milliseconds and some have no transcript at all. The
+        // daemon is supervised now and meant to run for weeks.
+        let mut registry = Registry::new();
+
+        for n in 0..(Registry::REMEMBERED_STARTS + 500) {
+            let key = SessionKey::new(Harness::new(Harness::CLAUDE_CODE), format!("ghost-{n}"));
+            registry.observe(&key, Observed::bare(session_start()));
+        }
+
+        assert_eq!(registry.remembered_starts(), Registry::REMEMBERED_STARTS);
+    }
+
+    #[test]
+    fn forgetting_a_session_start_does_not_cost_its_conversation() {
+        let mut registry = Registry::new();
+        registry.observe(&key(), Observed::bare(session_start()));
+        for n in 0..(Registry::REMEMBERED_STARTS + 1) {
+            let other = SessionKey::new(Harness::new(Harness::CLAUDE_CODE), format!("ghost-{n}"));
+            registry.observe(&other, Observed::bare(session_start()));
+        }
+
+        // The remembered start is gone, but the prompt still mints and is still
+        // written — only the retroactive session_candidate record is lost.
+        let disposition = registry.observe(&key(), Observed::bare(prompt("late")));
+
+        let Disposition::Write { observed, .. } = disposition else {
+            panic!("a prompt must still mint, got {disposition:?}");
+        };
+        assert_eq!(observed, vec![Observed::bare(prompt("late"))]);
     }
 
     #[test]

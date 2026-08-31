@@ -183,6 +183,17 @@ impl SegmentLog {
         })
     }
 
+    /// The segment a writer would append to right now, whether or not it
+    /// exists yet. Exposed so a diagnostic can probe the same file the writer
+    /// opens rather than guessing from the directory.
+    pub fn current_segment(dir: &Path) -> io::Result<PathBuf> {
+        let existing = segment_paths(dir)?;
+        Ok(existing
+            .last()
+            .cloned()
+            .unwrap_or_else(|| dir.join(segment_name(0))))
+    }
+
     /// The sequence number the next appended record will carry.
     pub fn next_sequence(&self) -> u64 {
         self.next_seq

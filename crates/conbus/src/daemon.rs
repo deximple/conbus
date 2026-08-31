@@ -37,6 +37,30 @@ impl Daemon {
 
     /// Record one observed event.
     pub fn handle(&mut self, request: Request) -> Response {
+        // A newer hook may carry envelope fields this build does not know, and
+        // dropping them silently is exactly the class of bug this refuses to
+        // repeat. Upgrading conbus leaves the old daemon running until someone
+        // restarts it, so this is an ordinary situation, not an exotic one.
+        if request
+            .protocol_version
+            .is_some_and(|v| v > crate::wire::PROTOCOL_VERSION)
+        {
+            // The daemon's own stderr, like every other refusal here: it is the
+            // channel launchd captures, and the hook's is swallowed.
+            eprintln!(
+                "conbus daemon: refusing a hook speaking protocol v{}; this daemon speaks v{}",
+                request.protocol_version.unwrap_or_default(),
+                crate::wire::PROTOCOL_VERSION
+            );
+            return Response::Failed {
+                error: format!(
+                    "this daemon speaks protocol v{}; the hook speaks v{}. Restart the daemon.",
+                    crate::wire::PROTOCOL_VERSION,
+                    request.protocol_version.unwrap_or_default()
+                ),
+            };
+        }
+
         let key = SessionKey::new(request.harness.clone(), request.vendor_session_id);
         let observed = Observed {
             vendor_turn_id: request.vendor_turn_id,
@@ -209,6 +233,7 @@ mod tests {
 
     fn request(event: Event) -> Request {
         Request {
+            protocol_version: Some(crate::wire::PROTOCOL_VERSION),
             harness: Harness::new(Harness::CLAUDE_CODE),
             harness_version: None,
             vendor_session_id: "abc123".into(),
@@ -216,6 +241,47 @@ mod tests {
             vendor_agent_id: None,
             event,
         }
+    }
+
+    #[test]
+    fn a_daemon_older_than_the_hook_refuses_instead_of_dropping_what_it_cannot_read() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = SegmentLog::open(dir.path(), Retention::default()).expect("open");
+        let mut daemon = Daemon::new(log, Registry::new());
+
+        let response = daemon.handle(Request {
+            protocol_version: Some(crate::wire::PROTOCOL_VERSION + 1),
+            ..request(Event::TurnStarted {
+                author: None,
+                prompt: Body::kept("from a newer hook"),
+            })
+        });
+
+        let Response::Failed { error } = response else {
+            panic!("a newer hook must be refused, not half-read: {response:?}");
+        };
+        assert!(error.contains("Restart the daemon"), "{error}");
+        assert_eq!(SegmentLog::scan(dir.path()).expect("scan").records, vec![]);
+    }
+
+    #[test]
+    fn a_hook_too_old_to_name_a_version_is_still_served() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = SegmentLog::open(dir.path(), Retention::default()).expect("open");
+        let mut daemon = Daemon::new(log, Registry::new());
+
+        let response = daemon.handle(Request {
+            protocol_version: None,
+            ..request(Event::TurnStarted {
+                author: None,
+                prompt: Body::kept("from an older hook"),
+            })
+        });
+
+        assert!(
+            matches!(response, Response::Recorded { .. }),
+            "{response:?}"
+        );
     }
 
     #[test]

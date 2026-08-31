@@ -176,6 +176,7 @@ mod tests {
             },
             Event::ToolBatchEnded {
                 tool_calls: vec![VendorToolUseId::new("toolu_01ABC")],
+                unreadable: 2,
             },
             Event::ToolDenied {
                 tool: "Bash".into(),

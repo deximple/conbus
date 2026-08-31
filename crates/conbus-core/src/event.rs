@@ -211,10 +211,16 @@ pub enum Event {
     /// begins. So this is a list of ids, joinable to the records that carry the
     /// substance.
     ToolBatchEnded {
-        /// In the order the vendor listed them. An entry the vendor sends
-        /// without an id cannot be named here and is skipped; the schema marks
-        /// the field required, so that would mean the vendor changed.
+        /// In the order the vendor listed them.
         tool_calls: Vec<VendorToolUseId>,
+        /// Entries the vendor sent that could not be named.
+        ///
+        /// Without this, "the batch held no calls" and "the batch held calls we
+        /// could not read" are the same line, and the second is a vendor change
+        /// worth noticing. The schema marks the id required, so a non-zero
+        /// count here means the shape moved.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        unreadable: usize,
     },
     /// A tool the harness refused to run.
     ///
@@ -299,6 +305,10 @@ pub enum ToolOutcome {
 
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 /// Text captured from a session, carrying whether it actually reached disk.

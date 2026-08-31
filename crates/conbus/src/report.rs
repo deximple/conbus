@@ -9,6 +9,7 @@ use conbus_core::paths::Paths;
 use crate::cli::LogFilter;
 use conbus_core::record::Record;
 use conbus_core::segment::SegmentLog;
+use std::fs::OpenOptions;
 
 pub fn log(paths: &Paths, json: bool, filter: &LogFilter) -> io::Result<()> {
     let scan = SegmentLog::scan(paths.log_dir())?;
@@ -62,15 +63,61 @@ fn select<'a>(records: &'a [Record], filter: &LogFilter) -> Vec<&'a Record> {
     }
 }
 
+/// Can the log actually be appended to?
+///
+/// Probes the operation the writer performs — opening the current segment for
+/// append — rather than creating a file in the directory. POSIX checks
+/// directory permission for the one and file permission for the other, so a
+/// directory probe is wrong in both directions: it passes while a read-only
+/// segment refuses every record, and it fails while a daemon holding an open
+/// handle keeps recording fine.
+///
+/// Deliberately does not create the log directory. A diagnostic that repairs
+/// what it is measuring cannot report on it.
+fn appendable(paths: &Paths) -> io::Result<()> {
+    let dir = paths.log_dir();
+    if !dir.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("{} does not exist yet", dir.display()),
+        ));
+    }
+    let segment = SegmentLog::current_segment(&dir)?;
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&segment)
+        .map(|_| ())
+}
+
+fn describe_appendable(result: &io::Result<()>) -> String {
+    match result {
+        Ok(()) => "appendable".to_string(),
+        Err(err) => format!("NOT APPENDABLE: {err} — records will be refused"),
+    }
+}
+
 fn summarise(record: &Record) -> String {
     let what = match &record.event {
         Event::SessionCandidate { trigger, .. } => {
             format!("session-start {}", trigger.as_deref().unwrap_or("?"))
         }
-        Event::TurnStarted { .. } => "turn-started".to_string(),
-        Event::ToolBatchEnded { tool_calls } => {
-            format!("tool-batch of {} resolved", tool_calls.len())
-        }
+        // The author is rendered because a machine-authored turn reading
+        // exactly like a person's is how a survival meter starts lying.
+        Event::TurnStarted { author, .. } => match author {
+            Some(author) => format!("turn-started <{}>", author.as_str()),
+            None => "turn-started".to_string(),
+        },
+        Event::ToolBatchEnded {
+            tool_calls,
+            unreadable,
+        } => match unreadable {
+            0 => format!("tool-batch of {} resolved", tool_calls.len()),
+            n => format!(
+                "tool-batch of {} resolved ({n} unreadable)",
+                tool_calls.len()
+            ),
+        },
         Event::ToolRequested { tool, .. } => format!("tool {tool} requested"),
         Event::ToolDenied { tool, reason, .. } => format!("tool {tool} denied ({reason})"),
         Event::ToolUse {
@@ -218,6 +265,13 @@ pub fn doctor(paths: &Paths) -> io::Result<()> {
             .unwrap_or_default()
     );
 
+    println!("writable  {}", describe_appendable(&appendable(paths)));
+
+    println!(
+        "drops     {}",
+        crate::drops::describe(&crate::drops::summary(paths))
+    );
+
     let scan = SegmentLog::scan(paths.log_dir())?;
     let conversations: std::collections::HashSet<_> =
         scan.records.iter().map(|r| r.bus_id).collect();
@@ -233,7 +287,9 @@ pub fn doctor(paths: &Paths) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use conbus_core::event::{Body, Harness, Source, ToolOutcome, VendorAgentId, VendorToolUseId};
+    use conbus_core::event::{
+        Author, Body, Harness, Source, ToolOutcome, VendorAgentId, VendorToolUseId,
+    };
     use conbus_core::record::SCHEMA_VERSION;
 
     fn record(event: Event) -> Record {
@@ -434,12 +490,43 @@ mod tests {
     }
 
     #[test]
+    fn a_machine_authored_turn_does_not_read_like_a_persons() {
+        let human = summarise(&record(Event::TurnStarted {
+            author: None,
+            prompt: Body::kept("p"),
+        }));
+        let machine = summarise(&record(Event::TurnStarted {
+            author: Some(Author::new(Author::SCHEDULE_WAKEUP)),
+            prompt: Body::kept("p"),
+        }));
+
+        assert!(machine.contains("schedule_wakeup"), "{machine}");
+        assert_ne!(human, machine);
+    }
+
+    #[test]
+    fn a_batch_that_named_nothing_reads_differently_from_one_we_could_not_read() {
+        let empty = summarise(&record(Event::ToolBatchEnded {
+            tool_calls: vec![],
+            unreadable: 0,
+        }));
+        let unread = summarise(&record(Event::ToolBatchEnded {
+            tool_calls: vec![],
+            unreadable: 2,
+        }));
+
+        assert_ne!(empty, unread);
+        assert!(unread.contains("2 unreadable"), "{unread}");
+    }
+
+    #[test]
     fn a_batch_boundary_says_how_many_calls_it_closed() {
         let line = summarise(&record(Event::ToolBatchEnded {
             tool_calls: vec![
                 VendorToolUseId::new("toolu_A"),
                 VendorToolUseId::new("toolu_B"),
             ],
+            unreadable: 0,
         }));
 
         assert!(line.contains("tool-batch of 2"), "{line}");

@@ -34,7 +34,7 @@ impl Change {
 }
 
 /// The Claude Code events the recorder mirrors.
-pub const CLAUDE_EVENTS: [&str; 10] = [
+pub const CLAUDE_EVENTS: [&str; 11] = [
     "SessionStart",
     "UserPromptSubmit",
     "PreToolUse",
@@ -44,6 +44,7 @@ pub const CLAUDE_EVENTS: [&str; 10] = [
     "PermissionDenied",
     "Stop",
     "StopFailure",
+    "SubagentStop",
     "SessionEnd",
 ];
 
@@ -269,5 +270,127 @@ mod tests {
             .as_str()
             .expect("command");
         assert!(command.starts_with('/'), "{command}");
+    }
+}
+
+#[cfg(test)]
+mod registration_agrees_with_the_adapters {
+    use super::*;
+    use crate::hook::{Normalized, claude_code, codex};
+    use conbus_core::event::Harness;
+
+    /// The vendors' own event lists, read from the contracts extracted from
+    /// their binaries.
+    ///
+    /// Read at compile time from the checked-in fixtures rather than restated
+    /// here, so that re-extracting a contract after a vendor release makes the
+    /// tests below fail until someone decides what the new event is. A list
+    /// maintained by hand beside the code it checks is a list that agrees with
+    /// the code by construction.
+    const CLAUDE_CONTRACT: &str = include_str!("../tests/fixtures/claude_code_2.1.241_contract.md");
+    const CODEX_CONTRACT: &str = include_str!("../tests/fixtures/codex_0.147.0_contract.md");
+
+    /// Every `### EventName` heading under the contract's payload section.
+    fn events_in(contract: &str) -> Vec<&str> {
+        contract
+            .lines()
+            .filter_map(|line| line.strip_prefix("### "))
+            .map(str::trim)
+            .filter(|name| {
+                !name.is_empty()
+                    && name.chars().all(|c| c.is_ascii_alphanumeric())
+                    && name.starts_with(char::is_uppercase)
+            })
+            .collect()
+    }
+
+    /// A payload carrying nothing but an event name, which is all the adapters
+    /// need in order to decide what an event is.
+    fn classify(harness: &str, event: &str) -> &'static str {
+        let payload = format!(r#"{{"session_id":"s","hook_event_name":"{event}"}}"#);
+        match crate::hook::normalize(&Harness::new(harness), &payload).expect("normalise") {
+            Normalized::Event { .. } => "mirrored",
+            Normalized::Ignored { .. } => "declined",
+            Normalized::Unknown { .. } => "unknown",
+        }
+    }
+
+    struct Harnessed {
+        harness: &'static str,
+        contract: &'static str,
+        registered: &'static [&'static str],
+        declined: &'static [&'static str],
+    }
+
+    fn harnesses() -> [Harnessed; 2] {
+        [
+            Harnessed {
+                harness: Harness::CLAUDE_CODE,
+                contract: CLAUDE_CONTRACT,
+                registered: CLAUDE_EVENTS.as_slice(),
+                declined: claude_code::DECLINED.as_slice(),
+            },
+            Harnessed {
+                harness: Harness::CODEX,
+                contract: CODEX_CONTRACT,
+                registered: CODEX_EVENTS.as_slice(),
+                declined: codex::DECLINED.as_slice(),
+            },
+        ]
+    }
+
+    /// The invariant that was missing, and the reason a mirrored event sat dead
+    /// for a whole commit.
+    ///
+    /// An adapter arm does nothing unless the event is also registered as a
+    /// hook, and a registration does nothing unless the adapter maps it. The
+    /// first version of this test iterated the two lists we maintain, which
+    /// cannot see an event that fell out of both — which is exactly what
+    /// happened. It iterates the *vendor's* list now.
+    #[test]
+    fn every_vendor_event_is_either_registered_and_mirrored_or_declined_and_ignored() {
+        for h in harnesses() {
+            let events = events_in(h.contract);
+            assert!(
+                events.len() > 5,
+                "{}: contract parsed as {events:?}",
+                h.harness
+            );
+
+            for event in events {
+                let registered = h.registered.contains(&event);
+                let declined = h.declined.contains(&event);
+                let classified = classify(h.harness, event);
+
+                assert!(
+                    registered ^ declined,
+                    "{}: {event} is {} — every vendor event must be exactly one of registered or                      declined, or it is silently dropped on a real machine",
+                    h.harness,
+                    if registered { "both" } else { "neither" }
+                );
+                let expected = if registered { "mirrored" } else { "declined" };
+                assert_eq!(
+                    classified,
+                    expected,
+                    "{}: {event} is {} but the adapter treats it as {classified}",
+                    h.harness,
+                    if registered { "registered" } else { "declined" }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn nothing_is_registered_or_declined_that_the_vendor_does_not_send() {
+        for h in harnesses() {
+            let events = events_in(h.contract);
+            for named in h.registered.iter().chain(h.declined.iter()) {
+                assert!(
+                    events.contains(named),
+                    "{}: {named} is named by conbus but is not in the vendor's contract",
+                    h.harness
+                );
+            }
+        }
     }
 }

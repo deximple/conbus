@@ -10,7 +10,7 @@ recording on this machine. Read this, then read the plan.
 - The plan is the single source of truth: [`.cursor/plans/shared_workspace_context_3f7139b8.plan.md`](.cursor/plans/shared_workspace_context_3f7139b8.plan.md). The filename is a generated ID and no longer matches the content; leave it alone so the Cursor plan UI keeps its association. A reader-facing copy under `docs/` gets generated when the repo goes public.
 - `cargo 1.94.1` and `rustc 1.94.1` are installed on this machine, so edition 2024 is available.
 - A cargo workspace exists: `crates/conbus` (the binary) and `crates/conbus-core` (the lib). Edition 2024.
-  173 tests, `cargo clippy --all-targets -- -D warnings` clean. See "Next task" for what is built and what is not.
+  191 tests, `cargo clippy --all-targets -- -D warnings` clean. See "Next task" for what is built and what is not.
 
 ## What Conbus is, in one paragraph
 
@@ -154,7 +154,12 @@ Steps 1–4 of the suggested order are built; step 5 is not.
    disabled. Memory locking is attempted and **reported**, not assumed — see the ENOSYS note above. Binding refuses
    to steal a socket a live daemon still owns and reclaims one a dead daemon left behind.
 4. `conbus hook` — a thin client that reads a payload on stdin and exits **zero no matter what**, because a non-zero
-   exit from `UserPromptSubmit` blocks the user's prompt. A dropped record goes to stderr. The `CONBUS_INTERNAL_SESSION`
+   exit from `UserPromptSubmit` blocks the user's prompt. A dropped record is written to
+   `~/.conbus/drops.jsonl` and surfaced by `doctor` — stderr is a bad channel for it, because the vendor swallows it
+   in normal use and when it does not it becomes a transcript attachment, so a standing fault like a stopped daemon
+   writes one per hook per turn into the conversation it exists to protect. stderr speaks once per distinct reason
+   per minute, keyed on when it last *spoke*, so a standing benign fault can never silence a new one.
+   The `CONBUS_INTERNAL_SESSION`
    marker makes it exit before reading anything, so our own background sessions are not mirrored.
    Also `conbus log` and `conbus doctor`.
 
@@ -247,8 +252,8 @@ mirrored one and a reader that cannot tell them apart will over-trust the log.
    returned `-32603 unknown variant` reading a thread a 0.150.0-alpha wrote. The plan's reasoning for treating the
    official path as safe and file parsing as risky does not survive that. OpenCode `export` is untouched.
 6. **The unmirrored events**, in the order they are worth having: `PermissionRequest` (where an ordinary refusal is
-   visible), `Notification` (the only hook-channel signal that a quota limit *lifted*), `SubagentStop`,
-   `MessageDisplay`. Each is argued under "Still open".
+   visible), `Notification` (the only hook-channel signal that a quota limit *lifted*), `MessageDisplay`. Each is
+   argued under "Still open". `SubagentStop` was on this list and is mirrored now.
 7. **A real quota exhaustion.** The one fixture that cannot be manufactured. Now that the recorder is running, the
    first exhaustion records itself — treat it as an opportunity rather than an interruption.
 
@@ -392,9 +397,9 @@ Take the lesson generally: **the adapter is only as good as the traffic it has b
   key. Mirroring it is what would make "every request has an answer" true.
 - **Still dropped from payloads already parsed**: `agent_type` and `transcript_path` (both on the common base of
   every payload), `session_title`, `model`, `permission_mode`, `effort.level`.
-- **`SubagentStart` / `SubagentStop` are not mirrored**, so a subagent's turn has no boundary in the log and its
-  closing text never reaches disk at any retention level — while the main thread's identical text is kept.
-  `SubagentStop` carries `agent_id` and `last_assistant_message`; it is two lines per subagent turn.
+- **`SubagentStop` is mirrored now**, as a `turn_ended` carrying the subagent's `agent_id` and its closing text.
+  `SubagentStart` is not: it carries no prompt, so mirroring it would write a turn that began with nothing. The
+  asymmetry is the vendor's.
 - **`Notification` is not mirrored**, and it carries the only hook-channel signal that a quota limit has *lifted*.
   For a product whose stated reason to exist is routing on quota, that is the cheapest signal on the surface: the
   hook can be registered with a matcher on the notification type, so the volume cost is near zero.

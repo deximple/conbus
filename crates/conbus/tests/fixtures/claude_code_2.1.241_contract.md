@@ -85,6 +85,12 @@ under the parent `session_id`, told apart only by `agent_id`.
 
 `SessionEnd.reason` is one of five: clear, resume, logout, prompt_input_exit, other.
 
+`PermissionDenied` fires from **one** call site, guarded by
+`decisionReason.type === "classifier" && decisionReason.classifier === "auto-mode"`. It is not
+emitted when a person simply answers no at the prompt, so it does not make every tool request
+answerable. `PermissionRequest` — the pre-decision event, which carries no `tool_use_id` — is where
+an ordinary refusal is visible, and conbus does not mirror it.
+
 ## Payloads
 
 ### PreToolUse
@@ -105,7 +111,21 @@ under the parent `session_id`, told apart only by `agent_id`.
 
 ### PostToolBatch
 
-    tool_calls:array(Lqb())}))),Nqb=Se(()=>YP().and(ye({hook_event_name:Ct("PermissionDenied"),tool_name:string,tool_input:json,tool_use_id:string,reason:string
+    tool_calls: array of {
+        tool_name: string
+        tool_input: json
+        tool_use_id: string
+        tool_response: json?      # absent when the call did not return one
+    }
+
+    "Fired once after every tool call in a batch has resolved, before the next model
+     request. PostToolUse fires per-tool and may run concurrently for parallel tool
+     calls; PostToolBatch fires exactly once with the full batch."
+
+    conbus records only the ids. The ids are the only part the per-call events do not
+    already carry: under `Full` retention the bodies would be written a third time, and
+    under the shipping default they would be elided to a byte count a third time. Either
+    way the batch line is the grouping and the boundary, nothing else.
 
 ### PermissionDenied
 
@@ -169,15 +189,17 @@ under the parent `session_id`, told apart only by `agent_id`.
 
 ### Elicitation
 
-    mcp_server_name:string,message:string,mode:enum["form","url"])?,url:string?,elicitation_id:string?,requested_schema:map(string,json)?}))),Qqb=Se(()=>YP().and(ye({hook_event_name:Ct("ElicitationResult"),mcp_server_name:string,elicitation_id:string?,mode:enum["form","url"])?,action:enum["accept","decline","cancel"]),content:map(string,json)?}))),e6b=["user_settings","project_settings","local_setting
+    mcp_server_name: string, message: string, mode: enum["form","url"]?, url: string?,
+    elicitation_id: string?, requested_schema: map(string, json)?
 
 ### ElicitationResult
 
-    mcp_server_name:string,elicitation_id:string?,mode:enum["form","url"])?,action:enum["accept","decline","cancel"]),content:map(string,json)?}))),e6b=["user_settings","project_settings","local_settings","policy_settings","skills"],t6b=Se(()=>YP().and(ye({hook_event_name:Ct("ConfigChange"),source:Dr(e6b),file_path:string?
+    mcp_server_name: string, elicitation_id: string?, mode: enum["form","url"]?,
+    action: enum["accept","decline","cancel"], content: map(string, json)?
 
 ### ConfigChange
 
-    source:Dr(e6b),file_path:string?
+    source: enum["user_settings","project_settings","local_settings","policy_settings","skills"], file_path: string?
 
 ### InstructionsLoaded
 
@@ -205,7 +227,16 @@ under the parent `session_id`, told apart only by `agent_id`.
 
 ### MessageDisplay
 
-    turn_id:string,message_id:string,index:number,final:bool,delta:string})).describe("Hook input for the MessageDisplay event. Fired with each batch of newly completed lines while an assistant message streams. Display-only: the stored message and what the model s
+    turn_id: string, message_id: string, index: number, final: bool, delta: string
+
+    `turn_id` here is NOT the turn correlator conbus records: the same payload carries
+    both `prompt_id` and `turn_id` with different UUIDs. See the note above.
+
+    `delta` is "the newly completed lines since the prior flush", so this fires many
+    times per assistant message. conbus does not mirror it: it is the only official
+    channel carrying every assistant message rather than just the last, and it collides
+    with the shipping default of writing conversation but not tool bodies. A retention
+    decision before it is an adapter change.
 
 ### SessionEnd
 
