@@ -364,27 +364,39 @@ fn hook_runs(command: &str) -> Result<(), String> {
 /// one proves trusted-or-modified, which this cannot tell apart without asking
 /// Codex, so it does not claim to.
 fn report_codex_trust(home: &Path) {
-    let Some((trusted, untrusted)) = codex_trust(home) else {
+    let Some(state) = codex_trust(home) else {
         return;
     };
-    if untrusted.is_empty() && trusted == 0 {
+    if state.untrusted.is_empty() && state.trusted == 0 {
         return;
     }
-    if untrusted.is_empty() {
-        println!("codex     {trusted} hook(s) have a trust record");
-    } else {
+    if state.untrusted.is_empty() {
+        println!("codex     {} hook(s) trusted", state.trusted);
+        return;
+    }
+    println!(
+        "codex     {} of {} hook(s) NOT TRUSTED, so Codex never spawns them: {}",
+        state.untrusted.len(),
+        state.untrusted.len() + state.trusted,
+        state.untrusted.join(", ")
+    );
+    // The gesture, named. Approving is a person's act inside Codex and there is
+    // no command conbus could run instead: the record is a hash, and Codex's
+    // own `hooks/list` hands out the value that would forge it.
+    println!(
+        "          start Codex; it asks about hooks that are new or changed at startup. conbus reads that record and must never write it."
+    );
+    if state.others_untrusted > 0 {
         println!(
-            "codex     {} of {} hook(s) NOT TRUSTED, so Codex never runs them: {} — approve them in Codex; conbus must not write its trust record",
-            untrusted.len(),
-            untrusted.len() + trusted,
-            untrusted.join(", ")
+            "          note: {} other untrusted hook(s) share that file and are approved in the same gesture",
+            state.others_untrusted
         );
     }
 }
 
 /// How many of our Codex hooks Codex has a trust record for, and which it does
 /// not, in the order Codex lists them.
-fn codex_trust(home: &Path) -> Option<(usize, Vec<String>)> {
+fn codex_trust(home: &Path) -> Option<CodexTrust> {
     let codex_home = std::env::var_os("CODEX_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".codex"));
@@ -395,6 +407,11 @@ fn codex_trust(home: &Path) -> Option<(usize, Vec<String>)> {
 
     let mut untrusted = Vec::new();
     let mut trusted = 0;
+    // Approving happens per file, not per hook: Codex reviews everything that
+    // is new or changed at once. Somebody who says yes on our account is also
+    // saying yes to whatever else is sitting untrusted in the same file, so the
+    // count is part of what they are being asked.
+    let mut others_untrusted = 0;
     for (event, groups) in settings
         .get("hooks")
         .and_then(serde_json::Value::as_object)
@@ -413,25 +430,39 @@ fn codex_trust(home: &Path) -> Option<(usize, Vec<String>)> {
                     .get("command")
                     .and_then(serde_json::Value::as_str)
                     .is_some_and(is_ours);
-                if !ours {
-                    continue;
-                }
                 let key = format!(
                     "{}:{}:{group}:{index}",
                     hooks_path.display(),
                     snake_case(event)
                 );
-                if config.contains(&format!("[hooks.state.\"{key}\"]")) {
-                    trusted += 1;
-                } else {
-                    untrusted.push(event.clone());
+                let has_record = config.contains(&format!("[hooks.state.\"{key}\"]"));
+                match (ours, has_record) {
+                    (true, true) => trusted += 1,
+                    (true, false) => untrusted.push(event.clone()),
+                    (false, false) => others_untrusted += 1,
+                    (false, true) => {}
                 }
             }
         }
     }
 
     untrusted.sort();
-    Some((trusted, untrusted))
+    Some(CodexTrust {
+        trusted,
+        untrusted,
+        others_untrusted,
+    })
+}
+
+/// What Codex's own consent record says about the hooks in one file.
+struct CodexTrust {
+    /// Ours, with a trust record.
+    trusted: usize,
+    /// Ours, without one — the events Codex will not run.
+    untrusted: Vec<String>,
+    /// Everybody else's, without one. Not ours to report on beyond the number,
+    /// but part of what a person approves in the same gesture.
+    others_untrusted: usize,
 }
 
 /// Codex names its events in snake_case in the trust key, where its hook file
@@ -652,9 +683,13 @@ mod tests {
         )
         .expect("write");
 
-        let (trusted, untrusted) = codex_trust(home.path()).expect("read");
-        assert_eq!(trusted, 0);
-        assert_eq!(untrusted, vec!["PostToolUse", "UserPromptSubmit"]);
+        let state = codex_trust(home.path()).expect("read");
+        assert_eq!(state.trusted, 0);
+        assert_eq!(state.untrusted, vec!["PostToolUse", "UserPromptSubmit"]);
+        assert_eq!(
+            state.others_untrusted, 1,
+            "the neighbour in the same file is approved in the same gesture"
+        );
 
         // Codex keys the record by file, snake-cased event, matcher-group index
         // and position within the group — so the second group's index is what
@@ -668,10 +703,10 @@ mod tests {
         )
         .expect("write");
 
-        let (trusted, untrusted) = codex_trust(home.path()).expect("read");
-        assert_eq!(trusted, 1);
+        let state = codex_trust(home.path()).expect("read");
+        assert_eq!(state.trusted, 1);
         assert_eq!(
-            untrusted,
+            state.untrusted,
             vec!["UserPromptSubmit"],
             "a record for one hook says nothing about another"
         );

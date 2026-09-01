@@ -6,6 +6,7 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
+use std::time::Duration;
 
 use conbus_core::continuation::{Asking, Decision, decide, opening_units, unattended};
 use conbus_core::event::{Event, Source};
@@ -368,11 +369,51 @@ pub fn serve(paths: &Paths, retention: Retention) -> io::Result<()> {
     Ok(())
 }
 
+/// How long an accepted connection may stay silent before the daemon walks
+/// away from it.
+///
+/// The daemon serves one connection to its end before it accepts the next, so
+/// a client that connects and says nothing is not its own problem but
+/// everybody else's: every hook behind it waits in the backlog, and the hook
+/// client gives up after its `REPLY_DEADLINE` — the turn goes on, and its
+/// record is gone. A hook has its whole request ready before it connects (the
+/// payload was read from stdin first), so silence here is never a hook that is
+/// thinking; it is something that is not a hook, or one that has wedged. Well
+/// inside the hook's half second, so a silent neighbour costs the hooks behind
+/// it a wait rather than their records.
+pub const SILENCE_BOUND: Duration = Duration::from_millis(200);
+
+// The daemon has to give up on silence before the hook gives up on the daemon,
+// or the bound protects nobody.
+const _: () = assert!(SILENCE_BOUND.as_millis() < crate::hook::client::REPLY_DEADLINE.as_millis());
+
 fn handle_connection(daemon: &mut Daemon, stream: UnixStream) -> io::Result<()> {
+    stream.set_read_timeout(Some(SILENCE_BOUND))?;
+    stream.set_write_timeout(Some(SILENCE_BOUND))?;
     let mut writer = stream.try_clone()?;
     let reader = BufReader::new(stream);
+    let mut served = 0usize;
     for line in reader.lines() {
-        let line = line?;
+        let line = match line {
+            Ok(line) => line,
+            // A client that has been answered and not yet closed is on its way
+            // out, and that is the ordinary end of a connection. One that never
+            // spoke is not a hook, and the hooks queued behind it must not wait
+            // for it.
+            Err(err) if went_silent(&err) => {
+                return if served == 0 {
+                    Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!(
+                            "a connection sent no request within {SILENCE_BOUND:?}; dropped it"
+                        ),
+                    ))
+                } else {
+                    Ok(())
+                };
+            }
+            Err(err) => return Err(err),
+        };
         if line.is_empty() {
             continue;
         }
@@ -388,8 +429,18 @@ fn handle_connection(daemon: &mut Daemon, stream: UnixStream) -> io::Result<()> 
             serde_json::to_string(&response).map_err(io::Error::other)?
         )?;
         writer.flush()?;
+        served += 1;
     }
     Ok(())
+}
+
+/// A read or write that ran out its deadline. Unix reports it as `WouldBlock`;
+/// the standard library documents either kind.
+fn went_silent(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+    )
 }
 
 #[cfg(test)]
@@ -574,5 +625,67 @@ mod tests {
         );
 
         bind(&socket).expect("a stale socket must be reclaimable");
+    }
+
+    #[test]
+    fn a_connection_that_never_speaks_is_dropped_so_the_hooks_behind_it_are_served() {
+        // The daemon serves one connection to its end before it accepts the
+        // next, so a client that connects and says nothing is not its own
+        // problem but everybody else's. A hook has its request ready before it
+        // connects — the payload was read from stdin first — so silence here
+        // is never a hook that is thinking.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = SegmentLog::open(dir.path(), Retention::default()).expect("open");
+        let mut daemon = Daemon::new(log, Registry::new(), HashMap::new());
+        let (ours, theirs) = UnixStream::pair().expect("socketpair");
+
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let outcome = handle_connection(&mut daemon, ours);
+            let _ = done.send(outcome.map_err(|err| err.kind()));
+        });
+
+        let outcome = finished
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("the daemon is still waiting on a client that will never speak");
+        assert_eq!(outcome, Err(io::ErrorKind::TimedOut));
+        drop(theirs);
+    }
+
+    #[test]
+    fn a_client_that_lingers_after_being_answered_is_not_a_fault() {
+        // A hook exits the moment it has printed its reply, and the kernel
+        // closes its end for it. One that is a little slow about it has still
+        // been served, so walking away from it is the ordinary end of a
+        // connection, not a failure to report.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = SegmentLog::open(dir.path(), Retention::default()).expect("open");
+        let mut daemon = Daemon::new(log, Registry::new(), HashMap::new());
+        let (ours, mut theirs) = UnixStream::pair().expect("socketpair");
+        let line = serde_json::to_string(&request(Event::TurnStarted {
+            author: None,
+            prompt: Body::kept("hello"),
+        }))
+        .expect("json");
+        writeln!(theirs, "{line}").expect("write the request");
+
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let outcome = handle_connection(&mut daemon, ours);
+            let _ = done.send(outcome.map_err(|err| err.kind()));
+        });
+
+        let mut reply = String::new();
+        BufReader::new(&theirs)
+            .read_line(&mut reply)
+            .expect("read the reply");
+        assert!(reply.contains(r#""status":"recorded""#), "{reply}");
+
+        // Say nothing more, and do not hang up.
+        let outcome = finished
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("the daemon is still waiting on a client it already answered");
+        assert_eq!(outcome, Ok(()));
+        drop(theirs);
     }
 }
