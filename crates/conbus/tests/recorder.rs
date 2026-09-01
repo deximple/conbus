@@ -1076,3 +1076,42 @@ fn a_wedged_daemon_does_not_hold_the_turn_open() {
     );
     drop(held);
 }
+
+#[test]
+fn a_silent_connection_does_not_hold_the_hooks_behind_it() {
+    // The daemon serves one connection to its end before it accepts the next.
+    // So a client that connects and then says nothing is not its own problem
+    // but everybody else's: every hook behind it sits in the backlog, and the
+    // hook client gives up after half a second — the turn goes on, and its
+    // record is gone. The daemon has to walk away from silence by itself.
+    let home = tempfile::tempdir().expect("tempdir");
+    let daemon = start_daemon(home.path());
+
+    let silent =
+        std::os::unix::net::UnixStream::connect(home.path().join("conbus.sock")).expect("connect");
+    // Long enough for the daemon to accept it and block on the read.
+    std::thread::sleep(Duration::from_millis(50));
+
+    let started = Instant::now();
+    let (code, stdout, stderr) = run_hook_full(
+        home.path(),
+        r#"{"session_id":"s-behind","hook_event_name":"UserPromptSubmit","cwd":"/repo",
+            "prompt":"still here"}"#,
+        ATTENDED,
+    );
+    let waited = started.elapsed();
+    drop(silent);
+
+    assert_eq!(code, 0, "a hook must never fail the turn");
+    assert!(says_nothing(&stdout), "{stdout}");
+    assert!(waited < Duration::from_secs(1), "waited {waited:?}");
+    let prompts = log_lines(home.path())
+        .into_iter()
+        .filter(|line| line["event"] == "turn_started")
+        .count();
+    assert_eq!(
+        prompts, 1,
+        "the hook behind a silent connection lost its record after {waited:?}: {stderr}"
+    );
+    daemon.stop();
+}

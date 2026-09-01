@@ -461,6 +461,19 @@ making somebody wait for it.
 six also approves whatever else sits untrusted alongside them — five other hooks on the machine this was written
 on. `doctor` says so, because being asked to consent without being told the scope is not consent.
 
+**The daemon has a bound of its own now, because the hook's did not cover the daemon.** The client's 500ms
+deadline bounds how long a *hook* waits; it says nothing about how long the *daemon* waits. The daemon serves one
+connection to its end before accepting the next, and an accepted connection had no timeout at all — so anything
+that connected and said nothing held every hook behind it in the backlog: until the vendor's own timeout before the
+client deadline shipped, and after it, until each hook gave up at 500ms and lost its record instead. A read-only
+audit on 2026-09-02 found it by reading, and the e2e that pins it
+(`a_silent_connection_does_not_hold_the_hooks_behind_it`) failed first with exactly that shape — the hook behind a
+silent connection exited zero after 506ms with `record dropped`. Accepted connections now carry a 200ms read and
+write timeout, asserted at compile time to be shorter than the client's deadline, because the daemon has to give up
+on silence before the hook gives up on the daemon or the bound protects nobody. A hook has its whole request ready
+before it connects, so silence is never a hook that is thinking. A client that was answered and lingers is the
+ordinary end of a connection; one that never spoke is reported on the daemon's stderr.
+
 One reading settled: the AGENTS.md rule against injecting into a Codex thread the user opened targets
 `thread/inject_items` on the app-server. Returning `additionalContext` from a hook does not violate it — the plan
 lists Codex `SessionStart additionalContext` as a sanctioned channel in the same breath. The rule's literal words
