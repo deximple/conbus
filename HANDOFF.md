@@ -474,6 +474,13 @@ on silence before the hook gives up on the daemon or the bound protects nobody. 
 before it connects, so silence is never a hook that is thinking. A client that was answered and lingers is the
 ordinary end of a connection; one that never spoke is reported on the daemon's stderr.
 
+And the thing installing it proved, in the same hour: **Darwin refuses to set socket options on a peer that has
+already hung up**, with `EINVAL`, and `doctor`'s liveness probe is exactly such a peer — it connects and leaves. The
+first build of the bound reported every probe as `connection failed: Invalid argument (os error 22)`, one line in
+`daemon.log` per `conbus doctor`, and the e2e suite could not have shown it because the test daemon's stderr goes
+to `/dev/null`. A peer that left before it was served is nobody to serve; that case now ends the connection quietly,
+and a unit test on a socketpair pins it.
+
 One reading settled: the AGENTS.md rule against injecting into a Codex thread the user opened targets
 `thread/inject_items` on the app-server. Returning `additionalContext` from a hook does not violate it — the plan
 lists Codex `SessionStart additionalContext` as a sanctioned channel in the same breath. The rule's literal words
