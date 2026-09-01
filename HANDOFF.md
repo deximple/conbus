@@ -448,6 +448,19 @@ source id to `{kind, value}` with `kind` in `["untrusted", "application"]` — a
 neither `inject_items` nor `developerInstructions`, so it carries no rollback-source hazard. That is the right
 channel for a leg the bus spawns.
 
+**Codex gives `SessionEnd` one second, and it is Codex's default rather than something conbus asked for** —
+`hooks/list` reports `timeoutSec: 1` for that event where every other conbus entry reports 600, and the entry
+itself carries only `command` and `type`. So the tightest deadline on the whole surface is a second, on session
+teardown, and the hook client now bounds its own call to the daemon at 500ms. It had no timeout at all: a daemon
+that is up but wedged would block the read forever, and the vendor's timeout would become the user's wait — 30
+seconds on Claude Code's `UserPromptSubmit`, with the prompt stalled the whole time. The daemon's work per request
+is a map lookup and an append, so anything near that bound is a fault, and losing one record is cheaper than
+making somebody wait for it.
+
+**Approval is per file, not per hook.** Codex reviews everything new or changed at startup, so approving conbus's
+six also approves whatever else sits untrusted alongside them — five other hooks on the machine this was written
+on. `doctor` says so, because being asked to consent without being told the scope is not consent.
+
 One reading settled: the AGENTS.md rule against injecting into a Codex thread the user opened targets
 `thread/inject_items` on the app-server. Returning `additionalContext` from a hook does not violate it — the plan
 lists Codex `SessionStart additionalContext` as a sanctioned channel in the same breath. The rule's literal words

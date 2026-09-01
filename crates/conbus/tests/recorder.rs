@@ -1038,3 +1038,41 @@ fn a_briefing_survives_a_daemon_restart() {
     );
     second.stop();
 }
+
+#[test]
+fn a_wedged_daemon_does_not_hold_the_turn_open() {
+    // The hook must never fail the turn, and it must not delay it either. A
+    // daemon that accepts the connection and then answers nothing is the case
+    // no other test covers: the socket is up, so the connect succeeds, and
+    // without a deadline the read blocks until the vendor's own timeout — 30
+    // seconds on Claude Code's UserPromptSubmit, with the prompt stalled the
+    // whole time, and one second on Codex's SessionEnd.
+    let home = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(home.path()).expect("mkdir");
+    let socket = home.path().join("conbus.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
+    // Accept and then say nothing, holding the connection open.
+    let held = std::thread::spawn(move || {
+        let mut kept = Vec::new();
+        while let Ok((stream, _)) = listener.accept() {
+            kept.push(stream);
+        }
+    });
+
+    let started = Instant::now();
+    let (code, stdout, _) = run_hook_full(
+        home.path(),
+        r#"{"session_id":"s-wedged","hook_event_name":"UserPromptSubmit","cwd":"/repo",
+            "prompt":"hello"}"#,
+        ATTENDED,
+    );
+    let waited = started.elapsed();
+
+    assert_eq!(code, 0, "a hook must never fail the turn");
+    assert!(says_nothing(&stdout), "{stdout}");
+    assert!(
+        waited < Duration::from_secs(1),
+        "held the turn open for {waited:?}, past Codex's own SessionEnd limit"
+    );
+    drop(held);
+}
