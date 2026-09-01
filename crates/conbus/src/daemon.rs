@@ -388,8 +388,19 @@ pub const SILENCE_BOUND: Duration = Duration::from_millis(200);
 const _: () = assert!(SILENCE_BOUND.as_millis() < crate::hook::client::REPLY_DEADLINE.as_millis());
 
 fn handle_connection(daemon: &mut Daemon, stream: UnixStream) -> io::Result<()> {
-    stream.set_read_timeout(Some(SILENCE_BOUND))?;
-    stream.set_write_timeout(Some(SILENCE_BOUND))?;
+    if let Err(err) = bound(&stream) {
+        // A peer that connected and left before it was served — the doctor's
+        // liveness probe, the daemon's own bind check. Darwin refuses to set
+        // options on a socket that can no longer send or receive, with EINVAL,
+        // and there is nobody left to serve, so this is the ordinary end of a
+        // connection rather than a fault to report. The first build of this
+        // bound reported it, one line in daemon.log per `conbus doctor`.
+        return if err.raw_os_error() == Some(libc::EINVAL) {
+            Ok(())
+        } else {
+            Err(err)
+        };
+    }
     let mut writer = stream.try_clone()?;
     let reader = BufReader::new(stream);
     let mut served = 0usize;
@@ -432,6 +443,13 @@ fn handle_connection(daemon: &mut Daemon, stream: UnixStream) -> io::Result<()> 
         served += 1;
     }
     Ok(())
+}
+
+/// Bound how long this connection may keep the daemon waiting, in either
+/// direction.
+fn bound(stream: &UnixStream) -> io::Result<()> {
+    stream.set_read_timeout(Some(SILENCE_BOUND))?;
+    stream.set_write_timeout(Some(SILENCE_BOUND))
 }
 
 /// A read or write that ran out its deadline. Unix reports it as `WouldBlock`;
@@ -687,5 +705,23 @@ mod tests {
             .expect("the daemon is still waiting on a client it already answered");
         assert_eq!(outcome, Ok(()));
         drop(theirs);
+    }
+
+    #[test]
+    fn a_client_that_hangs_up_before_it_is_served_is_not_a_fault() {
+        // The doctor's liveness probe and the daemon's own bind check connect
+        // and leave without a word. Darwin refuses to set options on a socket
+        // whose peer has already gone, with EINVAL, and the first build of the
+        // silence bound reported every such probe as a failed connection — one
+        // line in daemon.log per `conbus doctor`.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = SegmentLog::open(dir.path(), Retention::default()).expect("open");
+        let mut daemon = Daemon::new(log, Registry::new(), HashMap::new());
+        let (ours, theirs) = UnixStream::pair().expect("socketpair");
+        drop(theirs);
+
+        let outcome = handle_connection(&mut daemon, ours).map_err(|err| err.kind());
+
+        assert_eq!(outcome, Ok(()), "a peer that left is nobody to serve");
     }
 }
