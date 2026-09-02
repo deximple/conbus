@@ -295,6 +295,12 @@ pub fn parse_codex_thread(thread: &serde_json::Value, turns: &[serde_json::Value
         backfilled_from: Some(CODEX_THREAD.to_string()),
     };
 
+    // A reply belongs to the most recent prompt, and the last reply is the
+    // one that ends it — the transcript parser's rule, needed here because
+    // the VS Code extension's legacy history splits one exchange into a
+    // prompt turn and reply-only turns (590 of 1,070 turns in the 60 most
+    // recent threads on 2026-09-03 carried nothing but replies).
+    let mut open: Option<OpenCodexTurn> = None;
     for turn in turns {
         let items: Vec<&serde_json::Value> = turn
             .get("items")
@@ -303,17 +309,23 @@ pub fn parse_codex_thread(thread: &serde_json::Value, turns: &[serde_json::Value
             .flatten()
             .collect();
         let mut prompt: Vec<&str> = Vec::new();
+        let mut saw_user = false;
         let mut answer: Option<&str> = None;
         for item in &items {
             match item.get("type").and_then(serde_json::Value::as_str) {
-                Some("userMessage") => prompt.extend(
-                    item.get("content")
-                        .and_then(serde_json::Value::as_array)
-                        .into_iter()
-                        .flatten()
-                        .filter(|block| block.get("type").and_then(|t| t.as_str()) == Some("text"))
-                        .filter_map(|block| block.get("text")?.as_str()),
-                ),
+                Some("userMessage") => {
+                    saw_user = true;
+                    prompt.extend(
+                        item.get("content")
+                            .and_then(serde_json::Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .filter(|block| {
+                                block.get("type").and_then(|t| t.as_str()) == Some("text")
+                            })
+                            .filter_map(|block| block.get("text")?.as_str()),
+                    );
+                }
                 Some("agentMessage") => {
                     if let Some(said) = item.get("text").and_then(serde_json::Value::as_str) {
                         answer = Some(said);
@@ -323,10 +335,26 @@ pub fn parse_codex_thread(thread: &serde_json::Value, turns: &[serde_json::Value
                 None => out.skip("item without a type"),
             }
         }
+        let completed = turn.get("status").and_then(serde_json::Value::as_str) == Some("completed");
+        let completed_at = unix_seconds(turn.get("completedAt"));
         if prompt.is_empty() {
-            out.skip("turn without a user message");
+            if saw_user {
+                // An image-only prompt, most often. Its text is not on this
+                // surface; inventing one would be a fabrication.
+                out.skip("user message without text");
+            }
+            match open.as_mut() {
+                Some(current) => {
+                    if let Some(said) = answer {
+                        current.reply = Some((completed_at, said.to_string()));
+                    }
+                    current.completed = completed;
+                }
+                None => out.skip("reply before any prompt"),
+            }
             continue;
         }
+        close_codex(&mut out, bus_id, &source, open.take());
         let vendor_turn_id = turn
             .get("id")
             .and_then(serde_json::Value::as_str)
@@ -342,22 +370,13 @@ pub fn parse_codex_thread(thread: &serde_json::Value, turns: &[serde_json::Value
                 prompt: Body::kept(prompt.join("\n")),
             },
         });
-        // A turn still in progress, or one that never completed, has no
-        // ending in the thread — which is the truth about it.
-        if turn.get("status").and_then(serde_json::Value::as_str) == Some("completed") {
-            out.entries.push(Entry {
-                bus_id,
-                observed_at: unix_seconds(turn.get("completedAt")),
-                source: source.clone(),
-                vendor_turn_id,
-                vendor_agent_id: None,
-                event: Event::TurnEnded {
-                    state: TurnState::Complete,
-                    assistant_message: answer.map(Body::kept),
-                },
-            });
-        }
+        open = Some(OpenCodexTurn {
+            vendor_turn_id,
+            reply: answer.map(|said| (completed_at, said.to_string())),
+            completed,
+        });
     }
+    close_codex(&mut out, bus_id, &source, open.take());
 
     if out.entries.is_empty() {
         return out;
@@ -375,6 +394,44 @@ pub fn parse_codex_thread(thread: &serde_json::Value, turns: &[serde_json::Value
         },
     );
     out
+}
+
+/// A Codex prompt that has not yet been ended by the next prompt.
+struct OpenCodexTurn {
+    vendor_turn_id: Option<VendorTurnId>,
+    /// The most recent reply: when it completed and what it said.
+    reply: Option<(Option<Timestamp>, String)>,
+    /// Whether the last turn that touched it completed. A turn still in
+    /// progress, or one that never completed, has no ending — which is the
+    /// truth about it.
+    completed: bool,
+}
+
+/// End a Codex prompt with the last reply it received.
+fn close_codex(out: &mut Recovered, bus_id: BusId, source: &Source, open: Option<OpenCodexTurn>) {
+    let Some(OpenCodexTurn {
+        vendor_turn_id,
+        reply,
+        completed: true,
+    }) = open
+    else {
+        return;
+    };
+    let (observed_at, said) = match reply {
+        Some((at, said)) => (at, Some(Body::kept(said))),
+        None => (None, None),
+    };
+    out.entries.push(Entry {
+        bus_id,
+        observed_at,
+        source: source.clone(),
+        vendor_turn_id,
+        vendor_agent_id: None,
+        event: Event::TurnEnded {
+            state: TurnState::Complete,
+            assistant_message: said,
+        },
+    });
 }
 
 /// Unix seconds as the app-server writes them: a number on a turn, a string
@@ -782,5 +839,68 @@ mod codex_tests {
 
         assert!(out.entries.is_empty());
         assert_eq!(out.skipped.get("thread id is not a uuid"), Some(&1));
+    }
+    #[test]
+    fn a_turn_of_nothing_but_replies_ends_the_prompt_before_it() {
+        // Measured on 2026-09-03: of 1,070 turns in the 60 most recent
+        // threads, 590 carried only `agentMessage` items — the VS Code
+        // extension's legacy history splits one exchange into a prompt turn
+        // and one or more reply-only turns. The Claude transcript parser's
+        // rule holds here too: a reply belongs to the most recent prompt,
+        // and the last reply is the one that ends it.
+        let mut turns = turns();
+        turns.truncate(1);
+        turns.push(serde_json::json!({
+            "id": "01a06316-5c00-7000-8000-000000000003",
+            "items": [{"type": "agentMessage", "id": "a9", "text": "and here is the real answer", "phase": "final_answer"}],
+            "status": "completed", "error": null,
+            "startedAt": 1788368900, "completedAt": 1788368950, "durationMs": 50000
+        }));
+
+        let out = parse_codex_thread(&thread(), &turns);
+
+        let kinds: Vec<&str> = out
+            .entries
+            .iter()
+            .map(|e| match &e.event {
+                Event::SessionCandidate { .. } => "session",
+                Event::TurnStarted { .. } => "started",
+                Event::TurnEnded { .. } => "ended",
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec!["session", "started", "ended"],
+            "one prompt, one ending"
+        );
+        let Event::TurnEnded {
+            assistant_message: Some(message),
+            ..
+        } = &out.entries[2].event
+        else {
+            panic!("expected an ended turn");
+        };
+        assert_eq!(*message, Body::kept("and here is the real answer"));
+        assert_eq!(
+            out.entries[2].observed_at.map(|t| t.to_string()).as_deref(),
+            Some("2026-09-02T17:09:10.000Z"),
+            "the ending is stamped when the last reply completed"
+        );
+        assert_eq!(out.skipped.get("turn without a user message"), None);
+    }
+
+    #[test]
+    fn a_reply_before_any_prompt_is_counted_not_attached_to_nothing() {
+        let turns = vec![serde_json::json!({
+            "id": "01a06316-5c00-7000-8000-000000000004",
+            "items": [{"type": "agentMessage", "id": "a0", "text": "hello?", "phase": "final_answer"}],
+            "status": "completed", "error": null, "startedAt": 1788368700, "completedAt": 1788368701
+        })];
+
+        let out = parse_codex_thread(&thread(), &turns);
+
+        assert!(out.entries.is_empty());
+        assert_eq!(out.skipped.get("reply before any prompt"), Some(&1));
     }
 }
