@@ -250,6 +250,144 @@ fn prepend_session_candidate(out: &mut Recovered, bus_id: BusId, harness_version
     );
 }
 
+/// Names the source a Codex thread was read from: the app-server's
+/// `thread/list` and `thread/turns/list`, not its rollout files.
+pub const CODEX_THREAD: &str = "codex_thread";
+
+/// Recover one Codex thread from what the app-server said about it.
+///
+/// Probed on 2026-09-03 against Codex 0.152.1: a `thread/list` item carries
+/// `id` — equal to `sessionId`, equal to the hook's `session_id`, so it can
+/// *be* the `bus_id` the way a Claude transcript's file name can — plus
+/// `cwd`, `source` (`cli`, `vscode`), `cliVersion` and `createdAt` (unix
+/// seconds, as a string). A `thread/turns/list` turn carries `id`, `status`,
+/// `startedAt`/`completedAt` (numbers) and items of type `userMessage` (text
+/// blocks) and `agentMessage` (`text`, `phase`). The app-server read threads
+/// back to 0.107.0 on the same machine, so the version skew the plan feared
+/// belongs to rollout files, not to this surface. Read tolerantly, like the
+/// transcript parser: what it does not understand is counted, not fatal.
+pub fn parse_codex_thread(thread: &serde_json::Value, turns: &[serde_json::Value]) -> Recovered {
+    let mut out = Recovered::default();
+    let Some(bus_id) = thread
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|id| id.parse::<BusId>().ok())
+    else {
+        out.skip("thread id is not a uuid");
+        return out;
+    };
+    let text = |key: &str| {
+        thread
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    out.vendor_session_id = text("sessionId").or_else(|| Some(bus_id.to_string()));
+    out.workspace = text("cwd");
+    out.entrypoint = text("source").map(Entrypoint::new);
+    let source = Source {
+        harness: Harness::new(Harness::CODEX),
+        harness_version: text("cliVersion"),
+        vendor_session_id: out.vendor_session_id.clone(),
+        workspace: out.workspace.clone(),
+        entrypoint: out.entrypoint.clone(),
+        backfilled_from: Some(CODEX_THREAD.to_string()),
+    };
+
+    for turn in turns {
+        let items: Vec<&serde_json::Value> = turn
+            .get("items")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .collect();
+        let mut prompt: Vec<&str> = Vec::new();
+        let mut answer: Option<&str> = None;
+        for item in &items {
+            match item.get("type").and_then(serde_json::Value::as_str) {
+                Some("userMessage") => prompt.extend(
+                    item.get("content")
+                        .and_then(serde_json::Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter(|block| block.get("type").and_then(|t| t.as_str()) == Some("text"))
+                        .filter_map(|block| block.get("text")?.as_str()),
+                ),
+                Some("agentMessage") => {
+                    if let Some(said) = item.get("text").and_then(serde_json::Value::as_str) {
+                        answer = Some(said);
+                    }
+                }
+                Some(other) => out.skip(format!("item type {other}")),
+                None => out.skip("item without a type"),
+            }
+        }
+        if prompt.is_empty() {
+            out.skip("turn without a user message");
+            continue;
+        }
+        let vendor_turn_id = turn
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .map(VendorTurnId::new);
+        out.entries.push(Entry {
+            bus_id,
+            observed_at: unix_seconds(turn.get("startedAt")),
+            source: source.clone(),
+            vendor_turn_id: vendor_turn_id.clone(),
+            vendor_agent_id: None,
+            event: Event::TurnStarted {
+                author: None,
+                prompt: Body::kept(prompt.join("\n")),
+            },
+        });
+        // A turn still in progress, or one that never completed, has no
+        // ending in the thread — which is the truth about it.
+        if turn.get("status").and_then(serde_json::Value::as_str) == Some("completed") {
+            out.entries.push(Entry {
+                bus_id,
+                observed_at: unix_seconds(turn.get("completedAt")),
+                source: source.clone(),
+                vendor_turn_id,
+                vendor_agent_id: None,
+                event: Event::TurnEnded {
+                    state: TurnState::Complete,
+                    assistant_message: answer.map(Body::kept),
+                },
+            });
+        }
+    }
+
+    if out.entries.is_empty() {
+        return out;
+    }
+    let observed_at = unix_seconds(thread.get("createdAt")).or(out.entries[0].observed_at);
+    out.entries.insert(
+        0,
+        Entry {
+            bus_id,
+            observed_at,
+            source,
+            vendor_turn_id: None,
+            vendor_agent_id: None,
+            event: Event::SessionCandidate { trigger: None },
+        },
+    );
+    out
+}
+
+/// Unix seconds as the app-server writes them: a number on a turn, a string
+/// on a thread.
+fn unix_seconds(value: Option<&serde_json::Value>) -> Option<Timestamp> {
+    let seconds = match value {
+        Some(serde_json::Value::Number(n)) => n.as_i64(),
+        Some(serde_json::Value::String(s)) => s.parse().ok(),
+        _ => None,
+    }?;
+    Timestamp::from_unix_seconds(seconds)
+}
+
 /// End a turn with the last reply it received. A prompt that was never answered
 /// simply has no ending in the transcript, which is the truth about it.
 fn close(out: &mut Recovered, bus_id: BusId, open: Option<OpenTurn>) {
@@ -513,5 +651,136 @@ mod tests {
 
         assert_eq!(turns(&out).len(), 4);
         assert_eq!(out.skipped.get("sidechain"), Some(&1));
+    }
+}
+
+#[cfg(test)]
+mod codex_tests {
+    use super::*;
+
+    /// Shaped from the real app-server on 2026-09-03: a `thread/list` item
+    /// (timestamps are strings there) and one `thread/turns/list` turn
+    /// (timestamps are numbers there), for the throwaway checkout's session.
+    fn thread() -> serde_json::Value {
+        serde_json::json!({
+            "id": "01a06316-03dc-7c31-abae-aa2c2606cdba",
+            "sessionId": "01a06316-03dc-7c31-abae-aa2c2606cdba",
+            "cwd": "/Applications/conbus-hooktest", "name": "Check conbus-record context",
+            "preview": "Is there a conbus-record block in your context?",
+            "createdAt": "1788368782", "updatedAt": "1788368799", "recencyAt": "1788368799",
+            "historyMode": "paginated", "source": "cli", "cliVersion": "0.152.1",
+            "status": "completed", "turns": [], "gitInfo": null, "forkedFromId": null
+        })
+    }
+
+    fn turns() -> Vec<serde_json::Value> {
+        vec![
+            serde_json::json!({
+                "id": "01a06316-3a98-7022-b592-f9e9ac2305b5",
+                "items": [
+                    {"type": "userMessage", "id": "01a06316-3d9c-7e01-bab7-2b6046c367a9",
+                     "content": [{"type": "text", "text": "Is there a conbus-record block in your context?", "text_elements": []}]},
+                    {"type": "agentMessage", "id": "msg_0f41", "text": "Let me look.", "phase": "commentary"},
+                    {"type": "agentMessage", "id": "msg_0f42", "text": "YES-RECORD", "phase": "final_answer"}
+                ],
+                "itemsView": "summary", "status": "completed", "error": null,
+                "startedAt": 1788368796, "completedAt": 1788368799, "durationMs": 3242
+            }),
+            serde_json::json!({
+                "id": "01a06316-4b00-7000-8000-000000000002",
+                "items": [{"type": "userMessage", "id": "u2", "content": [{"type": "text", "text": "and again"}]}],
+                "itemsView": "summary", "status": "inProgress", "error": null,
+                "startedAt": 1788368900, "completedAt": null, "durationMs": null
+            }),
+        ]
+    }
+
+    #[test]
+    fn a_thread_yields_a_session_its_turns_and_their_endings() {
+        let out = parse_codex_thread(&thread(), &turns());
+
+        let kinds: Vec<&str> = out
+            .entries
+            .iter()
+            .map(|e| match &e.event {
+                Event::SessionCandidate { .. } => "session",
+                Event::TurnStarted { .. } => "started",
+                Event::TurnEnded { .. } => "ended",
+                other => panic!("codex backfill produced {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec!["session", "started", "ended", "started"],
+            "a turn still in progress has no ending, which is the truth about it"
+        );
+        assert_eq!(
+            out.vendor_session_id.as_deref(),
+            Some("01a06316-03dc-7c31-abae-aa2c2606cdba")
+        );
+        assert_eq!(
+            out.workspace.as_deref(),
+            Some("/Applications/conbus-hooktest")
+        );
+        assert_eq!(
+            out.entrypoint.as_ref().map(Entrypoint::as_str),
+            Some("cli"),
+            "the thread's `source` is the vendor's own word for where it ran"
+        );
+    }
+
+    #[test]
+    fn a_turn_ends_with_the_final_answer_not_the_commentary() {
+        let out = parse_codex_thread(&thread(), &turns());
+
+        let Event::TurnEnded {
+            assistant_message: Some(message),
+            state,
+        } = &out.entries[2].event
+        else {
+            panic!("expected an ended turn, got {:?}", out.entries[2].event);
+        };
+        assert_eq!(*message, Body::kept("YES-RECORD"));
+        assert_eq!(*state, TurnState::Complete);
+        assert_eq!(
+            out.entries[1]
+                .vendor_turn_id
+                .as_ref()
+                .map(VendorTurnId::as_str),
+            Some("01a06316-3a98-7022-b592-f9e9ac2305b5")
+        );
+    }
+
+    #[test]
+    fn every_recovered_codex_record_says_where_it_came_from_and_when() {
+        let out = parse_codex_thread(&thread(), &turns());
+
+        assert!(out.entries.iter().all(|e| {
+            e.source.backfilled_from.as_deref() == Some(CODEX_THREAD)
+                && e.source.harness.as_str() == Harness::CODEX
+                && e.source.harness_version.as_deref() == Some("0.152.1")
+        }));
+        // The session is stamped with the thread's creation, the turn with
+        // its own start — the thread's `createdAt` is a string and the
+        // turn's `startedAt` a number, and both are unix seconds.
+        assert_eq!(
+            out.entries[0].observed_at.map(|t| t.to_string()).as_deref(),
+            Some("2026-09-02T17:06:22.000Z")
+        );
+        assert_eq!(
+            out.entries[1].observed_at.map(|t| t.to_string()).as_deref(),
+            Some("2026-09-02T17:06:36.000Z")
+        );
+    }
+
+    #[test]
+    fn a_thread_whose_id_is_not_a_uuid_is_counted_not_recovered() {
+        let mut odd = thread();
+        odd["id"] = serde_json::json!("not-a-uuid");
+
+        let out = parse_codex_thread(&odd, &turns());
+
+        assert!(out.entries.is_empty());
+        assert_eq!(out.skipped.get("thread id is not a uuid"), Some(&1));
     }
 }

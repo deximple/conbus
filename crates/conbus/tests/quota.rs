@@ -76,3 +76,45 @@ fn quota_says_so_when_the_app_server_is_not_there() {
         "the failure must name what could not be run"
     );
 }
+
+#[test]
+fn doctor_carries_the_quota_line() {
+    // The router's signal belongs where every other health fact is.
+    let (_dir, codex) = fake_app_server();
+    let home = tempfile::tempdir().expect("tempdir");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_conbus"))
+        .arg("doctor")
+        .env("CONBUS_HOME", home.path())
+        .env("CONBUS_CODEX_BIN", &codex)
+        .output()
+        .expect("run doctor");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        stdout.lines().any(|line| line.starts_with("quota ")
+            && line.contains("22%")
+            && line.contains("not exhausted")),
+        "doctor must show the account's windows:\n{stdout}"
+    );
+}
+
+#[test]
+fn doctor_says_when_the_quota_cannot_be_read() {
+    let home = tempfile::tempdir().expect("tempdir");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_conbus"))
+        .arg("doctor")
+        .env("CONBUS_HOME", home.path())
+        .env("CONBUS_CODEX_BIN", "/nonexistent/codex")
+        .output()
+        .expect("run doctor");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.starts_with("quota ") && line.contains("unavailable")),
+        "an unreadable quota must be said, not omitted:\n{stdout}"
+    );
+}

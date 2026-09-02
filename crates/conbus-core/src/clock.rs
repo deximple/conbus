@@ -42,6 +42,14 @@ impl Timestamp {
         )
     }
 
+    /// A timestamp from unix seconds, which is how Codex's thread APIs
+    /// report time (as a number on a turn, as a string on a thread).
+    pub fn from_unix_seconds(seconds: i64) -> Option<Self> {
+        OffsetDateTime::from_unix_timestamp(seconds)
+            .ok()
+            .map(Timestamp)
+    }
+
     /// Whole seconds from `earlier` to this instant. Negative when this one
     /// came first, which is a real case rather than a bug: a backfilled record
     /// carries the time it happened, so a conversation recovered today can be

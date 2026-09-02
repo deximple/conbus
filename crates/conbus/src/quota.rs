@@ -10,10 +10,10 @@
 //! Read-only. It starts an app-server, asks, and stops it; nothing about the
 //! account changes.
 
-use std::io::{self, BufRead, BufReader, Write};
-use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::io;
 use std::time::Duration;
+
+use crate::appserver::AppServer;
 
 /// One rate-limit window.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -40,89 +40,11 @@ pub struct Quota {
 /// can hang it, and they are not our question.
 pub const DEADLINE: Duration = Duration::from_secs(15);
 
-/// Which binary answers. `CONBUS_CODEX_BIN` overrides `codex` on `PATH`, for
-/// tests and for a Codex installed somewhere the daemon's `PATH` does not see.
-fn codex_binary() -> std::ffi::OsString {
-    std::env::var_os("CONBUS_CODEX_BIN")
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "codex".into())
-}
-
 /// Ask a fresh app-server for the account's limits.
 pub fn read() -> io::Result<Quota> {
-    let binary = codex_binary();
-    let mut child = Command::new(&binary)
-        .arg("app-server")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|err| {
-            io::Error::other(format!(
-                "could not run `{} app-server`: {err}",
-                binary.to_string_lossy()
-            ))
-        })?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| io::Error::other("no stdin"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| io::Error::other("no stdout"))?;
-
-    // A watchdog rather than a read timeout: the reply is a few lines, and
-    // what can stall is the server itself. Stopping it unblocks the read.
-    let child = Arc::new(Mutex::new(child));
-    let watched = Arc::clone(&child);
-    std::thread::spawn(move || {
-        std::thread::sleep(DEADLINE);
-        if let Ok(mut child) = watched.lock() {
-            let _ = child.kill();
-        }
-    });
-
-    let answer = ask(&mut stdin, BufReader::new(stdout));
-    drop(stdin);
-    if let Ok(mut child) = child.lock() {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-    answer
-}
-
-/// The JSON-RPC exchange: `initialize`, the `initialized` notification, then
-/// the one question. Anything the server says in between is skipped.
-fn ask(stdin: &mut impl Write, stdout: impl BufRead) -> io::Result<Quota> {
-    for line in [
-        serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
-            "clientInfo": {"name": "conbus", "title": "conbus quota probe", "version": crate::build_info::BUILD},
-            "capabilities": {"experimentalApi": true}}}),
-        serde_json::json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}),
-        serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "account/rateLimits/read", "params": {}}),
-    ] {
-        writeln!(stdin, "{line}")?;
-        stdin.flush()?;
-    }
-    for line in stdout.lines() {
-        let line = line?;
-        let Ok(message) = serde_json::from_str::<serde_json::Value>(&line) else {
-            continue;
-        };
-        if message["id"] != 2 {
-            continue;
-        }
-        if let Some(error) = message.get("error") {
-            return Err(io::Error::other(format!(
-                "codex app-server refused account/rateLimits/read: {error}"
-            )));
-        }
-        return parse(&message["result"]);
-    }
-    Err(io::Error::other(
-        "codex app-server closed without answering account/rateLimits/read",
-    ))
+    let mut server = AppServer::start(DEADLINE)?;
+    let result = server.call("account/rateLimits/read", serde_json::json!({}))?;
+    parse(&result)
 }
 
 /// Read the captured shape. Tolerant: a field the server stops sending
@@ -159,7 +81,7 @@ pub fn parse(result: &serde_json::Value) -> io::Result<Quota> {
     })
 }
 
-/// One line, the way `doctor` would say it.
+/// The account in one line: the plan, each window, the credits, the signal.
 pub fn describe(quota: &Quota, now: i64) -> String {
     let mut parts = vec![format!(
         "plan {}",
@@ -178,7 +100,7 @@ pub fn describe(quota: &Quota, now: i64) -> String {
         Some(kind) => format!("EXHAUSTED ({kind})"),
         None => "not exhausted".to_string(),
     });
-    format!("codex     {}", parts.join(" · "))
+    parts.join(" · ")
 }
 
 fn label(minutes: u64) -> String {
@@ -211,7 +133,7 @@ pub fn run() -> io::Result<()> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    println!("{}", describe(&quota, now));
+    println!("codex     {}", describe(&quota, now));
     Ok(())
 }
 
@@ -257,7 +179,7 @@ mod tests {
 
         assert_eq!(
             line,
-            "codex     plan plus · 5h 22% used, resets in 1h 12m · weekly 9% used, resets in 4d 7h · reset credits 1 · not exhausted"
+            "plan plus · 5h 22% used, resets in 1h 12m · weekly 9% used, resets in 4d 7h · reset credits 1 · not exhausted"
         );
     }
 

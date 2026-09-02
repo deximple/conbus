@@ -1,3 +1,4 @@
+mod appserver;
 mod backfill;
 mod build_info;
 mod cli;

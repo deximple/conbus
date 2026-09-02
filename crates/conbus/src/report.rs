@@ -773,6 +773,17 @@ pub fn doctor(paths: &Paths) -> io::Result<()> {
             conbus_core::continuation::BRIEF_MAX
         );
     }
+
+    // The router's signal, where every other health fact is. Read from a
+    // fresh app-server; "unavailable" is a fact too, not an omission.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    match crate::quota::read() {
+        Ok(quota) => println!("quota     codex {}", crate::quota::describe(&quota, now)),
+        Err(err) => println!("quota     codex unavailable — {err}"),
+    }
     Ok(())
 }
 
