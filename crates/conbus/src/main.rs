@@ -1,4 +1,5 @@
 mod backfill;
+mod build_info;
 mod cli;
 mod daemon;
 mod drops;
@@ -56,6 +57,10 @@ fn main() -> ExitCode {
         Command::Install { apply } => run(|_| report::install(apply)),
         Command::Backfill { apply } => run(|paths| backfill::run(paths, apply)),
         Command::Doctor => run(report::doctor),
+        Command::Version => {
+            println!("conbus {}", build_info::BUILD);
+            ExitCode::SUCCESS
+        }
         Command::Help => {
             print!("{}", cli::USAGE);
             ExitCode::SUCCESS

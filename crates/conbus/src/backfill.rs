@@ -102,6 +102,12 @@ pub fn recover(paths: &Paths, transcripts: &Path, apply: bool) -> io::Result<Out
         .then(|| SegmentLog::open(paths.log_dir(), Retention::default()))
         .transpose()?;
     let mut outcome = Outcome::default();
+    if !known.unreadable_live.is_empty() {
+        outcome.unread.insert(
+            "live session id is not a uuid".into(),
+            known.unreadable_live.len() as u64,
+        );
+    }
 
     for file in session_files(transcripts)? {
         // The file's own name is the vendor session id, and it is a UUID — so
@@ -199,20 +205,31 @@ struct Known {
     /// first run of this that keyed only on its own output recovered every
     /// live session a second time.
     live: HashSet<BusId>,
+    /// Live Claude Code session ids that are not UUIDs, so cannot be matched
+    /// to a transcript and cannot be protected from a copy either. None have
+    /// been seen; counted so that the first one is not a silent gap.
+    unreadable_live: HashSet<String>,
 }
 
 fn known_sessions(paths: &Paths) -> io::Result<Known> {
     let mut known = Known {
         backfilled: HashMap::new(),
         live: HashSet::new(),
+        unreadable_live: HashSet::new(),
     };
     for record in SegmentLog::scan(paths.log_dir())?.records {
         if record.source.backfilled_from.is_none() {
             if record.source.harness.as_str() == Harness::CLAUDE_CODE
                 && let Some(session) = record.source.vendor_session_id.as_deref()
-                && let Ok(session) = session.parse::<BusId>()
             {
-                known.live.insert(session);
+                match session.parse::<BusId>() {
+                    Ok(session) => {
+                        known.live.insert(session);
+                    }
+                    Err(_) => {
+                        known.unreadable_live.insert(session.to_string());
+                    }
+                }
             }
             continue;
         }
@@ -398,6 +415,25 @@ mod tests {
             1,
             "nothing may be appended for a session the recorder already holds"
         );
+    }
+
+    #[test]
+    fn a_live_session_whose_id_is_not_a_uuid_is_counted_not_forgotten() {
+        // Such a session cannot match a transcript's file name, so it cannot
+        // be twinned either — but a live id this code could not read is a
+        // fact about the log, and this codebase counts what it does not
+        // understand rather than dropping it in silence.
+        let machine = machine();
+        recorded_live(&machine, "not-a-uuid-at-all");
+        transcript(&machine, SESSION);
+
+        let outcome = recover(&machine.paths, &machine.transcripts, false).expect("recover");
+
+        assert_eq!(
+            outcome.unread.get("live session id is not a uuid"),
+            Some(&1)
+        );
+        assert_eq!(outcome.sessions, 1, "the transcript is still recovered");
     }
 
     #[test]

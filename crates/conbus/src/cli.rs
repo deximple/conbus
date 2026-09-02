@@ -23,6 +23,8 @@ pub enum Command {
         apply: bool,
     },
     Doctor,
+    /// Say which build this binary is.
+    Version,
     Help,
     Unknown(String),
 }
@@ -86,6 +88,7 @@ where
             },
         },
         "doctor" => Command::Doctor,
+        "version" | "--version" | "-V" => Command::Version,
         "help" | "--help" | "-h" => Command::Help,
         other => Command::Unknown(other.to_string()),
     }
@@ -107,6 +110,7 @@ USAGE:
     conbus install [--apply]      register the hook with Claude Code and Codex
     conbus backfill [--apply]     recover history from before the recorder ran
     conbus doctor                 report what is and is not wired up
+    conbus --version              say which build this is
 ";
 
 #[cfg(test)]
@@ -146,6 +150,18 @@ mod tests {
                 harness: "codex".into()
             }
         );
+    }
+
+    #[test]
+    fn the_binary_can_say_which_build_it_is() {
+        // The first audit had to run `strings` on the installed binary to
+        // guess which commit it was, and the deploy after the second one
+        // opened a window where doctor and the daemon ran different code
+        // with nothing to say so. A build that cannot name itself cannot be
+        // compared to anything.
+        assert_eq!(parse(["--version"], None), Command::Version);
+        assert_eq!(parse(["-V"], None), Command::Version);
+        assert_eq!(parse(["version"], None), Command::Version);
     }
 
     #[test]

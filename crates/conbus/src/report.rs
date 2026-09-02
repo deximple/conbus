@@ -515,6 +515,23 @@ fn report_hooks(home: &Path) {
                 ),
             }
         }
+        // Which events reach it. A command that runs says nothing about the
+        // events it was never registered for.
+        let missing = missing_events(&settings, target.events);
+        if missing.is_empty() {
+            println!(
+                "events    {:<12} {}/{} registered",
+                target.harness,
+                target.events.len(),
+                target.events.len()
+            );
+        } else {
+            println!(
+                "events    {:<12} MISSING {} — run `conbus install --apply`",
+                target.harness,
+                missing.join(", ")
+            );
+        }
     }
     if !any {
         println!("hooks     nothing registered; run `conbus install --apply`");
@@ -568,6 +585,11 @@ fn twins(records: &[Record]) -> Twins {
         split: 0,
     };
     for (key, conversations) in &live {
+        // Split is a fact about the live records alone: a torn first record
+        // followed by a restart forks a session with no backfill involved.
+        if conversations.len() > 1 {
+            summary.split += 1;
+        }
         if !copied.contains(key) {
             continue;
         }
@@ -576,11 +598,41 @@ fn twins(records: &[Record]) -> Twins {
             Some(bound) if conversations.contains(&bound) => summary.bound_live += 1,
             _ => summary.bound_to_copy += 1,
         }
-        if conversations.len() > 1 {
-            summary.split += 1;
-        }
     }
     summary
+}
+
+/// The events a settings document does not register the recorder for, out of
+/// the ones this build expects.
+///
+/// A conbus binary at any path counts as registered — the question here is
+/// whether the event reaches *a* recorder, and which binary is the probe's
+/// job. Somebody else's hook on the same event does not count. This is the
+/// drift the first audit found by hand: eleven events expected, ten on the
+/// machine, and every other line of `doctor` reporting health.
+fn missing_events(settings: &serde_json::Value, events: &[&str]) -> Vec<String> {
+    events
+        .iter()
+        .filter(|event| {
+            let registered = settings
+                .get("hooks")
+                .and_then(|hooks| hooks.get(**event))
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .flat_map(|block| {
+                    block
+                        .get("hooks")
+                        .and_then(serde_json::Value::as_array)
+                        .into_iter()
+                        .flatten()
+                })
+                .filter_map(|hook| hook.get("command")?.as_str())
+                .any(is_ours);
+            !registered
+        })
+        .map(|event| (*event).to_string())
+        .collect()
 }
 
 fn report_twins(records: &[Record]) {
@@ -610,6 +662,7 @@ fn report_twins(records: &[Record]) {
 }
 
 pub fn doctor(paths: &Paths) -> io::Result<()> {
+    println!("build     {}", crate::build_info::BUILD);
     println!(
         "root      {} ({:?})",
         paths.root().display(),
@@ -623,6 +676,33 @@ pub fn doctor(paths: &Paths) -> io::Result<()> {
         Err(err) => format!("not answering ({err})"),
     };
     println!("socket    {} — {daemon}", socket.display());
+    // Which build answers on that socket. The daemon writes it at start; a
+    // binary replaced underneath a running daemon shows up here as DIFFERS,
+    // which is the window this line exists for.
+    match crate::build_info::daemon_build(paths) {
+        crate::build_info::DaemonBuild::Running(stamp)
+            if stamp.build == crate::build_info::BUILD =>
+        {
+            println!(
+                "daemon    build {} pid {} since {}",
+                stamp.build, stamp.pid, stamp.started
+            );
+        }
+        crate::build_info::DaemonBuild::Running(stamp) => println!(
+            "daemon    build {} pid {} since {} — DIFFERS from this binary ({}); restart the daemon",
+            stamp.build,
+            stamp.pid,
+            stamp.started,
+            crate::build_info::BUILD
+        ),
+        crate::build_info::DaemonBuild::Stale(stamp) => println!(
+            "daemon    build {} left by pid {}, which is gone; the stamp is stale",
+            stamp.build, stamp.pid
+        ),
+        crate::build_info::DaemonBuild::Unstamped => {
+            println!("daemon    build unknown — no stamp; started by a build older than this one")
+        }
+    }
 
     let report = crate::harden::harden();
     println!(
@@ -810,6 +890,29 @@ mod tests {
         assert_eq!(snake_case("UserPromptSubmit"), "user_prompt_submit");
         assert_eq!(snake_case("PreToolUse"), "pre_tool_use");
         assert_eq!(snake_case("Stop"), "stop");
+    }
+
+    #[test]
+    fn an_event_the_settings_do_not_register_is_named() {
+        // The drift the first audit found by hand: the code expected eleven
+        // Claude Code events and the machine had ten registered, because
+        // `install --apply` had not been re-run after `SubagentStop` was
+        // added. `doctor` said the hooks ran, which was true of the ten.
+        let settings = serde_json::json!({
+            "hooks": {
+                "SessionStart": [{"hooks": [{"command": "/Users/x/.local/bin/conbus hook"}]}],
+                "UserPromptSubmit": [{"hooks": [{"command": "/opt/elsewhere/conbus hook"}]}],
+                "Stop": [{"hooks": [{"command": "paseo hooks claude Stop"}]}]
+            }
+        });
+
+        let missing = missing_events(&settings, &["SessionStart", "UserPromptSubmit", "Stop"]);
+
+        assert_eq!(
+            missing,
+            vec!["Stop".to_string()],
+            "a conbus binary at any path registers the event; somebody else's hook does not"
+        );
     }
 
     #[test]
@@ -1229,5 +1332,21 @@ mod tests {
         let records = vec![twin_record(0, "ea1d23e9-bb83-4df5-9a73-a6a12e138d85", true)];
 
         assert_eq!(twins(&records).total, 0);
+    }
+
+    #[test]
+    fn a_session_split_without_a_backfilled_copy_is_still_reported_as_split() {
+        // A torn first record followed by a restart forks a live session with
+        // no backfill involved. The line says "recorded live under more than
+        // one conversation", so it has to count that shape too, not only the
+        // twins it happened to be written next to.
+        let first = "01a0585c-0000-7000-8000-000000000003";
+        let second = "01a0585c-0000-7000-8000-000000000004";
+        let records = vec![twin_record(0, first, false), twin_record(1, second, false)];
+
+        let summary = twins(&records);
+
+        assert_eq!(summary.total, 0, "no reconstruction, so not a twin");
+        assert_eq!(summary.split, 1);
     }
 }
