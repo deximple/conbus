@@ -7,7 +7,7 @@
 //! (anthropics/claude-code#78455). Minting there would pile up ids that no
 //! conversation ever uses, and can leave a real session aliased to a ghost.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::event::{Event, Harness, VendorAgentId, VendorTurnId};
 use crate::ids::BusId;
@@ -109,18 +109,36 @@ impl Registry {
     /// and its next prompt mints a second `bus_id`.
     ///
     /// Later records win, so a session that was rebound keeps its newest
-    /// conversation. Cost is one pass over the log; the derived SQLite index
-    /// the plan schedules is what replaces it once the log stops being small.
+    /// conversation — with one exception. A record the recorder mirrored live
+    /// outranks one backfill reconstructed, whatever order they were written
+    /// in. Backfill runs with the daemon stopped and appends its copy of a
+    /// transcript *after* whatever the recorder had already written for the
+    /// same session, so "later wins" alone bound every session alive across a
+    /// backfill to its copy when the daemon came back, and their remaining
+    /// turns were written under the wrong conversation. Two conversations on
+    /// a real log were split that way. A reconstruction only binds a session
+    /// nothing live has claimed, which is the case it was meant for: a
+    /// session resuming after its history was recovered continues the
+    /// recovered conversation instead of minting a second one.
+    ///
+    /// Cost is one pass over the log; the derived SQLite index the plan
+    /// schedules is what replaces it once the log stops being small.
     pub fn restore(records: &[Record]) -> Self {
         let mut registry = Registry::new();
+        let mut seen_live: HashSet<SessionKey> = HashSet::new();
         for record in records {
             let Some(vendor_session_id) = &record.source.vendor_session_id else {
                 continue;
             };
-            registry.bound.insert(
-                SessionKey::new(record.source.harness.clone(), vendor_session_id.clone()),
-                record.bus_id,
-            );
+            let key = SessionKey::new(record.source.harness.clone(), vendor_session_id.clone());
+            let reconstructed = record.source.backfilled_from.is_some();
+            if reconstructed && seen_live.contains(&key) {
+                continue;
+            }
+            if !reconstructed {
+                seen_live.insert(key.clone());
+            }
+            registry.bound.insert(key, record.bus_id);
         }
         registry
     }
@@ -197,10 +215,35 @@ impl Registry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::{Body, TurnState};
+    use crate::backfill::CLAUDE_TRANSCRIPT;
+    use crate::clock::Timestamp;
+    use crate::event::{Body, Source, TurnState};
+    use crate::record::SCHEMA_VERSION;
 
     fn key() -> SessionKey {
         SessionKey::new(Harness::new(Harness::CLAUDE_CODE), "vendor-abc")
+    }
+
+    /// A record as the log would hold it for the session `key()` names, either
+    /// mirrored live or reconstructed by backfill.
+    fn logged(seq: u64, bus_id: BusId, backfilled_from: Option<&str>, event: Event) -> Record {
+        Record {
+            schema_version: SCHEMA_VERSION,
+            seq,
+            ts: Timestamp::now(),
+            bus_id,
+            vendor_turn_id: None,
+            vendor_agent_id: None,
+            source: Source {
+                harness: Harness::new(Harness::CLAUDE_CODE),
+                harness_version: None,
+                vendor_session_id: Some("vendor-abc".into()),
+                workspace: None,
+                entrypoint: None,
+                backfilled_from: backfilled_from.map(str::to_string),
+            },
+            event,
+        }
     }
 
     fn session_start() -> Event {
@@ -218,28 +261,8 @@ mod tests {
 
     #[test]
     fn restoring_from_the_log_keeps_a_vendor_session_on_its_conversation() {
-        use crate::clock::Timestamp;
-        use crate::event::Source;
-        use crate::record::SCHEMA_VERSION;
-
         let bus_id = BusId::mint();
-        let logged = Record {
-            schema_version: SCHEMA_VERSION,
-            seq: 0,
-            ts: Timestamp::now(),
-            bus_id,
-            vendor_turn_id: None,
-            vendor_agent_id: None,
-            source: Source {
-                harness: Harness::new(Harness::CLAUDE_CODE),
-                harness_version: None,
-                vendor_session_id: Some("vendor-abc".into()),
-                workspace: None,
-                entrypoint: None,
-                backfilled_from: None,
-            },
-            event: prompt("before the restart"),
-        };
+        let logged = logged(0, bus_id, None, prompt("before the restart"));
 
         let mut registry = Registry::restore(std::slice::from_ref(&logged));
 
@@ -252,6 +275,71 @@ mod tests {
             },
             "a restored session must not mint a second conversation"
         );
+    }
+
+    #[test]
+    fn a_reconstructed_record_does_not_displace_a_live_binding() {
+        // The twin defect, as it happened on a real log. A session was minted
+        // live; then `backfill --apply`, which runs with the daemon stopped,
+        // recovered the same transcript under the file's own UUID and appended
+        // that copy *after* the live records. When the daemon came back,
+        // "later record wins" bound the session to the copy, and everything
+        // the session said next was written under the wrong conversation.
+        // Two conversations on this machine were split that way before anyone
+        // noticed. A reconstruction is the weaker fact, and it must never
+        // outrank what the recorder saw for itself.
+        let live = BusId::mint();
+        let copy = BusId::mint();
+        let records = vec![
+            logged(0, live, None, prompt("seen live")),
+            logged(
+                1,
+                copy,
+                Some(CLAUDE_TRANSCRIPT),
+                Event::SessionCandidate { trigger: None },
+            ),
+            logged(2, copy, Some(CLAUDE_TRANSCRIPT), prompt("seen live")),
+        ];
+
+        let registry = Registry::restore(&records);
+
+        assert_eq!(registry.bus_id(&key()), Some(live));
+    }
+
+    #[test]
+    fn a_session_nothing_live_has_claimed_is_bound_to_its_reconstruction() {
+        // The other half of the same rule, and the design working: backfill
+        // adopts the transcript's own UUID as the `bus_id`, so a session that
+        // resumes after its history was recovered continues the recovered
+        // conversation instead of minting a second one.
+        let copy = BusId::mint();
+        let records = vec![logged(
+            0,
+            copy,
+            Some(CLAUDE_TRANSCRIPT),
+            prompt("recovered"),
+        )];
+
+        let registry = Registry::restore(&records);
+
+        assert_eq!(registry.bus_id(&key()), Some(copy));
+    }
+
+    #[test]
+    fn among_live_records_the_later_binding_still_wins() {
+        // Precedence is about provenance, not position. Between two live
+        // records the newer one keeps winning, because that is what a session
+        // rebound while the daemon was up actually did.
+        let first = BusId::mint();
+        let second = BusId::mint();
+        let records = vec![
+            logged(0, first, None, prompt("first")),
+            logged(1, second, None, prompt("second")),
+        ];
+
+        let registry = Registry::restore(&records);
+
+        assert_eq!(registry.bus_id(&key()), Some(second));
     }
 
     #[test]
