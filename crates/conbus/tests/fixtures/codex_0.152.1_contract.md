@@ -96,7 +96,7 @@ Per the reference, and confirmed the hard way:
   taken as a paste, and the prompt is not submitted. Drive it with the text
   first and the Enter separately.
 
-## Quota probe #1 — `account/rateLimits/read` (2026-09-03 03:30 KST)
+## Quota probe #1 — `account/rateLimits/read` (2026-09-03 02:30 KST)
 
 The plan's first probe: does the app-server expose the account's rate limits
 to a client that is not a Codex session? It does, on the first try, read-only,
@@ -123,7 +123,7 @@ is the signal the router was designed around, and it is readable without
 opening a thread. Not yet wired into conbus; the obvious next brick is a
 `conbus quota` command that runs this probe and a `doctor` line that shows it.
 
-## Thread APIs for a Codex backfill (probed 2026-09-03 03:45 KST, read-only)
+## Thread APIs for a Codex backfill (probed 2026-09-03 02:36 KST, read-only)
 
 Same handshake, then `thread/list {"limit": 3}` → `{"data": [...], "nextCursor",
 "backwardsCursor"}`; each thread carries `id`, `sessionId`, `cwd`, `name`,
