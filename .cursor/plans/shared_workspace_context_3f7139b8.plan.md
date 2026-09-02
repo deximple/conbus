@@ -4,7 +4,7 @@ overview: 목적지는 버스가 루프를 소유하고 턴 단위로 라우팅�
 todos:
   - id: recorder-first
     content: 0단계 1주 - 기록만. 훅 미러 → append-only 로그 → 백필. 주입은 이 단계에 없다
-    status: pending
+    status: done
   - id: injection-hardening
     content: 0단계 - 주입 견고화(주 단위). 유령 SessionStart, 트랜스크립트 플러시 지연, 10k 상한 열화, Desktop /clear 예외
     status: pending
@@ -19,16 +19,16 @@ todos:
     status: pending
   - id: bus-id-aliases
     content: 0단계 - SessionStart는 후보 등록만, 첫 UserPromptSubmit에서 bus_id 민트·바인딩 (유령 세션 회피)
-    status: pending
+    status: done
   - id: log-pack-schema
     content: 0단계 - dual-warm 전제 로그·팩 스키마. schema_version, turn_state, 데이터 경계, 턴 델타 문자 예산, 관련성 게이트
-    status: pending
+    status: done
   - id: attach-two-modes
     content: 0단계 - Attach에 interactive+hooks / headless 두 모드 + capability descriptor. 없는 능력은 라우터가 열화
     status: pending
   - id: doctor-diagnose
     content: 0단계 - conbus doctor. 훅이 실제로 발화하는지, 주입이 inline인지, 쿼터 신호가 오는지 진단. install 전체는 1단계
-    status: pending
+    status: done
   - id: codex-warm-leg
     content: 0단계 - 비대칭 dual-warm. app-server 사이드카가 소유한 Codex 스레드를 매 턴 inject_items로 동기화. Claude는 인터랙티브 유지
     status: pending
@@ -64,7 +64,7 @@ todos:
     status: pending
   - id: secure-handles
     content: 실행 첫 단계 - GitHub 개인 계정 아래 conbus 저장소(비공개 시작), crates.io·npm 이름 확보 여부 결정
-    status: pending
+    status: done
   - id: domain-landing
     content: MVP 직전 - 도메인 확정(conbus.sh 우선)과 랜딩·웹 UI 작업을 한 묶음으로
     status: pending
@@ -91,7 +91,7 @@ todos:
     status: pending
   - id: retention-levels
     content: 1단계 - 보관 3단계 워크스페이스별, 출하 기본은 대화만. (1.5) 로컬 암호화 본문과 명시 회수까지 1단계에 포함
-    status: pending
+    status: done
   - id: envelope-crypto-kek
     content: 1단계 - 크로스플랫폼 KEK 추상화(Keychain/secret-service/DPAPI)와 툴 본문 봉투 암호화. (1.5)의 전제
     status: pending

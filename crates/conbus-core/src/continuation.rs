@@ -54,9 +54,9 @@ pub struct Asking {
     ///
     /// Named for the direction that is knowable. The vendor labels machine
     /// origins and almost never labels human ones, so this is set only when it
-    /// said so, and an unlabelled session is briefed. On the real log this one
-    /// condition is the difference between speaking to 3,259 sessions and
-    /// speaking to 15: all but 78 of 3,443 conversations there are explicitly
+    /// said so, and an unlabelled session is briefed. On the real log (by
+    /// entrypoint, 2026-09-02) this one condition is the difference between
+    /// speaking to 3,443 sessions and speaking to 349: the rest are explicitly
     /// somebody's script, and briefing a script is tokens spent on a reader
     /// that does not exist.
     pub unattended: bool,
@@ -157,7 +157,8 @@ pub enum Decision {
 /// How long ago a conversation can have stopped and still be worth mentioning.
 ///
 /// A week, chosen off the measurement rather than from taste. On the real log,
-/// counting only the sessions a person was actually at, a week briefs 13 of 78
+/// counting only the sessions a person was actually at, a week briefed 13 of 78
+/// on the first measurement (2026-08-31) and 40 of 349 by entrypoint (2026-09-02),
 /// and a month briefs 15 — four times the window for two more briefings. The
 /// knee is inside the first week, and a week is also the span a person can
 /// reason about: "what I was doing here recently" rather than archaeology.
@@ -780,7 +781,8 @@ mod tests {
     fn nobody_is_briefed_when_nobody_is_reading() {
         // The single condition that separates a feature from chrome. On the
         // real log all but 78 of 3,443 conversations are explicitly somebody's
-        // script; briefing those is 3,244 injections nobody reads.
+        // script (3,094 of 3,443 by entrypoint, 2026-09-02); briefing those is
+        // injections nobody reads.
         assert_eq!(
             decide(
                 &Asking {

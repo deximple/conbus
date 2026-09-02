@@ -12,7 +12,7 @@ These are legal or structural, not preferences.
 - Never modify a vendor binary or strip its authentication.
 - Never pool credentials or quota across people.
 - Never parse vendor session files on the live path. Mirroring, gap filling, and routing use official channels. Backfill is the only exception, and only through a fixture-protected parser that skips unknown schemas.
-- Never inject into a Codex thread the user opened. Our warm thread is one we opened through app-server.
+- Never write into a Codex thread the user opened (`thread/inject_items`). Our warm thread is one we opened through app-server. The hook's `additionalContext` on `UserPromptSubmit` is the vendor's own context channel and is how the briefing reaches both harnesses.
 - Never expose a secret-reading tool to the model. Secrets are injected as child env at spawn.
 - Never use vendor trademarks in product or feature names.
 - Never send the rolling summary to the leg it is protecting.
@@ -20,7 +20,7 @@ These are legal or structural, not preferences.
 ## Decided, do not redesign
 
 - Vendor TUIs stay the window. We do not build a chat UI.
-- One binary, argv dispatch: `conbus daemon|hook|log|doctor`. Cargo workspace internally.
+- One binary, argv dispatch: `conbus daemon|hook|log|install|backfill|doctor|quota|--version`. Cargo workspace internally.
 - JSONL segments are the source of truth. SQLite is a disposable derived index, always rebuildable from segments.
 - Data in `~/.conbus/`, respecting `$XDG_STATE_HOME`.
 - Derived state lives in the daemon's private memory, not a file-backed mmap ring.

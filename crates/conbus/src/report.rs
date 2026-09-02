@@ -754,7 +754,8 @@ pub fn doctor(paths: &Paths) -> io::Result<()> {
     report_twins(&scan.records);
 
     // What a session opening in each checkout would have been told, replayed
-    // over the whole log. Nothing is injected yet; this is the measurement that
+    // over the whole log. The briefing is live since 2026-09-01; this replay is
+    // the offline measurement of the same decision, the one that
     // has to come first, because how often it speaks and how wide it speaks is
     // the only way to know whether it is chrome before it is chrome in front of
     // a person.
