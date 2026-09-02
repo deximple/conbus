@@ -405,15 +405,22 @@ A hook cannot see the model's context, finding the marker means reading a transc
 live path — and ordinary large tool results produce the same marker, so it is not specific. Assert
 the budget locally on every emit; use the marker only in a probe against a session we own.
 
-**What a person sees, and how they stop it.** One `systemMessage` line on the turn that was actually
-hydrated, naming the source id and the command to inspect it — a field both vendors have, separate
-from `additionalContext`, that costs no model tokens. No injection, no line, ever; silence is the
-default. `/clear` already means "forget this", so `SessionStart.source == "clear"` suppresses
-hydration for that session — a gesture the user already makes rather than one we invented, with the
-Desktop caveat above. The explicit off is a command, and a command is acceptable **only** here: a
-missed hydration costs one sentence of re-explanation, a wrong one costs credibility in every
-session opened afterwards, so the negative case gets a boring lever and the positive case must never
-need one.
+**What a person sees, and how they stop it** (as built, 2026-09-03). One `systemMessage` line on the turn
+that was actually briefed, naming the conversation recounted — its first 13 characters, because 8 collide
+within a 65-second window and three scheduled tasks minted in one second — and the command to inspect it;
+a field both vendors have, separate from `additionalContext`, that costs no model tokens. The first live
+briefing named the reader's own brand-new session instead, which is how this sentence got checked. No
+injection, no line, ever; silence is the default. `/clear` already means "forget this", so a session whose
+flushed start says `source: clear` is not briefed — a gesture the user already makes rather than one we
+invented, with the Desktop caveat above. The explicit off is `CONBUS_BRIEFING=off` in the environment the
+vendor runs hooks in (not a command: a command would need a second process to consult, and the hook already
+reads its environment), carried on the wire as `brief: false` so the daemon neither injects nor records a
+briefing nobody received — off means no briefing, not no recording. A boring lever for the negative case;
+the positive case must never need one: a missed briefing costs one sentence of re-explanation, a wrong one
+costs credibility in every session opened afterwards. Two more things the briefing now says honestly: a
+prompt that opens with a vendor's own tell that a program wrote it (`<scheduled-task`, `## Memory Writing
+Agent`) is not briefed even when the entrypoint calls the session attended, and a conversation with both
+recovered and live records is "partly reconstructed", not "not observed live".
 
 **What the gate does on the real log, measured before anything is injected.**
 
