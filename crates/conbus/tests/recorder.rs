@@ -928,6 +928,33 @@ fn a_second_session_in_the_same_checkout_is_told_what_happened_there() {
         briefed[0]["units"].as_u64(),
         Some(context.encode_utf16().count() as u64)
     );
+    // The receipt names the conversation that was narrated, not the session
+    // reading it — the first live briefing pointed the person at their own
+    // brand-new session.
+    let old = lines
+        .iter()
+        .find(|line| line["vendor_session_id"] == "s-old")
+        .and_then(|line| line["bus_id"].as_str())
+        .expect("the old conversation's id");
+    let message = reply["systemMessage"].as_str().expect("message");
+    assert!(message.contains(&old[..13]), "{message} should name {old}");
+    assert!(
+        !message.contains(&briefed[0]["bus_id"].as_str().expect("id")[..13]),
+        "the receipt points at the reader's own session: {message}"
+    );
+    // The briefing record knows where it happened, like every other record.
+    assert_eq!(briefed[0]["workspace"], "/repo", "{:#?}", briefed[0]);
+    // The budget and the fence, on the wire and not only in a unit test.
+    assert!(
+        context.encode_utf16().count() <= 2_600,
+        "over budget: {} units",
+        context.encode_utf16().count()
+    );
+    assert_eq!(
+        context.matches("</conbus-record").count(),
+        1,
+        "exactly one closing fence: {context}"
+    );
     daemon.stop();
 }
 
@@ -1230,5 +1257,84 @@ fn doctor_says_when_the_daemon_runs_a_different_build() {
         "doctor must flag a daemon on another build:\n{doctor}"
     );
 
+    daemon.stop();
+}
+
+#[test]
+fn a_session_the_person_just_cleared_is_not_briefed() {
+    // `/clear` says "forget it". Opening the next prompt by handing back what
+    // was just dismissed is the opposite of what was asked, and the vendor
+    // says exactly when it happened: `SessionStart.source == "clear"`.
+    let home = tempfile::tempdir().expect("tempdir");
+    let daemon = start_daemon(home.path());
+    conversation(
+        home.path(),
+        "s-old",
+        "/repo",
+        &["ship the recorder", "now the gate"],
+    );
+
+    run_hook(
+        home.path(),
+        r#"{"session_id":"s-cleared","hook_event_name":"SessionStart","source":"clear","cwd":"/repo"}"#,
+        ATTENDED,
+    );
+    let (code, stdout, _) = run_hook_full(
+        home.path(),
+        r#"{"session_id":"s-cleared","hook_event_name":"UserPromptSubmit","cwd":"/repo",
+            "prompt":"start over"}"#,
+        ATTENDED,
+    );
+
+    assert_eq!(code, 0);
+    assert!(
+        says_nothing(&stdout),
+        "the person asked to forget: {stdout}"
+    );
+    let lines = log_lines(home.path());
+    assert!(!lines.iter().any(|line| line["event"] == "briefed"));
+    assert!(
+        lines
+            .iter()
+            .any(|line| line["vendor_session_id"] == "s-cleared" && line["event"] == "turn_started"),
+        "the cleared session is still recorded: {lines:#?}"
+    );
+    daemon.stop();
+}
+
+#[test]
+fn a_person_can_switch_the_briefing_off() {
+    // The one lever toward silence the first audit found missing. Read by the
+    // hook from its own environment, carried on the wire, honoured by the
+    // daemon: nothing is injected, and nothing claims to have been.
+    let home = tempfile::tempdir().expect("tempdir");
+    let daemon = start_daemon(home.path());
+    conversation(
+        home.path(),
+        "s-old",
+        "/repo",
+        &["ship the recorder", "now the gate"],
+    );
+
+    let (code, stdout, _) = run_hook_full(
+        home.path(),
+        r#"{"session_id":"s-quiet","hook_event_name":"UserPromptSubmit","cwd":"/repo",
+            "prompt":"carry on"}"#,
+        &[
+            ("CLAUDE_CODE_ENTRYPOINT", "cli"),
+            ("CONBUS_BRIEFING", "off"),
+        ],
+    );
+
+    assert_eq!(code, 0);
+    assert!(says_nothing(&stdout), "switched off: {stdout}");
+    let lines = log_lines(home.path());
+    assert!(!lines.iter().any(|line| line["event"] == "briefed"));
+    assert!(
+        lines
+            .iter()
+            .any(|line| line["vendor_session_id"] == "s-quiet" && line["event"] == "turn_started"),
+        "off means no briefing, not no recording: {lines:#?}"
+    );
     daemon.stop();
 }

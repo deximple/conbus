@@ -85,6 +85,7 @@ impl Chapter {
                 last_turn: None,
                 turns: 0,
                 backfilled: false,
+                live: false,
             },
             last_prompt: None,
             last_said: None,
@@ -299,10 +300,12 @@ fn render(chapter: &Chapter, now: Timestamp, nonce: &str) -> String {
         "\n  conversation  {}\n  harness       {}{}\n  state         {}; last activity {}\n  turns         {}\n  tools         {} call(s), {} unanswered; arguments and outputs are not on disk\n  inspect       conbus log --bus-id {}\n",
         about.bus_id,
         about.harness.as_str(),
-        if about.backfilled {
-            "  (reconstructed from the vendor's history, not observed live)"
-        } else {
-            ""
+        // Provenance, honestly: a conversation with one recovered record
+        // among hundreds of live ones is not hearsay.
+        match (about.backfilled, about.live) {
+            (true, false) => "  (reconstructed from the vendor's history, not observed live)",
+            (true, true) => "  (partly reconstructed from the vendor's history)",
+            (false, _) => "",
         },
         describe(chapter.stopped()),
         age(now.seconds_since(about.last_activity)),
@@ -440,6 +443,7 @@ mod tests {
                 }),
                 turns: 14,
                 backfilled: false,
+                live: false,
             },
             last_prompt: Some("now the gate".into()),
             last_said: Some("the segment reader reads bytes".into()),
@@ -656,12 +660,31 @@ mod tests {
         let pack = packed(&[Chapter {
             about: Candidate {
                 backfilled: true,
+                live: false,
                 ..chapter().about
             },
             ..chapter()
         }]);
 
         assert!(pack.text.contains("not observed live"), "{}", pack.text);
+    }
+
+    #[test]
+    fn a_partly_recovered_conversation_says_partly() {
+        // Seen in the first live briefing: a conversation with 32 backfilled
+        // records and 1,786 live ones labelled as not observed live, on the
+        // same line that counted its 880 live tool calls.
+        let pack = packed(&[Chapter {
+            about: Candidate {
+                backfilled: true,
+                live: true,
+                ..chapter().about
+            },
+            ..chapter()
+        }]);
+
+        assert!(pack.text.contains("partly reconstructed"), "{}", pack.text);
+        assert!(!pack.text.contains("not observed live"), "{}", pack.text);
     }
 
     #[test]

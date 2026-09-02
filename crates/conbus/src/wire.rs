@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 /// this field existed ignores it, so the first deploy still needs the daemon
 /// restarted by hand. `the_wire_shape_is_pinned_to_the_protocol_version` below
 /// is what stops the constant falling behind the struct.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// One observed vendor event, on its way to the log.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -48,7 +48,23 @@ pub struct Request {
     /// all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entrypoint: Option<Entrypoint>,
+    /// Whether this session may be briefed. The hook reads the person's
+    /// `CONBUS_BRIEFING=off` from its own environment and carries it here so
+    /// the daemon neither injects nor records a briefing — off means no
+    /// briefing, not no recording. Absent means yes, which is what every hook
+    /// before this field meant.
+    #[serde(default = "yes", skip_serializing_if = "is_yes")]
+    pub brief: bool,
     pub event: Event,
+}
+
+fn yes() -> bool {
+    true
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_yes(brief: &bool) -> bool {
+    *brief
 }
 
 /// What the daemon did with it.
@@ -106,6 +122,9 @@ mod tests {
             vendor_agent_id: Some(conbus_core::event::VendorAgentId::new("A")),
             workspace: Some("/repo".into()),
             entrypoint: Some(Entrypoint::new(Entrypoint::CLI)),
+            // Off, so the field is on the wire: it is skipped when it says
+            // yes, which is what every hook before it meant.
+            brief: false,
             event: Event::TurnStarted {
                 author: None,
                 prompt: Body::kept("p"),
@@ -124,6 +143,7 @@ mod tests {
         assert_eq!(
             keys,
             vec![
+                "brief",
                 "entrypoint",
                 "event",
                 "harness",
@@ -136,6 +156,6 @@ mod tests {
             ],
             "the wire shape changed; bump PROTOCOL_VERSION (now {PROTOCOL_VERSION})"
         );
-        assert_eq!(PROTOCOL_VERSION, 3);
+        assert_eq!(PROTOCOL_VERSION, 4);
     }
 }
