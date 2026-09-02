@@ -12,6 +12,7 @@ use std::os::unix::net::UnixStream;
 use conbus_core::event::{Entrypoint, Harness};
 use conbus_core::paths::Paths;
 
+use crate::drops::Dropped;
 use crate::hook::{self, Normalized};
 use crate::wire::{Request, Response};
 
@@ -146,7 +147,7 @@ pub fn briefing_reply(harness: &str, hook_event_name: &str, context: &str, messa
 /// Mirror one hook payload. Returns the line to print, or a diagnostic when the
 /// record did not land; the caller reports it, prints the silent reply, and
 /// still exits zero.
-pub fn run(harness: &str, stdin: &mut impl Read) -> Result<Reply, String> {
+pub fn run(harness: &str, stdin: &mut impl Read) -> Result<Reply, Dropped> {
     if std::env::var_os(INTERNAL_MARKER).is_some_and(|value| !value.is_empty()) {
         return Ok(silent_reply(harness).to_string());
     }
@@ -179,7 +180,8 @@ pub fn run(harness: &str, stdin: &mut impl Read) -> Result<Reply, String> {
             return Err(format!(
                 "no mapping for hook event {hook_event_name:?} (as {harness}, fields: {})",
                 field_names(&payload)
-            ));
+            )
+            .into());
         }
     }
     let paths = Paths::resolve().map_err(|_| "no home directory to resolve".to_string())?;
@@ -223,7 +225,7 @@ fn send(
     mut stream: UnixStream,
     request: &Request,
     hook_event_name: &str,
-) -> Result<Reply, String> {
+) -> Result<Reply, Dropped> {
     let line = serde_json::to_string(request).map_err(|err| err.to_string())?;
     writeln!(stream, "{line}").map_err(|err| format!("could not send the record: {err}"))?;
     stream
@@ -242,19 +244,28 @@ fn send(
         Ok(Response::Briefed {
             context, message, ..
         }) => Ok(briefing_reply(harness, hook_event_name, &context, &message)),
-        Ok(Response::Failed { error }) => Err(format!("the daemon refused the record: {error}")),
+        Ok(Response::Failed { error }) => {
+            Err(format!("the daemon refused the record: {error}").into())
+        }
         // Not written, and the caller has to hear about it. An orphan is the
         // normal shape of a daemon restart mid-turn: the session is unbound, so
         // the rest of that turn belongs to no conversation. Reporting it is the
         // difference between a known gap and a turn that quietly disappears.
-        Ok(Response::Orphaned) => Err(
-            "no conversation for this session; the daemon has no binding for it              (a restart mid-turn looks exactly like this)"
-                .to_string(),
-        ),
+        // The reason is the throttle key and stays fixed; the detail names
+        // the event and the session — identifiers the log already holds in
+        // full — so a ghost session's end can be told from a lost tool call
+        // when the drop log is read back.
+        Ok(Response::Orphaned) => Err(Dropped::new(
+            "no conversation for this session; the daemon has no binding for it              (a restart mid-turn looks exactly like this)",
+        )
+        .with_detail(format!(
+            "{hook_event_name} for session {}",
+            request.vendor_session_id.chars().take(8).collect::<String>()
+        ))),
         Ok(Response::Withheld) => {
-            Err("retention withheld this record from disk".to_string())
+            Err("retention withheld this record from disk".to_string().into())
         }
-        Err(err) => Err(format!("unreadable reply {reply:?}: {err}")),
+        Err(err) => Err(format!("unreadable reply {reply:?}: {err}").into()),
     }
 }
 

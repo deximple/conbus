@@ -341,8 +341,15 @@ pub fn serve(paths: &Paths, retention: Retention) -> io::Result<()> {
     let log = SegmentLog::open(paths.log_dir(), retention)?;
     let mut daemon = Daemon::new(log, registry, chapters);
 
+    // Left beside the socket so `doctor` can compare the daemon's build with
+    // its own — the drift a rename without a restart leaves behind.
+    if let Err(err) = crate::build_info::stamp(paths) {
+        eprintln!("conbus daemon: could not write the build stamp: {err}");
+    }
+
     eprintln!(
-        "conbus daemon: socket {} log {} ({} record(s), {} unreadable) core_dumps_disabled={} memory_locked={}{}",
+        "conbus daemon {}: socket {} log {} ({} record(s), {} unreadable) core_dumps_disabled={} memory_locked={}{}",
+        crate::build_info::BUILD,
         paths.socket().display(),
         paths.log_dir().display(),
         scan.records.len(),

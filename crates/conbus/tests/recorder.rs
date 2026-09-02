@@ -596,6 +596,15 @@ fn an_event_the_daemon_cannot_place_is_reported_rather_than_dropped_in_silence()
         !stderr.is_empty(),
         "an unplaceable event must say so; silence is how a whole turn disappears"
     );
+    // And say *what*: the event and the session, so a ghost session's end can
+    // be told from a lost tool call when the drop log is read back.
+    let drops = std::fs::read_to_string(home.path().join("drops.jsonl")).expect("drop log");
+    let last: serde_json::Value =
+        serde_json::from_str(drops.lines().last().expect("a drop")).expect("json");
+    assert_eq!(
+        last["detail"], "Stop for session s-orphan",
+        "the drop must name the event and the session: {last}"
+    );
 
     daemon.stop();
 }
@@ -1139,6 +1148,86 @@ fn a_codex_hook_says_only_what_codex_accepts() {
         stdout.trim(),
         "{}",
         "Codex fails a PreToolUse hook that says more"
+    );
+
+    daemon.stop();
+}
+
+#[test]
+fn the_daemon_leaves_its_build_where_doctor_can_compare_it() {
+    // Deploying is three steps — merge, rename the binary, restart the daemon
+    // — and between the last two `doctor` runs new code while the daemon runs
+    // old code. Nothing said so on a real machine. Now the daemon writes its
+    // build beside its socket, the binary can name its own, and doctor puts
+    // the two on one line.
+    let home = tempfile::tempdir().expect("tempdir");
+    let daemon = start_daemon(home.path());
+
+    let version = Command::new(bin())
+        .arg("--version")
+        .output()
+        .expect("run --version");
+    let version = String::from_utf8_lossy(&version.stdout).trim().to_string();
+    let build = version
+        .strip_prefix("conbus ")
+        .expect("`conbus <build>`")
+        .to_string();
+    assert!(!build.is_empty() && build != "unknown", "{version}");
+
+    let stamp = std::fs::read_to_string(home.path().join("daemon.build")).expect("daemon.build");
+    let stamp: serde_json::Value = serde_json::from_str(stamp.trim()).expect("json");
+    assert_eq!(stamp["build"], build, "{stamp}");
+    assert_eq!(stamp["pid"], daemon.0.id(), "{stamp}");
+
+    let doctor = Command::new(bin())
+        .arg("doctor")
+        .env("CONBUS_HOME", home.path())
+        .output()
+        .expect("run doctor");
+    let doctor = String::from_utf8_lossy(&doctor.stdout).into_owned();
+    assert!(
+        doctor
+            .lines()
+            .any(|line| line.starts_with("build ") && line.contains(&build)),
+        "doctor must name its own build:\n{doctor}"
+    );
+    assert!(
+        doctor.lines().any(|line| line.starts_with("daemon ")
+            && line.contains(&build)
+            && !line.contains("DIFFERS")),
+        "doctor must say the daemon runs the same build:\n{doctor}"
+    );
+
+    daemon.stop();
+}
+
+#[test]
+fn doctor_says_when_the_daemon_runs_a_different_build() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let daemon = start_daemon(home.path());
+    // What a rename-without-restart leaves behind: a stamp from another build,
+    // written by a daemon that is still alive.
+    std::fs::write(
+        home.path().join("daemon.build"),
+        format!(
+            r#"{{"build":"0000000-older","pid":{},"started":"2026-09-02T08:14:53.000Z"}}"#,
+            daemon.0.id()
+        ),
+    )
+    .expect("write stamp");
+
+    let doctor = Command::new(bin())
+        .arg("doctor")
+        .env("CONBUS_HOME", home.path())
+        .output()
+        .expect("run doctor");
+    let doctor = String::from_utf8_lossy(&doctor.stdout).into_owned();
+
+    assert!(
+        doctor
+            .lines()
+            .any(|line| line.starts_with("daemon ") && line.contains("DIFFERS")),
+        "doctor must flag a daemon on another build:\n{doctor}"
     );
 
     daemon.stop();

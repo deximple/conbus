@@ -343,6 +343,36 @@ mod tests {
     }
 
     #[test]
+    fn a_session_that_kept_going_under_its_copy_stays_there() {
+        // The shape the two split conversations on a real log have: minted
+        // live as A, reconstructed as B by a backfill, then — after a restart
+        // that predates the precedence rule — live again under B. The newest
+        // live fact is B, and a restart must keep it there rather than send
+        // the next turn back to A and fork the session a second time.
+        let live = BusId::mint();
+        let copy = BusId::mint();
+        let records = vec![
+            logged(0, live, None, prompt("first")),
+            logged(1, copy, Some(CLAUDE_TRANSCRIPT), prompt("first")),
+            logged(2, copy, None, prompt("second, after the restart")),
+        ];
+
+        let registry = Registry::restore(&records);
+
+        assert_eq!(registry.bus_id(&key()), Some(copy));
+    }
+
+    #[test]
+    fn a_record_with_no_vendor_session_binds_nothing() {
+        let mut anonymous = logged(0, BusId::mint(), None, prompt("who?"));
+        anonymous.source.vendor_session_id = None;
+
+        let registry = Registry::restore(&[anonymous]);
+
+        assert_eq!(registry.bus_id(&key()), None);
+    }
+
+    #[test]
     fn the_bound_is_large_enough_to_be_useless_to_hit_by_accident() {
         // Asserted as a literal because every other test here is written
         // against the constant and would pass at any value, including two.

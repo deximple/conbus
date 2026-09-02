@@ -50,21 +50,69 @@ fn spoke_file(paths: &Paths) -> std::path::PathBuf {
     paths.root().join("drops.spoke")
 }
 
+/// A record that did not land: why, and — when the hook knew — what it was.
+///
+/// `reason` is the stderr line and the throttle key. `detail` names the event
+/// and the session for the durable record only, because thirty-one orphans on
+/// a real log all said "no binding" and nothing else, and a ghost session's
+/// `SessionEnd` could not be told from a lost tool call. Identifiers, never
+/// content: the log already carries the event name and the whole session id.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Dropped {
+    pub reason: String,
+    pub detail: Option<String>,
+}
+
+impl Dropped {
+    pub fn new(reason: impl Into<String>) -> Self {
+        Dropped {
+            reason: reason.into(),
+            detail: None,
+        }
+    }
+
+    pub fn with_detail(self, detail: impl Into<String>) -> Self {
+        Dropped {
+            detail: Some(detail.into()),
+            ..self
+        }
+    }
+}
+
+impl From<String> for Dropped {
+    fn from(reason: String) -> Self {
+        Dropped::new(reason)
+    }
+}
+
+impl std::fmt::Display for Dropped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.detail {
+            Some(detail) => write!(f, "{} ({detail})", self.reason),
+            None => f.write_str(&self.reason),
+        }
+    }
+}
+
 /// Record a dropped record. Returns whether the caller should also say so on
 /// stderr.
 ///
 /// Never fails and never panics: it runs on the path that exists in order not
 /// to fail.
-pub fn record(reason: &str) -> bool {
+pub fn record(dropped: &Dropped) -> bool {
     let Ok(paths) = Paths::resolve() else {
         return true;
     };
     let _ = fs::create_dir_all(paths.root());
-    append(&paths, reason);
-    should_speak(&paths, reason)
+    record_at(&paths, dropped)
 }
 
-fn append(paths: &Paths, reason: &str) {
+fn record_at(paths: &Paths, dropped: &Dropped) -> bool {
+    append(paths, dropped);
+    should_speak(paths, &dropped.reason)
+}
+
+fn append(paths: &Paths, dropped: &Dropped) {
     let file = drops_file(paths);
     if fs::metadata(&file).map(|m| m.len()).unwrap_or(0) >= CAP_BYTES {
         return;
@@ -73,11 +121,14 @@ fn append(paths: &Paths, reason: &str) {
         return;
     };
     // Built whole, written once. See the module note.
-    let mut line = serde_json::json!({
+    let mut entry = serde_json::json!({
         "ts": Timestamp::now().to_string(),
-        "reason": reason,
-    })
-    .to_string();
+        "reason": dropped.reason,
+    });
+    if let Some(detail) = &dropped.detail {
+        entry["detail"] = serde_json::Value::String(detail.clone());
+    }
+    let mut line = entry.to_string();
     line.push('\n');
     let _ = handle.write_all(line.as_bytes());
 }
@@ -131,10 +182,13 @@ pub fn summary(paths: &Paths) -> Summary {
     let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
     let last = lines.last().and_then(|line| {
         let value: serde_json::Value = serde_json::from_str(line).ok()?;
-        Some((
-            value.get("ts")?.as_str()?.to_string(),
-            value.get("reason")?.as_str()?.to_string(),
-        ))
+        let reason = value.get("reason")?.as_str()?.to_string();
+        // The detail rides along in the human view, when there is one.
+        let reason = match value.get("detail").and_then(|d| d.as_str()) {
+            Some(detail) => format!("{reason} ({detail})"),
+            None => reason,
+        };
+        Some((value.get("ts")?.as_str()?.to_string(), reason))
     });
     Summary {
         count: lines.len(),
@@ -174,13 +228,56 @@ mod tests {
         let dir = home();
         let paths = paths_at(dir.path());
 
-        append(&paths, "no daemon");
+        append(&paths, &Dropped::new("no daemon"));
 
         let summary = summary(&paths);
         assert_eq!(summary.count, 1);
         assert_eq!(
             summary.last.as_ref().map(|(_, reason)| reason.as_str()),
             Some("no daemon")
+        );
+    }
+
+    #[test]
+    fn a_drop_keeps_what_was_dropped_apart_from_why() {
+        // Thirty-one orphan drops on a real log, and no way to tell a ghost
+        // session's `SessionEnd` from a lost tool call: the reason said "no
+        // binding" and nothing else. The event name and the first eight
+        // characters of the vendor's session id are identifiers, not content
+        // — the log already carries both in full — and they are enough to
+        // sort every one of the thirty-one.
+        let dir = home();
+        let paths = paths_at(dir.path());
+
+        append(
+            &paths,
+            &Dropped::new("no conversation for this session")
+                .with_detail("SessionEnd for session 01a06300"),
+        );
+
+        let line = std::fs::read_to_string(drops_file(&paths)).expect("drop log");
+        let value: serde_json::Value = serde_json::from_str(line.trim()).expect("json");
+        assert_eq!(value["reason"], "no conversation for this session");
+        assert_eq!(value["detail"], "SessionEnd for session 01a06300");
+    }
+
+    #[test]
+    fn the_throttle_keys_on_the_reason_and_not_on_the_detail() {
+        // Every orphan carries a different session id. If the detail were part
+        // of the key, a daemon restart would put one stderr line per orphan
+        // into the transcript — the burying this module exists to prevent.
+        let dir = home();
+        let paths = paths_at(dir.path());
+
+        assert!(should_speak(&paths, "no binding"));
+        assert!(!should_speak(&paths, "no binding"));
+        let _ = record_at(
+            &paths,
+            &Dropped::new("no binding").with_detail("Stop for session 11111111"),
+        );
+        assert!(
+            !should_speak(&paths, "no binding"),
+            "a different detail is the same reason"
         );
     }
 
@@ -221,7 +318,7 @@ mod tests {
         std::fs::create_dir_all(paths.root()).expect("dir");
         std::fs::write(&file, "x".repeat(CAP_BYTES as usize + 10)).expect("fill");
 
-        append(&paths, "one more");
+        append(&paths, &Dropped::new("one more"));
 
         let grown = std::fs::metadata(&file).expect("meta").len();
         assert_eq!(grown, CAP_BYTES + 10, "it kept growing past the cap");
