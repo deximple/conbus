@@ -138,3 +138,17 @@ written by the same build; the 0.147-reads-0.150 skew the plan recorded is
 still the risk for older rollouts, and `historyMode` is the field to branch
 on. This is enough to build `conbus backfill` for Codex from the official
 surface rather than from rollout files.
+
+## What the enumeration found (2026-09-03 08:10 KST, read-only)
+
+`thread/list` paginates at `limit` with `nextCursor`; on this machine it listed
+281 threads from 2026-03-09 to 2026-09-02 in three pages. `id == sessionId`
+on all 281, and four of the five Codex sessions the recorder had mirrored
+were among them (the fifth is the memory agent, which has no thread).
+`historyMode` was `legacy` for 276 and `paginated` for 5; `source` was
+`vscode` for 269 and `cli` for 12; `cliVersion` ran from 0.107.0 to 0.152.1.
+`thread/turns/list` answered for the oldest thread (0.107.0, legacy) and for
+0.148/0.150/0.152 threads alike — the 0.147-reads-0.150 skew recorded in the
+plan did not reproduce on 0.152.1's app-server. `turns` on a `thread/list`
+item is always `[]`; the turns come from `thread/turns/list` only. Records
+recovered this way are stamped `backfilled_from: codex_thread`.

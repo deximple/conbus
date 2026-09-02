@@ -10,7 +10,11 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use conbus_core::backfill::{CLAUDE_TRANSCRIPT, parse_claude_transcript};
+use conbus_core::backfill::{
+    CLAUDE_TRANSCRIPT, CODEX_THREAD, parse_claude_transcript, parse_codex_thread,
+};
+
+use crate::appserver::AppServer;
 use conbus_core::event::{Event, Harness};
 use conbus_core::ids::BusId;
 use conbus_core::paths::Paths;
@@ -35,7 +39,21 @@ pub struct Outcome {
     pub recorded_live: u64,
     /// Lines and files not read, counted by why.
     pub unread: BTreeMap<String, u64>,
+    /// Codex threads recovered whole through the app-server.
+    pub codex_threads: u64,
+    pub codex_turns: u64,
+    pub codex_records: u64,
+    /// Codex threads already in the log from an earlier run.
+    pub codex_already: u64,
+    /// Codex threads the recorder saw as they happened, left alone.
+    pub codex_live: u64,
+    /// Why the Codex source could not be read at all, when it could not.
+    pub codex_unavailable: Option<String>,
 }
+
+/// How long the app-server gets for the whole enumeration. Hundreds of
+/// threads at two calls each ran in well under a minute on this machine.
+const CODEX_DEADLINE: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// Recover Claude Code history into the log.
 pub fn run(paths: &Paths, apply: bool) -> io::Result<()> {
@@ -44,7 +62,7 @@ pub fn run(paths: &Paths, apply: bool) -> io::Result<()> {
         .ok_or_else(|| io::Error::other("no HOME to read history from"))?;
     let transcripts = home.join(".claude").join("projects");
 
-    let outcome = recover(paths, &transcripts, apply)?;
+    let outcome = recover(paths, &transcripts, apply, true)?;
 
     println!("history   {}", transcripts.display());
     println!(
@@ -71,6 +89,17 @@ pub fn run(paths: &Paths, apply: bool) -> io::Result<()> {
             outcome.recorded_live
         );
     }
+    match &outcome.codex_unavailable {
+        Some(why) => println!("codex     history unavailable — {why}"),
+        None => println!(
+            "codex     recovered {} thread(s), {} turn(s), {} record(s); {} already backfilled; {} the recorder saw live",
+            outcome.codex_threads,
+            outcome.codex_turns,
+            outcome.codex_records,
+            outcome.codex_already,
+            outcome.codex_live
+        ),
+    }
     println!("not read  {}", summarise_unread(&outcome.unread));
     if apply {
         println!("written to {}", paths.log_dir().display());
@@ -80,9 +109,11 @@ pub fn run(paths: &Paths, apply: bool) -> io::Result<()> {
     Ok(())
 }
 
-/// Read every transcript under `transcripts` and, when `apply`, append what
-/// the log does not already hold.
-pub fn recover(paths: &Paths, transcripts: &Path, apply: bool) -> io::Result<Outcome> {
+/// Read every transcript under `transcripts` — and, when `codex`, every
+/// thread the app-server lists — and, when `apply`, append what the log does
+/// not already hold. `codex` is a parameter so a test of the transcript path
+/// never starts the real app-server underneath it.
+pub fn recover(paths: &Paths, transcripts: &Path, apply: bool, codex: bool) -> io::Result<Outcome> {
     // Backfill appends to the segments directly, so it must not race the daemon
     // for the same file. Refusing is the honest answer; interleaved writes would
     // corrupt the one thing the whole design calls the source of truth. A dry
@@ -185,7 +216,118 @@ pub fn recover(paths: &Paths, transcripts: &Path, apply: bool) -> io::Result<Out
             }
         }
     }
+    if codex {
+        recover_codex(&known, log.as_mut(), &mut outcome)?;
+    }
     Ok(outcome)
+}
+
+/// Codex history, through the app-server's thread APIs.
+///
+/// A source that cannot be read is reported and does not fail the run: the
+/// Claude transcripts above were already recovered, and a machine without
+/// Codex is an ordinary machine.
+fn recover_codex(
+    known: &Known,
+    mut log: Option<&mut SegmentLog>,
+    outcome: &mut Outcome,
+) -> io::Result<()> {
+    let mut server = match AppServer::start(CODEX_DEADLINE) {
+        Ok(server) => server,
+        Err(err) => {
+            outcome.codex_unavailable = Some(err.to_string());
+            return Ok(());
+        }
+    };
+    let mut cursor: Option<String> = None;
+    loop {
+        let mut params = serde_json::json!({"limit": 100});
+        if let Some(cursor) = &cursor {
+            params["cursor"] = serde_json::json!(cursor);
+        }
+        let page = match server.call("thread/list", params) {
+            Ok(page) => page,
+            Err(err) => {
+                outcome.codex_unavailable = Some(err.to_string());
+                return Ok(());
+            }
+        };
+        for thread in page["data"].as_array().into_iter().flatten() {
+            let Some(id) = thread["id"]
+                .as_str()
+                .and_then(|id| id.parse::<BusId>().ok())
+            else {
+                *outcome
+                    .unread
+                    .entry("thread id is not a uuid".into())
+                    .or_default() += 1;
+                continue;
+            };
+            // The same two rules as the transcripts: the recorder's own
+            // records outrank a reconstruction, and a thread already
+            // recovered is not recovered twice.
+            if known.live_codex.contains(&id) {
+                outcome.codex_live += 1;
+                continue;
+            }
+            if known.backfilled.contains_key(&id) {
+                outcome.codex_already += 1;
+                continue;
+            }
+            let turns = match list_turns(&mut server, &id.to_string()) {
+                Ok(turns) => turns,
+                Err(err) => {
+                    *outcome
+                        .unread
+                        .entry(format!("thread/turns/list failed: {err}"))
+                        .or_default() += 1;
+                    continue;
+                }
+            };
+            let recovered = parse_codex_thread(thread, &turns);
+            for (reason, count) in &recovered.skipped {
+                *outcome.unread.entry(reason.clone()).or_default() += count;
+            }
+            if recovered.entries.is_empty() {
+                continue;
+            }
+            outcome.codex_threads += 1;
+            outcome.codex_turns += recovered
+                .entries
+                .iter()
+                .filter(|e| matches!(e.event, Event::TurnStarted { .. }))
+                .count() as u64;
+            outcome.codex_records += recovered.entries.len() as u64;
+            if let Some(log) = log.as_deref_mut() {
+                for entry in recovered.entries {
+                    log.append(entry)?;
+                }
+            }
+        }
+        cursor = page["nextCursor"].as_str().map(str::to_string);
+        if cursor.is_none() {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// Every turn of one thread, page by page.
+fn list_turns(server: &mut AppServer, thread_id: &str) -> io::Result<Vec<serde_json::Value>> {
+    let mut turns = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let mut params = serde_json::json!({"threadId": thread_id, "limit": 100});
+        if let Some(cursor) = &cursor {
+            params["cursor"] = serde_json::json!(cursor);
+        }
+        let page = server.call("thread/turns/list", params)?;
+        turns.extend(page["data"].as_array().into_iter().flatten().cloned());
+        cursor = page["nextCursor"].as_str().map(str::to_string);
+        if cursor.is_none() {
+            return Ok(turns);
+        }
+    }
 }
 
 /// What the log already holds, keyed the two ways a transcript can be in it.
@@ -205,6 +347,9 @@ struct Known {
     /// first run of this that keyed only on its own output recovered every
     /// live session a second time.
     live: HashSet<BusId>,
+    /// Codex sessions the recorder mirrored, by the vendor's session id —
+    /// which is the thread id the app-server lists.
+    live_codex: HashSet<BusId>,
     /// Live Claude Code session ids that are not UUIDs, so cannot be matched
     /// to a transcript and cannot be protected from a copy either. None have
     /// been seen; counted so that the first one is not a silent gap.
@@ -215,22 +360,30 @@ fn known_sessions(paths: &Paths) -> io::Result<Known> {
     let mut known = Known {
         backfilled: HashMap::new(),
         live: HashSet::new(),
+        live_codex: HashSet::new(),
         unreadable_live: HashSet::new(),
     };
     for record in SegmentLog::scan(paths.log_dir())?.records {
         if record.source.backfilled_from.is_none() {
-            if record.source.harness.as_str() == Harness::CLAUDE_CODE
-                && let Some(session) = record.source.vendor_session_id.as_deref()
-            {
-                match session.parse::<BusId>() {
-                    Ok(session) => {
-                        known.live.insert(session);
-                    }
-                    Err(_) => {
-                        known.unreadable_live.insert(session.to_string());
-                    }
+            let Some(session) = record.source.vendor_session_id.as_deref() else {
+                continue;
+            };
+            match (record.source.harness.as_str(), session.parse::<BusId>()) {
+                (Harness::CLAUDE_CODE, Ok(session)) => {
+                    known.live.insert(session);
                 }
+                (Harness::CLAUDE_CODE, Err(_)) => {
+                    known.unreadable_live.insert(session.to_string());
+                }
+                (Harness::CODEX, Ok(session)) => {
+                    known.live_codex.insert(session);
+                }
+                _ => {}
             }
+            continue;
+        }
+        if record.source.backfilled_from.as_deref() == Some(CODEX_THREAD) {
+            known.backfilled.insert(record.bus_id, true);
             continue;
         }
         if record.source.backfilled_from.as_deref() != Some(CLAUDE_TRANSCRIPT) {
@@ -383,7 +536,7 @@ mod tests {
         let machine = machine();
         transcript(&machine, SESSION);
 
-        let outcome = recover(&machine.paths, &machine.transcripts, true).expect("recover");
+        let outcome = recover(&machine.paths, &machine.transcripts, true, false).expect("recover");
 
         assert_eq!(outcome.sessions, 1);
         assert_eq!(outcome.turns, 1);
@@ -406,7 +559,7 @@ mod tests {
         recorded_live(&machine, SESSION);
         transcript(&machine, SESSION);
 
-        let outcome = recover(&machine.paths, &machine.transcripts, true).expect("recover");
+        let outcome = recover(&machine.paths, &machine.transcripts, true, false).expect("recover");
 
         assert_eq!(outcome.recorded_live, 1);
         assert_eq!(outcome.sessions, 0, "the live records are the conversation");
@@ -427,7 +580,7 @@ mod tests {
         recorded_live(&machine, "not-a-uuid-at-all");
         transcript(&machine, SESSION);
 
-        let outcome = recover(&machine.paths, &machine.transcripts, false).expect("recover");
+        let outcome = recover(&machine.paths, &machine.transcripts, false, false).expect("recover");
 
         assert_eq!(
             outcome.unread.get("live session id is not a uuid"),
@@ -446,7 +599,8 @@ mod tests {
         transcript(&machine, SESSION);
         let _daemon = UnixListener::bind(machine.paths.socket()).expect("listen");
 
-        let outcome = recover(&machine.paths, &machine.transcripts, false).expect("a dry run");
+        let outcome =
+            recover(&machine.paths, &machine.transcripts, false, false).expect("a dry run");
 
         assert_eq!(outcome.sessions, 1);
         assert_eq!(records_on_disk(&machine), 0, "a dry run writes nothing");
@@ -461,7 +615,7 @@ mod tests {
         transcript(&machine, SESSION);
         let _daemon = UnixListener::bind(machine.paths.socket()).expect("listen");
 
-        let refused = recover(&machine.paths, &machine.transcripts, true);
+        let refused = recover(&machine.paths, &machine.transcripts, true, false);
 
         assert!(refused.is_err(), "two writers on one segment");
         assert_eq!(records_on_disk(&machine), 0);
