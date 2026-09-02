@@ -216,3 +216,153 @@ fn a_real_session_start_carries_no_correlator() {
     assert_eq!(record["event"], "session_candidate");
     assert_eq!(record["vendor_turn_id"], serde_json::Value::Null);
 }
+
+/// Real Codex 0.152.1 traffic: an interactive session in a throwaway checkout
+/// (two turns, one `ls -la`), plus the session start and prompt of the
+/// memory-writing agent Codex spawned beside it. Username redacted; the
+/// agent's 50 KB instruction prompt cut to its first line.
+const CODEX: &str = include_str!("fixtures/codex_0.152.1.jsonl");
+
+fn codex_payloads(hook_event_name: &str) -> Vec<serde_json::Value> {
+    CODEX
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("fixture is json"))
+        .filter(|value| value["hook_event_name"] == hook_event_name)
+        .collect()
+}
+
+/// As `record_for`, through the Codex adapter: mint with the same session's
+/// real prompt, then replay the subject.
+fn codex_record_for(subject: &serde_json::Value) -> serde_json::Value {
+    let home = tempfile::tempdir().expect("tempdir");
+    let bin = env!("CARGO_BIN_EXE_conbus");
+    let mut daemon = Command::new(bin)
+        .arg("daemon")
+        .env("CONBUS_HOME", home.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn daemon");
+    let socket = home.path().join("conbus.sock");
+    for _ in 0..250 {
+        if std::os::unix::net::UnixStream::connect(&socket).is_ok() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    let minting = codex_payloads("UserPromptSubmit")
+        .into_iter()
+        .find(|p| p["session_id"] == subject["session_id"])
+        .expect("the fixture holds a prompt for every session it holds");
+    for value in [&minting, subject] {
+        let mut child = Command::new(bin)
+            .arg("hook")
+            .arg("--harness")
+            .arg("codex")
+            .env("CONBUS_HOME", home.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn hook");
+        use std::io::Write;
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin")
+            .write_all(value.to_string().as_bytes())
+            .expect("write");
+        child.wait().expect("hook exit");
+    }
+
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+
+    let segment = home.path().join("log").join("segment-00000000.jsonl");
+    let text = std::fs::read_to_string(&segment).expect("a segment must exist");
+    let last = text.lines().rfind(|l| !l.is_empty()).expect("a record");
+    serde_json::from_str(last).expect("record is json")
+}
+
+#[test]
+fn a_real_codex_prompt_mints_with_its_turn_correlator() {
+    let prompt = codex_payloads("UserPromptSubmit").remove(0);
+
+    let record = codex_record_for(&prompt);
+
+    assert_eq!(record["harness"], "codex");
+    assert_eq!(record["event"], "turn_started");
+    assert_eq!(record["prompt"]["text"], "Reply with the single word OK");
+    assert_eq!(record["vendor_turn_id"], prompt["turn_id"]);
+    assert_eq!(record["workspace"], "/Applications/conbus-hooktest");
+    assert_eq!(record["author"], serde_json::Value::Null);
+}
+
+#[test]
+fn a_real_codex_tool_call_keeps_its_exec_id_on_both_halves() {
+    // Codex names a tool call `exec-<uuid>`, and the join between the request
+    // and its result is that id — the same join Claude's `toolu_` ids give.
+    let request = codex_payloads("PreToolUse").remove(0);
+    let result = codex_payloads("PostToolUse").remove(0);
+    assert_eq!(request["tool_use_id"], result["tool_use_id"]);
+
+    let requested = codex_record_for(&request);
+    let used = codex_record_for(&result);
+
+    assert_eq!(requested["event"], "tool_requested");
+    assert_eq!(requested["tool"], "Bash");
+    assert!(
+        requested["tool_use_id"]
+            .as_str()
+            .unwrap_or("")
+            .starts_with("exec-"),
+        "{requested}"
+    );
+    assert_eq!(used["event"], "tool_use");
+    assert_eq!(used["tool_use_id"], request["tool_use_id"]);
+    assert_eq!(used["outcome"], "succeeded");
+    assert_eq!(used["vendor_turn_id"], request["turn_id"]);
+}
+
+#[test]
+fn a_real_codex_stop_carries_the_closing_message() {
+    let stop = codex_payloads("Stop").remove(0);
+
+    let record = codex_record_for(&stop);
+
+    assert_eq!(record["event"], "turn_ended");
+    assert_eq!(record["state"], "complete");
+    assert_eq!(record["assistant_message"]["text"], "OK");
+    assert_eq!(record["vendor_turn_id"], stop["turn_id"]);
+}
+
+#[test]
+fn a_real_codex_session_end_keeps_its_reason() {
+    let end = codex_payloads("SessionEnd").remove(0);
+
+    let record = codex_record_for(&end);
+
+    assert_eq!(record["event"], "session_ended");
+    assert_eq!(record["reason"], "other");
+}
+
+#[test]
+fn codexs_memory_agent_is_a_session_of_its_own_with_no_transcript() {
+    // Codex 0.152.1 spawns a "Memory Writing Agent" beside an interactive
+    // session: its own session id, `transcript_path: null`, cwd
+    // `~/.codex/memories`, a 50 KB instruction prompt, and no `Stop`. It is a
+    // machine's conversation and it must still normalise, or the hook fails
+    // on something the person never typed.
+    let start = codex_payloads("SessionStart")
+        .into_iter()
+        .find(|p| p["transcript_path"].is_null())
+        .expect("the memory agent's session start");
+
+    let record = codex_record_for(&start);
+
+    assert_eq!(record["event"], "session_candidate");
+    assert_eq!(record["trigger"], "startup");
+    assert_eq!(record["workspace"], "/Users/user/.codex/memories");
+}

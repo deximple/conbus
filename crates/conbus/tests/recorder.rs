@@ -1115,3 +1115,31 @@ fn a_silent_connection_does_not_hold_the_hooks_behind_it() {
     );
     daemon.stop();
 }
+
+#[test]
+fn a_codex_hook_says_only_what_codex_accepts() {
+    // Codex 0.152.1, first session with trusted hooks: "PreToolUse hook
+    // (failed) — error: PreToolUse hook returned unsupported suppressOutput",
+    // and again on PostToolUse, on every tool call. Its reference says which
+    // fields fail which event; the empty object is the one reply all of them
+    // take. The record still landed — this is about what the person saw.
+    let home = tempfile::tempdir().expect("tempdir");
+    let daemon = start_daemon(home.path());
+
+    let (code, stdout, stderr) = run_hook_full(
+        home.path(),
+        r#"{"session_id":"cx-9","hook_event_name":"PreToolUse","cwd":"/repo","model":"gpt-5.6-sol",
+            "permission_mode":"bypassPermissions","tool_name":"Bash","tool_input":{"command":"ls"},
+            "tool_use_id":"exec-1","transcript_path":null,"turn_id":"CX-TURN-9"}"#,
+        &[("CONBUS_HARNESS", "codex")],
+    );
+
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(
+        stdout.trim(),
+        "{}",
+        "Codex fails a PreToolUse hook that says more"
+    );
+
+    daemon.stop();
+}

@@ -202,13 +202,17 @@ true of `~/.claude/settings.json` and **false of `$CODEX_HOME/hooks.json`**, whe
 registered — `PreToolUse`, `PostToolUse`, `SessionStart`, `SessionEnd`, `UserPromptSubmit`, `Stop`. Both files
 carry conbus again now, deliberately.
 
-**None of the six Codex hooks has ever run.** A Codex hook does not run until a person approves it inside Codex;
-it is not executed-and-ignored, the process is never spawned. Codex keeps the consent record as `trusted_hash`
-under `[hooks.state."<key>"]` in `config.toml` — keyed by hooks file, snake-cased event, matcher-group index and
-position within the group — and there is no record for any conbus entry. `conbus doctor` now says so, because the
-executability probe cheerfully reports "runs" about a command Codex will never invoke, which is the same shape of
-lie as an empty drop log. conbus reads that record and must never write it: `hooks/list` hands out the very value
-that would forge it.
+**The six Codex hooks were trusted on 2026-09-03 and have run.** A Codex hook does not run until a person approves
+it inside Codex; it is not executed-and-ignored, the process is never spawned. Codex keeps the consent record as
+`trusted_hash` under `[hooks.state."<key>"]` in `config.toml` — keyed by hooks file, snake-cased event,
+matcher-group index and position within the group. Until 2026-09-03 there was no record for any conbus entry, and
+`conbus doctor` said so, because the executability probe cheerfully reports "runs" about a command Codex will never
+invoke, which is the same shape of lie as an empty drop log. conbus reads that record and must never write it:
+`hooks/list` hands out the very value that would forge it. The gesture that grants it is the CLI's startup dialog
+("Hooks need review — 19 hooks are new or changed — Trust all and continue"), which reviews every untrusted hook in
+every file Codex loaded at once — so trusting conbus's six also trusted paseo's five and two bundled plugin hooks.
+Within the hour the log held its first Codex conversations, and a Codex session in a checkout with history was
+briefed and quoted the record back. See `tests/fixtures/codex_0.152.1_contract.md` for what the traffic taught.
 
 Two upgrade traps follow from the same hash. It covers more than the command string, so any edit to a conbus entry
 flips it from `trusted` to `modified` — and a modified hook silently stops running. And inserting a hook ahead of
@@ -242,8 +246,24 @@ backfill leaves alone any transcript whose session the recorder has seen (the dr
 recovers nothing). `doctor` prints the twins and which side each is bound to — 14 twins, 14 live, 2 split — by
 running the same restore the daemon does, so the two cannot disagree.
 
-**Codex is registered and silent.** Its hooks do not run until a human trusts them in Codex itself, and an untrusted
-hook fails without printing anything.
+**Codex is registered, trusted and recording** (Codex 0.152.1, since 2026-09-03). What its first traffic taught,
+in order of how much it changed:
+
+- **Codex fails a hook over fields it does not take.** `PreToolUse` rejects `continue`, `stopReason` and
+  `suppressOutput`; `PostToolUse` rejects `suppressOutput`. The Claude-shaped silent reply produced "hook (failed)"
+  twice per tool call in the TUI while every record landed. The hook now answers Codex with `{}` on every silent
+  path and drops the two control fields from the briefing; Claude Code keeps its reply, because a zero-byte stdout
+  once took a session down there.
+- **The briefing reaches Codex's model.** `systemMessage` + `hookSpecificOutput.additionalContext` on
+  `UserPromptSubmit` was shown in the TUI and quoted back by the model. Model-visible hook output is capped at
+  ~2,500 tokens (`additionalContextLimit`), above the pack budget.
+- **Codex spawns a memory-writing agent beside a session**: its own `session_id`, `transcript_path: null`, cwd
+  `~/.codex/memories`, a 50 KB instruction prompt beginning `## Memory Writing Agent`, tool calls, `SessionEnd`, no
+  `Stop`. The recorder mints it as a conversation in the memory workspace; nothing marks it machine-authored yet.
+- **`SessionStart` fires at the first prompt, not when the TUI opens**; a session closed without a prompt fires
+  `SessionEnd` alone, which the daemon can only orphan. `tool_use_id` is `exec-<uuid>`; `tool_response` is a string.
+- Async hooks are allowed from 0.148 (0.147.0 dropped them). `codex exec` hung at MCP start-up here and is
+  unverified as a hook source. Project-local `.codex/hooks.json` loads only after the directory itself is trusted.
 
 **History is recovered.**
 
