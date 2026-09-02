@@ -95,3 +95,46 @@ Per the reference, and confirmed the hard way:
 - The TUI enables bracketed paste: text and Enter written in one burst are
   taken as a paste, and the prompt is not submitted. Drive it with the text
   first and the Enter separately.
+
+## Quota probe #1 — `account/rateLimits/read` (2026-09-03 03:30 KST)
+
+The plan's first probe: does the app-server expose the account's rate limits
+to a client that is not a Codex session? It does, on the first try, read-only,
+with `initialize` (`capabilities.experimentalApi: true`) then
+`account/rateLimits/read` with empty params:
+
+```json
+{"rateLimits": {"limitId": "codex", "limitName": null,
+  "primary":   {"usedPercent": 22, "windowDurationMins": 300,   "resetsAt": 1788385869},
+  "secondary": {"usedPercent": 9,  "windowDurationMins": 10080, "resetsAt": 1788752527},
+  "credits": {"hasCredits": false, "unlimited": false, "balance": "0"},
+  "individualLimit": null, "spendControlReached": false, "planType": "plus",
+  "rateLimitReachedType": null},
+ "rateLimitsByLimitId": {"codex": {…same…}},
+ "rateLimitResetCredits": {"availableCount": 1, "credits": [{"resetType": "codexRateLimits",
+  "status": "available", "title": "Full reset (Weekly + 5 hr)", "grantedAt": …, "expiresAt": …}]},
+ "accountId": "<uuid>", "rateLimitUpsell": null}
+```
+
+So: account-scoped (`accountId`), a five-hour window and a weekly window each
+with `usedPercent` and an absolute `resetsAt`, `rateLimitReachedType` as the
+"exhausted" signal (`null` here), and the reset credits the June PR added. This
+is the signal the router was designed around, and it is readable without
+opening a thread. Not yet wired into conbus; the obvious next brick is a
+`conbus quota` command that runs this probe and a `doctor` line that shows it.
+
+## Thread APIs for a Codex backfill (probed 2026-09-03 03:45 KST, read-only)
+
+Same handshake, then `thread/list {"limit": 3}` → `{"data": [...], "nextCursor",
+"backwardsCursor"}`; each thread carries `id`, `sessionId`, `cwd`, `name`,
+`preview`, `createdAt`/`updatedAt`/`recencyAt` (unix seconds as strings),
+`historyMode` (`paginated` for a 0.152.1 thread), `source` (`cli`), `status`,
+`forkedFromId`, `parentThreadId`, `gitInfo`, `cliVersion`, `turns`.
+`thread/turns/list {"threadId", "limit"}` → turns with `id`, `status`,
+`startedAt`/`completedAt`/`durationMs`, and `items`: `userMessage` (text
+blocks) and `agentMessage` (`text`, `phase: final_answer`). `thread/items/list`
+flattens the same with `turnId` per item. All three answered for a thread
+written by the same build; the 0.147-reads-0.150 skew the plan recorded is
+still the risk for older rollouts, and `historyMode` is the field to branch
+on. This is enough to build `conbus backfill` for Codex from the official
+surface rather than from rollout files.

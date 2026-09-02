@@ -54,12 +54,18 @@ pub struct Asking {
     ///
     /// Named for the direction that is knowable. The vendor labels machine
     /// origins and almost never labels human ones, so this is set only when it
-    /// said so, and an unlabelled session is briefed. On the real log this one
-    /// condition is the difference between speaking to 3,259 sessions and
-    /// speaking to 15: all but 78 of 3,443 conversations there are explicitly
+    /// said so, and an unlabelled session is briefed. On the real log (by
+    /// entrypoint, 2026-09-02) this one condition is the difference between
+    /// speaking to 3,443 sessions and speaking to 349: the rest are explicitly
     /// somebody's script, and briefing a script is tokens spent on a reader
     /// that does not exist.
     pub unattended: bool,
+    /// The opening prompt begins with a vendor's tell that a program wrote it
+    /// — see [`machine_authored`]. Separate from `unattended` because the two
+    /// come from different places and disagree on a real log: four scheduled
+    /// runs were `claude-desktop`, attended by the entrypoint, and Codex's
+    /// memory agent has no entrypoint at all.
+    pub machine_authored: bool,
     /// How long this session's opening prompt is, in UTF-16 code units.
     ///
     /// A proxy for something there is no direct signal for: whether the session
@@ -83,6 +89,10 @@ pub struct Candidate {
     pub turns: u64,
     /// Reconstructed from the vendor's own history rather than mirrored live.
     pub backfilled: bool,
+    /// Mirrored live, at least in part. Both can be true: a session resumed
+    /// after its history was recovered carries the recovery and the
+    /// continuation under one id, and the briefing has to say "partly".
+    pub live: bool,
 }
 
 /// How a conversation came to a stop.
@@ -124,6 +134,11 @@ pub enum Silent {
     /// Nobody is reading. A briefing is for orientation, and a program does not
     /// need orienting.
     Unattended,
+    /// The prompt itself says a program wrote it — a scheduled task's
+    /// envelope, Codex's memory agent's instructions. The entrypoint calls
+    /// these attended, because a person's front end ran them; the prompt's
+    /// own first line says otherwise, in the vendor's words.
+    MachineAuthored,
     /// The session opened by supplying its own context, at length. Whatever is
     /// driving it already knows what it is doing.
     ArrivedWithContext,
@@ -142,7 +157,8 @@ pub enum Decision {
 /// How long ago a conversation can have stopped and still be worth mentioning.
 ///
 /// A week, chosen off the measurement rather than from taste. On the real log,
-/// counting only the sessions a person was actually at, a week briefs 13 of 78
+/// counting only the sessions a person was actually at, a week briefed 13 of 78
+/// on the first measurement (2026-08-31) and 40 of 349 by entrypoint (2026-09-02),
 /// and a month briefs 15 — four times the window for two more briefings. The
 /// knee is inside the first week, and a week is also the span a person can
 /// reason about: "what I was doing here recently" rather than archaeology.
@@ -218,6 +234,7 @@ impl Candidate {
             last_turn: None,
             turns: 0,
             backfilled: false,
+            live: false,
         });
 
         candidate.harness = record.source.harness.clone();
@@ -226,6 +243,7 @@ impl Candidate {
             candidate.workspace.clone_from(&record.source.workspace);
         }
         candidate.backfilled |= record.source.backfilled_from.is_some();
+        candidate.live |= record.source.backfilled_from.is_none();
 
         match &record.event {
             Event::TurnStarted { .. } => {
@@ -349,6 +367,10 @@ pub fn replay(records: &[Record], home: Option<&str>) -> Replay {
                 workspace,
                 first_prompt: true,
                 unattended: unattended(entrypoint_of.get(&record.bus_id)),
+                machine_authored: match &record.event {
+                    Event::TurnStarted { prompt, .. } => machine_authored(prompt),
+                    _ => false,
+                },
                 prompt_units: match &record.event {
                     Event::TurnStarted { prompt, .. } => opening_units(prompt),
                     _ => 0,
@@ -366,6 +388,7 @@ pub fn replay(records: &[Record], home: Option<&str>) -> Replay {
                     Silent::NothingToSay => "silent/nothing_to_say",
                     Silent::Unattended => "silent/unattended",
                     Silent::ArrivedWithContext => "silent/arrived_with_context",
+                    Silent::MachineAuthored => "silent/machine_authored",
                 },
             };
             *out.verdicts.entry(name).or_default() += 1;
@@ -409,6 +432,25 @@ pub fn opening_units(prompt: &crate::event::Body) -> usize {
     }
 }
 
+/// Whether an opening prompt says, in the vendor's own words, that a program
+/// wrote it.
+///
+/// Two tells, both verbatim from the vendors: Claude Code wraps a scheduled
+/// task's run in `<scheduled-task name="…">`, and Codex's memory agent opens
+/// with `## Memory Writing Agent`. Nothing looser — a person asking about a
+/// scheduled task is still a person, and an elided body is retention's doing,
+/// not a machine's.
+pub fn machine_authored(prompt: &crate::event::Body) -> bool {
+    const TELLS: [&str; 2] = ["<scheduled-task", "## Memory Writing Agent"];
+    match prompt {
+        crate::event::Body::Kept { text } => {
+            let head = text.trim_start();
+            TELLS.iter().any(|tell| head.starts_with(tell))
+        }
+        crate::event::Body::Clipped { .. } | crate::event::Body::Elided { .. } => false,
+    }
+}
+
 /// How a conversation stopped, as the briefing would put it.
 pub fn stopped(candidate: &Candidate) -> Stopped {
     match candidate.last_turn.as_ref() {
@@ -433,6 +475,9 @@ pub fn decide(
     }
     if asking.unattended {
         return Decision::Silent(Silent::Unattended);
+    }
+    if asking.machine_authored {
+        return Decision::Silent(Silent::MachineAuthored);
     }
     if asking.prompt_units > SELF_SUPPLIED_UNITS {
         return Decision::Silent(Silent::ArrivedWithContext);
@@ -528,6 +573,7 @@ mod tests {
             workspace: Some(WORKSPACE.into()),
             first_prompt: true,
             unattended: false,
+            machine_authored: false,
             prompt_units: 40,
         }
     }
@@ -541,6 +587,7 @@ mod tests {
             last_turn: Some(TurnState::Complete),
             turns: 6,
             backfilled: false,
+            live: false,
         }
     }
 
@@ -588,6 +635,7 @@ mod tests {
         // its own provenance.
         let recovered = Candidate {
             backfilled: true,
+            live: false,
             ..candidate()
         };
 
@@ -733,11 +781,13 @@ mod tests {
     fn nobody_is_briefed_when_nobody_is_reading() {
         // The single condition that separates a feature from chrome. On the
         // real log all but 78 of 3,443 conversations are explicitly somebody's
-        // script; briefing those is 3,244 injections nobody reads.
+        // script (3,094 of 3,443 by entrypoint, 2026-09-02); briefing those is
+        // injections nobody reads.
         assert_eq!(
             decide(
                 &Asking {
                     unattended: true,
+                    machine_authored: false,
                     ..asking()
                 },
                 &[candidate()],
@@ -757,6 +807,7 @@ mod tests {
             decide(
                 &Asking {
                     unattended: false,
+                    machine_authored: false,
                     ..asking()
                 },
                 &[candidate()],
@@ -1019,6 +1070,63 @@ mod tests {
             "closing the window does not undo how the conversation ended"
         );
         assert!(!only.backfilled);
+    }
+
+    #[test]
+    fn a_prompt_that_says_a_machine_wrote_it_is_not_briefed() {
+        // Four scheduled-task runs on a real log were `claude-desktop`
+        // sessions — attended, by the entrypoint rule — and Codex's memory
+        // agent opens with its own instruction prompt under a person's hooks.
+        // Both begin with the vendor's own tell. A briefing is for a person
+        // who was not there; these are programs that were.
+        let asking = Asking {
+            harness: Harness::new(Harness::CLAUDE_CODE),
+            workspace: Some(WORKSPACE.into()),
+            first_prompt: true,
+            unattended: false,
+            machine_authored: true,
+            prompt_units: 40,
+        };
+
+        assert_eq!(
+            decide(&asking, &[], None, now()),
+            Decision::Silent(Silent::MachineAuthored)
+        );
+    }
+
+    #[test]
+    fn the_machine_tells_are_the_vendors_own_and_nothing_looser() {
+        assert!(machine_authored(&Body::kept(
+            "<scheduled-task name=\"moet-daily-report\" file=\"/x\">run it</scheduled-task>"
+        )));
+        assert!(machine_authored(&Body::kept(
+            "## Memory Writing Agent: Phase 2 (Consolidation)\n\nYou are…"
+        )));
+        assert!(
+            !machine_authored(&Body::kept("fix the scheduled task that broke")),
+            "a person talking about a scheduled task is still a person"
+        );
+        assert!(
+            !machine_authored(&Body::Elided { bytes: 900 }),
+            "retention took the text; absent is not a machine"
+        );
+    }
+
+    #[test]
+    fn a_conversation_with_live_and_reconstructed_records_knows_both() {
+        // The pack labelled a conversation with one backfilled record among
+        // 1,786 live ones "reconstructed from the vendor's history, not
+        // observed live" — a first-hand fact dressed as hearsay. Both flags,
+        // so the label can say "partly".
+        let bus_id = BusId::mint();
+        let mut reconstructed = logged(bus_id, ago(300), prompt());
+        reconstructed.source.backfilled_from = Some("claude_transcript".into());
+        let records = vec![reconstructed, logged(bus_id, ago(100), prompt())];
+
+        let index = Candidate::index(&records);
+
+        assert!(index[0].backfilled);
+        assert!(index[0].live);
     }
 
     #[test]

@@ -6,11 +6,11 @@ recording on this machine. Read this, then read the plan.
 ## Where things are
 
 - Repo: `/Applications/conbus`, remote `deximple/conbus`, **private**. The recorder work is on
-  `claude/conbus-handoff-docs-f9187a`, 13 commits ahead of `main` and unpushed.
+  `claude/pack-honesty` (as of 2026-09-03 03:50 KST). `main` is `ede9ae8`; PRs #5 (the Codex leg), #6 (doctor's eyes) and #7 (pack honesty, `conbus quota`) are stacked on it awaiting merge; nothing else is unpushed.
 - The plan is the single source of truth: [`.cursor/plans/shared_workspace_context_3f7139b8.plan.md`](.cursor/plans/shared_workspace_context_3f7139b8.plan.md). The filename is a generated ID and no longer matches the content; leave it alone so the Cursor plan UI keeps its association. A reader-facing copy under `docs/` gets generated when the repo goes public.
 - `cargo 1.94.1` and `rustc 1.94.1` are installed on this machine, so edition 2024 is available.
 - A cargo workspace exists: `crates/conbus` (the binary) and `crates/conbus-core` (the lib). Edition 2024.
-  191 tests, `cargo clippy --all-targets -- -D warnings` clean. See "Next task" for what is built and what is not.
+  298 tests as of 2026-09-03 (130 + 2 + 14 + 28 + 124), `cargo clippy --all-targets -- -D warnings` clean. See "Next task" for what is built and what is not.
 
 ## What Conbus is, in one paragraph
 
@@ -27,7 +27,7 @@ All of these were argued through four review rounds. The reasoning is in the pla
 5. **The rolling summary cannot be cut**, and it must never run on the leg it is protecting. `claude -p` draws from the subscription limit, so summarizing with Claude burns the quota we're trying to preserve. Default backend is the opposite vendor's low-effort model.
 6. **Retention (1.5) is pulled into stage 1**, which drags envelope encryption and the cross-platform KEK abstraction with it. Shipping default stays "conversation only" (tool bodies not written to disk).
 7. **Name is Conbus** — conversation bus. Binary `conbus`, conversation ID stays `bus_id`. crates.io and npm names are free and deliberately unclaimed; publishing a placeholder would announce the name before the launch window. GitHub org `conbus` is taken by an unrelated 2015 org, hence `deximple/conbus`. Domain is deferred to just before MVP, `conbus.sh` leading.
-8. **Implementation:** one binary with argv dispatch (`conbus daemon|hook|log|doctor`), cargo workspace internally. JSONL segments are the source of truth, SQLite is a **disposable** derived index that can always be rebuilt from segments. Data lives in `~/.conbus/`, respecting `$XDG_STATE_HOME`.
+8. **Implementation:** one binary with argv dispatch (`conbus daemon|hook|log|install|backfill|doctor|quota|--version`), cargo workspace internally. JSONL segments are the source of truth, SQLite is a **disposable** derived index that can always be rebuilt from segments. Data lives in `~/.conbus/`, respecting `$XDG_STATE_HOME`.
 
 ## Hard constraints — violating these breaks the product legally or technically
 
@@ -47,7 +47,7 @@ All of these were argued through four review rounds. The reasoning is in the pla
 - `SessionStart` matchers are `startup`, `resume`, `clear`, `compact`, `fork`, and the hook re-runs on resume — so a fresh pack can be re-injected on every resume, and `compact` is the hook for re-injecting right after compaction. Mid-session events replay stale saved text instead of re-running, so stamp the pack with its creation time.
 - `initialUserMessage` is headless-only in practice. The interactive injection channels are hook stdout / `additionalContext` and the system-prompt flags. Nothing else.
 - Claude Code **Desktop**'s `/clear` omits `source` (`anthropics/claude-code#76704`). Document it, don't work around it.
-- Codex hooks need **absolute** node paths because VS Code's app-server has a different PATH. `Stop` hooks need `async: true`.
+- Codex hooks need **absolute** node paths because VS Code's app-server has a different PATH. The plan said `Stop` hooks need `async: true`; they do not — conbus registers no async hook, 0.147.0 dropped them, 0.148+ allows them again.
 - Codex quota lives on `account/rateLimits` via app-server, and there is no `StopFailure` equivalent in Codex hooks. Rate limits are **account-scoped**, so a sidecar `codex app-server` polling `account/rateLimits/read` sees consumption regardless of which process burned it. **This is probe #1** — if it doesn't hold, stage 0 is one-directional failover only and the docs must say so.
 - Global hooks will mirror our own background `-p` sessions. Mark them with an env variable at spawn and have the hook exit immediately when it sees the marker.
 
@@ -144,7 +144,7 @@ and run one session; the schemas themselves come out of the binary with a search
 
 ## Next task
 
-`recorder-first`. One week, **recording only, no injection.** Injection hardening is a separate item because the
+`recorder-first`. One week, **recording only, no injection** — that was the plan; the briefing shipped on 2026-09-01 and is live on both harnesses as of 2026-09-03. Injection hardening is a separate item because the
 quirks above take weeks, not days.
 
 Steps 1–4 of the suggested order are built; step 5 is not.
@@ -221,7 +221,7 @@ an existing one shifts its group index, changes its key, and orphans its trust r
 **When it was installed, it was supervised and recording.**
 
 The binary lives at `~/.local/bin/conbus` — outside the worktree, so tidying a branch does not break the hooks.
-`conbus install --apply` registered ten events with Claude Code and six with Codex, merging into settings files
+`conbus install --apply` registered ten events with Claude Code and six with Codex (eleven since `SubagentStop` was added; 11/11 and 6/6 on this machine as of 2026-09-03), merging into settings files
 that already held fourteen and five of the user's own hook events respectively; every pre-existing key and hook came
 back byte-for-byte and still first. A `launchd` agent (`sh.conbus.daemon`, `RunAtLoad` + `KeepAlive`) supervises
 the daemon; killing it `-9` gets it restarted, which was checked rather than assumed.
@@ -361,6 +361,8 @@ conflated because only the first existed.
   default answer is no. The invisible case never guesses; the guessing case is tuned so its visible
   failure is "it did not help", never "it lied".
 
+*(Superseded on 2026-08-31 by the briefing decision in `continuation.rs` — it narrates the checkout instead of choosing a conversation, and its seven silence reasons replace the rules below; "What a person sees" further down is current. Kept for the reasoning.)*
+
 **The gate is a refusal engine with one positive signal.** It runs on the session's *first*
 `UserPromptSubmit`, never on `SessionStart` — that event has no prompt to judge and fires several
 times per project, some of them ghosts, so paying a pack there is paying on ghosts. It requires all
@@ -377,7 +379,7 @@ too tight" are the same observation.
 - **92.6% of conversations are one turn** — 3,179 of 3,434. The 255 multi-turn ones hold 8,862 of
   12,041 turns. Requiring two turns removes nine tenths of the candidates before any other test.
 - **Only 2 conversations carry a workspace.** The live path now stamps every record, but the 3,425
-  backfilled ones predate that and backfill emits no session record at all. Until that is fixed the
+  backfilled ones predate that and backfill emitted no session record at all (fixed 2026-09-01: it emits one, with workspace and entrypoint). Until then the
   gate has no corpus to be tested against, which is the point of making it a pure function: it can
   be replayed over the whole log offline, and "over 3,434 real conversations it fires N times and
   picks wrong M times" is a claim available before a single hydration ships.
@@ -397,7 +399,7 @@ plain stdout is shown to the model on only three events and discarded everywhere
 much narrower — five of eleven events accept it, there is no `fork` source, and it has neither
 `Stop` nor `PostCompact` injection, so `UserPromptSubmit` is its only per-turn channel. Codex's
 `additionalContextLimit` is a real per-hook key but its default is **unverified**; the plan's
-"~2,500 tokens" stands unconfirmed, so the pack builder is budget-parameterised per leg rather than
+"~2,500 tokens" stands unconfirmed, so the pack builder takes a budget argument (one constant, `PACK_BUDGET_UNITS = 2_600` UTF-16 units, for both harnesses as of 2026-09-03; Codex's ~2,500-token cap sits above it) rather than
 assuming the two vendors are symmetric.
 
 One correction to the note above: `<persisted-output>` is the right oracle but the wrong detector.
@@ -405,17 +407,24 @@ A hook cannot see the model's context, finding the marker means reading a transc
 live path — and ordinary large tool results produce the same marker, so it is not specific. Assert
 the budget locally on every emit; use the marker only in a probe against a session we own.
 
-**What a person sees, and how they stop it.** One `systemMessage` line on the turn that was actually
-hydrated, naming the source id and the command to inspect it — a field both vendors have, separate
-from `additionalContext`, that costs no model tokens. No injection, no line, ever; silence is the
-default. `/clear` already means "forget this", so `SessionStart.source == "clear"` suppresses
-hydration for that session — a gesture the user already makes rather than one we invented, with the
-Desktop caveat above. The explicit off is a command, and a command is acceptable **only** here: a
-missed hydration costs one sentence of re-explanation, a wrong one costs credibility in every
-session opened afterwards, so the negative case gets a boring lever and the positive case must never
-need one.
+**What a person sees, and how they stop it** (as built, 2026-09-03). One `systemMessage` line on the turn
+that was actually briefed, naming the conversation recounted — its first 13 characters, because 8 collide
+within a 65-second window and three scheduled tasks minted in one second — and the command to inspect it;
+a field both vendors have, separate from `additionalContext`, that costs no model tokens. The first live
+briefing named the reader's own brand-new session instead, which is how this sentence got checked. No
+injection, no line, ever; silence is the default. `/clear` already means "forget this", so a session whose
+flushed start says `source: clear` is not briefed — a gesture the user already makes rather than one we
+invented, with the Desktop caveat above. The explicit off is `CONBUS_BRIEFING=off` in the environment the
+vendor runs hooks in (not a command: a command would need a second process to consult, and the hook already
+reads its environment), carried on the wire as `brief: false` so the daemon neither injects nor records a
+briefing nobody received — off means no briefing, not no recording. A boring lever for the negative case;
+the positive case must never need one: a missed briefing costs one sentence of re-explanation, a wrong one
+costs credibility in every session opened afterwards. Two more things the briefing now says honestly: a
+prompt that opens with a vendor's own tell that a program wrote it (`<scheduled-task`, `## Memory Writing
+Agent`) is not briefed even when the entrypoint calls the session attended, and a conversation with both
+recovered and live records is "partly reconstructed", not "not observed live".
 
-**What the gate does on the real log, measured before anything is injected.**
+**What the gate did on the real log** *(measured 2026-08-31, before the gate was replaced in `897164c`; the numbers below are that measurement. `conbus doctor` now replays the briefing decision instead — as of 2026-09-03: 3,488 conversations judged, 42 briefed, 93 silent/machine_authored; the replay histogram has the rest.)*
 
 `conbus doctor` replays the gate over every conversation, judging each one against only what had
 already happened when its first prompt arrived. On this machine's 3,443 conversations it fires
@@ -578,8 +587,8 @@ are its schema, its values are somebody's conversation.
    first exhaustion records itself — treat it as an opportunity rather than an interruption. It is also the only
    thing that can produce a `continue/displaced` verdict: the counterfactual above found twelve `handed_off` and no
    `displaced`, because backfill can only recover a turn that completed.
-8. **Delivery.** The gate decides; nothing yet acts on it. Next is the pack builder — pure, budgeted in UTF-16 code
-   units, well under the 10,000 cap — then the `Hydrated` event so an injection is a record rather than a belief,
+8. **Delivery.** Shipped 2026-09-01 — the pack builder — pure, budgeted in UTF-16 code
+   units, well under the 10,000 cap — then the `Briefed` event (the plan called it `Hydrated`) so an injection is a record rather than a belief,
    then the hook client learning a second reply beside `SILENT_OK`. Note the hazard in the client's own reply
    matching: it treats `Recorded | Deferred` as success and everything else as a defect, so a new response variant
    with no arm becomes a per-turn stderr diagnostic.
@@ -773,7 +782,7 @@ Take the lesson generally: **the adapter is only as good as the traffic it has b
   fixed that.** Live traffic has now confirmed `PreToolUse`, `PostToolUse` and `PostToolBatch`, and with them
   `tool_use_id`, `duration_ms`, `tool_calls` and `prompt_id` — all four had been read off the schema and the
   emit sites and never seen on the wire.
-- **Still unverified against traffic**: `agent_id` (no subagent has run under the recorder yet),
+- **Still unverified against traffic**: `agent_id` (verified 2026-09-02: 2,263 live records carried it, `SubagentStop` mirrored),
   `PostToolUseFailure`, `PermissionDenied`, and `StopFailure`. The `agent_id` one carries the most risk: the
   schema says a subagent's hooks arrive under the *parent's* `session_id`, and if that is wrong in the other
   direction — subagents getting their own — the recorder has a bogus-session problem instead, which is worse than

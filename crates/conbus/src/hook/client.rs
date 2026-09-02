@@ -104,6 +104,21 @@ fn entrypoint(harness: &str) -> Option<Entrypoint> {
         .map(Entrypoint::new)
 }
 
+/// Whether the person has switched briefings off: `CONBUS_BRIEFING=off`
+/// (or `0`, `false`, `no`) in the environment the vendor runs hooks in.
+///
+/// The one lever toward silence that does not also stop the recording. Read
+/// here and carried on the wire, so the daemon neither injects nor writes a
+/// `briefed` record for a briefing nobody received.
+fn briefing_enabled() -> bool {
+    !std::env::var("CONBUS_BRIEFING").is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "off" | "0" | "false" | "no"
+        )
+    })
+}
+
 /// The line to print on stdout, and whether it carries anything.
 ///
 /// A hook always says something well-formed; the only question is whether it
@@ -215,6 +230,7 @@ pub fn run(harness: &str, stdin: &mut impl Read) -> Result<Reply, Dropped> {
         vendor_agent_id: observed.vendor_agent_id,
         workspace: observed.workspace,
         entrypoint: entrypoint(harness),
+        brief: briefing_enabled(),
         event: observed.event,
     };
     send(harness, stream, &request, &hook_event_name)

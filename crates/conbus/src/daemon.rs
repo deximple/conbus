@@ -8,7 +8,9 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::time::Duration;
 
-use conbus_core::continuation::{Asking, Decision, decide, opening_units, unattended};
+use conbus_core::continuation::{
+    Asking, Decision, decide, machine_authored, opening_units, unattended,
+};
 use conbus_core::event::{Event, Source};
 use conbus_core::ids::BusId;
 use conbus_core::pack::{self, Chapter};
@@ -96,6 +98,7 @@ impl Daemon {
             };
         }
 
+        let brief = request.brief;
         let key = SessionKey::new(request.harness.clone(), request.vendor_session_id);
         let observed = Observed {
             vendor_turn_id: request.vendor_turn_id,
@@ -178,9 +181,23 @@ impl Daemon {
                 if seqs.is_empty() {
                     return Response::Withheld;
                 }
-                let briefing = first_prompt.then(|| self.brief(bus_id, &written)).flatten();
+                // Not after `/clear`: the person just said "forget it", and
+                // the vendor names that moment on the session start flushed
+                // behind this prompt. And not when the person switched it off.
+                let cleared = written.iter().any(|record| {
+                    matches!(&record.event, Event::SessionCandidate { trigger: Some(t) } if t == "clear")
+                });
+                let briefing = (first_prompt && brief && !cleared)
+                    .then(|| self.brief(bus_id, &written))
+                    .flatten();
                 match briefing {
                     Some((context, message, event)) => {
+                        // The briefing knows where it happened, like every
+                        // other record: the workspace is the prompt's.
+                        let workspace = written
+                            .iter()
+                            .find(|record| matches!(record.event, Event::TurnStarted { .. }))
+                            .and_then(|record| record.source.workspace.clone());
                         // Appended after the turn it belongs to, so the log
                         // reads in the order things happened. If this write
                         // fails the briefing still goes out — the person is
@@ -190,7 +207,10 @@ impl Daemon {
                         match self.log.append(Entry {
                             bus_id,
                             observed_at: None,
-                            source: source.clone(),
+                            source: Source {
+                                workspace,
+                                ..source.clone()
+                            },
                             vendor_turn_id: None,
                             vendor_agent_id: None,
                             event,
@@ -252,6 +272,10 @@ impl Daemon {
             // so reading it as "not a person" would go silent on exactly the
             // sessions worth speaking to.
             unattended: unattended(prompt.source.entrypoint.as_ref()),
+            machine_authored: match &prompt.event {
+                Event::TurnStarted { prompt, .. } => machine_authored(prompt),
+                _ => false,
+            },
             prompt_units: match &prompt.event {
                 Event::TurnStarted { prompt, .. } => opening_units(prompt),
                 _ => 0,
@@ -281,11 +305,22 @@ impl Daemon {
             return None;
         }
 
+        // The receipt names what was narrated, most recent first, so the
+        // command it offers opens the conversation the person is being told
+        // about — not the session they are sitting in.
+        let named = chapters
+            .first()
+            .map(|chapter| chapter.about.bus_id.to_string())
+            .unwrap_or_default();
         let message = format!(
-            "conbus · {} earlier session{} in this checkout · conbus log --bus-id {}",
+            "conbus · {} earlier session{} in this checkout · conbus log --bus-id {}{}",
             chapters.len(),
             if chapters.len() == 1 { "" } else { "s" },
-            &bus_id.to_string()[..8],
+            named.get(..13).unwrap_or(&named),
+            match chapters.len() {
+                0 | 1 => String::new(),
+                n => format!(" (+{} more)", n - 1),
+            },
         );
         let event = Event::Briefed {
             about: chapters.iter().map(|c| c.about.bus_id).collect(),
@@ -484,6 +519,7 @@ mod tests {
             vendor_agent_id: None,
             workspace: Some("/repo".into()),
             entrypoint: None,
+            brief: true,
             event,
         }
     }

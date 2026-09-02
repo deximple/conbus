@@ -6,6 +6,7 @@ mod drops;
 mod harden;
 mod hook;
 mod install;
+mod quota;
 mod report;
 mod wire;
 
@@ -57,6 +58,7 @@ fn main() -> ExitCode {
         Command::Install { apply } => run(|_| report::install(apply)),
         Command::Backfill { apply } => run(|paths| backfill::run(paths, apply)),
         Command::Doctor => run(report::doctor),
+        Command::Quota => run(|_| quota::run()),
         Command::Version => {
             println!("conbus {}", build_info::BUILD);
             ExitCode::SUCCESS
