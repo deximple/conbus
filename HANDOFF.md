@@ -230,6 +230,18 @@ One consequence worth knowing, and it is the design working: backfill adopts a s
 `bus_id`, so when the daemon restores bindings it recognises a *live* session whose history was backfilled and
 continues the same conversation. A resumed session's past and present are one `bus_id`, not two.
 
+**The same mechanism ran the other way, and it split two conversations.** Backfill keyed idempotency on what
+backfill had written, not on what the recorder had, so every session the recorder had already mirrored live was
+recovered a second time under the transcript's UUID — fourteen twins on this machine, thirty more one `--apply`
+away. And because `--apply` runs with the daemon stopped and appends its copy *after* the live records, "later
+record wins" bound each of those sessions to the copy when the daemon came back. Two sessions that were still open
+kept going there — `1ce6bfb1…`, minted live twenty minutes before the third backfill, and `9f8b6bf2…`, resumed the
+next day — so each is one conversation under two `bus_id`s, and nothing un-splits an append-only log. Fixed on
+2026-09-02 at both ends: `Registry::restore` never lets a reconstructed record displace a live binding, and
+backfill leaves alone any transcript whose session the recorder has seen (the dry run here now declines 44 and
+recovers nothing). `doctor` prints the twins and which side each is bound to — 14 twins, 14 live, 2 split — by
+running the same restore the daemon does, so the two cannot disagree.
+
 **Codex is registered and silent.** Its hooks do not run until a human trusts them in Codex itself, and an untrusted
 hook fails without printing anything.
 
@@ -238,8 +250,12 @@ hook fails without printing anything.
 `conbus backfill` reads Claude Code's own transcripts — the one place the plan permits a vendor session
 file to be parsed, because a backfill failure thins the corpus while a live-path failure loses the
 conversation happening now. On this machine it recovered **3,425 conversations, 12,025 turns and 23,280
-records from 5.24 GB in four seconds**, into a 78 MB log. It is idempotent: the session file's own name is
-a UUID, so it *becomes* the `bus_id`, and a second run recovers nothing rather than a second copy.
+records from 5.24 GB in four seconds**, into a 78 MB log. It is idempotent two ways: the session file's own
+name is a UUID, so it *becomes* the `bus_id`, and a second run recovers nothing rather than a second copy; and
+a transcript whose session the recorder mirrored live is left alone, because a copy of it would be a second
+conversation for the same session (the twins above). A dry run reads beside the running daemon; only
+`--apply` needs it stopped. Note that 641 of the transcripts backfilled on 2026-08-31 were gone from disk two
+days later — the vendor prunes them — so the corpus already holds conversations nothing else does.
 
 It reads three line shapes and counts everything else by reason — 515k attachments, 88k tool-only
 assistant replies, 54k tool-result user lines. Tool traffic is deliberately not recovered: it is 90-97% of
@@ -564,6 +580,16 @@ process keeps the old inode. And the drop log's emptiness proved nothing, becaus
 written by the hook: a hook that cannot start writes no drops. `doctor` now runs the registered
 command, through a shell, marked internal, and insists on parseable JSON — and prints the most
 recent record by time, which is the line the outage was visible in the whole time.
+
+**The log's own repair split two conversations, and it was found by counting, not by testing.** Every
+`backfill --apply` runs with the daemon stopped, and every session that is open at that moment comes back
+bound to backfill's copy of itself, because the copy is the newest record for that session and restore took
+the newest. The test suite was green throughout: `Registry::restore` had one test, with one record. What found
+it was a survey of the real log keyed by `(harness, vendor_session_id)` — fourteen sessions held twice, two of
+them with live records under both ids. Two rules follow. **A reconstruction never outranks what the recorder
+saw**, in the registry and in backfill alike. And **run the survey, not the suite, when the question is about
+the corpus**: `doctor` now carries that survey as its `twins` line, so the next person does not need the
+script.
 
 **Where the milestone stands against its own success criteria.** "Every turn from both harnesses lands in the log":
 half. Claude Code is confirmed on live traffic, including the `PostToolUse` this file spent three revisions calling

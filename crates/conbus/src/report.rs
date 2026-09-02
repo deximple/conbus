@@ -1,13 +1,15 @@
 //! `conbus log` and `conbus doctor`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use conbus_core::event::{Event, ToolOutcome};
+use conbus_core::ids::BusId;
 use conbus_core::paths::Paths;
+use conbus_core::registry::{Registry, SessionKey};
 
 use crate::cli::LogFilter;
 use conbus_core::record::Record;
@@ -520,6 +522,93 @@ fn report_hooks(home: &Path) {
     report_codex_trust(home);
 }
 
+/// Vendor sessions the log holds twice — once as the recorder mirrored them
+/// and once as backfill reconstructed them — and where each one's binding
+/// lands.
+///
+/// A twin is what `backfill --apply` left behind when it recovered a
+/// transcript the recorder had already seen live: the copy carries the
+/// transcript's own UUID as its `bus_id`, so one session is two conversations.
+/// Which of the two a restart continues is the registry's decision, and this
+/// reports that decision rather than re-deriving it, so that `doctor` and the
+/// daemon cannot disagree about it.
+struct Twins {
+    total: usize,
+    /// Bound to a conversation the recorder wrote live.
+    bound_live: usize,
+    /// Bound to the reconstruction, so a restart carries on under the copy.
+    bound_to_copy: usize,
+    /// Live records under more than one conversation: a session that came
+    /// back from a restart bound to its copy and kept going there. An
+    /// append-only log cannot take that back, so the least that can be done
+    /// is to say it happened.
+    split: usize,
+}
+
+fn twins(records: &[Record]) -> Twins {
+    let mut live: HashMap<SessionKey, BTreeSet<BusId>> = HashMap::new();
+    let mut copied: HashSet<SessionKey> = HashSet::new();
+    for record in records {
+        let Some(vendor_session_id) = &record.source.vendor_session_id else {
+            continue;
+        };
+        let key = SessionKey::new(record.source.harness.clone(), vendor_session_id.clone());
+        if record.source.backfilled_from.is_some() {
+            copied.insert(key);
+        } else {
+            live.entry(key).or_default().insert(record.bus_id);
+        }
+    }
+
+    let registry = Registry::restore(records);
+    let mut summary = Twins {
+        total: 0,
+        bound_live: 0,
+        bound_to_copy: 0,
+        split: 0,
+    };
+    for (key, conversations) in &live {
+        if !copied.contains(key) {
+            continue;
+        }
+        summary.total += 1;
+        match registry.bus_id(key) {
+            Some(bound) if conversations.contains(&bound) => summary.bound_live += 1,
+            _ => summary.bound_to_copy += 1,
+        }
+        if conversations.len() > 1 {
+            summary.split += 1;
+        }
+    }
+    summary
+}
+
+fn report_twins(records: &[Record]) {
+    let summary = twins(records);
+    if summary.total == 0 {
+        println!("twins     none");
+        return;
+    }
+    println!(
+        "twins     {} vendor session(s) recorded both live and by backfill; {} bound to their \
+         live conversation",
+        summary.total, summary.bound_live
+    );
+    if summary.bound_to_copy > 0 {
+        println!(
+            "          {} bound to their backfilled copy — a restart continues them under the copy",
+            summary.bound_to_copy
+        );
+    }
+    if summary.split > 0 {
+        println!(
+            "          {} recorded live under more than one conversation; a reader following one \
+             id misses the rest",
+            summary.split
+        );
+    }
+}
+
 pub fn doctor(paths: &Paths) -> io::Result<()> {
     println!(
         "root      {} ({:?})",
@@ -579,6 +668,10 @@ pub fn doctor(paths: &Paths) -> io::Result<()> {
         Some(last) => println!("last      {}", summarise(last)),
         None => println!("last      nothing recorded yet"),
     }
+    // Sessions the log holds twice, and which copy a restart would continue.
+    // The binding is the daemon's decision, so this asks the same code the
+    // daemon runs at start rather than guessing at it.
+    report_twins(&scan.records);
 
     // What a session opening in each checkout would have been told, replayed
     // over the whole log. Nothing is injected yet; this is the measurement that
@@ -1067,5 +1160,74 @@ mod tests {
             "{line}"
         );
         assert!(line.contains("claude_code"), "{line}");
+    }
+
+    /// A record of the one vendor session these tests are about, as either the
+    /// recorder or backfill would have written it.
+    fn twin_record(seq: u64, bus: &str, backfilled: bool) -> Record {
+        Record {
+            seq,
+            bus_id: bus.parse().expect("bus id"),
+            source: Source {
+                harness: Harness::new(Harness::CLAUDE_CODE),
+                harness_version: None,
+                vendor_session_id: Some("vendor-abc".into()),
+                workspace: None,
+                entrypoint: None,
+                backfilled_from: backfilled
+                    .then(|| conbus_core::backfill::CLAUDE_TRANSCRIPT.to_string()),
+            },
+            ..tool(None, None)
+        }
+    }
+
+    #[test]
+    fn a_session_recorded_both_live_and_by_backfill_is_a_twin_bound_to_its_live_side() {
+        // The shape the twin defect left on a real log: live records first,
+        // then backfill's copy of the same session appended behind them.
+        let live = "01a0572a-418e-7d71-8927-870a858b6ee1";
+        let copy = "ea1d23e9-bb83-4df5-9a73-a6a12e138d85";
+        let records = vec![
+            twin_record(0, live, false),
+            twin_record(1, copy, true),
+            twin_record(2, copy, true),
+        ];
+
+        let summary = twins(&records);
+
+        assert_eq!(summary.total, 1);
+        assert_eq!(
+            summary.bound_live, 1,
+            "a restart must continue this session under what the recorder saw, not under the copy"
+        );
+        assert_eq!(summary.bound_to_copy, 0);
+        assert_eq!(summary.split, 0);
+    }
+
+    #[test]
+    fn a_session_whose_live_records_fell_under_two_conversations_is_reported_as_split() {
+        // What a restart did on a real machine before the binding rule was
+        // fixed: the session outlived a backfill, came back bound to its copy,
+        // and the rest of its turns landed there. Nothing can un-split an
+        // append-only log, so the least doctor can do is say it happened.
+        let live = "01a0585c-0000-7000-8000-000000000002";
+        let copy = "1ce6bfb1-0000-4000-8000-000000000002";
+        let records = vec![
+            twin_record(0, live, false),
+            twin_record(1, copy, true),
+            twin_record(2, copy, false),
+        ];
+
+        let summary = twins(&records);
+
+        assert_eq!(summary.total, 1);
+        assert_eq!(summary.split, 1);
+    }
+
+    #[test]
+    fn a_session_only_backfill_knows_is_not_a_twin() {
+        let records = vec![twin_record(0, "ea1d23e9-bb83-4df5-9a73-a6a12e138d85", true)];
+
+        assert_eq!(twins(&records).total, 0);
     }
 }
