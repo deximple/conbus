@@ -122,3 +122,19 @@ with `usedPercent` and an absolute `resetsAt`, `rateLimitReachedType` as the
 is the signal the router was designed around, and it is readable without
 opening a thread. Not yet wired into conbus; the obvious next brick is a
 `conbus quota` command that runs this probe and a `doctor` line that shows it.
+
+## Thread APIs for a Codex backfill (probed 2026-09-03 03:45 KST, read-only)
+
+Same handshake, then `thread/list {"limit": 3}` → `{"data": [...], "nextCursor",
+"backwardsCursor"}`; each thread carries `id`, `sessionId`, `cwd`, `name`,
+`preview`, `createdAt`/`updatedAt`/`recencyAt` (unix seconds as strings),
+`historyMode` (`paginated` for a 0.152.1 thread), `source` (`cli`), `status`,
+`forkedFromId`, `parentThreadId`, `gitInfo`, `cliVersion`, `turns`.
+`thread/turns/list {"threadId", "limit"}` → turns with `id`, `status`,
+`startedAt`/`completedAt`/`durationMs`, and `items`: `userMessage` (text
+blocks) and `agentMessage` (`text`, `phase: final_answer`). `thread/items/list`
+flattens the same with `turnId` per item. All three answered for a thread
+written by the same build; the 0.147-reads-0.150 skew the plan recorded is
+still the risk for older rollouts, and `historyMode` is the field to branch
+on. This is enough to build `conbus backfill` for Codex from the official
+surface rather than from rollout files.
