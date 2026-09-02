@@ -15,18 +15,36 @@ use conbus_core::paths::Paths;
 use crate::hook::{self, Normalized};
 use crate::wire::{Request, Response};
 
-/// What the hook says on stdout when it has nothing to add.
+/// What the hook says on stdout when it has nothing to add, to Claude Code.
 ///
-/// The recorder never injects, so this is the whole of its output on every
-/// path, success or failure. It is JSON because the vendor's hook contract
-/// reads stdout as JSON control output; the two fields say "carry on" and
-/// "keep this out of the transcript".
+/// It is JSON because the vendor's hook contract reads stdout as JSON control
+/// output; the two fields say "carry on" and "keep this out of the transcript".
+/// On every path that does not brief — success or failure — this is the whole
+/// of the output.
 ///
 /// It exists because writing *nothing* is not the same as saying nothing. A
 /// zero-byte stdout on a context-injecting event was observed to reach the API
 /// as an empty text block carrying `cache_control`, which the API rejects —
 /// taking the user's session down with it. See the quirk note in HANDOFF.md.
+///
+/// Codex is told nothing differently: see [`silent_reply`].
 pub const SILENT_OK: &str = r#"{"continue":true,"suppressOutput":true}"#;
+
+/// The reply that says nothing, in the dialect the harness accepts.
+///
+/// Codex 0.152.1 fails a `PreToolUse` hook that says `continue` or
+/// `suppressOutput`, and rejects `suppressOutput` on `PostToolUse`. The first
+/// session run with trusted hooks showed "hook (failed)" twice per tool call
+/// while every record had already landed — the recorder was right and the
+/// person saw it failing. Codex's reference lists the fields each event takes;
+/// the empty object is the one reply all of them take, and nothing on the
+/// Codex side has ever needed the non-empty one.
+pub fn silent_reply(harness: &str) -> &'static str {
+    match harness {
+        Harness::CODEX => "{}",
+        _ => SILENT_OK,
+    }
+}
 
 /// How long the hook will wait on the daemon before giving up on it.
 pub const REPLY_DEADLINE: std::time::Duration = std::time::Duration::from_millis(500);
@@ -103,21 +121,25 @@ pub type Reply = String;
 /// written here. The vendor throws away the whole hook result when it does not
 /// match, without blocking the turn, and reports that failure only once per
 /// session — so a name that drifts would be invisible after its first turn.
-pub fn briefing_reply(hook_event_name: &str, context: &str, message: &str) -> Reply {
-    let reply = serde_json::json!({
-        "continue": true,
-        // Kept even though it is inert in 2.1.241 — its single runtime read is
-        // unreachable for a hook that emits JSON — because it is the
-        // documented way to say "keep this out of the transcript" and costs
-        // nothing if a later build wires it up. It does not suppress the
-        // injection: nothing on that path reads it.
-        "suppressOutput": true,
+pub fn briefing_reply(harness: &str, hook_event_name: &str, context: &str, message: &str) -> Reply {
+    let mut reply = serde_json::json!({
         "systemMessage": message,
         "hookSpecificOutput": {
             "hookEventName": hook_event_name,
             "additionalContext": context,
         },
     });
+    // Claude Code's two control fields. `suppressOutput` is kept even though
+    // it is inert in 2.1.241 — its single runtime read is unreachable for a
+    // hook that emits JSON — because it is the documented way to say "keep
+    // this out of the transcript" and costs nothing if a later build wires it
+    // up. It does not suppress the injection: nothing on that path reads it.
+    // Codex is not sent either: it fails a hook over fields it does not take
+    // (see `silent_reply`), and its reference accepts a briefing without them.
+    if harness != Harness::CODEX {
+        reply["continue"] = serde_json::Value::Bool(true);
+        reply["suppressOutput"] = serde_json::Value::Bool(true);
+    }
     reply.to_string()
 }
 
@@ -126,7 +148,7 @@ pub fn briefing_reply(hook_event_name: &str, context: &str, message: &str) -> Re
 /// still exits zero.
 pub fn run(harness: &str, stdin: &mut impl Read) -> Result<Reply, String> {
     if std::env::var_os(INTERNAL_MARKER).is_some_and(|value| !value.is_empty()) {
-        return Ok(SILENT_OK.to_string());
+        return Ok(silent_reply(harness).to_string());
     }
 
     let mut payload = String::new();
@@ -149,7 +171,7 @@ pub fn run(harness: &str, stdin: &mut impl Read) -> Result<Reply, String> {
             observed = *o;
         }
         // A decision, so nothing to say.
-        Normalized::Ignored { .. } => return Ok(SILENT_OK.to_string()),
+        Normalized::Ignored { .. } => return Ok(silent_reply(harness).to_string()),
         // A surprise. The vendor grew an event this adapter has never seen, and
         // it is being dropped — which is the right thing to do and the wrong
         // thing to do quietly.
@@ -193,10 +215,15 @@ pub fn run(harness: &str, stdin: &mut impl Read) -> Result<Reply, String> {
         entrypoint: entrypoint(harness),
         event: observed.event,
     };
-    send(stream, &request, &hook_event_name)
+    send(harness, stream, &request, &hook_event_name)
 }
 
-fn send(mut stream: UnixStream, request: &Request, hook_event_name: &str) -> Result<Reply, String> {
+fn send(
+    harness: &str,
+    mut stream: UnixStream,
+    request: &Request,
+    hook_event_name: &str,
+) -> Result<Reply, String> {
     let line = serde_json::to_string(request).map_err(|err| err.to_string())?;
     writeln!(stream, "{line}").map_err(|err| format!("could not send the record: {err}"))?;
     stream
@@ -209,10 +236,12 @@ fn send(mut stream: UnixStream, request: &Request, hook_event_name: &str) -> Res
         .map_err(|err| format!("no reply from the daemon: {err}"))?;
 
     match serde_json::from_str::<Response>(reply.trim()) {
-        Ok(Response::Recorded { .. } | Response::Deferred) => Ok(SILENT_OK.to_string()),
+        Ok(Response::Recorded { .. } | Response::Deferred) => {
+            Ok(silent_reply(harness).to_string())
+        }
         Ok(Response::Briefed {
             context, message, ..
-        }) => Ok(briefing_reply(hook_event_name, &context, &message)),
+        }) => Ok(briefing_reply(harness, hook_event_name, &context, &message)),
         Ok(Response::Failed { error }) => Err(format!("the daemon refused the record: {error}")),
         // Not written, and the caller has to hear about it. An orphan is the
         // normal shape of a daemon restart mid-turn: the session is unbound, so
@@ -251,5 +280,39 @@ mod tests {
     fn a_payload_that_is_not_an_object_says_so_rather_than_guessing() {
         assert_eq!(field_names("[1,2,3]"), "unreadable");
         assert_eq!(field_names("not json"), "unreadable");
+    }
+
+    #[test]
+    fn codex_is_never_sent_a_field_it_rejects() {
+        // Seen in the Codex 0.152.1 TUI the first time its hooks were trusted:
+        // "PreToolUse hook (failed) — error: PreToolUse hook returned
+        // unsupported suppressOutput", and the same on PostToolUse, on every
+        // tool call. The record had already landed; what the person saw was
+        // a hook failing twice per tool call. Codex's reference is explicit:
+        // on PreToolUse `continue`, `stopReason` and `suppressOutput` fail the
+        // hook, and `suppressOutput` is unsupported on PostToolUse. An empty
+        // object is the one reply every Codex event accepts.
+        assert_eq!(silent_reply(Harness::CODEX), "{}");
+
+        let brief = briefing_reply(Harness::CODEX, "UserPromptSubmit", "the pack", "one line");
+        assert!(!brief.contains("suppressOutput"), "{brief}");
+        assert!(!brief.contains("\"continue\""), "{brief}");
+        assert!(
+            brief.contains("\"additionalContext\":\"the pack\""),
+            "{brief}"
+        );
+        assert!(brief.contains("\"systemMessage\":\"one line\""), "{brief}");
+    }
+
+    #[test]
+    fn claude_code_keeps_the_reply_that_kept_its_sessions_up() {
+        // The other vendor is the reason the silent reply is not empty: a
+        // zero-byte stdout on a context-injecting event took a real session
+        // down. Codex's rule must not leak into Claude Code's reply.
+        assert_eq!(silent_reply(Harness::CLAUDE_CODE), SILENT_OK);
+        assert!(
+            briefing_reply(Harness::CLAUDE_CODE, "UserPromptSubmit", "c", "m")
+                .contains("\"suppressOutput\":true")
+        );
     }
 }

@@ -41,7 +41,7 @@ fn main() -> ExitCode {
                     if drops::record(&err) {
                         eprintln!("conbus hook: record dropped: {err}");
                     }
-                    hook::client::SILENT_OK.to_string()
+                    hook::client::silent_reply(&harness).to_string()
                 }
             };
             // One JSON object and nothing else. The vendor's parser runs
