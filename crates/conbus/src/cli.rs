@@ -23,6 +23,8 @@ pub enum Command {
         apply: bool,
     },
     Doctor,
+    /// Ask Codex's app-server how much of the account's quota is used.
+    Quota,
     /// Say which build this binary is.
     Version,
     Help,
@@ -88,6 +90,7 @@ where
             },
         },
         "doctor" => Command::Doctor,
+        "quota" => Command::Quota,
         "version" | "--version" | "-V" => Command::Version,
         "help" | "--help" | "-h" => Command::Help,
         other => Command::Unknown(other.to_string()),
@@ -110,6 +113,7 @@ USAGE:
     conbus install [--apply]      register the hook with Claude Code and Codex
     conbus backfill [--apply]     recover history from before the recorder ran
     conbus doctor                 report what is and is not wired up
+    conbus quota                  ask Codex how much of the account's quota is used
     conbus --version              say which build this is
 ";
 
@@ -150,6 +154,15 @@ mod tests {
                 harness: "codex".into()
             }
         );
+    }
+
+    #[test]
+    fn the_quota_probe_is_a_command() {
+        // Probe #1 of the plan, answered on 2026-09-03: Codex's app-server
+        // hands out the account's rate limits to any client. The router's
+        // whole premise is that this signal exists; a command makes it a
+        // thing a person can look at.
+        assert_eq!(parse(["quota"], None), Command::Quota);
     }
 
     #[test]

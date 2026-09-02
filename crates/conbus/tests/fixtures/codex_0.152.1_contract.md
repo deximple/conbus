@@ -95,3 +95,30 @@ Per the reference, and confirmed the hard way:
 - The TUI enables bracketed paste: text and Enter written in one burst are
   taken as a paste, and the prompt is not submitted. Drive it with the text
   first and the Enter separately.
+
+## Quota probe #1 — `account/rateLimits/read` (2026-09-03 03:30 KST)
+
+The plan's first probe: does the app-server expose the account's rate limits
+to a client that is not a Codex session? It does, on the first try, read-only,
+with `initialize` (`capabilities.experimentalApi: true`) then
+`account/rateLimits/read` with empty params:
+
+```json
+{"rateLimits": {"limitId": "codex", "limitName": null,
+  "primary":   {"usedPercent": 22, "windowDurationMins": 300,   "resetsAt": 1788385869},
+  "secondary": {"usedPercent": 9,  "windowDurationMins": 10080, "resetsAt": 1788752527},
+  "credits": {"hasCredits": false, "unlimited": false, "balance": "0"},
+  "individualLimit": null, "spendControlReached": false, "planType": "plus",
+  "rateLimitReachedType": null},
+ "rateLimitsByLimitId": {"codex": {…same…}},
+ "rateLimitResetCredits": {"availableCount": 1, "credits": [{"resetType": "codexRateLimits",
+  "status": "available", "title": "Full reset (Weekly + 5 hr)", "grantedAt": …, "expiresAt": …}]},
+ "accountId": "<uuid>", "rateLimitUpsell": null}
+```
+
+So: account-scoped (`accountId`), a five-hour window and a weekly window each
+with `usedPercent` and an absolute `resetsAt`, `rateLimitReachedType` as the
+"exhausted" signal (`null` here), and the reset credits the June PR added. This
+is the signal the router was designed around, and it is readable without
+opening a thread. Not yet wired into conbus; the obvious next brick is a
+`conbus quota` command that runs this probe and a `doctor` line that shows it.
