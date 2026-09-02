@@ -611,6 +611,15 @@ saw**, in the registry and in backfill alike. And **run the survey, not the suit
 the corpus**: `doctor` now carries that survey as its `twins` line, so the next person does not need the
 script.
 
+**`doctor` grew eyes for the three things the audits found by hand.** `build` on its first line and `daemon`
+right after the socket: the binary names its commit (`conbus --version`, set by `build.rs`, `+dirty` when the
+tree was not clean) and the daemon writes `daemon.build` beside its socket at start, so a binary renamed under a
+running daemon reads `DIFFERS … restart the daemon` instead of nothing. `events` per harness says which of the
+expected events the settings file does not register — the ten-of-eleven drift, in one line. And an orphan drop
+now carries `detail` — the event name and the first eight characters of the session id, identifiers the log
+already holds in full — so the drop log can tell a ghost session's `SessionEnd` from a lost tool call; the stderr
+throttle still keys on the reason alone, so a restart does not put one line per orphan into the transcript.
+
 **Where the milestone stands against its own success criteria.** "Every turn from both harnesses lands in the log":
 half. Claude Code is confirmed on live traffic, including the `PostToolUse` this file spent three revisions calling
 the most valuable missing capture. Codex is registered and correct as far as the schema goes, but its hooks do not
