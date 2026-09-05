@@ -1,22 +1,27 @@
-# Handoff — 2026-09-03
+# Handoff — 2026-09-06
 
 Written for whoever picks this up next. The design phase is finished, the recorder is built, and it is installed and
 recording on this machine. Read this, then read the plan.
 
 ## Where things are
 
-- Repo: `/Applications/conbus`, remote `deximple/conbus`, **private**. As of 2026-09-03 08:10 KST everything is on
-  `main` (`4ed23e9`, PRs #1–#9 merged) and nothing is unpushed. The installed binary (`~/.local/bin/conbus`) and the
-  launchd daemon are build `883bf1610`, which is `main` minus two timestamps in a fixture document; `conbus doctor`
-  prints both stamps and says `DIFFERS` when they do not match.
-- The live machine, same moment: 41,259 records in 12 segments (94 MB), 3,767 conversations, 0 unreadable;
-  Claude Code hooks 11/11 registered, Codex hooks 6/6 registered and trusted; 15 twin sessions all bound to their
-  live side, 2 of them split before the twin rule existed; 157 drops, none unexplained. Codex history is in the
-  corpus: 277 threads, 2,783 turns, 5,759 records, applied 2026-09-03 08:02 KST.
+- Repo: `/Applications/conbus`, remote `deximple/conbus`, **private**. As of 2026-09-06 the stage-0 close
+  (router, meter, hop-time Codex warm, fact-schema document, live quota fixture) is the next PR off `main`
+  (`b9db8f7`, PRs #1–#10 merged). The installed binary (`~/.local/bin/conbus`) and the
+  launchd daemon are still build `883bf1610` — `4ed23e9` (PR #9) minus two timestamps in a fixture document; PR #10
+  was docs only. Do not overwrite that inode in place. `conbus doctor` prints both stamps and says `DIFFERS` when they do not match.
+- The live machine, same moment: 46,256 records in 13 segments (96 MB), 3,886 conversations, 0 unreadable;
+  Claude Code hooks 11/11 registered, Codex hooks 6/6 registered and trusted; 17 twin sessions all bound to their
+  live side, 2 of them split before the twin rule existed; 578 drops, most of them Cursor camelCase events arriving
+  under Claude Code's name (`preToolUse` / `postToolUse` / `beforeSubmitPrompt`). Codex history is in the
+  corpus: 277 threads, 2,783 turns, 5,759 records, applied 2026-09-03 08:02 KST. Last *hooked* Codex record is a
+  `session-end` on 2026-09-04; Codex.app desktop has been running and burning the same account since.
+- Codex quota, same moment: `plan plus · 5h 100% used · weekly 76% · reset credits 3 · EXHAUSTED (rate_limit_reached)`.
+  That is the first live exhaustion. See item 7 under "Not done, and next".
 - The plan is the single source of truth: [`.cursor/plans/shared_workspace_context_3f7139b8.plan.md`](.cursor/plans/shared_workspace_context_3f7139b8.plan.md). The filename is a generated ID and no longer matches the content; leave it alone so the Cursor plan UI keeps its association. A reader-facing copy under `docs/` gets generated when the repo goes public.
 - `cargo 1.94.1` and `rustc 1.94.1` are installed on this machine, so edition 2024 is available.
 - A cargo workspace exists: `crates/conbus` (the binary) and `crates/conbus-core` (the lib). Edition 2024.
-  308 tests as of 2026-09-03 08:10 KST (130 + 2 + 4 + 14 + 28 + 130), `cargo clippy --all-targets -- -D warnings` clean. See "Next task" for what is built and what is not.
+  330 tests as of 2026-09-06 (137 + 2 + 5 + 14 + 28 + 144), `cargo clippy --all-targets -- -D warnings` clean. See "Next task" for what is built and what is not.
 
 ## What Conbus is, in one paragraph
 
@@ -33,7 +38,7 @@ All of these were argued through four review rounds. The reasoning is in the pla
 5. **The rolling summary cannot be cut**, and it must never run on the leg it is protecting. `claude -p` draws from the subscription limit, so summarizing with Claude burns the quota we're trying to preserve. Default backend is the opposite vendor's low-effort model.
 6. **Retention (1.5) is pulled into stage 1**, which drags envelope encryption and the cross-platform KEK abstraction with it. Shipping default stays "conversation only" (tool bodies not written to disk).
 7. **Name is Conbus** — conversation bus. Binary `conbus`, conversation ID stays `bus_id`. crates.io and npm names are free and deliberately unclaimed; publishing a placeholder would announce the name before the launch window. GitHub org `conbus` is taken by an unrelated 2015 org, hence `deximple/conbus`. Domain is deferred to just before MVP, `conbus.sh` leading.
-8. **Implementation:** one binary with argv dispatch (`conbus daemon|hook|log|install|backfill|doctor|quota|--version`), cargo workspace internally. JSONL segments are the source of truth, SQLite is a **disposable** derived index that can always be rebuilt from segments. Data lives in `~/.conbus/`, respecting `$XDG_STATE_HOME`.
+8. **Implementation:** one binary with argv dispatch (`conbus daemon|hook|log|install|backfill|doctor|quota|hop|--version`), cargo workspace internally. JSONL segments are the source of truth, SQLite is a **disposable** derived index that can always be rebuilt from segments. Data lives in `~/.conbus/`, respecting `$XDG_STATE_HOME`.
 
 ## Hard constraints — violating these breaks the product legally or technically
 
@@ -446,7 +451,7 @@ prompt that opens with a vendor's own tell that a program wrote it (`<scheduled-
 Agent`) is not briefed even when the entrypoint calls the session attended, and a conversation with both
 recovered and live records is "partly reconstructed", not "not observed live".
 
-**What the gate did on the real log** *(measured 2026-08-31, before the gate was replaced in `897164c`; the numbers below are that measurement. `conbus doctor` now replays the briefing decision instead — as of 2026-09-03: 3,488 conversations judged, 42 briefed, 93 silent/machine_authored; the replay histogram has the rest.)*
+**What the gate did on the real log** *(measured 2026-08-31, before the gate was replaced in `897164c`; the numbers below are that measurement. `conbus doctor` now replays the briefing decision instead — as of 2026-09-06: 3,886 conversations judged, 115 brief, 100 silent/machine_authored; the replay histogram has the rest.)*
 
 `conbus doctor` replays the gate over every conversation, judging each one against only what had
 already happened when its first prompt arrived. On this machine's 3,443 conversations it fires
@@ -608,26 +613,53 @@ are its schema, its values are somebody's conversation.
 6. **The unmirrored events**, in the order they are worth having: `PermissionRequest` (where an ordinary refusal is
    visible), `Notification` (the only hook-channel signal that a quota limit *lifted*), `MessageDisplay`. Each is
    argued under "Still open". `SubagentStop` was on this list and is mirrored now.
-7. **A real quota exhaustion.** The one fixture that cannot be manufactured. The signal is already readable: probe #1
-   held (`account/rateLimits/read` is account-scoped), `conbus quota` prints the windows, and `doctor` ends with them. Now that the recorder is running, the
-   first exhaustion records itself — treat it as an opportunity rather than an interruption. It is also the only
-   thing that can produce a `continue/displaced` verdict: the counterfactual above found twelve `handed_off` and no
-   `displaced`, because backfill can only recover a turn that completed.
+7. ~~**A real quota exhaustion.**~~ **Arrived 2026-09-06 00:13 KST**, on the Codex
+   account, not on a hooked turn. Probe #1 held in the direction that matters for
+   the router: `conbus quota` printed
+   `EXHAUSTED (rate_limit_reached)` without opening a thread. The redacted reply
+   is `crates/conbus/tests/fixtures/codex_0.152.1_quota_exhausted.json`. Three
+   things it taught, in order:
+   - **The live `rateLimitReachedType` is `rate_limit_reached`.** A unit test had
+     guessed `"primary"` from the window name. Wrong vocabulary; the parser is an
+     open string so it still printed, but the fixture is what the router should
+     match on.
+   - **It is not a log event.** Codex hooks have no `StopFailure`; every hooked
+     `Stop` is recorded `complete`. The whole corpus still has zero
+     `interrupted_quota` records. A `continue/displaced` verdict still cannot be
+     derived from the log — the counterfactual's "twelve handed_off, no
+     displaced" stands.
+   - **Desktop spent the quota the hooks never saw.** Last hooked Codex record:
+     `session-end` on 2026-09-04. Codex.app (`152.0.7977.64`) had been up for
+     hours. Same account, no hook traffic. The bus is a passenger there, which
+     the design already said; this is the first measurement. Claude `StopFailure`
+     is still the fixture that has to wait for a Claude limit.
 8. **Delivery.** Shipped 2026-09-01 — the pack builder — pure, budgeted in UTF-16 code
    units, well under the 10,000 cap — then the `Briefed` event (the plan called it `Hydrated`) so an injection is a record rather than a belief,
    then the hook client learning a second reply beside `SILENT_OK`. Note the hazard in the client's own reply
    matching: it treats `Recorded | Deferred` as success and everything else as a defect, so a new response variant
    with no arm becomes a per-turn stderr diagnostic.
-10. **Stage 0's remainder, in order.** The router — its inputs exist now: `conbus quota`'s `reached` signal on the
-   Codex side and `StopFailure` on the Claude side; then the rolling summary on the opposite vendor's low-effort model
-   (never on the leg it protects); then the asymmetric warm (Codex leg only); then the survival meter with the
-   counters written down beside the fields (see "The counters have to be written down"). None of these has a line of
-   code yet, and the plan's kill criteria start counting the day the router does.
-9. **The unknown fourth harness.** Something on this machine invokes the hook under Claude Code's name with camelCase
-   events — `beforeSubmitPrompt`, `preToolUse`, `postToolUse`, `stop` — which neither known vendor uses. Cursor,
-   Copilot CLI and Devin CLI all read Claude Code's settings file, so this is the third-harness surface arriving on
-   its own. The drop diagnostic now records the payload's field names, which is what identifies it; do not guess
-   before reading one.
+10. **Stage 0 close, 2026-09-06.** Router, extractive rolling summary, survival
+   meter, hop-time Codex warm, and the fact-schema document. `conbus hop`
+   decides from Codex `reached` / used% and from Claude `StopFailure`; the
+   daemon writes `routed` on an `interrupted_quota` turn and `continued` when
+   a briefing leads with a displaced conversation. `--apply` records the hop
+   through the daemon (never a direct segment write) and, when the next leg is
+   Codex, opens a bus-owned app-server thread and injects the extractive
+   digest. A later `--apply` on a `warm:<id>` lease syncs that thread; any
+   other holder still refuses. The hook path does not start an app-server —
+   that bound is ~15s and would stall a prompt. Per-turn `inject_items` is
+   therefore hop-time, not every Claude turn. Summaries stay extractive every
+   8 turns; hop-path model calls stay 0. Fact contract: `docs/fact-schema.md`.
+   **Not yet, and not required to close the wedge:** model-backed summary
+   refresh, Claude quota probe, per-turn warm sync, a hop that opens a vendor
+   window. The kill criteria start counting the day a `routed`/`continued`
+   line lands on the live machine.
+9. **The unknown fourth harness is Cursor, and it is the drop majority.** Identified
+   2026-09-03 from field names (`cursor_version`, `conversation_id`, …). As of
+   2026-09-06 about 385 of 578 drops are its camelCase events arriving under
+   Claude Code's name — `preToolUse` / `postToolUse` / `beforeSubmitPrompt` /
+   `stop`. Names only; values are somebody's conversation. Stage 0 still does
+   not register a Cursor adapter. Do not guess a mapping from Claude's schema.
 
 **Two live-machine failures worth not repeating.**
 
@@ -661,11 +693,12 @@ already holds in full — so the drop log can tell a ghost session's `SessionEnd
 throttle still keys on the reason alone, so a restart does not put one line per orphan into the transcript.
 
 **Where the milestone stands against its own success criteria.** "Every turn from both harnesses lands in the log":
-half. Claude Code is confirmed on live traffic, including the `PostToolUse` this file spent three revisions calling
-the most valuable missing capture. Codex is registered and correct as far as the schema goes, but its hooks do not
-fire until a human trusts them, so nothing has been seen on the wire. "The log survives a daemon restart":
-yes, and now proven at 78 MB rather than argued. "Installed history is queryable": yes — 3,425 conversations back to
-April, with `--bus-id`, `--since`, `--tail` and `--grep`.
+the hooked surfaces, yes. Claude Code is confirmed on live traffic, including the `PostToolUse` this file spent
+three revisions calling the most valuable missing capture. Codex hooks are trusted and have run — first live
+traffic 2026-09-03, last hooked record a `session-end` on 2026-09-04. What still does not land is Codex.app
+desktop, which burns the same account and never hits our hooks (see item 7). "The log survives a daemon restart":
+yes, and now proven at 96 MB rather than argued. "Installed history is queryable": yes — 3,886 conversations,
+with `--bus-id`, `--since`, `--tail` and `--grep`.
 
 **Every tool request now has an answer in the log, and batches are marked.**
 

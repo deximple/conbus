@@ -9,9 +9,9 @@ use std::path::Path;
 use std::time::Duration;
 
 use conbus_core::continuation::{
-    Asking, Decision, decide, machine_authored, opening_units, unattended,
+    Asking, Decision, Stopped, decide, machine_authored, opening_units, stopped, unattended,
 };
-use conbus_core::event::{Event, Source};
+use conbus_core::event::{Event, Hop, Source, TurnState};
 use conbus_core::ids::BusId;
 use conbus_core::pack::{self, Chapter};
 use conbus_core::paths::Paths;
@@ -224,7 +224,9 @@ impl Daemon {
                                 eprintln!("conbus daemon: briefing sent but not recorded: {err}")
                             }
                         }
+                        self.maybe_continue(bus_id, &source, &mut written, &mut seqs);
                         self.remember(&written);
+                        self.follow_through(bus_id, &source, &mut written, &mut seqs);
                         Response::Briefed {
                             bus_id,
                             seqs,
@@ -234,6 +236,7 @@ impl Daemon {
                     }
                     None => {
                         self.remember(&written);
+                        self.follow_through(bus_id, &source, &mut written, &mut seqs);
                         Response::Recorded { bus_id, seqs }
                     }
                 }
@@ -247,6 +250,139 @@ impl Daemon {
     fn remember(&mut self, written: &[Record]) {
         for record in written {
             Chapter::apply(&mut self.chapters, record);
+        }
+    }
+
+    /// The hop and the digest, after the vendor events are on disk.
+    fn follow_through(
+        &mut self,
+        bus_id: BusId,
+        source: &Source,
+        written: &mut Vec<Record>,
+        seqs: &mut Vec<u64>,
+    ) {
+        self.maybe_route(source, written, seqs);
+        self.maybe_summarise(bus_id, source, written, seqs);
+    }
+
+    fn maybe_route(&mut self, source: &Source, written: &mut Vec<Record>, seqs: &mut Vec<u64>) {
+        let Some(reason) = written.iter().find_map(|record| match &record.event {
+            Event::TurnEnded {
+                state: TurnState::InterruptedQuota { reason },
+                ..
+            } => Some(reason.clone()),
+            _ => None,
+        }) else {
+            return;
+        };
+        let Some(next) = conbus_core::route::opposite(&source.harness) else {
+            return;
+        };
+        let bus_id = written.last().map(|r| r.bus_id);
+        let Some(bus_id) = bus_id else {
+            return;
+        };
+        self.write_extra(
+            bus_id,
+            source,
+            Event::Routed {
+                next: next.as_str().to_string(),
+                hop: Hop::Displaced,
+                reason,
+            },
+            written,
+            seqs,
+        );
+    }
+
+    fn maybe_summarise(
+        &mut self,
+        bus_id: BusId,
+        source: &Source,
+        written: &mut Vec<Record>,
+        seqs: &mut Vec<u64>,
+    ) {
+        if !written
+            .iter()
+            .any(|record| matches!(record.event, Event::TurnEnded { .. }))
+        {
+            return;
+        }
+        let Some(chapter) = self.chapters.get(&bus_id) else {
+            return;
+        };
+        if !conbus_core::summary::due(chapter.about.turns) {
+            return;
+        }
+        let digest = conbus_core::summary::extract(chapter);
+        let covered_turns = chapter.about.turns;
+        self.write_extra(
+            bus_id,
+            source,
+            Event::Summarised {
+                backend: conbus_core::summary::EXTRACTIVE.to_string(),
+                covered_turns,
+                digest: conbus_core::event::Body::kept(digest),
+            },
+            written,
+            seqs,
+        );
+    }
+
+    fn maybe_continue(
+        &mut self,
+        bus_id: BusId,
+        source: &Source,
+        written: &mut Vec<Record>,
+        seqs: &mut Vec<u64>,
+    ) {
+        let Some(predecessor) = written.iter().rev().find_map(|record| match &record.event {
+            Event::Briefed { about, .. } => about.first().copied(),
+            _ => None,
+        }) else {
+            return;
+        };
+        let Some(chapter) = self.chapters.get(&predecessor) else {
+            return;
+        };
+        if stopped(&chapter.about) != Stopped::Displaced {
+            return;
+        }
+        self.write_extra(
+            bus_id,
+            source,
+            Event::Continued {
+                predecessor,
+                hop: Hop::Displaced,
+            },
+            written,
+            seqs,
+        );
+    }
+
+    fn write_extra(
+        &mut self,
+        bus_id: BusId,
+        source: &Source,
+        event: Event,
+        written: &mut Vec<Record>,
+        seqs: &mut Vec<u64>,
+    ) {
+        match self.log.append(Entry {
+            bus_id,
+            observed_at: None,
+            source: source.clone(),
+            vendor_turn_id: None,
+            vendor_agent_id: None,
+            event,
+        }) {
+            Ok(Some(record)) => {
+                Chapter::apply(&mut self.chapters, &record);
+                seqs.push(record.seq);
+                written.push(record);
+            }
+            Ok(None) => {}
+            Err(err) => eprintln!("conbus daemon: hop bookkeeping lost: {err}"),
         }
     }
 
@@ -312,8 +448,13 @@ impl Daemon {
             .first()
             .map(|chapter| chapter.about.bus_id.to_string())
             .unwrap_or_default();
+        let hop = chapters
+            .first()
+            .filter(|chapter| stopped(&chapter.about) == Stopped::Displaced)
+            .map(|_| " · conbus hop")
+            .unwrap_or("");
         let message = format!(
-            "conbus · {} earlier session{} in this checkout · conbus log --bus-id {}{}",
+            "conbus · {} earlier session{} in this checkout · conbus log --bus-id {}{}{hop}",
             chapters.len(),
             if chapters.len() == 1 { "" } else { "s" },
             named.get(..13).unwrap_or(&named),
@@ -506,7 +647,7 @@ fn went_silent(err: &io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use conbus_core::event::{Body, Event, Harness, TurnState, VendorTurnId};
+    use conbus_core::event::{Body, Event, Harness, Hop, TurnState, VendorTurnId};
     use conbus_core::segment::SegmentLog;
 
     fn request(event: Event) -> Request {
@@ -607,6 +748,41 @@ mod tests {
             Some("abc123"),
             "the vendor session id must be recorded as an alias of the bus_id"
         );
+    }
+
+    #[test]
+    fn a_quota_stop_records_the_hop_the_router_decided() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = SegmentLog::open(dir.path(), Retention::default()).expect("open");
+        let mut daemon = Daemon::new(log, Registry::new(), HashMap::new());
+        daemon.handle(request(Event::TurnStarted {
+            author: None,
+            prompt: Body::kept("keep going"),
+        }));
+
+        let response = daemon.handle(request(Event::TurnEnded {
+            state: TurnState::InterruptedQuota {
+                reason: "rate_limit".into(),
+            },
+            assistant_message: None,
+        }));
+
+        let Response::Recorded { seqs, .. } = response else {
+            panic!("expected a recording, got {response:?}");
+        };
+        assert!(seqs.len() >= 2, "turn + routed: {seqs:?}");
+
+        let scan = SegmentLog::scan(dir.path()).expect("scan");
+        let routed = scan
+            .records
+            .iter()
+            .find(|record| matches!(record.event, Event::Routed { .. }));
+        let Some(Event::Routed { next, hop, reason }) = routed.map(|r| &r.event) else {
+            panic!("the quota stop must leave a routed line: {scan:?}");
+        };
+        assert_eq!(next, Harness::CODEX);
+        assert_eq!(*hop, Hop::Displaced);
+        assert_eq!(reason, "rate_limit");
     }
 
     #[test]

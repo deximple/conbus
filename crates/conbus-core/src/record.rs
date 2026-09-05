@@ -196,6 +196,23 @@ mod tests {
                 units: 1_204,
                 dropped: 2,
             },
+            Event::Routed {
+                next: "codex".into(),
+                hop: crate::event::Hop::Displaced,
+                reason: "rate_limit".into(),
+            },
+            Event::Continued {
+                predecessor: "01996b1e-2c4a-7c31-9d0e-4f2a6b8c1d3e".parse().expect("id"),
+                hop: crate::event::Hop::HandedOff,
+            },
+            Event::Summarised {
+                backend: "extractive".into(),
+                covered_turns: 8,
+                digest: Body::kept("last ask: ship"),
+            },
+            Event::Leased {
+                holder: "conbus-hop".into(),
+            },
         ];
         all.extend(
             every_turn_state()
@@ -226,7 +243,11 @@ mod tests {
                 | Event::ToolUse { .. }
                 | Event::TurnEnded { .. }
                 | Event::SessionEnded { .. }
-                | Event::Briefed { .. } => {}
+                | Event::Briefed { .. }
+                | Event::Routed { .. }
+                | Event::Continued { .. }
+                | Event::Summarised { .. }
+                | Event::Leased { .. } => {}
             }
         }
         all

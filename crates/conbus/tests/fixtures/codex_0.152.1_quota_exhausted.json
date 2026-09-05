@@ -1,0 +1,77 @@
+{
+  "rateLimits": {
+    "limitId": "codex",
+    "limitName": null,
+    "primary": {
+      "usedPercent": 100,
+      "windowDurationMins": 300,
+      "resetsAt": 1788626797
+    },
+    "secondary": {
+      "usedPercent": 76,
+      "windowDurationMins": 10080,
+      "resetsAt": 1788752527
+    },
+    "credits": {
+      "hasCredits": false,
+      "unlimited": false,
+      "balance": "0"
+    },
+    "individualLimit": null,
+    "spendControlReached": false,
+    "planType": "plus",
+    "rateLimitReachedType": "rate_limit_reached"
+  },
+  "rateLimitsByLimitId": {
+    "codex": {
+      "limitId": "codex",
+      "limitName": null,
+      "primary": {
+        "usedPercent": 100,
+        "windowDurationMins": 300,
+        "resetsAt": 1788626797
+      },
+      "secondary": {
+        "usedPercent": 76,
+        "windowDurationMins": 10080,
+        "resetsAt": 1788752527
+      },
+      "credits": {
+        "hasCredits": false,
+        "unlimited": false,
+        "balance": "0"
+      },
+      "individualLimit": null,
+      "spendControlReached": false,
+      "planType": "plus",
+      "rateLimitReachedType": "rate_limit_reached"
+    }
+  },
+  "rateLimitResetCredits": {
+    "availableCount": 3,
+    "credits": [
+      {
+        "id": "RateLimitResetCredit_redacted_1",
+        "resetType": "codexRateLimits",
+        "status": "available",
+        "grantedAt": 0,
+        "expiresAt": 0,
+        "title": "Full reset (Weekly + 5 hr)",
+        "description": "Thanks for using Codex! You've been granted one free rate limit reset."
+      }
+    ]
+  },
+  "accountId": "00000000-0000-0000-0000-000000000000",
+  "rateLimitUpsell": {
+    "banner_type": "plus_rate_limit_reached",
+    "title": "You're out of Codex messages",
+    "description": "Your rate limit resets on {time}. Upgrade or use one of your rate limit resets now.",
+    "ctas": [
+      { "action": "open_pricing_dialog", "label": "Upgrade" },
+      { "action": "reset_usage", "label": "Reset usage" }
+    ],
+    "reset_at": 1788626797,
+    "referral": null,
+    "request_url": null
+  }
+}

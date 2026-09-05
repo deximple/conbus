@@ -13,7 +13,7 @@ todos:
     status: pending
   - id: probe-codex-quota
     content: 0단계 프로브 1번 - codex app-server 사이드카로 account/rateLimits/read 폴링이 계정 단위로 읽히는지. 실패 시 0단계는 단방향
-    status: pending
+    status: done
   - id: adapter-probe
     content: 0단계 - 알려진 quirk 10종을 픽스처 목표로. 주입 inline 단언(persisted-output 부재), 조용한 열화 감지, env 마커 자기제외
     status: pending
@@ -31,25 +31,25 @@ todos:
     status: done
   - id: codex-warm-leg
     content: 0단계 - 비대칭 dual-warm. app-server 사이드카가 소유한 Codex 스레드를 매 턴 inject_items로 동기화. Claude는 인터랙티브 유지
-    status: pending
+    status: done
   - id: hook-binary-multi
     content: 1단계 - 훅 바이너리 하나 + 등록 N개. Claude 포맷을 읽는 Cursor·Copilot CLI·Devin CLI는 등록만으로 편입
     status: pending
   - id: router-task-routing
     content: 0단계 - 작업별 라우팅이 1차. 예측 라우팅·failover·리셋 대기
-    status: pending
+    status: done
   - id: rolling-summary
     content: 0단계 - 기본 백엔드는 상대 벤더 저효력 모델, 라우터가 여유 레그로 재지정. 보호 중인 레그 금지. hop 경로 모델 호출 0
     status: pending
   - id: lease-only
     content: 0단계 - bus_id 단일 작가 리스와 hop-back 부재중 요약. 갭 메우기는 1단계(죽으면 갭을 기록만)
-    status: pending
+    status: done
   - id: survival-meter
     content: 0단계 - 생존 카운터 + 라우팅/failover hop 분리 + 턴당 주입 토큰을 비용 항목으로 나란히
-    status: pending
+    status: done
   - id: fact-schema-doc
     content: 0단계 - fact 스키마 계약을 문서로만 확정(타입·라이프사이클·evidence·출처·앵커·로그 도출 메커니즘). 구현은 workspace-arena
-    status: pending
+    status: done
   - id: verify-dogfood
     content: 0단계 종료 - 4주 본인 도그푸딩 계측과 킬 크리테리아 판정
     status: pending

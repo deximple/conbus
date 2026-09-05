@@ -25,6 +25,11 @@ pub enum Command {
     Doctor,
     /// Ask Codex's app-server how much of the account's quota is used.
     Quota,
+    /// Decide which harness should serve the next turn.
+    Hop {
+        from: Option<String>,
+        apply: bool,
+    },
     /// Say which build this binary is.
     Version,
     Help,
@@ -91,6 +96,10 @@ where
         },
         "doctor" => Command::Doctor,
         "quota" => Command::Quota,
+        "hop" => Command::Hop {
+            from: flag_value(&args, "--from"),
+            apply: args.iter().any(|a| a == "--apply"),
+        },
         "version" | "--version" | "-V" => Command::Version,
         "help" | "--help" | "-h" => Command::Help,
         other => Command::Unknown(other.to_string()),
@@ -114,6 +123,10 @@ USAGE:
     conbus backfill [--apply]     recover history from before the recorder ran
     conbus doctor                 report what is and is not wired up
     conbus quota                  ask Codex how much of the account's quota is used
+    conbus hop [--from ID] [--apply]
+                                  decide the next harness; --apply records the hop
+                                  and, when the next leg is Codex, opens or syncs
+                                  a bus-owned thread (not a model turn)
     conbus --version              say which build this is
 ";
 
@@ -152,6 +165,24 @@ mod tests {
             parse(["hook"], Some("codex".into())),
             Command::Hook {
                 harness: "codex".into()
+            }
+        );
+    }
+
+    #[test]
+    fn hop_is_a_command() {
+        assert_eq!(
+            parse(["hop"], None),
+            Command::Hop {
+                from: None,
+                apply: false
+            }
+        );
+        assert_eq!(
+            parse(["hop", "--from", "01996b1e", "--apply"], None),
+            Command::Hop {
+                from: Some("01996b1e".into()),
+                apply: true
             }
         );
     }

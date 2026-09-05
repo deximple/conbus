@@ -65,6 +65,15 @@ fn map_bodies(event: &Event, f: impl Fn(&Body) -> Body) -> Event {
             state: state.clone(),
             assistant_message: assistant_message.as_ref().map(&f),
         },
+        Event::Summarised {
+            backend,
+            covered_turns,
+            digest,
+        } => Event::Summarised {
+            backend: backend.clone(),
+            covered_turns: *covered_turns,
+            digest: f(digest),
+        },
         other => other.clone(),
     }
 }
@@ -88,7 +97,11 @@ fn elide_tool_bodies(event: &Event) -> Event {
         // Carries ids and counts, never text: every word of a briefing was
         // quoted from records that already passed through here at whatever
         // level applied to them.
-        | Event::Briefed { .. } => event.clone(),
+        | Event::Briefed { .. }
+        | Event::Routed { .. }
+        | Event::Continued { .. }
+        | Event::Summarised { .. }
+        | Event::Leased { .. } => event.clone(),
     }
 }
 

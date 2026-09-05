@@ -1,8 +1,8 @@
 //! A client for `codex app-server`: JSON-RPC over the child's stdio.
 //!
-//! One fresh server per use, stopped afterwards. Two things ask it questions
-//! — `conbus quota` reads the account's limits, `conbus backfill` reads the
-//! threads — and neither changes anything on the Codex side.
+//! One fresh server per use, stopped afterwards. Quota and backfill only
+//! read. The warm leg writes, and only into a thread we opened with
+//! `thread/start` — never into one the user minted.
 
 use std::io::{self, BufRead, BufReader, Lines, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};

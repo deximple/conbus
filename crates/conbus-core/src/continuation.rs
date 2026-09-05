@@ -257,8 +257,13 @@ impl Candidate {
             // which is something the bus did rather than something the
             // conversation did — and reading our own output back as activity is
             // how a feature starts feeding on itself.
-            Event::SessionCandidate { .. } | Event::SessionEnded { .. } | Event::Briefed { .. } => {
-            }
+            Event::SessionCandidate { .. }
+            | Event::SessionEnded { .. }
+            | Event::Briefed { .. }
+            | Event::Routed { .. }
+            | Event::Continued { .. }
+            | Event::Summarised { .. }
+            | Event::Leased { .. } => {}
             // Tool traffic means a turn is in flight, whatever came before.
             Event::ToolRequested { .. }
             | Event::ToolDenied { .. }
