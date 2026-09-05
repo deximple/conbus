@@ -259,6 +259,7 @@ impl Candidate {
             // how a feature starts feeding on itself.
             Event::SessionCandidate { .. }
             | Event::SessionEnded { .. }
+            | Event::Notified { .. }
             | Event::Briefed { .. }
             | Event::Routed { .. }
             | Event::Continued { .. }
@@ -266,6 +267,7 @@ impl Candidate {
             | Event::Leased { .. } => {}
             // Tool traffic means a turn is in flight, whatever came before.
             Event::ToolRequested { .. }
+            | Event::PermissionAsked { .. }
             | Event::ToolDenied { .. }
             | Event::ToolUse { .. }
             | Event::ToolBatchEnded { .. } => candidate.last_turn = None,

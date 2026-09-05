@@ -5,11 +5,10 @@ recording on this machine. Read this, then read the plan.
 
 ## Where things are
 
-- Repo: `/Applications/conbus`, remote `deximple/conbus`, **private**. As of 2026-09-06 the stage-0 close
-  (router, meter, hop-time Codex warm, fact-schema document, live quota fixture) is the next PR off `main`
-  (`b9db8f7`, PRs #1–#10 merged). The installed binary (`~/.local/bin/conbus`) and the
-  launchd daemon are still build `883bf1610` — `4ed23e9` (PR #9) minus two timestamps in a fixture document; PR #10
-  was docs only. Do not overwrite that inode in place. `conbus doctor` prints both stamps and says `DIFFERS` when they do not match.
+- Repo: `/Applications/conbus`, remote `deximple/conbus`, **private**. `main` is `4d1839f` (PR #11 merged).
+  The installed binary and `sh.conbus.daemon` are build `4d1839f76`. Do not overwrite that inode in place:
+  write beside, rename, then `launchctl kickstart -k gui/$UID/sh.conbus.daemon`. `conbus doctor` prints both
+  stamps and says `DIFFERS` when they do not match. Next increment is `feat/mirror-permission-notification`.
 - The live machine, same moment: 46,256 records in 13 segments (96 MB), 3,886 conversations, 0 unreadable;
   Claude Code hooks 11/11 registered, Codex hooks 6/6 registered and trusted; 17 twin sessions all bound to their
   live side, 2 of them split before the twin rule existed; 578 drops, most of them Cursor camelCase events arriving
@@ -610,9 +609,11 @@ are its schema, its values are somebody's conversation.
    which failed once with `Bootstrap failed: 5: Input/output error` and succeeded on retry. Every hook in that window
    drops as "no daemon" (2.5 minutes, three drops, on 2026-09-03). A dry run needs none of this: it reads beside
    the daemon.
-6. **The unmirrored events**, in the order they are worth having: `PermissionRequest` (where an ordinary refusal is
-   visible), `Notification` (the only hook-channel signal that a quota limit *lifted*), `MessageDisplay`. Each is
-   argued under "Still open". `SubagentStop` was on this list and is mirrored now.
+6. ~~**The unmirrored events**~~ **`PermissionRequest` and `Notification` mirrored 2026-09-06.**
+   The ask is `permission_asked`, never a denial. `Notification` keeps `notification_type`
+   verbatim as `kind`; the quota-lifted spelling is not pinned until a capture lands.
+   `MessageDisplay` stays unmirrored (retention decision first). Needs `conbus install --apply`
+   on the live machine (13 Claude events, 7 Codex) and an atomic binary deploy.
 7. ~~**A real quota exhaustion.**~~ **Arrived 2026-09-06 00:13 KST**, on the Codex
    account, not on a hooked turn. Probe #1 held in the direction that matters for
    the router: `conbus quota` printed
@@ -715,9 +716,10 @@ The tool surface is mirrored end to end: `PreToolUse` → `tool_requested`, and 
 `PermissionDenied` has exactly one call site in the bundle and it is guarded by
 `decisionReason.type === "classifier" && decisionReason.classifier === "auto-mode"` — so it fires for auto-mode
 classifier refusals and **not** when a person simply answers no at the prompt. An ordinary user denial leaves a
-`tool_requested` with no resolution. Neither is `PermissionRequest` mirrored, which is the pre-decision event and
-the only place an ordinary refusal is visible at all. So an unresolved request today means: denied by a person,
-still in flight when the session ended, or missed by the daemon — and the log cannot yet tell you which.
+`tool_requested` with no resolution. `PermissionRequest` is now `permission_asked` — the pre-decision
+event, and the only place an ordinary refusal is visible. An unresolved request after that line
+means: denied by a person, still in flight when the session ended, or missed by the daemon. The log
+can tell the first of those from the other two only by adjacency, because the ask has no `tool_use_id`.
 
 `tool_denied` is its own event rather than a third `ToolOutcome`, and the reasoning is the mirror image of why the
 two post events *do* share one: `tool_use` means the tool **ran**. A call that never executed sitting in that set
@@ -827,18 +829,19 @@ Take the lesson generally: **the adapter is only as good as the traffic it has b
   `error` has eleven values, collapsing account and request faults into `interrupted_quota` would make the failover
   counter lie, so there is now `interrupted_policy`. Both interrupted variants keep the vendor string verbatim.
   Nothing currently produces `interrupted_user` — Claude Code does not appear to distinguish it.
-- **`PermissionRequest` is not mirrored**, and it is where an ordinary user refusal is visible — `PermissionDenied`
-  covers only auto-mode classifier denials. It fires before the decision and carries no `tool_use_id` (the emitter
-  passes the id to the hook runner but not into the payload), so it joins by tool name plus adjacency rather than by
-  key. Mirroring it is what would make "every request has an answer" true.
+- ~~**`PermissionRequest` is not mirrored**~~ **Mirrored 2026-09-06** as `permission_asked`.
+  `PermissionDenied` still covers only auto-mode classifier denials. The ask carries no
+  `tool_use_id` (the emitter passes the id to the hook runner but not into the payload), so
+  it joins by tool name plus adjacency rather than by key. An ordinary no is this line
+  with no following `tool_use`.
 - **Still dropped from payloads already parsed**: `agent_type` and `transcript_path` (both on the common base of
   every payload), `session_title`, `model`, `permission_mode`, `effort.level`.
 - **`SubagentStop` is mirrored now**, as a `turn_ended` carrying the subagent's `agent_id` and its closing text.
   `SubagentStart` is not: it carries no prompt, so mirroring it would write a turn that began with nothing. The
   asymmetry is the vendor's.
-- **`Notification` is not mirrored**, and it carries the only hook-channel signal that a quota limit has *lifted*.
-  For a product whose stated reason to exist is routing on quota, that is the cheapest signal on the surface: the
-  hook can be registered with a matcher on the notification type, so the volume cost is near zero.
+- ~~**`Notification` is not mirrored**~~ **Mirrored 2026-09-06.** `kind` is the vendor's
+  `notification_type`, kept verbatim. The quota-lifted spelling is still unpinned; until a
+  capture names it the registration has no matcher and the router does not branch on it.
 - **`MessageDisplay` is not mirrored**, and it is the only official channel carrying every assistant message rather
   than the last one. High volume, and it collides with the "conversation only" shipping default, so it is a retention
   decision before it is an adapter change.

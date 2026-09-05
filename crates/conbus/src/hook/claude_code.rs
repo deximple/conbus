@@ -14,8 +14,9 @@
 //! `prompt_id`, `error`, `last_assistant_message`, `reason`.
 //! Schema and emit site only: `agent_id`, `tool_name`, `tool_input`,
 //! `tool_response`, `tool_use_id`, `duration_ms`, `is_interrupt`,
-//! `error_details`, `tool_calls`. **No capture contains a `PostToolUse` at
-//! all**, and none has exercised a subagent or a batch.
+//! `error_details`, `tool_calls`, `notification_type`, `title`, `message`.
+//! **No capture contains a `PostToolUse` at all**, and none has exercised a
+//! subagent, a batch, a `PermissionRequest`, or a `Notification`.
 
 use conbus_core::event::{
     Author, Body, Event, Harness, ToolOutcome, TurnState, VendorAgentId, VendorToolUseId,
@@ -124,6 +125,16 @@ pub struct Payload {
     /// vocabularies, told apart by `hook_event_name`.
     #[serde(default)]
     pub reason: Option<String>,
+    /// `Notification`. Open string; the quota-lifted spelling is not pinned
+    /// until a capture lands.
+    #[serde(default)]
+    pub notification_type: Option<String>,
+    /// `Notification`.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// `Notification`.
+    #[serde(default)]
+    pub message: Option<String>,
 }
 
 /// Hook events this adapter has seen and decided not to mirror.
@@ -131,9 +142,7 @@ pub struct Payload {
 /// Spelled out so that an event which is *not* here is reported as unknown
 /// rather than silently dropped. Read off the vendor's own event list in
 /// `tests/fixtures/claude_code_2.1.241_contract.md`.
-pub const DECLINED: [&str; 20] = [
-    "PermissionRequest",
-    "Notification",
+pub const DECLINED: [&str; 18] = [
     "UserPromptExpansion",
     "Setup",
     "SubagentStart",
@@ -210,6 +219,15 @@ pub fn normalize(harness: &Harness, json: &str) -> Result<Normalized, HookError>
                 unreadable,
             }
         }
+        "PermissionRequest" => Event::PermissionAsked {
+            tool: payload.tool_name.unwrap_or_default(),
+            input: body_of(payload.tool_input),
+        },
+        "Notification" => Event::Notified {
+            kind: payload.notification_type.unwrap_or_default(),
+            title: payload.title,
+            message: payload.message.unwrap_or_default(),
+        },
         "PermissionDenied" => Event::ToolDenied {
             tool: payload.tool_name.unwrap_or_default(),
             tool_use_id: payload.tool_use_id.map(VendorToolUseId::new),
@@ -661,6 +679,44 @@ mod tests {
             Event::ToolBatchEnded {
                 tool_calls: vec![VendorToolUseId::new("toolu_B")],
                 unreadable: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn a_permission_request_is_the_ask_not_the_refusal() {
+        // Fires before the person answers. An ordinary no has no later event
+        // (`PermissionDenied` is classifier-only), so the ask itself is the
+        // evidence. Mapping it to `ToolDenied` would log every yes as a no.
+        let event = event_of(
+            r#"{"session_id":"abc123","hook_event_name":"PermissionRequest","tool_name":"Bash",
+                "tool_input":{"command":"ls"}}"#,
+        );
+
+        assert_eq!(
+            event,
+            Event::PermissionAsked {
+                tool: "Bash".into(),
+                input: Body::kept(r#"{"command":"ls"}"#),
+            }
+        );
+    }
+
+    #[test]
+    fn a_notification_keeps_the_vendor_kind_verbatim() {
+        // The quota-lifted spelling is not pinned. Guessing it is how
+        // `rate_limit_reached` became `"primary"` in a unit test.
+        let event = event_of(
+            r#"{"session_id":"abc123","hook_event_name":"Notification",
+                "notification_type":"example_kind","title":"a title","message":"a message"}"#,
+        );
+
+        assert_eq!(
+            event,
+            Event::Notified {
+                kind: "example_kind".into(),
+                title: Some("a title".into()),
+                message: "a message".into(),
             }
         );
     }

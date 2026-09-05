@@ -179,6 +179,15 @@ mod tests {
                 tool_calls: vec![VendorToolUseId::new("toolu_01ABC")],
                 unreadable: 2,
             },
+            Event::PermissionAsked {
+                tool: "Bash".into(),
+                input: Body::kept("i"),
+            },
+            Event::Notified {
+                kind: "example_kind".into(),
+                title: Some("a title".into()),
+                message: "a message".into(),
+            },
             Event::ToolDenied {
                 tool: "Bash".into(),
                 tool_use_id: Some(VendorToolUseId::new("toolu_01ABC")),
@@ -238,6 +247,8 @@ mod tests {
                 Event::SessionCandidate { .. }
                 | Event::TurnStarted { .. }
                 | Event::ToolRequested { .. }
+                | Event::PermissionAsked { .. }
+                | Event::Notified { .. }
                 | Event::ToolBatchEnded { .. }
                 | Event::ToolDenied { .. }
                 | Event::ToolUse { .. }

@@ -34,14 +34,16 @@ impl Change {
 }
 
 /// The Claude Code events the recorder mirrors.
-pub const CLAUDE_EVENTS: [&str; 11] = [
+pub const CLAUDE_EVENTS: [&str; 13] = [
     "SessionStart",
     "UserPromptSubmit",
     "PreToolUse",
     "PostToolUse",
     "PostToolUseFailure",
     "PostToolBatch",
+    "PermissionRequest",
     "PermissionDenied",
+    "Notification",
     "Stop",
     "StopFailure",
     "SubagentStop",
@@ -49,12 +51,13 @@ pub const CLAUDE_EVENTS: [&str; 11] = [
 ];
 
 /// The Codex events the recorder mirrors. Its hook surface is smaller: no
-/// failure, batch, or denial events exist there at all.
-pub const CODEX_EVENTS: [&str; 6] = [
+/// failure, batch, denial, or notification events exist there at all.
+pub const CODEX_EVENTS: [&str; 7] = [
     "SessionStart",
     "UserPromptSubmit",
     "PreToolUse",
     "PostToolUse",
+    "PermissionRequest",
     "Stop",
     "SessionEnd",
 ];

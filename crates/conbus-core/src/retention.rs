@@ -25,6 +25,10 @@ fn map_bodies(event: &Event, f: impl Fn(&Body) -> Body) -> Event {
             tool_use_id: tool_use_id.clone(),
             input: f(input),
         },
+        Event::PermissionAsked { tool, input } => Event::PermissionAsked {
+            tool: tool.clone(),
+            input: f(input),
+        },
         Event::ToolDenied {
             tool,
             tool_use_id,
@@ -81,7 +85,10 @@ fn map_bodies(event: &Event, f: impl Fn(&Body) -> Body) -> Event {
 /// Replace tool result bodies with their size, leaving conversation alone.
 fn elide_tool_bodies(event: &Event) -> Event {
     match event {
-        Event::ToolRequested { .. } | Event::ToolDenied { .. } | Event::ToolUse { .. } => {
+        Event::ToolRequested { .. }
+        | Event::PermissionAsked { .. }
+        | Event::ToolDenied { .. }
+        | Event::ToolUse { .. } => {
             map_bodies(event, |body| Body::Elided {
                 bytes: body.original_bytes(),
             })
@@ -94,6 +101,7 @@ fn elide_tool_bodies(event: &Event) -> Event {
         | Event::SessionCandidate { .. }
         | Event::ToolBatchEnded { .. }
         | Event::SessionEnded { .. }
+        | Event::Notified { .. }
         // Carries ids and counts, never text: every word of a briefing was
         // quoted from records that already passed through here at whatever
         // level applied to them.
@@ -315,6 +323,28 @@ mod tests {
             "the join key is metadata and must survive"
         );
         assert_eq!(full.event, record.event, "full retention keeps it verbatim");
+    }
+
+    #[test]
+    fn a_permission_asks_input_is_withheld_by_default_like_any_other_tool_body() {
+        let record = Record {
+            event: Event::PermissionAsked {
+                tool: "Bash".into(),
+                input: Body::kept(r#"{"command":"a secret"}"#),
+            },
+            ..tool_use(Body::kept(""), Body::kept(""))
+        };
+
+        let default = Retention::default().redact(&record).expect("logged");
+        let Event::PermissionAsked { input, .. } = &default.event else {
+            panic!("the event kind must survive redaction");
+        };
+        assert_eq!(
+            *input,
+            Body::Elided {
+                bytes: r#"{"command":"a secret"}"#.len()
+            }
+        );
     }
 
     #[test]

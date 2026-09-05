@@ -127,6 +127,8 @@ impl Chapter {
             Event::ToolBatchEnded { .. }
             | Event::SessionCandidate { .. }
             | Event::SessionEnded { .. }
+            | Event::PermissionAsked { .. }
+            | Event::Notified { .. }
             // Never quoted back. A briefing is our own words, and a chapter
             // built from one would be the bus reading itself aloud.
             | Event::Briefed { .. }

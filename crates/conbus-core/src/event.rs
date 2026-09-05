@@ -363,6 +363,31 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "is_zero")]
         unreadable: usize,
     },
+    /// The harness asked a person whether a tool may run.
+    ///
+    /// This is not a refusal and not a request-to-run. `PermissionDenied` is
+    /// only the auto-mode classifier; an ordinary no at the prompt has no
+    /// later event at all. Recording the ask is what makes that silence
+    /// visible — a `permission_asked` with no following `tool_use` is the
+    /// refusal. Mapping this to `ToolDenied` would log every approval as one.
+    ///
+    /// Claude Code's payload has no `tool_use_id` here (the emitter has the
+    /// id and does not put it on the hook). Join is by tool name and
+    /// adjacency, not by key.
+    PermissionAsked { tool: String, input: Body },
+    /// A vendor notification reached a hook.
+    ///
+    /// Claude Code only. `kind` is the vendor's `notification_type`, kept
+    /// verbatim — one of those values is the only hook-channel signal that a
+    /// quota limit has lifted, and guessing the spelling before a capture
+    /// would repeat the `rate_limit_reached` mistake. `message` is chrome,
+    /// not conversation, so it is a string rather than a `Body`.
+    Notified {
+        kind: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        message: String,
+    },
     /// A tool the harness refused to run.
     ///
     /// Its own event rather than a third `ToolOutcome`, because `ToolUse` means

@@ -54,13 +54,7 @@ pub struct Payload {
 
 /// Hook events this adapter has seen and decided not to mirror. Anything not
 /// here is reported as unknown rather than dropped in silence.
-pub const DECLINED: [&str; 5] = [
-    "PermissionRequest",
-    "PreCompact",
-    "PostCompact",
-    "SubagentStart",
-    "SubagentStop",
-];
+pub const DECLINED: [&str; 4] = ["PreCompact", "PostCompact", "SubagentStart", "SubagentStop"];
 
 /// Read a Codex hook payload into a bus event.
 pub fn normalize(harness: &Harness, json: &str) -> Result<Normalized, HookError> {
@@ -77,6 +71,10 @@ pub fn normalize(harness: &Harness, json: &str) -> Result<Normalized, HookError>
             // Codex sends no author on a prompt. Absent, never guessed.
             author: None,
             prompt: Body::kept(payload.prompt.unwrap_or_default()),
+        },
+        "PermissionRequest" => Event::PermissionAsked {
+            tool: payload.tool_name.unwrap_or_default(),
+            input: body_of(payload.tool_input),
         },
         "PreToolUse" => Event::ToolRequested {
             tool: payload.tool_name.unwrap_or_default(),
@@ -252,19 +250,17 @@ mod tests {
         // `PermissionRequest` fires on every approval prompt, before the
         // decision. Codex has no `PermissionDenied` at all, so mapping this to
         // `ToolDenied` would record every approval as a refusal.
-        let normalized = normalize(
-            &Harness::new(Harness::CODEX),
-            &payload(
-                r#""hook_event_name":"PermissionRequest","tool_name":"shell","tool_input":{},
-                   "turn_id":"CX-TURN-1""#,
-            ),
-        )
-        .expect("normalise");
+        let event = observed_of(&payload(
+            r#""hook_event_name":"PermissionRequest","tool_name":"shell","tool_input":{},
+               "turn_id":"CX-TURN-1""#,
+        ))
+        .event;
 
         assert_eq!(
-            normalized,
-            Normalized::Ignored {
-                hook_event_name: "PermissionRequest".into()
+            event,
+            Event::PermissionAsked {
+                tool: "shell".into(),
+                input: Body::kept("{}"),
             }
         );
     }

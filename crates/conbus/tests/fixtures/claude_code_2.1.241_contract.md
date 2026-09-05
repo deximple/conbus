@@ -89,7 +89,7 @@ under the parent `session_id`, told apart only by `agent_id`.
 `decisionReason.type === "classifier" && decisionReason.classifier === "auto-mode"`. It is not
 emitted when a person simply answers no at the prompt, so it does not make every tool request
 answerable. `PermissionRequest` — the pre-decision event, which carries no `tool_use_id` — is where
-an ordinary refusal is visible, and conbus does not mirror it.
+an ordinary refusal is visible. conbus records it as `permission_asked`, not as a denial.
 
 ## Payloads
 
