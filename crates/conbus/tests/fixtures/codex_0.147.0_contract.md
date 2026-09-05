@@ -18,7 +18,8 @@ Extracted from the draft-07 JSON Schemas embedded in the shipped native binary o
   A failed tool and a quota refusal do not reach a hook at all; quota has to come from the
   app-server's `account/rateLimits`, which is the plan's probe #1.
 - **`PermissionRequest` is a pre-decision hook**, fired on every approval prompt. It is not a record
-  of refusal, and mapping it to a denial would log approvals as denials.
+  of refusal, and mapping it to a denial would log approvals as denials. conbus records it as
+  `permission_asked`.
 - `model` and `permission_mode` are required on nearly every event; `transcript_path` is nullable.
 
 ## Payloads

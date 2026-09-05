@@ -124,6 +124,8 @@ fn summarise(record: &Record) -> String {
             ),
         },
         Event::ToolRequested { tool, .. } => format!("tool {tool} requested"),
+        Event::PermissionAsked { tool, .. } => format!("permission asked for {tool}"),
+        Event::Notified { kind, .. } => format!("notified {kind}"),
         Event::ToolDenied { tool, reason, .. } => format!("tool {tool} denied ({reason})"),
         Event::ToolUse {
             tool,
@@ -193,6 +195,8 @@ fn summarise(record: &Record) -> String {
         | Event::TurnStarted { .. }
         | Event::TurnEnded { .. }
         | Event::SessionEnded { .. }
+        | Event::PermissionAsked { .. }
+        | Event::Notified { .. }
         | Event::Briefed { .. }
         | Event::Routed { .. }
         | Event::Continued { .. }
@@ -1232,6 +1236,23 @@ mod tests {
         }));
 
         assert!(line.contains("tool-batch of 2"), "{line}");
+    }
+
+    #[test]
+    fn a_permission_ask_does_not_read_as_a_denial() {
+        let asked = summarise(&record(Event::PermissionAsked {
+            tool: "Bash".into(),
+            input: Body::kept("i"),
+        }));
+        let notified = summarise(&record(Event::Notified {
+            kind: "example_kind".into(),
+            title: None,
+            message: "a message".into(),
+        }));
+
+        assert!(asked.contains("permission asked"), "{asked}");
+        assert!(!asked.contains("denied"), "{asked}");
+        assert!(notified.contains("notified example_kind"), "{notified}");
     }
 
     #[test]
