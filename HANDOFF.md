@@ -1,16 +1,22 @@
-# Handoff — 2026-08-31
+# Handoff — 2026-09-03
 
 Written for whoever picks this up next. The design phase is finished, the recorder is built, and it is installed and
 recording on this machine. Read this, then read the plan.
 
 ## Where things are
 
-- Repo: `/Applications/conbus`, remote `deximple/conbus`, **private**. The recorder work is on
-  `claude/pack-honesty` (as of 2026-09-03 03:50 KST). `main` is `ede9ae8`; PRs #5 (the Codex leg), #6 (doctor's eyes) and #7 (pack honesty, `conbus quota`) are stacked on it awaiting merge; nothing else is unpushed.
+- Repo: `/Applications/conbus`, remote `deximple/conbus`, **private**. As of 2026-09-03 08:10 KST everything is on
+  `main` (`4ed23e9`, PRs #1–#9 merged) and nothing is unpushed. The installed binary (`~/.local/bin/conbus`) and the
+  launchd daemon are build `883bf1610`, which is `main` minus two timestamps in a fixture document; `conbus doctor`
+  prints both stamps and says `DIFFERS` when they do not match.
+- The live machine, same moment: 41,259 records in 12 segments (94 MB), 3,767 conversations, 0 unreadable;
+  Claude Code hooks 11/11 registered, Codex hooks 6/6 registered and trusted; 15 twin sessions all bound to their
+  live side, 2 of them split before the twin rule existed; 157 drops, none unexplained. Codex history is in the
+  corpus: 277 threads, 2,783 turns, 5,759 records, applied 2026-09-03 08:02 KST.
 - The plan is the single source of truth: [`.cursor/plans/shared_workspace_context_3f7139b8.plan.md`](.cursor/plans/shared_workspace_context_3f7139b8.plan.md). The filename is a generated ID and no longer matches the content; leave it alone so the Cursor plan UI keeps its association. A reader-facing copy under `docs/` gets generated when the repo goes public.
 - `cargo 1.94.1` and `rustc 1.94.1` are installed on this machine, so edition 2024 is available.
 - A cargo workspace exists: `crates/conbus` (the binary) and `crates/conbus-core` (the lib). Edition 2024.
-  298 tests as of 2026-09-03 (130 + 2 + 14 + 28 + 124), `cargo clippy --all-targets -- -D warnings` clean. See "Next task" for what is built and what is not.
+  308 tests as of 2026-09-03 08:10 KST (130 + 2 + 4 + 14 + 28 + 130), `cargo clippy --all-targets -- -D warnings` clean. See "Next task" for what is built and what is not.
 
 ## What Conbus is, in one paragraph
 
@@ -264,6 +270,22 @@ in order of how much it changed:
   `SessionEnd` alone, which the daemon can only orphan. `tool_use_id` is `exec-<uuid>`; `tool_response` is a string.
 - Async hooks are allowed from 0.148 (0.147.0 dropped them). `codex exec` hung at MCP start-up here and is
   unverified as a hook source. Project-local `.codex/hooks.json` loads only after the directory itself is trusted.
+
+**Codex history is recovered too, through the app-server.**
+
+`conbus backfill` also asks a fresh `codex app-server` for `thread/list`, page by page, and `thread/turns/list` per
+thread, and folds each thread into a `session_candidate` plus a started/ended pair per prompt, stamped
+`backfilled_from: codex_thread` with the thread's `cwd`, `source` (`cli`, `vscode`) and `cliVersion`. The thread id
+equals `sessionId` equals the hook's `session_id`, so it is the `bus_id`, and the two rules the transcripts follow
+hold here: a thread the recorder saw live is left alone (4 of 281 on this machine), a thread recovered once is not
+recovered twice. One shape needed the transcript parser's rule: **the VS Code extension's legacy history splits one
+exchange into a prompt turn and reply-only turns** — 590 of 1,070 turns in the 60 most recent threads carried
+nothing but `agentMessage` items — so a reply belongs to the most recent prompt and the last reply ends it. A reply
+before any prompt (a forked or resumed thread whose prompt lives in its parent) is counted, 121 of them, not
+attached. On this machine: 277 threads from 2026-03-09, 2,783 turns, 5,759 records, in about two minutes, from
+0.107.0 threads onward. The JSON-RPC client (`appserver.rs`) is shared with `conbus quota`; tests never start the
+real server — a stand-in script speaks the captured shapes — because the first suite run that did recovered the
+author's real Codex history into two temp logs.
 
 **History is recovered.**
 
@@ -573,17 +595,21 @@ are its schema, its values are somebody's conversation.
 
 **Not done, and next.**
 
-5. **Codex backfill.** The Claude side is done; Codex is not, and it is harder than the plan assumes. Three things
-   were measured on this machine: `thread/read` returns metadata with `turns: []`, so content needs
-   `thread/turns/list` or `thread/items/list` chosen per thread by a `historyMode` field and both gated behind
-   `capabilities: {experimentalApi: true}`; `thread/list` sees 360 of the 1,335 rollouts actually on disk, i.e. 27%;
-   and the official path has **the same version-skew failure the plan attributes only to file parsing** — 0.147.0
-   returned `-32603 unknown variant` reading a thread a 0.150.0-alpha wrote. The plan's reasoning for treating the
-   official path as safe and file parsing as risky does not survive that. OpenCode `export` is untouched.
+5. ~~**Codex backfill.**~~ **Done 2026-09-03**, through the official surface — see "Codex history is recovered too"
+   below for the mechanism and the numbers. What the earlier version of this item measured on 0.147.0 (a
+   `-32603 unknown variant` reading a newer thread) did not reproduce on 0.152.1, whose app-server read every thread
+   back to 0.107.0. OpenCode `export` is untouched. **Running a backfill on the live machine** is a three-step
+   dance with two traps: `launchctl bootout gui/$UID/sh.conbus.daemon`, then *wait until the socket stops answering*
+   (the first `--apply` was refused with "a daemon is listening" because bootout had not finished), then
+   `conbus backfill --apply`, then `launchctl bootstrap gui/$UID ~/Library/LaunchAgents/sh.conbus.daemon.plist` —
+   which failed once with `Bootstrap failed: 5: Input/output error` and succeeded on retry. Every hook in that window
+   drops as "no daemon" (2.5 minutes, three drops, on 2026-09-03). A dry run needs none of this: it reads beside
+   the daemon.
 6. **The unmirrored events**, in the order they are worth having: `PermissionRequest` (where an ordinary refusal is
    visible), `Notification` (the only hook-channel signal that a quota limit *lifted*), `MessageDisplay`. Each is
    argued under "Still open". `SubagentStop` was on this list and is mirrored now.
-7. **A real quota exhaustion.** The one fixture that cannot be manufactured. Now that the recorder is running, the
+7. **A real quota exhaustion.** The one fixture that cannot be manufactured. The signal is already readable: probe #1
+   held (`account/rateLimits/read` is account-scoped), `conbus quota` prints the windows, and `doctor` ends with them. Now that the recorder is running, the
    first exhaustion records itself — treat it as an opportunity rather than an interruption. It is also the only
    thing that can produce a `continue/displaced` verdict: the counterfactual above found twelve `handed_off` and no
    `displaced`, because backfill can only recover a turn that completed.
@@ -592,6 +618,11 @@ are its schema, its values are somebody's conversation.
    then the hook client learning a second reply beside `SILENT_OK`. Note the hazard in the client's own reply
    matching: it treats `Recorded | Deferred` as success and everything else as a defect, so a new response variant
    with no arm becomes a per-turn stderr diagnostic.
+10. **Stage 0's remainder, in order.** The router — its inputs exist now: `conbus quota`'s `reached` signal on the
+   Codex side and `StopFailure` on the Claude side; then the rolling summary on the opposite vendor's low-effort model
+   (never on the leg it protects); then the asymmetric warm (Codex leg only); then the survival meter with the
+   counters written down beside the fields (see "The counters have to be written down"). None of these has a line of
+   code yet, and the plan's kill criteria start counting the day the router does.
 9. **The unknown fourth harness.** Something on this machine invokes the hook under Claude Code's name with camelCase
    events — `beforeSubmitPrompt`, `preToolUse`, `postToolUse`, `stop` — which neither known vendor uses. Cursor,
    Copilot CLI and Devin CLI all read Claude Code's settings file, so this is the third-harness surface arriving on
