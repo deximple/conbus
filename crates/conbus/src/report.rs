@@ -5,6 +5,7 @@ use std::io;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use conbus_core::event::{Event, ToolOutcome};
 use conbus_core::ids::BusId;
@@ -375,33 +376,53 @@ fn hook_runs(command: &str) -> Result<(), String> {
 /// A registered Codex hook does not run until a person approves it inside
 /// Codex. It is not executed-and-ignored — the process is never spawned — so
 /// the executability probe above says "runs" for a command Codex will never
-/// invoke. That is the same shape of lie as an empty drop log, and on this
-/// machine it is the live state: six conbus hooks registered, none trusted,
-/// none ever run.
+/// invoke. That is the same shape of lie as an empty drop log.
 ///
 /// Read, never written. Codex keeps the consent record as `trusted_hash` under
 /// `[hooks.state."<key>"]` in `config.toml`, and its own `hooks/list` hands out
 /// the very value that would forge it — so conbus detects and reports, and
-/// approving stays a person's act. A missing record proves untrusted; a present
-/// one proves trusted-or-modified, which this cannot tell apart without asking
-/// Codex, so it does not claim to.
+/// approving stays a person's act. A missing record proves untrusted. A present
+/// one is trusted *or* modified; only `hooks/list`'s `trustStatus` tells them
+/// apart, and a modified hook is as silent as an untrusted one.
 fn report_codex_trust(home: &Path) {
-    let Some(state) = codex_trust(home) else {
-        return;
+    let (state, from_list) = match live_codex_trust() {
+        Some(state) => (state, true),
+        None => match codex_trust(home) {
+            Some(state) => (state, false),
+            None => return,
+        },
     };
-    if state.untrusted.is_empty() && state.trusted == 0 {
+    if state.blocked() == 0 && state.trusted == 0 {
         return;
     }
-    if state.untrusted.is_empty() {
+    if state.blocked() == 0 {
         println!("codex     {} hook(s) trusted", state.trusted);
+        if !from_list {
+            println!(
+                "          consent record present; Codex may still review if the command changed (hooks/list unavailable)"
+            );
+        }
         return;
     }
     println!(
-        "codex     {} of {} hook(s) NOT TRUSTED, so Codex never spawns them: {}",
-        state.untrusted.len(),
-        state.untrusted.len() + state.trusted,
-        state.untrusted.join(", ")
+        "codex     {} of {} hook(s) Codex will not spawn:",
+        state.blocked(),
+        state.blocked() + state.trusted
     );
+    if !state.untrusted.is_empty() {
+        println!("          NOT TRUSTED: {}", state.untrusted.join(", "));
+    }
+    if !state.modified.is_empty() {
+        println!(
+            "          MODIFIED (hash changed; Codex will not spawn until re-trusted): {}",
+            state.modified.join(", ")
+        );
+    }
+    if !from_list {
+        println!(
+            "          file probe only — modified hooks can look trusted until hooks/list answers"
+        );
+    }
     // The gesture, named. Approving is a person's act inside Codex and there is
     // no command conbus could run instead: the record is a hash, and Codex's
     // own `hooks/list` hands out the value that would forge it.
@@ -410,9 +431,87 @@ fn report_codex_trust(home: &Path) {
     );
     if state.others_untrusted > 0 {
         println!(
-            "          note: {} other untrusted hook(s) share that file and are approved in the same gesture",
+            "          note: {} other untrusted or modified hook(s) share that file and are approved in the same gesture",
             state.others_untrusted
         );
+    }
+}
+
+/// Ask Codex what it will actually spawn. The file-backed record cannot tell
+/// trusted from modified, and modified is the live failure mode after a deploy.
+///
+/// Starts a fresh app-server and waits up to 8s. A missing `codex` binary or
+/// a hung MCP handshake returns `None` and the file probe takes over.
+fn live_codex_trust() -> Option<CodexTrust> {
+    let mut server = crate::appserver::AppServer::start(Duration::from_secs(8)).ok()?;
+    let result = server.call("hooks/list", serde_json::json!({})).ok()?;
+    let state = trust_from_hooks_list(&result);
+    (state.trusted + state.blocked() > 0).then_some(state)
+}
+
+/// Parse `hooks/list`. `trustStatus` is the only field that distinguishes a
+/// hash Codex will honour from one it will silently ignore.
+fn trust_from_hooks_list(result: &serde_json::Value) -> CodexTrust {
+    let mut seen = HashSet::new();
+    let mut trusted = 0;
+    let mut untrusted = Vec::new();
+    let mut modified = Vec::new();
+    let mut others_untrusted = 0;
+    for group in result
+        .get("data")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        for hook in group
+            .get("hooks")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let command = hook
+                .get("command")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let event_name = hook
+                .get("eventName")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            // Every conbus entry shares one command string. Dedup on key, and
+            // if Codex omits it, on command+event — never command alone.
+            let key = hook
+                .get("key")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("{command}\0{event_name}"));
+            if !seen.insert(key) {
+                continue;
+            }
+            let status = hook
+                .get("trustStatus")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let event = hook
+                .get("eventName")
+                .and_then(serde_json::Value::as_str)
+                .map(title_event)
+                .unwrap_or_else(|| "?".into());
+            match (is_ours(command), status) {
+                (true, "trusted") => trusted += 1,
+                (true, "modified") => modified.push(event),
+                (true, _) => untrusted.push(event),
+                (false, "trusted") => {}
+                (false, _) => others_untrusted += 1,
+            }
+        }
+    }
+    untrusted.sort();
+    modified.sort();
+    CodexTrust {
+        trusted,
+        untrusted,
+        modified,
+        others_untrusted,
     }
 }
 
@@ -472,19 +571,39 @@ fn codex_trust(home: &Path) -> Option<CodexTrust> {
     Some(CodexTrust {
         trusted,
         untrusted,
+        modified: Vec::new(),
         others_untrusted,
     })
 }
 
 /// What Codex's own consent record says about the hooks in one file.
 struct CodexTrust {
-    /// Ours, with a trust record.
+    /// Ours, with a hash Codex will honour.
     trusted: usize,
-    /// Ours, without one — the events Codex will not run.
+    /// Ours, with no consent record — the events Codex will not run.
     untrusted: Vec<String>,
-    /// Everybody else's, without one. Not ours to report on beyond the number,
-    /// but part of what a person approves in the same gesture.
+    /// Ours, with a stale hash. Same silence as untrusted after a deploy.
+    modified: Vec<String>,
+    /// Everybody else's, without a matching hash. Not ours to report on
+    /// beyond the number, but part of what a person approves in the same
+    /// gesture.
     others_untrusted: usize,
+}
+
+impl CodexTrust {
+    fn blocked(&self) -> usize {
+        self.untrusted.len() + self.modified.len()
+    }
+}
+
+/// `hooks/list` names events in camelCase; hooks.json and this report use
+/// PascalCase. First-letter title case is enough — the rest is already camel.
+fn title_event(name: &str) -> String {
+    let mut chars = name.chars();
+    match chars.next() {
+        None => String::new(),
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+    }
 }
 
 /// Codex names its events in snake_case in the trust key, where its hook file
@@ -937,6 +1056,83 @@ mod tests {
         assert_eq!(snake_case("UserPromptSubmit"), "user_prompt_submit");
         assert_eq!(snake_case("PreToolUse"), "pre_tool_use");
         assert_eq!(snake_case("Stop"), "stop");
+    }
+
+    #[test]
+    fn hooks_list_separates_modified_from_trusted() {
+        // The live lie this exists for: a consent record is still in
+        // config.toml after a dirty deploy, so the file probe said
+        // UserPromptSubmit was trusted while Codex's own hooks/list said
+        // modified — and modified hooks never spawn.
+        let listed = serde_json::json!({
+            "data": [{
+                "cwd": "/tmp/one",
+                "hooks": [
+                    {
+                        "key": "/x/hooks.json:user_prompt_submit:0:0",
+                        "eventName": "userPromptSubmit",
+                        "command": "/x/conbus hook --harness codex",
+                        "trustStatus": "modified"
+                    },
+                    {
+                        "key": "/x/hooks.json:session_start:0:0",
+                        "eventName": "sessionStart",
+                        "command": "/x/conbus hook --harness codex",
+                        "trustStatus": "trusted"
+                    },
+                    {
+                        "key": "/x/hooks.json:permission_request:1:0",
+                        "eventName": "permissionRequest",
+                        "command": "/x/conbus hook --harness codex",
+                        "trustStatus": "untrusted"
+                    },
+                    {
+                        "key": "/x/hooks.json:pre_tool_use:0:0",
+                        "eventName": "preToolUse",
+                        "command": "paseo hooks codex PreToolUse",
+                        "trustStatus": "modified"
+                    }
+                ]
+            }, {
+                "cwd": "/tmp/two",
+                "hooks": [
+                    {
+                        "key": "/x/hooks.json:user_prompt_submit:0:0",
+                        "eventName": "userPromptSubmit",
+                        "command": "/x/conbus hook --harness codex",
+                        "trustStatus": "modified"
+                    }
+                ]
+            }]
+        });
+        let state = trust_from_hooks_list(&listed);
+        assert_eq!(state.trusted, 1);
+        assert_eq!(state.modified, vec!["UserPromptSubmit"]);
+        assert_eq!(state.untrusted, vec!["PermissionRequest"]);
+        assert_eq!(state.others_untrusted, 1);
+        assert_eq!(state.blocked(), 2);
+    }
+
+    #[test]
+    fn a_hooks_list_entry_without_a_key_is_not_collapsed_by_command() {
+        let listed = serde_json::json!({
+            "data": [{
+                "hooks": [
+                    {
+                        "eventName": "userPromptSubmit",
+                        "command": "/x/conbus hook --harness codex",
+                        "trustStatus": "modified"
+                    },
+                    {
+                        "eventName": "stop",
+                        "command": "/x/conbus hook --harness codex",
+                        "trustStatus": "modified"
+                    }
+                ]
+            }]
+        });
+        let state = trust_from_hooks_list(&listed);
+        assert_eq!(state.modified, vec!["Stop", "UserPromptSubmit"]);
     }
 
     #[test]

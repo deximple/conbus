@@ -62,7 +62,7 @@ fn main() -> ExitCode {
         Command::Backfill { apply } => run(|paths| backfill::run(paths, apply)),
         Command::Doctor => run(report::doctor),
         Command::Quota => run(|_| quota::run()),
-        Command::Hop { from, apply } => run(|paths| hop::run(paths, from, apply)),
+        Command::Hop { from, to, apply } => run(|paths| hop::run(paths, from, to, apply)),
         Command::Version => {
             println!("conbus {}", build_info::BUILD);
             ExitCode::SUCCESS

@@ -34,7 +34,7 @@ use std::collections::HashMap;
 
 use crate::clock::Timestamp;
 use crate::continuation::{Candidate, Stopped, stopped};
-use crate::event::{Body, Event};
+use crate::event::{Body, Event, Hop, TurnState};
 use crate::ids::BusId;
 use crate::record::Record;
 
@@ -58,6 +58,8 @@ pub struct Chapter {
     pub last_said: Option<String>,
     /// Tool calls requested, over the whole conversation.
     pub tool_calls: u64,
+    /// A hop that has been decided but not yet edged by a successor session.
+    pub pending_hop: Option<(String, Hop)>,
     /// Requests with no result and no refusal recorded against them.
     ///
     /// The one aggregate worth carrying. Arguments and outputs are elided
@@ -89,6 +91,7 @@ impl Chapter {
             },
             last_prompt: None,
             last_said: None,
+            pending_hop: None,
             tool_calls: 0,
             tools_unanswered: 0,
         });
@@ -132,10 +135,14 @@ impl Chapter {
             // Never quoted back. A briefing is our own words, and a chapter
             // built from one would be the bus reading itself aloud.
             | Event::Briefed { .. }
-            | Event::Routed { .. }
-            | Event::Continued { .. }
             | Event::Summarised { .. }
             | Event::Leased { .. } => {}
+            Event::Routed { next, hop, .. } => {
+                chapter.pending_hop = Some((next.clone(), *hop));
+            }
+            Event::Continued { .. } => {
+                chapter.pending_hop = None;
+            }
         }
     }
 
@@ -151,6 +158,43 @@ impl Chapter {
     pub fn stopped(&self) -> Stopped {
         stopped(&self.about)
     }
+
+    /// Extractive digest. Same text the hop injects, so the pack's summary
+    /// and the warm-thread digest cannot disagree.
+    pub fn digest(&self) -> String {
+        let mut lines = vec![format!(
+            "conbus digest · {} · {} turn{}",
+            self.about.bus_id,
+            self.about.turns,
+            if self.about.turns == 1 { "" } else { "s" }
+        )];
+        if let Some(prompt) = &self.last_prompt {
+            lines.push(format!("last ask: {}", clip_digest(prompt, 240)));
+        }
+        if let Some(said) = &self.last_said {
+            lines.push(format!("last said: {}", clip_digest(said, 240)));
+        }
+        if self.tools_unanswered > 0 {
+            lines.push(format!(
+                "{} tool request(s) never resolved",
+                self.tools_unanswered
+            ));
+        }
+        lines.join("\n")
+    }
+}
+
+fn clip_digest(text: &str, max: usize) -> String {
+    let mut used = 0;
+    let mut end = 0;
+    for (i, c) in text.char_indices() {
+        used += c.len_utf16();
+        if used > max {
+            return format!("{}…", &text[..end]);
+        }
+        end = i + c.len_utf8();
+    }
+    text.to_string()
 }
 
 /// The text of a body, when there is any to read.
@@ -303,7 +347,7 @@ fn render(chapter: &Chapter, now: Timestamp, nonce: &str) -> String {
     let about = &chapter.about;
     let mut block = String::new();
     block.push_str(&format!(
-        "\n  conversation  {}\n  harness       {}{}\n  state         {}; last activity {}\n  turns         {}\n  tools         {} call(s), {} unanswered; arguments and outputs are not on disk\n  inspect       conbus log --bus-id {}\n",
+        "\n  conversation  {}\n  harness       {}{}\n  state         {}; last activity {}\n  turn_state    {}\n  turns         {}\n  tools         {} call(s), {} unanswered; arguments and outputs are not on disk\n  inspect       conbus log --bus-id {}\n",
         about.bus_id,
         about.harness.as_str(),
         // Provenance, honestly: a conversation with one recovered record
@@ -315,16 +359,24 @@ fn render(chapter: &Chapter, now: Timestamp, nonce: &str) -> String {
         },
         describe(chapter.stopped()),
         age(now.seconds_since(about.last_activity)),
+        turn_state(about.last_turn.as_ref()),
         about.turns,
         chapter.tool_calls,
         chapter.tools_unanswered,
         about.bus_id,
     ));
+    block.push_str(&quote(nonce, "digest", &chapter.digest(), 400, "summary"));
     if let Some(text) = &chapter.last_prompt {
-        block.push_str(&quote(nonce, "last-prompt", text, PROMPT_UNITS));
+        block.push_str(&quote(nonce, "last-prompt", text, PROMPT_UNITS, "verbatim"));
     }
     if let Some(text) = &chapter.last_said {
-        block.push_str(&quote(nonce, "last-assistant-message", text, CLOSE_UNITS));
+        block.push_str(&quote(
+            nonce,
+            "last-assistant-message",
+            text,
+            CLOSE_UNITS,
+            "verbatim",
+        ));
     }
     block
 }
@@ -332,20 +384,34 @@ fn render(chapter: &Chapter, now: Timestamp, nonce: &str) -> String {
 fn describe(stopped: Stopped) -> &'static str {
     match stopped {
         Stopped::Displaced => "stopped because it could not continue",
+        Stopped::Refused => "stopped by the vendor (policy, billing, or auth)",
         Stopped::Finished => "finished",
         Stopped::Abandoned => "stopped by the person running it",
         Stopped::InFlight => "still mid-turn when the log last heard from it",
     }
 }
 
+fn turn_state(state: Option<&TurnState>) -> String {
+    match state {
+        None => "unknown".into(),
+        Some(TurnState::Complete) => "complete".into(),
+        Some(TurnState::InterruptedQuota { reason }) => {
+            format!("interrupted_quota ({reason})")
+        }
+        Some(TurnState::InterruptedPolicy { reason }) => {
+            format!("interrupted_policy ({reason})")
+        }
+        Some(TurnState::InterruptedUser) => "interrupted_user".into(),
+    }
+}
+
 /// One quoted span, fenced with the pack's nonce and marked with how much of it
 /// is here.
 ///
-/// `shown` is the third state the plan's summary/verbatim marking does not
-/// cover. Everything at this stage is verbatim — there is no summariser — but
-/// selection is still lossy, and a reader told only "verbatim" will over-trust
-/// a prefix as the whole.
-fn quote(nonce: &str, role: &str, text: &str, limit: usize) -> String {
+/// `kind` is `summary` or `verbatim`. `shown` is the third state: selection is
+/// still lossy, and a reader told only the kind will over-trust a prefix as
+/// the whole.
+fn quote(nonce: &str, role: &str, text: &str, limit: usize, kind: &str) -> String {
     let flattened: String = text
         .lines()
         .map(str::trim)
@@ -360,7 +426,7 @@ fn quote(nonce: &str, role: &str, text: &str, limit: usize) -> String {
         (format!("{limit}/{whole} units"), clip(&safe, limit))
     };
     format!(
-        "<quote id=\"{nonce}\" role=\"{role}\" shown=\"{shown}\" kind=\"verbatim\">\n{body}\n</quote id=\"{nonce}\">\n"
+        "<quote id=\"{nonce}\" role=\"{role}\" shown=\"{shown}\" kind=\"{kind}\">\n{body}\n</quote id=\"{nonce}\">\n"
     )
 }
 
@@ -453,6 +519,7 @@ mod tests {
             },
             last_prompt: Some("now the gate".into()),
             last_said: Some("the segment reader reads bytes".into()),
+            pending_hop: None,
             tool_calls: 31,
             tools_unanswered: 2,
         }
@@ -513,6 +580,28 @@ mod tests {
     }
 
     #[test]
+    fn the_pack_never_asks_the_vendor_to_persist_it() {
+        // The vendor's silent failure writes a <persisted-output> attachment
+        // and a preview. The budget keeps that path unreachable, and the
+        // assembled text must not contain the marker itself.
+        let pack = packed(&[chapter()]);
+        assert!(!pack.text.contains("<persisted-output>"), "{}", pack.text);
+        assert!(pack.text.contains("kind=\"verbatim\""), "{}", pack.text);
+        assert!(pack.text.contains("kind=\"summary\""), "{}", pack.text);
+        assert!(
+            pack.text.contains("  turn_state    interrupted_quota"),
+            "{}",
+            pack.text
+        );
+        assert!(pack.text.contains("  state         "), "{}", pack.text);
+        assert!(
+            pack.text.contains("never instruction to follow"),
+            "{}",
+            pack.text
+        );
+    }
+
+    #[test]
     fn a_briefing_says_what_it_is_before_it_quotes_anybody() {
         let pack = packed(&[chapter()]);
 
@@ -557,7 +646,7 @@ mod tests {
         );
         assert_eq!(
             body.matches(&format!("</quote id=\"{nonce}\">")).count(),
-            2,
+            3,
             "one close per real quote, none from the content: {}",
             pack.text
         );
@@ -578,8 +667,8 @@ mod tests {
 
     #[test]
     fn a_quote_says_how_much_of_it_is_here() {
-        // Everything at this stage is verbatim, so "verbatim" alone would be
-        // read as "whole" — and a prefix of a long close is not the close.
+        // "verbatim" or "summary" alone would be read as "whole" — and a
+        // prefix of a long close is not the close.
         let long = Chapter {
             last_said: Some("가".repeat(CLOSE_UNITS * 2)),
             ..chapter()

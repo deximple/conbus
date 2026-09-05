@@ -33,34 +33,68 @@ pub fn decide_from(records: &[Record], from: Option<&str>) -> io::Result<String>
         })
 }
 
-pub fn run(paths: &Paths, from: Option<String>, apply: bool) -> io::Result<()> {
+pub fn run(paths: &Paths, from: Option<String>, to: Option<String>, apply: bool) -> io::Result<()> {
     let scan = SegmentLog::scan(paths.log_dir())?;
-    let (current, other, decision) = plan(&scan.records, from.as_deref())?;
+    let (current, other, automatic) = plan(&scan.records, from.as_deref())?;
+    let decision = match to.as_deref() {
+        Some(name) => directed(&current, &other, name)?,
+        None => automatic,
+    };
     println!("route     {}", decision.describe(&current.harness));
-    if let Decision::Hop { to, hop, reason } = &decision {
-        println!("next      {} · {reason}", to.as_str());
+    if let Decision::Hop {
+        to: next,
+        hop,
+        reason,
+    } = &decision
+    {
+        println!("next      {} · {reason}", next.as_str());
         if apply {
             apply_hop(
                 paths,
                 &scan.records,
                 from.as_deref(),
                 &current,
-                to,
+                next,
                 *hop,
                 reason,
             )?;
         } else {
             println!(
                 "record    conbus hop --apply{}",
-                match &from {
-                    Some(id) => format!(" --from {id}"),
-                    None => String::new(),
+                match (&from, &to) {
+                    (Some(id), Some(dest)) => format!(" --from {id} --to {dest}"),
+                    (Some(id), None) => format!(" --from {id}"),
+                    (None, Some(dest)) => format!(" --to {dest}"),
+                    (None, None) => String::new(),
                 }
             );
         }
     }
     let _ = other;
     Ok(())
+}
+
+/// A person named the next leg. That is a routing hop, not a failover.
+fn directed(current: &Leg, other: &Leg, name: &str) -> io::Result<Decision> {
+    let to = Harness::new(name);
+    if current.harness.as_str() == to.as_str() {
+        return Ok(Decision::Stay);
+    }
+    if route::opposite(&current.harness).as_ref() != Some(&to) {
+        return Err(io::Error::other(format!(
+            "can only hop to the other Stage 0 leg, not {name}"
+        )));
+    }
+    if other.harness == to && other.reached {
+        return Ok(Decision::Wait {
+            reason: "destination exhausted".into(),
+        });
+    }
+    Ok(Decision::Hop {
+        to,
+        hop: Hop::HandedOff,
+        reason: "directed".into(),
+    })
 }
 
 fn plan(records: &[Record], from: Option<&str>) -> io::Result<(Leg, Leg, Decision)> {
@@ -201,6 +235,13 @@ fn apply_hop(
             }
             Lease::Free => {
                 let thread = warm::open(focus.workspace.as_deref(), &text)?;
+                // A StopFailure hop already wrote `routed`. Opening the warm
+                // thread must not write a second decision.
+                if routed_to(records, focus.bus_id, to) {
+                    lease_only(paths, &focus, &warm::holder(&thread.id))?;
+                    println!("warm      opened {}", thread.id);
+                    return Ok(());
+                }
                 record_hop(paths, &focus, to, hop, reason, &warm::holder(&thread.id))?;
                 println!("recorded  routed {kind}");
                 println!("warm      opened {}", thread.id);
@@ -260,12 +301,70 @@ pub fn live_warm_threads(records: &[Record]) -> Vec<String> {
                 by_bus.insert(record.bus_id, warm::thread_id(holder).map(str::to_string));
             }
             Event::SessionEnded { .. } => {
-                by_bus.insert(record.bus_id, None);
+                if by_bus
+                    .get(&record.bus_id)
+                    .and_then(|id| id.as_deref())
+                    .is_none()
+                {
+                    by_bus.insert(record.bus_id, None);
+                }
             }
             _ => {}
         }
     }
     by_bus.into_values().flatten().collect()
+}
+
+fn routed_to(records: &[Record], bus_id: BusId, to: &Harness) -> bool {
+    records
+        .iter()
+        .rev()
+        .find_map(|record| {
+            if record.bus_id != bus_id {
+                return None;
+            }
+            match &record.event {
+                Event::Routed { next, .. } => Some(next == to.as_str()),
+                _ => None,
+            }
+        })
+        .unwrap_or(false)
+}
+
+fn lease_only(paths: &Paths, focus: &Focus, holder: &str) -> io::Result<()> {
+    let Some(session) = focus.vendor_session_id.clone() else {
+        return Err(io::Error::other(
+            "predecessor has no vendor session id; cannot lease a warm thread",
+        ));
+    };
+    match submit(
+        paths,
+        &Request {
+            protocol_version: Some(wire::PROTOCOL_VERSION),
+            harness: focus.harness.clone(),
+            harness_version: None,
+            vendor_session_id: session,
+            vendor_turn_id: None,
+            vendor_agent_id: None,
+            workspace: focus.workspace.clone(),
+            entrypoint: None,
+            brief: false,
+            event: Event::Leased {
+                holder: holder.into(),
+            },
+        },
+    ) {
+        Ok(Response::Recorded { .. } | Response::Briefed { .. }) => Ok(()),
+        Ok(Response::Orphaned) => Err(io::Error::other(
+            "daemon has no binding for this session; resume it or restart the daemon",
+        )),
+        Ok(other) => Err(io::Error::other(format!(
+            "daemon refused the lease: {other:?}"
+        ))),
+        Err(err) => Err(io::Error::other(format!(
+            "daemon not listening ({err}); hops are recorded through the daemon"
+        ))),
+    }
 }
 
 fn record_hop(
@@ -344,7 +443,11 @@ fn lease_of(records: &[Record], bus_id: BusId) -> Lease {
                     None => Lease::Held(holder.clone()),
                 };
             }
-            Event::SessionEnded { .. } => lease = Lease::Free,
+            Event::SessionEnded { .. } => {
+                if !matches!(lease, Lease::Warm(_)) {
+                    lease = Lease::Free;
+                }
+            }
             _ => {}
         }
     }
@@ -373,4 +476,166 @@ fn now_secs() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn claude() -> Leg {
+        Leg {
+            harness: Harness::new(Harness::CLAUDE_CODE),
+            last_turn: Some(TurnState::Complete),
+            used_percent: None,
+            minutes_to_reset: None,
+            reached: false,
+        }
+    }
+
+    fn codex() -> Leg {
+        Leg {
+            harness: Harness::new(Harness::CODEX),
+            last_turn: Some(TurnState::Complete),
+            used_percent: Some(0),
+            minutes_to_reset: Some(300),
+            reached: false,
+        }
+    }
+
+    #[test]
+    fn a_quota_routed_line_is_not_a_second_decision() {
+        let bus_id = "01a07243-a666-7d50-b64b-773b257d06e1".parse().expect("id");
+        let to = Harness::new(Harness::CODEX);
+        let routed = Record {
+            schema_version: conbus_core::record::SCHEMA_VERSION,
+            ts: "2026-09-06T00:00:00.000Z".parse().expect("ts"),
+            seq: 1,
+            bus_id,
+            vendor_turn_id: None,
+            vendor_agent_id: None,
+            source: conbus_core::event::Source {
+                harness: Harness::new(Harness::CLAUDE_CODE),
+                harness_version: None,
+                vendor_session_id: Some("s".into()),
+                workspace: None,
+                entrypoint: None,
+                backfilled_from: None,
+            },
+            event: Event::Routed {
+                next: Harness::CODEX.into(),
+                hop: Hop::Displaced,
+                reason: "rate_limit".into(),
+            },
+        };
+        assert!(routed_to(&[routed], bus_id, &to));
+    }
+
+    #[test]
+    fn a_directed_hop_is_a_routing_hop_not_a_failover() {
+        match directed(&claude(), &codex(), Harness::CODEX).expect("ok") {
+            Decision::Hop { to, hop, reason } => {
+                assert_eq!(to.as_str(), Harness::CODEX);
+                assert_eq!(hop, Hop::HandedOff);
+                assert_eq!(reason, "directed");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn directing_at_the_current_leg_stays() {
+        assert_eq!(
+            directed(&claude(), &codex(), Harness::CLAUDE_CODE).expect("ok"),
+            Decision::Stay
+        );
+    }
+
+    #[test]
+    fn directing_into_an_exhausted_leg_waits() {
+        let mut other = codex();
+        other.reached = true;
+        match directed(&claude(), &other, Harness::CODEX).expect("ok") {
+            Decision::Wait { reason } => assert!(reason.contains("exhausted"), "{reason}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn directing_at_an_unknown_harness_is_refused() {
+        let err = directed(&claude(), &codex(), "cursor").expect_err("must refuse");
+        assert!(err.to_string().contains("Stage 0"), "{err}");
+    }
+
+    fn rec(bus_id: BusId, session: &str, event: Event) -> Record {
+        Record {
+            schema_version: conbus_core::record::SCHEMA_VERSION,
+            ts: conbus_core::clock::Timestamp::now(),
+            seq: 0,
+            bus_id,
+            vendor_turn_id: None,
+            vendor_agent_id: None,
+            source: conbus_core::event::Source {
+                harness: Harness::new(Harness::CODEX),
+                harness_version: None,
+                vendor_session_id: Some(session.into()),
+                workspace: None,
+                entrypoint: None,
+                backfilled_from: None,
+            },
+            event,
+        }
+    }
+
+    #[test]
+    fn a_successor_session_end_does_not_drop_the_warm_thread() {
+        let bus_id = BusId::mint();
+        let records = [
+            rec(
+                bus_id,
+                "claude-1",
+                Event::Leased {
+                    holder: warm::holder("thr_bus"),
+                },
+            ),
+            rec(
+                bus_id,
+                "thr_bus",
+                Event::SessionEnded {
+                    reason: Some("other".into()),
+                },
+            ),
+        ];
+
+        assert!(matches!(lease_of(&records, bus_id), Lease::Warm(id) if id == "thr_bus"));
+        assert_eq!(live_warm_threads(&records), vec!["thr_bus".to_string()]);
+    }
+
+    #[test]
+    fn a_session_end_releases_a_plain_holder_but_not_a_warm_thread() {
+        let bus_id = BusId::mint();
+        let held = [
+            rec(
+                bus_id,
+                "claude-1",
+                Event::Leased {
+                    holder: "conbus-hop".into(),
+                },
+            ),
+            rec(bus_id, "claude-1", Event::SessionEnded { reason: None }),
+        ];
+        assert!(matches!(lease_of(&held, bus_id), Lease::Free));
+
+        let warm = [
+            rec(
+                bus_id,
+                "claude-1",
+                Event::Leased {
+                    holder: warm::holder("thr_bus"),
+                },
+            ),
+            rec(bus_id, "claude-1", Event::SessionEnded { reason: None }),
+        ];
+        assert!(matches!(lease_of(&warm, bus_id), Lease::Warm(id) if id == "thr_bus"));
+        assert_eq!(live_warm_threads(&warm), vec!["thr_bus".to_string()]);
+    }
 }

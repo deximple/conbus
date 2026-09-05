@@ -4,17 +4,62 @@
 //! read. The warm leg writes, and only into a thread we opened with
 //! `thread/start` — never into one the user minted.
 
+use std::ffi::OsString;
 use std::io::{self, BufRead, BufReader, Lines, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-/// Which binary answers. `CONBUS_CODEX_BIN` overrides `codex` on `PATH`, for
-/// tests and for a Codex installed somewhere the daemon's `PATH` does not see.
-pub fn codex_binary() -> std::ffi::OsString {
+/// Which binary answers. `CONBUS_CODEX_BIN` overrides `PATH`, for tests and
+/// for a Codex the daemon's launchd `PATH` (`/usr/bin:/bin:…`) cannot see.
+/// When that PATH is empty of `codex`, the sibling next to this binary is
+/// the install layout — both live under `~/.local/bin`.
+pub fn codex_binary() -> OsString {
     std::env::var_os("CONBUS_CODEX_BIN")
         .filter(|value| !value.is_empty())
+        .or_else(|| on_path("codex"))
+        .or_else(|| sibling_of_bus("codex"))
         .unwrap_or_else(|| "codex".into())
+}
+
+fn on_path(name: &str) -> Option<OsString> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path).find_map(|dir| executable(&dir.join(name)))
+}
+
+fn sibling_of_bus(name: &str) -> Option<OsString> {
+    let exe = std::env::current_exe().ok()?;
+    executable(&exe.parent()?.join(name))
+}
+
+fn executable(path: &Path) -> Option<OsString> {
+    path.is_file().then(|| path.as_os_str().to_os_string())
+}
+
+/// Codex is `#!/usr/bin/env node`. The launchd agent PATH is
+/// `/usr/bin:/bin:/usr/sbin:/sbin`, so `env node` dies before initialize.
+/// The node that can run the sibling `codex` lives next to this binary,
+/// then in the usual user-install directories.
+fn path_for_vendor() -> OsString {
+    let mut dirs = Vec::<PathBuf>::new();
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        dirs.push(dir.to_path_buf());
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        dirs.push(home.join(".local/bin"));
+        dirs.push(home.join(".npm-global/bin"));
+    }
+    dirs.push(PathBuf::from("/usr/local/bin"));
+    dirs.push(PathBuf::from("/opt/homebrew/bin"));
+    if let Some(existing) = std::env::var_os("PATH") {
+        dirs.extend(std::env::split_paths(&existing));
+    }
+    std::env::join_paths(dirs)
+        .unwrap_or_else(|_| std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into()))
 }
 
 pub struct AppServer {
@@ -35,6 +80,7 @@ impl AppServer {
         let binary = codex_binary();
         let mut child = Command::new(&binary)
             .arg("app-server")
+            .env("PATH", path_for_vendor())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -124,5 +170,34 @@ impl Drop for AppServer {
             let _ = child.kill();
             let _ = child.wait();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn a_codex_next_to_the_bus_is_found_when_path_is_empty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake = dir.path().join("codex");
+        fs::write(&fake, "#!/bin/sh\n").expect("write");
+        assert_eq!(
+            executable(&fake).as_deref(),
+            Some(fake.as_os_str()),
+            "the install layout is both binaries in one directory"
+        );
+        assert_eq!(executable(&dir.path().join("missing")), None);
+    }
+
+    #[test]
+    fn the_vendor_path_can_see_node_when_launchd_cannot() {
+        let path = path_for_vendor();
+        let path = path.to_string_lossy();
+        assert!(
+            path.contains("/usr/local/bin") && path.contains("/opt/homebrew/bin"),
+            "node is not on the launchd PATH: {path}"
+        );
     }
 }

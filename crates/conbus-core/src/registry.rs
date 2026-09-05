@@ -139,6 +139,7 @@ impl Registry {
                 seen_live.insert(key.clone());
             }
             registry.bound.insert(key, record.bus_id);
+            registry.alias_warm_leg(record.bus_id, &record.event);
         }
         registry
     }
@@ -146,6 +147,19 @@ impl Registry {
     /// The conversation a vendor session is bound to, if any.
     pub fn bus_id(&self, key: &SessionKey) -> Option<BusId> {
         self.bound.get(key).copied()
+    }
+
+    /// A `warm:` lease names a Codex thread the bus opened. Bind that thread
+    /// to this conversation so the successor keeps the predecessor's id.
+    ///
+    /// Does not steal: a Codex session that already has a binding stays there.
+    /// The strong identity claim is only for a thread we started ourselves.
+    fn alias_warm_leg(&mut self, bus_id: BusId, event: &Event) {
+        let Some(thread) = event.warm_thread() else {
+            return;
+        };
+        let alias = SessionKey::new(Harness::new(Harness::CODEX), thread);
+        self.bound.entry(alias).or_insert(bus_id);
     }
 
     /// The most session starts held at once before the oldest is forgotten.
@@ -184,6 +198,7 @@ impl Registry {
         // deferred — including the session starts that fire again on resume,
         // compact, and fork.
         if let Some(bus_id) = self.bound.get(key).copied() {
+            self.alias_warm_leg(bus_id, &observed.event);
             return Disposition::Write {
                 bus_id,
                 observed: vec![observed],
@@ -546,6 +561,107 @@ mod tests {
 
         assert_eq!(disposition, Disposition::Orphaned);
         assert_eq!(registry.bus_id(&key()), None);
+    }
+
+    #[test]
+    fn a_warm_thread_the_bus_opened_keeps_the_predecessors_id() {
+        let mut registry = Registry::new();
+        let claude = key();
+        let Disposition::Write { bus_id, .. } =
+            registry.observe(&claude, Observed::bare(prompt("work")))
+        else {
+            panic!("mint");
+        };
+
+        registry.observe(
+            &claude,
+            Observed::bare(Event::Leased {
+                holder: "warm:thr_bus".into(),
+            }),
+        );
+
+        let codex = SessionKey::new(Harness::new(Harness::CODEX), "thr_bus");
+        assert_eq!(
+            registry.observe(&codex, Observed::bare(prompt("continue"))),
+            Disposition::Write {
+                bus_id,
+                observed: vec![Observed::bare(prompt("continue"))],
+            }
+        );
+    }
+
+    #[test]
+    fn restoring_a_warm_lease_binds_the_codex_thread() {
+        let bus_id = BusId::mint();
+        let leased = logged(
+            0,
+            bus_id,
+            None,
+            Event::Leased {
+                holder: "warm:thr_bus".into(),
+            },
+        );
+
+        let mut registry = Registry::restore(std::slice::from_ref(&leased));
+
+        let codex = SessionKey::new(Harness::new(Harness::CODEX), "thr_bus");
+        assert_eq!(registry.bus_id(&codex), Some(bus_id));
+        assert_eq!(
+            registry.observe(&codex, Observed::bare(prompt("after restart"))),
+            Disposition::Write {
+                bus_id,
+                observed: vec![Observed::bare(prompt("after restart"))],
+            }
+        );
+    }
+
+    #[test]
+    fn a_warm_alias_does_not_steal_a_live_codex_session() {
+        let own = BusId::mint();
+        let other = BusId::mint();
+        let mut claimed = logged(0, own, None, prompt("already this conversation"));
+        claimed.source.harness = Harness::new(Harness::CODEX);
+        claimed.source.vendor_session_id = Some("thr_bus".into());
+        let mut leased = logged(
+            1,
+            other,
+            None,
+            Event::Leased {
+                holder: "warm:thr_bus".into(),
+            },
+        );
+        leased.source.vendor_session_id = Some("claude-1".into());
+
+        let registry = Registry::restore(&[claimed, leased]);
+
+        assert_eq!(
+            registry.bus_id(&SessionKey::new(Harness::new(Harness::CODEX), "thr_bus")),
+            Some(own)
+        );
+    }
+
+    #[test]
+    fn a_holder_that_is_not_a_warm_thread_aliases_nothing() {
+        let mut registry = Registry::new();
+        let Disposition::Write { bus_id, .. } =
+            registry.observe(&key(), Observed::bare(prompt("work")))
+        else {
+            panic!("mint");
+        };
+        registry.observe(
+            &key(),
+            Observed::bare(Event::Leased {
+                holder: "conbus-hop".into(),
+            }),
+        );
+
+        let stray = SessionKey::new(Harness::new(Harness::CODEX), "conbus-hop");
+        let Disposition::Write { bus_id: minted, .. } =
+            registry.observe(&stray, Observed::bare(prompt("unrelated")))
+        else {
+            panic!("must mint");
+        };
+        assert_ne!(minted, bus_id);
     }
 
     #[test]

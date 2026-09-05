@@ -6,6 +6,7 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use conbus_core::continuation::{
@@ -40,6 +41,10 @@ pub struct Daemon {
     /// The home directory, so a session started from it is not treated as a
     /// checkout containing every conversation on the machine.
     home: Option<String>,
+    /// A quota hop that still needs its Codex warm thread. Set on the hook
+    /// path, taken after the reply goes out — `thread/start` is too slow to
+    /// run while the vendor is waiting.
+    pending_warm: Option<BusId>,
 }
 
 impl Daemon {
@@ -56,6 +61,7 @@ impl Daemon {
             log,
             chapters,
             home: std::env::var("HOME").ok(),
+            pending_warm: None,
         }
     }
 
@@ -262,7 +268,49 @@ impl Daemon {
         seqs: &mut Vec<u64>,
     ) {
         self.maybe_route(source, written, seqs);
+        self.maybe_continue_leg(bus_id, source, written, seqs);
         self.maybe_summarise(bus_id, source, written, seqs);
+    }
+
+    /// The strong claim: we opened the next leg, so identity is known.
+    ///
+    /// Briefing never runs on this path — the chapter already exists — and
+    /// `maybe_continue` only fires after a briefing that led with a displaced
+    /// conversation. A directed hop would otherwise leave a `routed` line
+    /// with no edge.
+    fn maybe_continue_leg(
+        &mut self,
+        bus_id: BusId,
+        source: &Source,
+        written: &mut Vec<Record>,
+        seqs: &mut Vec<u64>,
+    ) {
+        if written
+            .iter()
+            .any(|record| matches!(record.event, Event::Continued { .. }))
+        {
+            return;
+        }
+        let Some((next, hop)) = self
+            .chapters
+            .get(&bus_id)
+            .and_then(|chapter| chapter.pending_hop.clone())
+        else {
+            return;
+        };
+        if source.harness.as_str() != next {
+            return;
+        }
+        self.write_extra(
+            bus_id,
+            source,
+            Event::Continued {
+                predecessor: bus_id,
+                hop,
+            },
+            written,
+            seqs,
+        );
     }
 
     fn maybe_route(&mut self, source: &Source, written: &mut Vec<Record>, seqs: &mut Vec<u64>) {
@@ -293,6 +341,15 @@ impl Daemon {
             written,
             seqs,
         );
+        if next.as_str() == conbus_core::event::Harness::CODEX {
+            self.pending_warm = Some(bus_id);
+        }
+    }
+
+    /// The conversation whose Codex warm thread should be opened now that
+    /// the hook has its reply.
+    pub fn take_pending_warm(&mut self) -> Option<BusId> {
+        self.pending_warm.take()
     }
 
     fn maybe_summarise(
@@ -545,11 +602,43 @@ pub fn serve(paths: &Paths, retention: Retention) -> io::Result<()> {
                 if let Err(err) = handle_connection(&mut daemon, stream) {
                     eprintln!("conbus daemon: connection failed: {err}");
                 }
+                if let Some(bus_id) = daemon.take_pending_warm() {
+                    spawn_warm_apply(bus_id);
+                }
             }
             Err(err) => eprintln!("conbus daemon: accept failed: {err}"),
         }
     }
     Ok(())
+}
+
+/// Open the Codex warm thread after a quota hop, out of the hook's deadline.
+///
+/// `conbus hop --apply` is the same path a person runs; it writes a lease
+/// and never injects into a thread they opened. The daemon must not wait
+/// for it — `thread/start` is seconds, the hook client gives up at 500ms.
+fn spawn_warm_apply(bus_id: BusId) {
+    let bin = std::env::current_exe().unwrap_or_else(|_| "conbus".into());
+    std::thread::spawn(move || {
+        let output = Command::new(bin)
+            .args(["hop", "--from", &bus_id.to_string(), "--apply"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output();
+        match output {
+            Ok(out) if out.status.success() => {}
+            Ok(out) => {
+                let err = String::from_utf8_lossy(&out.stderr);
+                eprintln!(
+                    "conbus daemon: automatic hop --apply for {bus_id} exited {}: {}",
+                    out.status,
+                    err.trim()
+                );
+            }
+            Err(err) => eprintln!("conbus daemon: automatic hop --apply failed: {err}"),
+        }
+    });
 }
 
 /// How long an accepted connection may stay silent before the daemon walks
@@ -783,6 +872,56 @@ mod tests {
         assert_eq!(next, Harness::CODEX);
         assert_eq!(*hop, Hop::Displaced);
         assert_eq!(reason, "rate_limit");
+        assert_eq!(
+            daemon.take_pending_warm(),
+            Some(scan.records[0].bus_id),
+            "the warm thread is opened after the hook is answered"
+        );
+    }
+
+    #[test]
+    fn a_successor_on_the_warm_leg_records_the_edge() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = SegmentLog::open(dir.path(), Retention::default()).expect("open");
+        let mut daemon = Daemon::new(log, Registry::new(), HashMap::new());
+        daemon.handle(request(Event::TurnStarted {
+            author: None,
+            prompt: Body::kept("hand this off"),
+        }));
+        daemon.handle(request(Event::Routed {
+            next: Harness::CODEX.into(),
+            hop: Hop::HandedOff,
+            reason: "directed".into(),
+        }));
+        daemon.handle(request(Event::Leased {
+            holder: "warm:thr_bus".into(),
+        }));
+
+        let response = daemon.handle(Request {
+            harness: Harness::new(Harness::CODEX),
+            vendor_session_id: "thr_bus".into(),
+            ..request(Event::SessionCandidate {
+                trigger: Some("resume".into()),
+            })
+        });
+
+        let Response::Recorded { bus_id, .. } = response else {
+            panic!("the warm thread must stay on the predecessor: {response:?}");
+        };
+        let scan = SegmentLog::scan(dir.path()).expect("scan");
+        let continued = scan
+            .records
+            .iter()
+            .find(|record| matches!(record.event, Event::Continued { .. }));
+        let Some(Event::Continued { predecessor, hop }) = continued.map(|r| &r.event) else {
+            panic!("the successor must leave a continued line: {scan:?}");
+        };
+        assert_eq!(*predecessor, bus_id);
+        assert_eq!(*hop, Hop::HandedOff);
+        assert!(
+            scan.records.iter().all(|r| r.bus_id == bus_id),
+            "identity must not move"
+        );
     }
 
     #[test]

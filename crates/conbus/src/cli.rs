@@ -28,6 +28,7 @@ pub enum Command {
     /// Decide which harness should serve the next turn.
     Hop {
         from: Option<String>,
+        to: Option<String>,
         apply: bool,
     },
     /// Say which build this binary is.
@@ -98,6 +99,7 @@ where
         "quota" => Command::Quota,
         "hop" => Command::Hop {
             from: flag_value(&args, "--from"),
+            to: flag_value(&args, "--to"),
             apply: args.iter().any(|a| a == "--apply"),
         },
         "version" | "--version" | "-V" => Command::Version,
@@ -123,10 +125,11 @@ USAGE:
     conbus backfill [--apply]     recover history from before the recorder ran
     conbus doctor                 report what is and is not wired up
     conbus quota                  ask Codex how much of the account's quota is used
-    conbus hop [--from ID] [--apply]
-                                  decide the next harness; --apply records the hop
-                                  and, when the next leg is Codex, opens or syncs
-                                  a bus-owned thread (not a model turn)
+    conbus hop [--from ID] [--to HARNESS] [--apply]
+                                  decide the next harness; --to is a directed
+                                  routing hop; --apply records it and, when the
+                                  next leg is Codex, opens or syncs a bus-owned
+                                  thread (not a model turn)
     conbus --version              say which build this is
 ";
 
@@ -175,13 +178,18 @@ mod tests {
             parse(["hop"], None),
             Command::Hop {
                 from: None,
+                to: None,
                 apply: false
             }
         );
         assert_eq!(
-            parse(["hop", "--from", "01996b1e", "--apply"], None),
+            parse(
+                ["hop", "--from", "01996b1e", "--to", "codex", "--apply"],
+                None
+            ),
             Command::Hop {
                 from: Some("01996b1e".into()),
+                to: Some("codex".into()),
                 apply: true
             }
         );
