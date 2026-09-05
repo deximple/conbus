@@ -120,8 +120,34 @@ So: account-scoped (`accountId`), a five-hour window and a weekly window each
 with `usedPercent` and an absolute `resetsAt`, `rateLimitReachedType` as the
 "exhausted" signal (`null` here), and the reset credits the June PR added. This
 is the signal the router was designed around, and it is readable without
-opening a thread. Not yet wired into conbus; the obvious next brick is a
-`conbus quota` command that runs this probe and a `doctor` line that shows it.
+opening a thread. `conbus quota` and doctor's last line run this probe.
+
+## First live exhaustion — `account/rateLimits/read` (2026-09-06 00:13 KST)
+
+The 5-hour window hit 100% while Codex.app (desktop, 152.0.7977.64) had been
+up for hours and the last *hooked* Codex record was a `session-end` on
+2026-09-04. Same handshake, same method, `rateLimitReachedType` was
+**`rate_limit_reached`** — not `primary`, which is the string a unit test had
+guessed from the window name. The captured, redacted reply is
+[`codex_0.152.1_quota_exhausted.json`](codex_0.152.1_quota_exhausted.json).
+
+```json
+{"rateLimits": {…same shape…, "primary": {"usedPercent": 100, …},
+  "rateLimitReachedType": "rate_limit_reached"},
+ "rateLimitUpsell": {"banner_type": "plus_rate_limit_reached",
+  "title": "You're out of Codex messages", …}}
+```
+
+Two things the capture changed:
+
+- **The router's Codex input is a poll, not a log event.** Codex hooks have no
+  `StopFailure`. Every hooked Codex `Stop` is recorded `complete`. This
+  exhaustion produced zero `interrupted_quota` / `rate_limit` records. A
+  `continue/displaced` verdict still cannot be derived from the log alone.
+- **Desktop burns the same account and does not hit our hooks.** The bus is a
+  passenger on Codex.app; probe #1 still sees the spend, because the limit is
+  account-scoped. That is why quota can read `EXHAUSTED` days after the last
+  mirrored Codex turn.
 
 ## Thread APIs for a Codex backfill (probed 2026-09-03 02:36 KST, read-only)
 

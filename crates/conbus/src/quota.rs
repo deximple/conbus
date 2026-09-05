@@ -185,12 +185,28 @@ mod tests {
 
     #[test]
     fn an_exhausted_account_says_so_in_capitals() {
+        // A 2026-09-03 guess used `"primary"` here. The first live exhaustion
+        // (2026-09-06) sent `rate_limit_reached` — pin that string, not the guess.
         let mut reply = captured();
-        reply["rateLimits"]["rateLimitReachedType"] = serde_json::json!("primary");
+        reply["rateLimits"]["rateLimitReachedType"] = serde_json::json!("rate_limit_reached");
 
         let line = describe(&parse(&reply).expect("parse"), 0);
 
-        assert!(line.contains("EXHAUSTED (primary)"), "{line}");
+        assert!(line.contains("EXHAUSTED (rate_limit_reached)"), "{line}");
+    }
+
+    #[test]
+    fn the_live_exhausted_reply_is_the_reached_signal() {
+        let reply: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/codex_0.152.1_quota_exhausted.json"
+        ))
+        .expect("fixture");
+        let quota = parse(&reply).expect("parse");
+
+        assert_eq!(quota.reached.as_deref(), Some("rate_limit_reached"));
+        assert_eq!(quota.primary.as_ref().map(|w| w.used_percent), Some(100));
+        assert_eq!(quota.reset_credits, 3);
+        assert!(describe(&quota, 1_788_626_797 - 5_400).contains("EXHAUSTED (rate_limit_reached)"));
     }
 
     #[test]

@@ -6,9 +6,11 @@ mod daemon;
 mod drops;
 mod harden;
 mod hook;
+mod hop;
 mod install;
 mod quota;
 mod report;
+mod warm;
 mod wire;
 
 use std::process::ExitCode;
@@ -60,6 +62,7 @@ fn main() -> ExitCode {
         Command::Backfill { apply } => run(|paths| backfill::run(paths, apply)),
         Command::Doctor => run(report::doctor),
         Command::Quota => run(|_| quota::run()),
+        Command::Hop { from, apply } => run(|paths| hop::run(paths, from, apply)),
         Command::Version => {
             println!("conbus {}", build_info::BUILD);
             ExitCode::SUCCESS

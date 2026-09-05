@@ -164,6 +164,18 @@ fn summarise(record: &Record) -> String {
             };
             format!("briefed about {} ({units} units{short})", named.join(" "))
         }
+        Event::Routed { next, hop, reason } => {
+            format!("routed {hop:?} → {next} ({reason})")
+        }
+        Event::Continued { predecessor, hop } => {
+            format!("continued {hop:?} from {predecessor}")
+        }
+        Event::Summarised {
+            backend,
+            covered_turns,
+            ..
+        } => format!("summarised {backend} after {covered_turns} turns"),
+        Event::Leased { holder } => format!("leased by {holder}"),
     };
     // Parallel calls of the same tool render identically without their id, and
     // the request-to-result join would be invisible in the view people read.
@@ -181,7 +193,11 @@ fn summarise(record: &Record) -> String {
         | Event::TurnStarted { .. }
         | Event::TurnEnded { .. }
         | Event::SessionEnded { .. }
-        | Event::Briefed { .. } => String::new(),
+        | Event::Briefed { .. }
+        | Event::Routed { .. }
+        | Event::Continued { .. }
+        | Event::Summarised { .. }
+        | Event::Leased { .. } => String::new(),
     };
     // A subagent's events arrive under the parent's session id, so without
     // this marker the human view interleaves two agents with no sign of it.
@@ -783,6 +799,21 @@ pub fn doctor(paths: &Paths) -> io::Result<()> {
     match crate::quota::read() {
         Ok(quota) => println!("quota     codex {}", crate::quota::describe(&quota, now)),
         Err(err) => println!("quota     codex unavailable — {err}"),
+    }
+
+    let meter = conbus_core::meter::Meter::fold(&scan.records);
+    println!("{}", meter.describe());
+    println!("{}", meter.describe_cost());
+    println!("{}", meter.describe_turns());
+    match crate::hop::decide_from(&scan.records, None) {
+        Ok(line) => println!("route     {line}"),
+        Err(err) => println!("route     unavailable — {err}"),
+    }
+    let warm = crate::hop::live_warm_threads(&scan.records);
+    if warm.is_empty() {
+        println!("warm      none");
+    } else {
+        println!("warm      {}", warm.join(" "));
     }
     Ok(())
 }

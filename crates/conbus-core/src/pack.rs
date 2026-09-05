@@ -129,7 +129,11 @@ impl Chapter {
             | Event::SessionEnded { .. }
             // Never quoted back. A briefing is our own words, and a chapter
             // built from one would be the bus reading itself aloud.
-            | Event::Briefed { .. } => {}
+            | Event::Briefed { .. }
+            | Event::Routed { .. }
+            | Event::Continued { .. }
+            | Event::Summarised { .. }
+            | Event::Leased { .. } => {}
         }
     }
 

@@ -290,6 +290,21 @@ pub enum TurnState {
     InterruptedUser,
 }
 
+/// Why a conversation moved to another harness.
+///
+/// Counted separately: failover (`displaced`) is how often a limit was hit,
+/// which we do not control; routing (`handed_off`) is the wedge.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Hop {
+    /// The current leg said it could not continue — quota, or an account that
+    /// is already exhausted. The router acts on this.
+    Displaced,
+    /// The bus moved the work before the limit, because the window was almost
+    /// gone and the reset was far enough away that staying would waste a turn.
+    HandedOff,
+}
+
 /// What a harness reported, normalised across vendors.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
@@ -418,6 +433,39 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "is_zero")]
         dropped: usize,
     },
+    /// The bus decided this conversation should continue on another harness.
+    ///
+    /// Written under the *predecessor*. Identity does not move: a later
+    /// `continued` under the successor is the edge, and either line can be
+    /// contradicted. `next` is a slug, not `harness` — that key is reserved
+    /// for the envelope.
+    Routed {
+        next: String,
+        hop: Hop,
+        reason: String,
+    },
+    /// A session is a continuation of an earlier conversation.
+    ///
+    /// Written under the *successor*. The predecessor keeps its id. Merging
+    /// two live trains of thought is forbidden; this records a relation that
+    /// can be wrong.
+    Continued { predecessor: BusId, hop: Hop },
+    /// A rolling digest of the conversation, written in the background.
+    ///
+    /// Hop path model calls stay zero: this is extractive (or produced by a
+    /// backend that is not the protected leg), never a call made while
+    /// hopping. The digest is conversation text, so default retention keeps it.
+    Summarised {
+        backend: String,
+        covered_turns: u64,
+        digest: Body,
+    },
+    /// A single writer claimed this conversation for a directed hop.
+    ///
+    /// `holder` starting `warm:` names a Codex thread the bus opened. A later
+    /// `conbus hop --apply` toward Codex syncs that thread instead of
+    /// refusing. Any other holder refuses until a later `session_ended` lands.
+    Leased { holder: String },
     SessionEnded {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,

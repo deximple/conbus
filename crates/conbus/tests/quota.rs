@@ -100,6 +100,51 @@ fn doctor_carries_the_quota_line() {
 }
 
 #[test]
+fn quota_prints_the_live_exhausted_signal() {
+    // The 2026-09-06 capture, not the "primary" guess. A fake app-server that
+    // speaks the live shape is how we know `conbus quota` will say so again.
+    let reply = include_str!("fixtures/codex_0.152.1_quota_exhausted.json");
+    let script = format!(
+        r#"#!/usr/bin/env python3
+import json, sys
+REPLY = json.loads({reply:?})
+for line in sys.stdin:
+    try:
+        msg = json.loads(line)
+    except Exception:
+        continue
+    if msg.get("method") == "initialize":
+        print(json.dumps({{"jsonrpc": "2.0", "id": msg["id"], "result": {{"userAgent": "fake"}}}}), flush=True)
+    elif msg.get("method") == "account/rateLimits/read":
+        print(json.dumps({{"jsonrpc": "2.0", "id": msg["id"], "result": REPLY}}), flush=True)
+"#
+    );
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("codex");
+    std::fs::write(&path, script).expect("write");
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_conbus"))
+        .arg("quota")
+        .env("CONBUS_CODEX_BIN", &path)
+        .output()
+        .expect("run quota");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("EXHAUSTED (rate_limit_reached)"),
+        "the live signal: {stdout}"
+    );
+    assert!(stdout.contains("100%"), "the five-hour window: {stdout}");
+}
+
+#[test]
 fn doctor_says_when_the_quota_cannot_be_read() {
     let home = tempfile::tempdir().expect("tempdir");
 
