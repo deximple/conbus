@@ -102,10 +102,11 @@ pub struct Candidate {
 /// something the briefing says, and every value of it is sayable.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Stopped {
-    /// It said it could not continue — quota, policy, billing, auth. The one a
-    /// person most needs told, because it is the only stop that was not a
-    /// choice.
+    /// The current leg hit quota. The one a person most needs told, and the
+    /// only stop the router hops on.
     Displaced,
+    /// The vendor refused on policy, billing, or auth. Not a quota hop.
+    Refused,
     /// It finished.
     Finished,
     /// The user stopped it.
@@ -462,9 +463,8 @@ pub fn machine_authored(prompt: &crate::event::Body) -> bool {
 pub fn stopped(candidate: &Candidate) -> Stopped {
     match candidate.last_turn.as_ref() {
         None => Stopped::InFlight,
-        Some(TurnState::InterruptedQuota { .. } | TurnState::InterruptedPolicy { .. }) => {
-            Stopped::Displaced
-        }
+        Some(TurnState::InterruptedQuota { .. }) => Stopped::Displaced,
+        Some(TurnState::InterruptedPolicy { .. }) => Stopped::Refused,
         Some(TurnState::Complete) => Stopped::Finished,
         Some(TurnState::InterruptedUser) => Stopped::Abandoned,
     }
@@ -958,7 +958,7 @@ mod tests {
             stopped(&with(Some(TurnState::InterruptedPolicy {
                 reason: "billing_error".into()
             }))),
-            Stopped::Displaced
+            Stopped::Refused
         );
         assert_eq!(stopped(&with(Some(TurnState::Complete))), Stopped::Finished);
         assert_eq!(

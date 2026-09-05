@@ -497,6 +497,20 @@ pub enum Event {
     },
 }
 
+impl Event {
+    /// The Codex thread a `leased` holder names, when the bus opened it.
+    ///
+    /// Identity is known on this path: the successor session is the thread we
+    /// started, not a conversation the briefing inferred. A holder that does
+    /// not start `warm:` is somebody else's claim and does not alias.
+    pub fn warm_thread(&self) -> Option<&str> {
+        match self {
+            Event::Leased { holder } => holder.strip_prefix("warm:").filter(|id| !id.is_empty()),
+            _ => None,
+        }
+    }
+}
+
 /// How a tool call ended.
 ///
 /// One call produces `PostToolUse` **or** `PostToolUseFailure`, never both, so

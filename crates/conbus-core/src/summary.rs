@@ -1,7 +1,8 @@
 //! Rolling digest of a conversation.
 //!
 //! Hop-path model calls are zero. The digest written on the live path is
-//! extractive: last prompt, last reply, unanswered tools. A model-backed
+//! extractive: last prompt, last reply, unanswered tools — the same digest
+//! the pack marks `kind="summary"`. A model-backed
 //! refresh is a separate command, and it is forbidden from using the leg
 //! it is protecting.
 
@@ -40,40 +41,9 @@ pub fn due(turns: u64) -> bool {
     turns > 0 && turns.is_multiple_of(EVERY_N_TURNS)
 }
 
-/// A short extractive digest. No model.
+/// A short extractive digest. No model. Same text the pack marks `summary`.
 pub fn extract(chapter: &Chapter) -> String {
-    let mut lines = vec![format!(
-        "conbus digest · {} · {} turn{}",
-        chapter.about.bus_id,
-        chapter.about.turns,
-        if chapter.about.turns == 1 { "" } else { "s" }
-    )];
-    if let Some(prompt) = &chapter.last_prompt {
-        lines.push(format!("last ask: {}", clip(prompt, 240)));
-    }
-    if let Some(said) = &chapter.last_said {
-        lines.push(format!("last said: {}", clip(said, 240)));
-    }
-    if chapter.tools_unanswered > 0 {
-        lines.push(format!(
-            "{} tool request(s) never resolved",
-            chapter.tools_unanswered
-        ));
-    }
-    lines.join("\n")
-}
-
-fn clip(text: &str, max: usize) -> String {
-    let mut units = 0;
-    let mut end = 0;
-    for (i, c) in text.char_indices() {
-        units += c.len_utf16();
-        if units > max {
-            return format!("{}…", &text[..end]);
-        }
-        end = i + c.len_utf8();
-    }
-    text.to_string()
+    chapter.digest()
 }
 
 #[cfg(test)]
@@ -97,6 +67,7 @@ mod tests {
             },
             last_prompt: Some("ship the router".into()),
             last_said: Some("working on it".into()),
+            pending_hop: None,
             tool_calls: 2,
             tools_unanswered: 1,
         }

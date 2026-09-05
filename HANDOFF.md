@@ -5,18 +5,34 @@ recording on this machine. Read this, then read the plan.
 
 ## Where things are
 
-- Repo: `/Applications/conbus`, remote `deximple/conbus`, **private**. `main` is `4d1839f` (PR #11 merged).
-  The installed binary and `sh.conbus.daemon` are build `4d1839f76`. Do not overwrite that inode in place:
-  write beside, rename, then `launchctl kickstart -k gui/$UID/sh.conbus.daemon`. `conbus doctor` prints both
-  stamps and says `DIFFERS` when they do not match. Next increment is `feat/mirror-permission-notification`.
-- The live machine, same moment: 46,256 records in 13 segments (96 MB), 3,886 conversations, 0 unreadable;
-  Claude Code hooks 11/11 registered, Codex hooks 6/6 registered and trusted; 17 twin sessions all bound to their
-  live side, 2 of them split before the twin rule existed; 578 drops, most of them Cursor camelCase events arriving
-  under Claude Code's name (`preToolUse` / `postToolUse` / `beforeSubmitPrompt`). Codex history is in the
-  corpus: 277 threads, 2,783 turns, 5,759 records, applied 2026-09-03 08:02 KST. Last *hooked* Codex record is a
-  `session-end` on 2026-09-04; Codex.app desktop has been running and burning the same account since.
-- Codex quota, same moment: `plan plus · 5h 100% used · weekly 76% · reset credits 3 · EXHAUSTED (rate_limit_reached)`.
-  That is the first live exhaustion. See item 7 under "Not done, and next".
+- Repo: `/Applications/conbus`, remote `deximple/conbus`, **private**. `main` is `f9d4a8e` (PR #12 merged).
+  This increment: `hop --to`, warm-thread identity bind, a warm lease that
+  survives the successor's `session_ended`, automatic quota `hop --apply`,
+  doctor reading `hooks/list` `trustStatus`, and the pack marking `summary` /
+  `verbatim` / `turn_state`. Do not overwrite the installed inode in place:
+  write beside, rename, then `launchctl kickstart -k gui/$UID/sh.conbus.daemon`.
+- The live machine, 2026-09-06 02:51 KST: ~46,425 records; Claude 13/13, Codex 7/7 **trusted**
+  via Codex's own "Trust all and continue" (conbus never writes `trusted_hash`). First live hop:
+  `01a07243-a666-7d50-b64b-773b257d06e1` routed `handed_off` → Codex (`directed`), leased
+  `warm:01a0728b-3c5e-7e61-abaa-1073358407f3`, `continued HandedOff` same `bus_id`. After trust,
+  `codex exec resume` without bypass wrote `turn-started`/`turn-ended Complete` (46394–46395).
+  A live `UserPromptSubmit` hook against `/Users/jaysong/Documents/myxpost` injected a 2479-unit
+  pack inline (`kind="summary"` + `kind="verbatim"` + `turn_state` + `CONBUS RECORD` fence;
+  no `<persisted-output>`; `continue: true`). Vendor TUI features recorded while hooks were
+  installed: `exit_plan_mode` (42589+), `session_candidate` `trigger=compact` (41646),
+  `spawn_subagent` succeeded (45632–45634). That briefing briefly treated an
+  `authentication_failed` conversation as Displaced and wrote `continued Displaced` (46399) —
+  policy is now `Stopped::Refused`, not a failover hop.
+- Automatic quota hop is live. A real `conbus hook` `StopFailure` `error=rate_limit` wrote
+  `InterruptedQuota` + one `routed Displaced` (46411). The daemon then spawned
+  `hop --apply` after the hook reply (launchd PATH has no `node`; `appserver` now finds the
+  sibling `codex` and prepends `~/.local/bin` so `#!/usr/bin/env node` runs). That opened
+  bus-owned `warm:01a072b0-5548-7da0-9a04-306dbdf4a1d7` and leased it (46412) without a
+  second `routed`. The same `bus_id` `01a072b0-5105-7243-b58e-1d9b92e5889e` then
+  `continued Displaced` (46414) and completed three Codex turns (`AUTOHOP` / `AUTOHOP2` /
+  `AUTOHOP3`) with no re-ask. Meter: `hops routing 1 · failover 3 · edges routing 1 ·
+  failover 3`. No organic Anthropic 5h 429 has appeared; the live path is the vendor hook
+  channel. Do not fire `StopFailure` at `01a07243` (the person's hop conversation).
 - The plan is the single source of truth: [`.cursor/plans/shared_workspace_context_3f7139b8.plan.md`](.cursor/plans/shared_workspace_context_3f7139b8.plan.md). The filename is a generated ID and no longer matches the content; leave it alone so the Cursor plan UI keeps its association. A reader-facing copy under `docs/` gets generated when the repo goes public.
 - `cargo 1.94.1` and `rustc 1.94.1` are installed on this machine, so edition 2024 is available.
 - A cargo workspace exists: `crates/conbus` (the binary) and `crates/conbus-core` (the lib). Edition 2024.
