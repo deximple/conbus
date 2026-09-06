@@ -149,17 +149,20 @@ impl Registry {
         self.bound.get(key).copied()
     }
 
-    /// A `warm:` lease names a Codex thread the bus opened. Bind that thread
-    /// to this conversation so the successor keeps the predecessor's id.
+    /// A `warm:` / `warm-claude:` lease names a session the bus opened. Bind
+    /// that session to this conversation so hop-back keeps the predecessor's id.
     ///
-    /// Does not steal: a Codex session that already has a binding stays there.
-    /// The strong identity claim is only for a thread we started ourselves.
+    /// Does not steal: a session that already has a binding stays there.
+    /// The strong identity claim is only for a session we started ourselves.
     fn alias_warm_leg(&mut self, bus_id: BusId, event: &Event) {
-        let Some(thread) = event.warm_thread() else {
-            return;
-        };
-        let alias = SessionKey::new(Harness::new(Harness::CODEX), thread);
-        self.bound.entry(alias).or_insert(bus_id);
+        if let Some(thread) = event.warm_thread() {
+            let alias = SessionKey::new(Harness::new(Harness::CODEX), thread);
+            self.bound.entry(alias).or_insert(bus_id);
+        }
+        if let Some(session) = event.claude_warm_session() {
+            let alias = SessionKey::new(Harness::new(Harness::CLAUDE_CODE), session);
+            self.bound.entry(alias).or_insert(bus_id);
+        }
     }
 
     /// The most session starts held at once before the oldest is forgotten.
@@ -637,6 +640,41 @@ mod tests {
         assert_eq!(
             registry.bus_id(&SessionKey::new(Harness::new(Harness::CODEX), "thr_bus")),
             Some(own)
+        );
+    }
+
+    #[test]
+    fn a_claude_warm_session_the_bus_opened_keeps_the_predecessors_id() {
+        let mut registry = Registry::new();
+        let claude = key();
+        let Disposition::Write { bus_id, .. } =
+            registry.observe(&claude, Observed::bare(prompt("work")))
+        else {
+            panic!("mint");
+        };
+
+        registry.observe(
+            &claude,
+            Observed::bare(Event::Leased {
+                holder: "warm-claude:sess_bus".into(),
+            }),
+        );
+
+        let resumed = SessionKey::new(Harness::new(Harness::CLAUDE_CODE), "sess_bus");
+        assert_eq!(
+            registry.observe(&resumed, Observed::bare(prompt("continue"))),
+            Disposition::Write {
+                bus_id,
+                observed: vec![Observed::bare(prompt("continue"))],
+            }
+        );
+        assert_eq!(
+            Event::Leased {
+                holder: "warm-claude:sess_bus".into(),
+            }
+            .warm_thread(),
+            None,
+            "warm-claude: must not look like a Codex thread"
         );
     }
 

@@ -111,11 +111,13 @@ mod tests {
                 next: "codex".into(),
                 hop: Hop::HandedOff,
                 reason: "80%".into(),
+                code_freshness: None,
             }),
             record(Event::Routed {
                 next: "codex".into(),
                 hop: Hop::Displaced,
                 reason: "rate_limit".into(),
+                code_freshness: None,
             }),
             record(Event::Continued {
                 predecessor: "01996b1e-2c4a-7c31-9d0e-4f2a6b8c1d3e".parse().expect("id"),

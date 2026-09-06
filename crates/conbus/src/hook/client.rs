@@ -223,14 +223,16 @@ pub fn run(harness: &str, stdin: &mut impl Read) -> Result<Reply, Dropped> {
 
     let request = Request {
         protocol_version: Some(crate::wire::PROTOCOL_VERSION),
-        harness: key.harness,
+        harness: key.harness.clone(),
         harness_version: vendor_version(harness),
         vendor_session_id: key.vendor_session_id,
         vendor_turn_id: observed.vendor_turn_id,
         vendor_agent_id: observed.vendor_agent_id,
         workspace: observed.workspace,
         entrypoint: entrypoint(harness),
-        brief: briefing_enabled(),
+        // Cursor's beforeSubmitPrompt accepts `continue`, not Claude's
+        // hookSpecificOutput. A briefing reply would be a different dialect.
+        brief: briefing_enabled() && key.harness.as_str() != Harness::CURSOR,
         event: observed.event,
     };
     send(harness, stream, &request, &hook_event_name)

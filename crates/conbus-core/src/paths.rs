@@ -88,6 +88,22 @@ impl Paths {
     pub fn socket(&self) -> PathBuf {
         self.root.join("conbus.sock")
     }
+
+    /// Written by `hop --apply` so `conbus run` can exec the next leg
+    /// in the same TTY, without the person opening a vendor window.
+    pub fn takeover(&self) -> PathBuf {
+        self.root.join("takeover.json")
+    }
+
+    /// Accepted facts. Derived from the log, confirmed here.
+    pub fn facts(&self) -> PathBuf {
+        self.root.join("facts.jsonl")
+    }
+
+    /// Workspace links: facts from `from` are visible in `to`.
+    pub fn links(&self) -> PathBuf {
+        self.root.join("links.jsonl")
+    }
 }
 
 #[cfg(test)]
@@ -144,5 +160,8 @@ mod tests {
 
         assert_eq!(paths.log_dir(), Path::new("/tmp/bus/log"));
         assert_eq!(paths.socket(), Path::new("/tmp/bus/conbus.sock"));
+        assert_eq!(paths.takeover(), Path::new("/tmp/bus/takeover.json"));
+        assert_eq!(paths.facts(), Path::new("/tmp/bus/facts.jsonl"));
+        assert_eq!(paths.links(), Path::new("/tmp/bus/links.jsonl"));
     }
 }

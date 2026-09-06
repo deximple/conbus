@@ -5,11 +5,56 @@ recording on this machine. Read this, then read the plan.
 
 ## Where things are
 
-- Repo: `/Applications/conbus`, remote `deximple/conbus`, **private**. `main` is `f9d4a8e` (PR #12 merged).
-  This increment: `hop --to`, warm-thread identity bind, a warm lease that
-  survives the successor's `session_ended`, automatic quota `hop --apply`,
-  doctor reading `hooks/list` `trustStatus`, and the pack marking `summary` /
-  `verbatim` / `turn_state`. Do not overwrite the installed inode in place:
+- Repo: `/Applications/conbus`, remote `deximple/conbus`, **private**. `main` is `069ea6c` (PR #13 merged).
+  Stage 1 is open (uncommitted on `main`). Cursor adapter keys on
+  `cursor_version` (live drop field names). Probe
+  `01a072c5-3022-7c62-b64a-578cd6177239` recorded 4 `cursor` lines
+  (46426–46429). Organic Cursor session `fb95c3ed` (this chat) is parsed —
+  36 `preToolUse`/`postToolUse`/`stop` orphans because no
+  `beforeSubmitPrompt` has fired since the adapter shipped; the next user
+  prompt will mint. `user_email` is discarded. No Cursor briefing yet.
+  `conbus status` is the control plane (not a chat): rules, quota, hop
+  history, cost. Live hops line matches doctor
+  (`routing 4 · failover 3 · edges routing 2 · failover 3`). Doctor:
+  `cursor    adapter live — 4 record(s)`.
+  **Gap fill is live.** Daemon restart reads official Claude transcripts
+  (same fixture-protected parser as `backfill`, not the hook path) and
+  appends missed turns under the live `bus_id`. `conbus backfill --gaps`
+  is the dry-run. Kickstart at 2026-09-05T18:21Z wrote
+  `filled 10 gap record(s)` (seq 46430–46439,
+  `backfilled_from=claude_transcript`) onto three existing conversations
+  (`01a0611a…`, `c6f006fc…`, `01a0611c…`). Second restart filled 0; dry-run
+  now reports 0. Ordinary `backfill --apply` still leaves live sessions
+  alone so it cannot twin them.
+  **`code_freshness` is live.** `gh` failing does not block hop. Throwaway
+  `01a072d2-2e0f-7b72-8afb-b4045e646cde` with `CONBUS_GH=/usr/bin/false`
+  `--apply --to claude_code` wrote seq 46441 `routed handed_off` carrying
+  `code_freshness=stale · 069ea6c · gh exited exit status: 1`, then leased
+  (46442).   The pack quotes that line; it does not call `gh` on the prompt
+  path.
+  **Same TTY:** `conbus run` is the parent of the vendor. `hop --apply`
+  writes `~/.conbus/takeover.json`. Run execs the next leg in that process
+  (`codex exec resume <warm-id> continue`). Live: hop on
+  `01a072d7-875b-7a13-b60a-a97ebdc007c7` opened bus-owned
+  `warm:01a072d7-a5b4-7e62-bdf3-e78825bbe7fc`, wrote takeover, and
+  `conbus run` started `exec resume … continue` in the same process.
+  **Arena live inject:** fact
+  `01a072d7-1d4f-7410-8620-123a2d614fb3` (A=`/Applications/conbus`) linked
+  into `/tmp/conbus-arena-b.IlB8`. B's first prompt (seq 46447) received
+  inline `additionalContext` with `arena decision · /Applications/conbus`
+  and the claim. Not a chat.
+  **Symmetric dual-warm is live.** Hop opens or syncs both legs.
+  Claude warm is `--session-id` we minted, `--max-turns 0` (no model turn),
+  `--permission-prompts none` (auto-deny, not skip-all). Holder
+  `warm-claude:<id>` aliases the Claude session to the predecessor `bus_id`.
+  Hop-back on the AUTOHOP bus
+  `01a072b0-5105-7243-b58e-1d9b92e5889e` opened
+  `01a072de-0883-7620-a656-8bdd0c0a33df` (seq 46453–46455), synced the
+  existing Codex warm `01a072b0-5548-7da0-9a04-306dbdf4a1d7`, wrote
+  takeover, and `conbus run` exec'd `--resume` of that same id. A later
+  `claude -p --resume … --max-turns 0` reported the same `session_id` —
+  not a new mint. Doctor: `warm      claude 01a072de-0883-…`.
+  Do not overwrite the installed inode in place:
   write beside, rename, then `launchctl kickstart -k gui/$UID/sh.conbus.daemon`.
 - The live machine, 2026-09-06 02:51 KST: ~46,425 records; Claude 13/13, Codex 7/7 **trusted**
   via Codex's own "Trust all and continue" (conbus never writes `trusted_hash`). First live hop:
@@ -48,7 +93,7 @@ All of these were argued through four review rounds. The reasoning is in the pla
 
 1. **The bus owns state and ID; vendor TUIs stay the window.** Stage 0 does not build a chat UI. Building one is what kills the product, because the vendor TUI is better than anything we'd ship in four weeks.
 2. **Stage 0 is Claude Code ↔ Codex only.** Cursor is excluded, not because it lacks hooks but because it has no structured quota signal, so automatic routing can't be proven there.
-3. **Stage 0 dual-warm is asymmetric: only the Codex leg stays warm.** Claude stays interactive. Claude's warm primitive (`shouldQuery: false`) runs through the Agent SDK, which is the exact path Anthropic's paused credit-separation policy targets. Symmetric dual-warm and the permission proxy are stage 1.
+3. **Stage 0 dual-warm is asymmetric: only the Codex leg stays warm.** Claude stays interactive. Claude's warm primitive (`shouldQuery: false`) runs through the Agent SDK, which is the exact path Anthropic's paused credit-separation policy targets. Symmetric dual-warm and the permission proxy are stage 1 — **delivered** (CLI stand-in: `--max-turns 0` + `--permission-prompts none`; see Where things are).
 4. **Stage 0 keeps four weeks by cutting scope**, not by extending. Moved to stage 1: the control plane, the arena implementation, full multi-harness install, gap filling. Kept: recorder, injection hardening, probes, pack/log schema, asymmetric warm, router, rolling summary, lease, survival meter, `doctor`, fact schema as a document.
 5. **The rolling summary cannot be cut**, and it must never run on the leg it is protecting. `claude -p` draws from the subscription limit, so summarizing with Claude burns the quota we're trying to preserve. Default backend is the opposite vendor's low-effort model.
 6. **Retention (1.5) is pulled into stage 1**, which drags envelope encryption and the cross-platform KEK abstraction with it. Shipping default stays "conversation only" (tool bodies not written to disk).
@@ -169,6 +214,13 @@ next to the real traffic that pins it. Read that before touching the adapter. Th
 and run one session; the schemas themselves come out of the binary with a search for `hook_event_name:Ct("`.
 
 ## Next task
+
+Stage 1 observation conditions are live on this machine (quota hop + 3 Codex
+turns, gap fill, Cursor adapter, `conbus status`, arena inject, `gh` stale,
+symmetric hop-back). Uncommitted on `main`. Do not commit unless asked. Do not
+register native `~/.cursor/hooks.json` yet (would double-record). Organic
+Cursor session `fb95c3ed` still has no minted `bus_id` until
+`beforeSubmitPrompt`. Do not fire `StopFailure` at `01a07243`.
 
 `recorder-first`. One week, **recording only, no injection** — that was the plan; the briefing shipped on 2026-09-01 and is live on both harnesses as of 2026-09-03. Injection hardening is a separate item because the
 quirks above take weeks, not days.

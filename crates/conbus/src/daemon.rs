@@ -45,6 +45,9 @@ pub struct Daemon {
     /// path, taken after the reply goes out — `thread/start` is too slow to
     /// run while the vendor is waiting.
     pending_warm: Option<BusId>,
+    /// Conbus root, so a briefing can load linked facts. Tests leave this
+    /// unset so they do not read the machine's arena files.
+    arena_root: Option<std::path::PathBuf>,
 }
 
 impl Daemon {
@@ -62,7 +65,13 @@ impl Daemon {
             chapters,
             home: std::env::var("HOME").ok(),
             pending_warm: None,
+            arena_root: None,
         }
+    }
+
+    pub fn with_arena(mut self, root: std::path::PathBuf) -> Self {
+        self.arena_root = Some(root);
+        self
     }
 
     /// Fold the log into the per-conversation state the briefing reads.
@@ -337,6 +346,7 @@ impl Daemon {
                 next: next.as_str().to_string(),
                 hop: Hop::Displaced,
                 reason,
+                code_freshness: None,
             },
             written,
             seqs,
@@ -480,20 +490,32 @@ impl Daemon {
             .values()
             .map(|chapter| chapter.about.clone())
             .collect();
-        let Decision::Brief { recent } =
-            decide(&asking, &candidates, self.home.as_deref(), prompt.ts)
-        else {
-            return None;
+        let decision = decide(&asking, &candidates, self.home.as_deref(), prompt.ts);
+        let facts = self.arena_facts(asking.workspace.as_deref());
+        let chapters: Vec<Chapter> = match &decision {
+            Decision::Brief { recent } => recent
+                .iter()
+                .filter_map(|id| self.chapters.get(id).cloned())
+                .collect(),
+            Decision::Silent(silent)
+                if matches!(silent, conbus_core::continuation::Silent::NothingToSay)
+                    && !facts.is_empty() =>
+            {
+                Vec::new()
+            }
+            _ => return None,
         };
 
         // In the order the decision named them. A briefing that reorders itself
         // is one whose leading item — the conversation that could not continue
         // — stops leading.
-        let chapters: Vec<Chapter> = recent
-            .iter()
-            .filter_map(|id| self.chapters.get(id).cloned())
-            .collect();
-        let packed = pack::brief(bus_id, &chapters, prompt.ts, pack::PACK_BUDGET_UNITS);
+        let packed = pack::brief_with(
+            bus_id,
+            &chapters,
+            &facts,
+            prompt.ts,
+            pack::PACK_BUDGET_UNITS,
+        );
         if packed.is_empty() {
             return None;
         }
@@ -526,6 +548,19 @@ impl Daemon {
             dropped: packed.dropped,
         };
         Some((packed.text, message, event))
+    }
+
+    fn arena_facts(&self, workspace: Option<&str>) -> Vec<String> {
+        let Some(root) = &self.arena_root else {
+            return Vec::new();
+        };
+        let Ok(paths) = Paths::from_env(root.to_str(), None, None) else {
+            return Vec::new();
+        };
+        match crate::arena::visible(&paths, workspace) {
+            Ok(facts) if !facts.is_empty() => crate::arena::render(&facts),
+            _ => Vec::new(),
+        }
     }
 }
 
@@ -561,7 +596,7 @@ pub fn serve(paths: &Paths, retention: Retention) -> io::Result<()> {
     // But a log we cannot read must not stop us recording: an empty registry
     // costs a forked conversation, which the vendor session id on every record
     // still makes recoverable, while refusing to start costs every future turn.
-    let scan = SegmentLog::scan(paths.log_dir()).unwrap_or_else(|err| {
+    let mut scan = SegmentLog::scan(paths.log_dir()).unwrap_or_else(|err| {
         eprintln!(
             "conbus daemon: could not read {} ({err}); starting with no bindings, \
              so a session that outlived the last daemon will get a second bus_id",
@@ -569,10 +604,21 @@ pub fn serve(paths: &Paths, retention: Retention) -> io::Result<()> {
         );
         Scan::default()
     });
+    let mut log = SegmentLog::open(paths.log_dir(), retention)?;
+    // Official transcripts only, same parser as `backfill --gaps`. Turns
+    // that happened while this process was dead join the live `bus_id`
+    // before hooks are accepted, so the registry sees one conversation.
+    match crate::backfill::append_gaps_at_start(paths, &scan.records, &mut log) {
+        Ok(0) => {}
+        Ok(n) => {
+            eprintln!("conbus daemon: filled {n} gap record(s) from official transcripts");
+            scan = SegmentLog::scan(paths.log_dir()).unwrap_or(scan);
+        }
+        Err(err) => eprintln!("conbus daemon: gap fill skipped ({err})"),
+    }
     let registry = Registry::restore(&scan.records);
     let chapters = Daemon::chapters(&scan.records);
-    let log = SegmentLog::open(paths.log_dir(), retention)?;
-    let mut daemon = Daemon::new(log, registry, chapters);
+    let mut daemon = Daemon::new(log, registry, chapters).with_arena(paths.root().to_path_buf());
 
     // Left beside the socket so `doctor` can compare the daemon's build with
     // its own — the drift a rename without a restart leaves behind.
@@ -866,7 +912,10 @@ mod tests {
             .records
             .iter()
             .find(|record| matches!(record.event, Event::Routed { .. }));
-        let Some(Event::Routed { next, hop, reason }) = routed.map(|r| &r.event) else {
+        let Some(Event::Routed {
+            next, hop, reason, ..
+        }) = routed.map(|r| &r.event)
+        else {
             panic!("the quota stop must leave a routed line: {scan:?}");
         };
         assert_eq!(next, Harness::CODEX);
@@ -892,6 +941,7 @@ mod tests {
             next: Harness::CODEX.into(),
             hop: Hop::HandedOff,
             reason: "directed".into(),
+            code_freshness: None,
         }));
         daemon.handle(request(Event::Leased {
             holder: "warm:thr_bus".into(),

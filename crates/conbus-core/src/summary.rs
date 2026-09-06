@@ -68,6 +68,7 @@ mod tests {
             last_prompt: Some("ship the router".into()),
             last_said: Some("working on it".into()),
             pending_hop: None,
+            code_freshness: None,
             tool_calls: 2,
             tools_unanswered: 1,
         }

@@ -20,7 +20,7 @@ These are legal or structural, not preferences.
 ## Decided, do not redesign
 
 - Vendor TUIs stay the window. We do not build a chat UI.
-- One binary, argv dispatch: `conbus daemon|hook|log|install|backfill|doctor|quota|hop|--version`. Cargo workspace internally. `hop --apply` toward Codex writes a bus-owned thread; it never injects into a thread the user opened.
+- One binary, argv dispatch: `conbus daemon|hook|log|install|backfill|doctor|quota|hop|status|run|arena|--version`. Cargo workspace internally. `hop --apply` opens or syncs a bus-owned warm on both legs (`warm:` Codex, `warm-claude:` Claude). It never injects into a thread the user opened.
 - JSONL segments are the source of truth. SQLite is a disposable derived index, always rebuildable from segments.
 - Data in `~/.conbus/`, respecting `$XDG_STATE_HOME`.
 - Derived state lives in the daemon's private memory, not a file-backed mmap ring.

@@ -209,6 +209,7 @@ mod tests {
                 next: "codex".into(),
                 hop: crate::event::Hop::Displaced,
                 reason: "rate_limit".into(),
+                code_freshness: Some("stale · gh unavailable".into()),
             },
             Event::Continued {
                 predecessor: "01996b1e-2c4a-7c31-9d0e-4f2a6b8c1d3e".parse().expect("id"),

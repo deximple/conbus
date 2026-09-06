@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use conbus_core::event::{Event, ToolOutcome};
+use conbus_core::event::{Event, Harness, ToolOutcome};
 use conbus_core::ids::BusId;
 use conbus_core::paths::Paths;
 use conbus_core::registry::{Registry, SessionKey};
@@ -167,8 +167,17 @@ fn summarise(record: &Record) -> String {
             };
             format!("briefed about {} ({units} units{short})", named.join(" "))
         }
-        Event::Routed { next, hop, reason } => {
-            format!("routed {hop:?} → {next} ({reason})")
+        Event::Routed {
+            next,
+            hop,
+            reason,
+            code_freshness,
+        } => {
+            let code = code_freshness
+                .as_deref()
+                .map(|c| format!(" · {c}"))
+                .unwrap_or_default();
+            format!("routed {hop:?} → {next} ({reason}){code}")
         }
         Event::Continued { predecessor, hop } => {
             format!("continued {hop:?} from {predecessor}")
@@ -928,15 +937,78 @@ pub fn doctor(paths: &Paths) -> io::Result<()> {
     println!("{}", meter.describe());
     println!("{}", meter.describe_cost());
     println!("{}", meter.describe_turns());
+    println!("{}", cursor_line(&scan.records));
     match crate::hop::decide_from(&scan.records, None) {
         Ok(line) => println!("route     {line}"),
         Err(err) => println!("route     unavailable — {err}"),
     }
     let warm = crate::hop::live_warm_threads(&scan.records);
-    if warm.is_empty() {
+    let claude = crate::hop::live_claude_sessions(&scan.records);
+    if warm.is_empty() && claude.is_empty() {
         println!("warm      none");
     } else {
-        println!("warm      {}", warm.join(" "));
+        if !warm.is_empty() {
+            println!("warm      {}", warm.join(" "));
+        }
+        if !claude.is_empty() {
+            println!("warm      claude {}", claude.join(" "));
+        }
+    }
+    Ok(())
+}
+
+/// How the router decides. Kept next to the numbers so a person can see
+/// the rule and the count on one page, without opening a chat.
+const ROUTING_RULES: &str = "\
+rules     Stage 0 legs claude_code ↔ codex; hop on InterruptedQuota or account \
+reached; predictive handoff at 80% used with reset > 120m; --to is HandedOff; \
+policy/auth is Refused, not failover";
+
+fn cursor_line(records: &[Record]) -> String {
+    let n = records
+        .iter()
+        .filter(|record| record.source.harness.as_str() == Harness::CURSOR)
+        .count();
+    format!(
+        "cursor    adapter live — {n} record(s); identified by cursor_version, not Claude field names"
+    )
+}
+
+fn hop_history(records: &[Record], limit: usize) -> Vec<String> {
+    records
+        .iter()
+        .rev()
+        .filter(|record| matches!(record.event, Event::Routed { .. } | Event::Continued { .. }))
+        .take(limit)
+        .map(summarise)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect()
+}
+
+/// The control plane. Not a chat: rules, quota, hop history, cost.
+pub fn status(paths: &Paths) -> io::Result<()> {
+    let scan = SegmentLog::scan(paths.log_dir())?;
+    let meter = conbus_core::meter::Meter::fold(&scan.records);
+    println!("{ROUTING_RULES}");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    match crate::quota::read() {
+        Ok(quota) => println!("quota     {}", crate::quota::describe(&quota, now)),
+        Err(err) => println!("quota     unavailable — {err}"),
+    }
+    println!("{}", meter.describe());
+    println!("{}", meter.describe_cost());
+    let hops = hop_history(&scan.records, 8);
+    if hops.is_empty() {
+        println!("history   no routed or continued line yet");
+    } else {
+        for line in hops {
+            println!("history   {line}");
+        }
     }
     Ok(())
 }
@@ -1608,5 +1680,42 @@ mod tests {
 
         assert_eq!(summary.total, 0, "no reconstruction, so not a twin");
         assert_eq!(summary.split, 1);
+    }
+
+    #[test]
+    fn doctor_names_the_cursor_adapter_and_how_many_records_it_wrote() {
+        let mut cursor = record(Event::TurnStarted {
+            author: None,
+            prompt: Body::kept("hi"),
+        });
+        cursor.source.harness = Harness::new(Harness::CURSOR);
+        assert_eq!(
+            cursor_line(&[cursor]),
+            "cursor    adapter live — 1 record(s); identified by cursor_version, not Claude field names"
+        );
+        assert!(cursor_line(&[]).contains("0 record(s)"));
+    }
+
+    #[test]
+    fn status_hop_history_matches_the_meter() {
+        use conbus_core::event::Hop;
+        let routed = record(Event::Routed {
+            next: Harness::CODEX.into(),
+            hop: Hop::Displaced,
+            reason: "rate_limit".into(),
+            code_freshness: None,
+        });
+        let continued = record(Event::Continued {
+            predecessor: routed.bus_id,
+            hop: Hop::Displaced,
+        });
+        let records = vec![routed, continued];
+        let meter = conbus_core::meter::Meter::fold(&records);
+        assert_eq!(meter.failover_hops, 1);
+        assert_eq!(meter.failover_edges, 1);
+        let history = hop_history(&records, 8);
+        assert_eq!(history.len(), 2);
+        assert!(history[0].contains("routed"), "{history:?}");
+        assert!(history[1].contains("continued"), "{history:?}");
     }
 }

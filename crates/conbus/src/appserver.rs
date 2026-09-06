@@ -41,7 +41,8 @@ fn executable(path: &Path) -> Option<OsString> {
 /// `/usr/bin:/bin:/usr/sbin:/sbin`, so `env node` dies before initialize.
 /// The node that can run the sibling `codex` lives next to this binary,
 /// then in the usual user-install directories.
-fn path_for_vendor() -> OsString {
+/// PATH a vendor child can see. Launchd's is too thin for `#!/usr/bin/env node`.
+pub fn path_for_vendor() -> OsString {
     let mut dirs = Vec::<PathBuf>::new();
     if let Ok(exe) = std::env::current_exe()
         && let Some(dir) = exe.parent()

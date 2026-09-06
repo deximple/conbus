@@ -315,7 +315,7 @@ pub fn normalize(harness: &Harness, json: &str) -> Result<Normalized, HookError>
 /// Anything that is not a finite, non-negative number that fits is recorded as
 /// no measurement at all, which is honest — we did not receive one we could
 /// read — and costs nothing else on the line.
-fn lenient_millis<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+pub(crate) fn lenient_millis<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
 where
     D: Deserializer<'de>,
 {
