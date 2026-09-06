@@ -3,6 +3,7 @@
 pub mod claude_code;
 pub mod client;
 pub mod codex;
+pub mod cursor;
 
 use conbus_core::event::Harness;
 use conbus_core::registry::{Observed, SessionKey};
@@ -49,16 +50,20 @@ pub struct HookError(pub String);
 /// one with the other's adapter produces records with no correlator at all and
 /// a full green test suite.
 ///
-/// An unfamiliar harness is refused rather than guessed at. Cursor, Copilot CLI
-/// and Devin CLI read Claude Code's settings format, so they will most likely
-/// share that adapter — but "most likely" is how the wrong parser gets chosen,
-/// and none of their payloads have been seen yet.
+/// An unfamiliar harness is refused rather than guessed at. Cursor reads
+/// Claude Code's settings file and invokes this hook under that name, so
+/// dispatch is by payload (`cursor_version`), not by the argv harness. The
+/// fields were pinned by the live drop log, not by Claude's schema.
 pub fn normalize(harness: &Harness, payload: &str) -> Result<Normalized, HookError> {
+    if cursor::looks_like(payload) {
+        return cursor::normalize(&Harness::new(Harness::CURSOR), payload);
+    }
     match harness.as_str() {
         Harness::CLAUDE_CODE => claude_code::normalize(harness, payload),
         Harness::CODEX => codex::normalize(harness, payload),
+        Harness::CURSOR => cursor::normalize(harness, payload),
         other => Err(HookError(format!(
-            "no adapter for harness {other:?}; conbus reads claude_code and codex"
+            "no adapter for harness {other:?}; conbus reads claude_code, codex, and cursor"
         ))),
     }
 }
@@ -115,8 +120,8 @@ mod tests {
 
     #[test]
     fn an_unknown_harness_is_refused_rather_than_guessed_at() {
-        let err = normalize(&Harness::new("cursor"), CLAUDE).expect_err("must refuse");
+        let err = normalize(&Harness::new("devin"), CLAUDE).expect_err("must refuse");
 
-        assert!(err.0.contains("cursor"), "unhelpful error: {}", err.0);
+        assert!(err.0.contains("devin"), "unhelpful error: {}", err.0);
     }
 }

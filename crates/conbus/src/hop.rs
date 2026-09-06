@@ -3,8 +3,8 @@
 //! The vendor TUI stays the window. This command does not open a chat. It
 //! prints where the next turn should go, and `--apply` writes that as a
 //! `routed` line under the predecessor so the kill criteria can start counting.
-//! When the next leg is Codex it also opens — or syncs — a bus-owned thread
-//! so the hop is not a cold start. That write is not a model turn.
+//! A hop opens — or syncs — a bus-owned warm on both legs so neither
+//! direction is a cold start. Those writes are not model turns.
 
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -41,6 +41,9 @@ pub fn run(paths: &Paths, from: Option<String>, to: Option<String>, apply: bool)
         None => automatic,
     };
     println!("route     {}", decision.describe(&current.harness));
+    let workspace = focus(&scan.records, from.as_deref()).and_then(|f| f.workspace);
+    let freshness = crate::code::probe(workspace.as_deref());
+    println!("code      {}", freshness.line());
     if let Decision::Hop {
         to: next,
         hop,
@@ -215,52 +218,92 @@ fn apply_hop(
     reason: &str,
 ) -> io::Result<()> {
     let focus = predecessor(records, from, current)?;
+    let code_freshness = Some(crate::code::probe(focus.workspace.as_deref()).line());
     let kind = match hop {
         Hop::Displaced => "displaced",
         Hop::HandedOff => "handed_off",
     };
-
-    if to.as_str() == Harness::CODEX {
-        let text = digest(records, focus.bus_id);
-        match lease_of(records, focus.bus_id) {
-            Lease::Held(holder) => {
-                return Err(io::Error::other(format!(
-                    "this conversation is already leased ({holder}); wait for it to end"
-                )));
-            }
-            Lease::Warm(id) => {
-                warm::sync(&id, &text)?;
-                println!("warm      synced {id}");
-                return Ok(());
-            }
-            Lease::Free => {
-                let thread = warm::open(focus.workspace.as_deref(), &text)?;
-                // A StopFailure hop already wrote `routed`. Opening the warm
-                // thread must not write a second decision.
-                if routed_to(records, focus.bus_id, to) {
-                    lease_only(paths, &focus, &warm::holder(&thread.id))?;
-                    println!("warm      opened {}", thread.id);
-                    return Ok(());
-                }
-                record_hop(paths, &focus, to, hop, reason, &warm::holder(&thread.id))?;
-                println!("recorded  routed {kind}");
-                println!("warm      opened {}", thread.id);
-                return Ok(());
-            }
-        }
-    }
 
     if matches!(lease_of(records, focus.bus_id), Lease::Held(_)) {
         return Err(io::Error::other(
             "this conversation is already leased for a hop; wait for it to end",
         ));
     }
-    record_hop(paths, &focus, to, hop, reason, "conbus-hop")?;
+
+    let text = digest(records, focus.bus_id);
+    let claude = ensure_claude_warm(paths, records, &focus, &text)?;
+    let had_codex = matches!(lease_of(records, focus.bus_id), Lease::Warm(_));
+    let codex = ensure_codex_warm(records, &focus, &text)?;
+    if !had_codex {
+        lease_only(paths, &focus, &warm::holder(&codex))?;
+    }
+
+    let (holder, thread) = if to.as_str() == Harness::CODEX {
+        (warm::holder(&codex), codex)
+    } else {
+        (warm::claude_holder(&claude), claude)
+    };
+
+    if routed_to(records, focus.bus_id, to) {
+        handoff(paths, &focus, to.as_str(), Some(&thread))?;
+        return Ok(());
+    }
+    record_hop(paths, &focus, to, hop, reason, &holder, code_freshness)?;
     println!("recorded  routed {kind}");
-    println!(
-        "open      the {} TUI in this checkout — the bus does not drive the vendor window",
-        to.as_str()
-    );
+    handoff(paths, &focus, to.as_str(), Some(&thread))?;
+    Ok(())
+}
+
+fn ensure_claude_warm(
+    paths: &Paths,
+    records: &[Record],
+    focus: &Focus,
+    text: &str,
+) -> io::Result<String> {
+    match claude_warm_of(records, focus.bus_id) {
+        Some(id) => {
+            warm::sync_claude(&id, text)?;
+            println!("warm      claude synced {id}");
+            Ok(id)
+        }
+        None => {
+            let thread = warm::open_claude(focus.workspace.as_deref(), text)?;
+            lease_only(paths, focus, &warm::claude_holder(&thread.id))?;
+            println!("warm      claude opened {}", thread.id);
+            Ok(thread.id)
+        }
+    }
+}
+
+fn ensure_codex_warm(records: &[Record], focus: &Focus, text: &str) -> io::Result<String> {
+    match lease_of(records, focus.bus_id) {
+        Lease::Warm(id) => {
+            warm::sync(&id, text)?;
+            println!("warm      synced {id}");
+            Ok(id)
+        }
+        Lease::Free => {
+            let thread = warm::open(focus.workspace.as_deref(), text)?;
+            println!("warm      opened {}", thread.id);
+            Ok(thread.id)
+        }
+        Lease::Held(holder) => Err(io::Error::other(format!(
+            "this conversation is already leased ({holder}); wait for it to end"
+        ))),
+    }
+}
+
+fn handoff(paths: &Paths, focus: &Focus, next: &str, thread: Option<&str>) -> io::Result<()> {
+    crate::takeover::write(
+        paths,
+        &crate::takeover::Takeover {
+            next: next.into(),
+            thread: thread.map(str::to_string),
+            bus_id: focus.bus_id.to_string(),
+            cwd: focus.workspace.clone(),
+        },
+    )?;
+    println!("window    takeover → {next} — conbus run execs the next leg in this TTY");
     Ok(())
 }
 
@@ -298,7 +341,9 @@ pub fn live_warm_threads(records: &[Record]) -> Vec<String> {
     for record in records {
         match &record.event {
             Event::Leased { holder } => {
-                by_bus.insert(record.bus_id, warm::thread_id(holder).map(str::to_string));
+                if let Some(id) = warm::thread_id(holder) {
+                    by_bus.insert(record.bus_id, Some(id.to_string()));
+                }
             }
             Event::SessionEnded { .. } => {
                 if by_bus
@@ -310,6 +355,19 @@ pub fn live_warm_threads(records: &[Record]) -> Vec<String> {
                 }
             }
             _ => {}
+        }
+    }
+    by_bus.into_values().flatten().collect()
+}
+
+/// Live Claude sessions the bus still holds a lease on.
+pub fn live_claude_sessions(records: &[Record]) -> Vec<String> {
+    let mut by_bus = std::collections::HashMap::<BusId, Option<String>>::new();
+    for record in records {
+        if let Event::Leased { holder } = &record.event
+            && let Some(id) = warm::claude_id(holder)
+        {
+            by_bus.insert(record.bus_id, Some(id.to_string()));
         }
     }
     by_bus.into_values().flatten().collect()
@@ -374,11 +432,13 @@ fn record_hop(
     hop: Hop,
     reason: &str,
     holder: &str,
+    code_freshness: Option<String>,
 ) -> io::Result<()> {
     let event = Event::Routed {
         next: to.as_str().to_string(),
         hop,
         reason: reason.to_string(),
+        code_freshness,
     };
     let Some(session) = focus.vendor_session_id.clone() else {
         return Err(io::Error::other(
@@ -430,6 +490,21 @@ enum Lease {
     Held(String),
 }
 
+fn claude_warm_of(records: &[Record], bus_id: BusId) -> Option<String> {
+    let mut id = None;
+    for record in records {
+        if record.bus_id != bus_id {
+            continue;
+        }
+        if let Event::Leased { holder } = &record.event
+            && let Some(session) = warm::claude_id(holder)
+        {
+            id = Some(session.to_string());
+        }
+    }
+    id
+}
+
 fn lease_of(records: &[Record], bus_id: BusId) -> Lease {
     let mut lease = Lease::Free;
     for record in records {
@@ -440,6 +515,10 @@ fn lease_of(records: &[Record], bus_id: BusId) -> Lease {
             Event::Leased { holder } => {
                 lease = match warm::thread_id(holder) {
                     Some(id) => Lease::Warm(id.to_string()),
+                    None if warm::claude_id(holder).is_some() => match lease {
+                        Lease::Warm(id) => Lease::Warm(id),
+                        other => other,
+                    },
                     None => Lease::Held(holder.clone()),
                 };
             }
@@ -525,6 +604,7 @@ mod tests {
                 next: Harness::CODEX.into(),
                 hop: Hop::Displaced,
                 reason: "rate_limit".into(),
+                code_freshness: None,
             },
         };
         assert!(routed_to(&[routed], bus_id, &to));
@@ -637,5 +717,50 @@ mod tests {
         ];
         assert!(matches!(lease_of(&warm, bus_id), Lease::Warm(id) if id == "thr_bus"));
         assert_eq!(live_warm_threads(&warm), vec!["thr_bus".to_string()]);
+    }
+
+    #[test]
+    fn a_claude_warm_does_not_drop_the_codex_lease() {
+        let bus_id = BusId::mint();
+        let records = [
+            rec(
+                bus_id,
+                "claude-1",
+                Event::Leased {
+                    holder: warm::holder("thr_bus"),
+                },
+            ),
+            rec(
+                bus_id,
+                "claude-1",
+                Event::Leased {
+                    holder: warm::claude_holder("sess_bus"),
+                },
+            ),
+        ];
+        assert!(matches!(lease_of(&records, bus_id), Lease::Warm(id) if id == "thr_bus"));
+        assert_eq!(
+            claude_warm_of(&records, bus_id).as_deref(),
+            Some("sess_bus")
+        );
+        assert_eq!(live_warm_threads(&records), vec!["thr_bus".to_string()]);
+        assert_eq!(live_claude_sessions(&records), vec!["sess_bus".to_string()]);
+    }
+
+    #[test]
+    fn a_claude_warm_alone_is_not_a_held_lease() {
+        let bus_id = BusId::mint();
+        let records = [rec(
+            bus_id,
+            "claude-1",
+            Event::Leased {
+                holder: warm::claude_holder("sess_bus"),
+            },
+        )];
+        assert!(matches!(lease_of(&records, bus_id), Lease::Free));
+        assert_eq!(
+            claude_warm_of(&records, bus_id).as_deref(),
+            Some("sess_bus")
+        );
     }
 }

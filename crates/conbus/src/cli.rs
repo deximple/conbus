@@ -19,10 +19,19 @@ pub enum Command {
         apply: bool,
     },
     /// Recover history from before the recorder was installed.
+    ///
+    /// `--gaps` is the other job: turns that happened while the daemon was
+    /// down, written under the live `bus_id` rather than as a second
+    /// conversation.
     Backfill {
         apply: bool,
+        gaps: bool,
     },
     Doctor,
+    /// The control plane: routing rules, quota, hop history, cost.
+    ///
+    /// Not a chat. The vendor TUI stays the window.
+    Status,
     /// Ask Codex's app-server how much of the account's quota is used.
     Quota,
     /// Decide which harness should serve the next turn.
@@ -30,6 +39,22 @@ pub enum Command {
         from: Option<String>,
         to: Option<String>,
         apply: bool,
+    },
+    /// Same TTY: start a vendor, and exec the next one when a hop lands.
+    Run {
+        harness: String,
+    },
+    /// Confirm a fact or link two workspaces so the next pack can see it.
+    Arena {
+        action: String,
+        workspace: Option<String>,
+        kind: Option<String>,
+        claim: Option<String>,
+        anchor: Option<String>,
+        from: Option<String>,
+        to: Option<String>,
+        bus_id: Option<String>,
+        seq: Option<u64>,
     },
     /// Say which build this binary is.
     Version,
@@ -85,6 +110,7 @@ where
         },
         "backfill" => Command::Backfill {
             apply: args.iter().any(|a| a == "--apply"),
+            gaps: args.iter().any(|a| a == "--gaps"),
         },
         "log" => Command::Log {
             json: args.iter().any(|a| a == "--json"),
@@ -96,11 +122,26 @@ where
             },
         },
         "doctor" => Command::Doctor,
+        "status" => Command::Status,
         "quota" => Command::Quota,
         "hop" => Command::Hop {
             from: flag_value(&args, "--from"),
             to: flag_value(&args, "--to"),
             apply: args.iter().any(|a| a == "--apply"),
+        },
+        "run" => Command::Run {
+            harness: args.get(1).cloned().unwrap_or_else(|| "claude_code".into()),
+        },
+        "arena" => Command::Arena {
+            action: args.get(1).cloned().unwrap_or_else(|| "fact".into()),
+            workspace: flag_value(&args, "--workspace"),
+            kind: flag_value(&args, "--type"),
+            claim: flag_value(&args, "--claim"),
+            anchor: flag_value(&args, "--anchor"),
+            from: flag_value(&args, "--from"),
+            to: flag_value(&args, "--to"),
+            bus_id: flag_value(&args, "--bus-id"),
+            seq: flag_value(&args, "--seq").and_then(|n| n.parse().ok()),
         },
         "version" | "--version" | "-V" => Command::Version,
         "help" | "--help" | "-h" => Command::Help,
@@ -122,14 +163,21 @@ USAGE:
     conbus log [--json] [--bus-id ID] [--since TS] [--tail N] [--grep TEXT]
                                   read the conversation log back
     conbus install [--apply]      register the hook with Claude Code and Codex
-    conbus backfill [--apply]     recover history from before the recorder ran
+    conbus backfill [--apply] [--gaps]
+                                  recover history; --gaps fills missed turns of live sessions
     conbus doctor                 report what is and is not wired up
+    conbus status                 routing rules, quota, hop history, cost
     conbus quota                  ask Codex how much of the account's quota is used
     conbus hop [--from ID] [--to HARNESS] [--apply]
                                   decide the next harness; --to is a directed
                                   routing hop; --apply records it and, when the
                                   next leg is Codex, opens or syncs a bus-owned
                                   thread (not a model turn)
+    conbus run [claude_code|codex]
+                                  same TTY: start a vendor; hop execs the next
+    conbus arena fact --workspace DIR --claim TEXT --anchor PATH
+    conbus arena link --from DIR --to DIR
+                                  accept a fact or link workspaces for the pack
     conbus --version              say which build this is
 ";
 
@@ -191,6 +239,53 @@ mod tests {
                 from: Some("01996b1e".into()),
                 to: Some("codex".into()),
                 apply: true
+            }
+        );
+    }
+
+    #[test]
+    fn status_is_a_command() {
+        assert_eq!(parse(["status"], None), Command::Status);
+    }
+
+    #[test]
+    fn run_and_arena_are_commands() {
+        assert_eq!(
+            parse(["run", "codex"], None),
+            Command::Run {
+                harness: "codex".into()
+            }
+        );
+        assert_eq!(
+            parse(["arena", "link", "--from", "/a", "--to", "/b"], None),
+            Command::Arena {
+                action: "link".into(),
+                workspace: None,
+                kind: None,
+                claim: None,
+                anchor: None,
+                from: Some("/a".into()),
+                to: Some("/b".into()),
+                bus_id: None,
+                seq: None
+            }
+        );
+    }
+
+    #[test]
+    fn backfill_gaps_is_a_flag() {
+        assert_eq!(
+            parse(["backfill"], None),
+            Command::Backfill {
+                apply: false,
+                gaps: false
+            }
+        );
+        assert_eq!(
+            parse(["backfill", "--gaps", "--apply"], None),
+            Command::Backfill {
+                apply: true,
+                gaps: true
             }
         );
     }

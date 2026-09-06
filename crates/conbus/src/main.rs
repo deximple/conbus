@@ -1,7 +1,9 @@
 mod appserver;
+mod arena;
 mod backfill;
 mod build_info;
 mod cli;
+mod code;
 mod daemon;
 mod drops;
 mod harden;
@@ -10,6 +12,8 @@ mod hop;
 mod install;
 mod quota;
 mod report;
+mod runner;
+mod takeover;
 mod warm;
 mod wire;
 
@@ -59,10 +63,33 @@ fn main() -> ExitCode {
         Command::Daemon => run(|paths| daemon::serve(paths, Retention::default())),
         Command::Log { json, filter } => run(|paths| report::log(paths, json, &filter)),
         Command::Install { apply } => run(|_| report::install(apply)),
-        Command::Backfill { apply } => run(|paths| backfill::run(paths, apply)),
+        Command::Backfill { apply, gaps } => run(|paths| {
+            if gaps {
+                backfill::run_gaps(paths, apply)
+            } else {
+                backfill::run(paths, apply)
+            }
+        }),
         Command::Doctor => run(report::doctor),
+        Command::Status => run(report::status),
         Command::Quota => run(|_| quota::run()),
         Command::Hop { from, to, apply } => run(|paths| hop::run(paths, from, to, apply)),
+        Command::Run { harness } => run(|paths| runner::run(paths, &harness)),
+        Command::Arena {
+            action,
+            workspace,
+            kind,
+            claim,
+            anchor,
+            from,
+            to,
+            bus_id,
+            seq,
+        } => run(|paths| {
+            arena::run(
+                paths, &action, workspace, kind, claim, anchor, from, to, bus_id, seq,
+            )
+        }),
         Command::Version => {
             println!("conbus {}", build_info::BUILD);
             ExitCode::SUCCESS

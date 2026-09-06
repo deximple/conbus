@@ -11,13 +11,14 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use conbus_core::backfill::{
-    CLAUDE_TRANSCRIPT, CODEX_THREAD, parse_claude_transcript, parse_codex_thread,
+    CLAUDE_TRANSCRIPT, CODEX_THREAD, Recovered, parse_claude_transcript, parse_codex_thread,
 };
 
 use crate::appserver::AppServer;
-use conbus_core::event::{Event, Harness};
+use conbus_core::event::{Body, Event, Harness};
 use conbus_core::ids::BusId;
 use conbus_core::paths::Paths;
+use conbus_core::record::{Entry, Record};
 use conbus_core::retention::Retention;
 use conbus_core::segment::SegmentLog;
 
@@ -49,6 +50,11 @@ pub struct Outcome {
     pub codex_live: u64,
     /// Why the Codex source could not be read at all, when it could not.
     pub codex_unavailable: Option<String>,
+    /// Live conversations that had at least one turn the official source
+    /// held and the log did not.
+    pub gap_sessions: u64,
+    pub gap_turns: u64,
+    pub gap_records: u64,
 }
 
 /// How long the app-server gets for the whole enumeration. Hundreds of
@@ -107,6 +113,187 @@ pub fn run(paths: &Paths, apply: bool) -> io::Result<()> {
         println!("\nNothing was written. Re-run with --apply to record it.");
     }
     Ok(())
+}
+
+/// Turns missed while the daemon was down, written under the live `bus_id`.
+///
+/// Ordinary backfill leaves live sessions alone so it cannot twin them.
+/// Gap fill is the other job: the official transcript (the same
+/// fixture-protected parser, not the live hook path) is read only to find
+/// turns the log does not already hold, and those are appended to the
+/// conversation the recorder already bound.
+pub fn run_gaps(paths: &Paths, apply: bool) -> io::Result<()> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| io::Error::other("no HOME to read history from"))?;
+    let transcripts = home.join(".claude").join("projects");
+    let outcome = fill_gaps(paths, &transcripts, apply)?;
+
+    println!("history   {}", transcripts.display());
+    println!(
+        "gaps      {} conversation(s), {} turn(s), {} record(s)",
+        outcome.gap_sessions, outcome.gap_turns, outcome.gap_records
+    );
+    println!("not read  {}", summarise_unread(&outcome.unread));
+    if apply {
+        println!("written to {}", paths.log_dir().display());
+    } else {
+        println!("\nNothing was written. Re-run with --apply to record it, or restart the daemon.");
+    }
+    Ok(())
+}
+
+/// Daemon start: fill gaps into a log the daemon already owns.
+///
+/// The socket is bound but the accept loop has not started, so this is not
+/// racing hook writes. A failure here must not stop the daemon recording.
+pub fn append_gaps_at_start(
+    _paths: &Paths,
+    held: &[Record],
+    log: &mut SegmentLog,
+) -> io::Result<u64> {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return Ok(0);
+    };
+    let transcripts = home.join(".claude").join("projects");
+    if !transcripts.is_dir() {
+        return Ok(0);
+    }
+    let outcome = append_gaps(&transcripts, held, Some(log))?;
+    Ok(outcome.gap_records)
+}
+
+/// Read live sessions' official transcripts and, when `apply`, append the
+/// turns the log does not already hold. Refuses to write while a daemon is
+/// listening — the daemon fills the same gaps itself on restart.
+pub fn fill_gaps(paths: &Paths, transcripts: &Path, apply: bool) -> io::Result<Outcome> {
+    if apply && std::os::unix::net::UnixStream::connect(paths.socket()).is_ok() {
+        return Err(io::Error::other(format!(
+            "a daemon is listening on {}; it fills gaps on restart, and writing \
+             beside it would interleave the same segment",
+            paths.socket().display()
+        )));
+    }
+    let held = SegmentLog::scan(paths.log_dir())?.records;
+    let mut log = apply
+        .then(|| SegmentLog::open(paths.log_dir(), Retention::default()))
+        .transpose()?;
+    append_gaps(transcripts, &held, log.as_mut())
+}
+
+/// Turns the official transcript has that the live log does not.
+///
+/// Reconstruction never outranks a live record: an already-seen turn stays
+/// the live one. A turn that happened while the daemon was down is written
+/// under the live `bus_id` so a restart does not fork the conversation.
+fn missing_from<'a>(
+    held: impl IntoIterator<Item = &'a Record>,
+    recovered: Recovered,
+) -> Vec<Entry> {
+    let mut seen_ids = HashSet::new();
+    let mut seen_prompts = HashSet::new();
+    let mut bus_id = None;
+    for record in held {
+        bus_id = Some(record.bus_id);
+        if let Some(id) = &record.vendor_turn_id {
+            seen_ids.insert(id.as_str().to_string());
+        }
+        if let Event::TurnStarted { prompt, .. } = &record.event
+            && let Some(text) = prompt_text(prompt)
+        {
+            seen_prompts.insert(text);
+        }
+    }
+    let Some(bus_id) = bus_id else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut keep_open = false;
+    for mut entry in recovered.entries {
+        if matches!(entry.event, Event::SessionCandidate { .. }) {
+            continue;
+        }
+        if let Event::TurnStarted { prompt, .. } = &entry.event {
+            let by_id = entry
+                .vendor_turn_id
+                .as_ref()
+                .is_some_and(|id| seen_ids.contains(id.as_str()));
+            let by_prompt = prompt_text(prompt).is_some_and(|text| seen_prompts.contains(&text));
+            keep_open = !by_id && !by_prompt;
+        }
+        if !keep_open {
+            continue;
+        }
+        entry.bus_id = bus_id;
+        if let Some(id) = &entry.vendor_turn_id {
+            seen_ids.insert(id.as_str().to_string());
+        }
+        if let Event::TurnStarted { prompt, .. } = &entry.event
+            && let Some(text) = prompt_text(prompt)
+        {
+            seen_prompts.insert(text);
+        }
+        out.push(entry);
+    }
+    out
+}
+
+fn prompt_text(body: &Body) -> Option<String> {
+    match body {
+        Body::Kept { text } | Body::Clipped { text, .. } => Some(text.clone()),
+        Body::Elided { .. } => None,
+    }
+}
+
+fn append_gaps(
+    transcripts: &Path,
+    held: &[Record],
+    mut log: Option<&mut SegmentLog>,
+) -> io::Result<Outcome> {
+    let known = known_from(held.iter());
+    let mut outcome = Outcome::default();
+    if !known.unreadable_live.is_empty() {
+        outcome.unread.insert(
+            "live session id is not a uuid".into(),
+            known.unreadable_live.len() as u64,
+        );
+    }
+    for file in session_files(transcripts)? {
+        let Some(session) = file
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .and_then(|stem| stem.parse::<BusId>().ok())
+        else {
+            continue;
+        };
+        let Some(&live_bus) = known.live_bus.get(&session) else {
+            continue;
+        };
+        let Ok(text) = fs::read_to_string(&file) else {
+            *outcome.unread.entry("unreadable file".into()).or_default() += 1;
+            continue;
+        };
+        let recovered = parse_claude_transcript(&text, live_bus);
+        for (reason, count) in &recovered.skipped {
+            *outcome.unread.entry(reason.clone()).or_default() += count;
+        }
+        let missing = missing_from(held.iter().filter(|r| r.bus_id == live_bus), recovered);
+        if missing.is_empty() {
+            continue;
+        }
+        outcome.gap_sessions += 1;
+        outcome.gap_turns += missing
+            .iter()
+            .filter(|e| matches!(e.event, Event::TurnStarted { .. }))
+            .count() as u64;
+        outcome.gap_records += missing.len() as u64;
+        if let Some(log) = log.as_deref_mut() {
+            for entry in missing {
+                log.append(entry)?;
+            }
+        }
+    }
+    Ok(outcome)
 }
 
 /// Read every transcript under `transcripts` — and, when `codex`, every
@@ -347,6 +534,9 @@ struct Known {
     /// first run of this that keyed only on its own output recovered every
     /// live session a second time.
     live: HashSet<BusId>,
+    /// The live `bus_id` the recorder minted for each Claude session. Last
+    /// write wins so a restart binds the same way the registry does.
+    live_bus: HashMap<BusId, BusId>,
     /// Codex sessions the recorder mirrored, by the vendor's session id —
     /// which is the thread id the app-server lists.
     live_codex: HashSet<BusId>,
@@ -357,13 +547,20 @@ struct Known {
 }
 
 fn known_sessions(paths: &Paths) -> io::Result<Known> {
+    Ok(known_from(
+        SegmentLog::scan(paths.log_dir())?.records.iter(),
+    ))
+}
+
+fn known_from<'a>(records: impl IntoIterator<Item = &'a Record>) -> Known {
     let mut known = Known {
         backfilled: HashMap::new(),
         live: HashSet::new(),
+        live_bus: HashMap::new(),
         live_codex: HashSet::new(),
         unreadable_live: HashSet::new(),
     };
-    for record in SegmentLog::scan(paths.log_dir())?.records {
+    for record in records {
         if record.source.backfilled_from.is_none() {
             let Some(session) = record.source.vendor_session_id.as_deref() else {
                 continue;
@@ -371,6 +568,7 @@ fn known_sessions(paths: &Paths) -> io::Result<Known> {
             match (record.source.harness.as_str(), session.parse::<BusId>()) {
                 (Harness::CLAUDE_CODE, Ok(session)) => {
                     known.live.insert(session);
+                    known.live_bus.insert(session, record.bus_id);
                 }
                 (Harness::CLAUDE_CODE, Err(_)) => {
                     known.unreadable_live.insert(session.to_string());
@@ -399,7 +597,7 @@ fn known_sessions(paths: &Paths) -> io::Result<Known> {
             .and_modify(|seen| *seen |= complete)
             .or_insert(complete);
     }
-    Ok(known)
+    known
 }
 
 /// Top-level session files only.
@@ -619,5 +817,92 @@ mod tests {
 
         assert!(refused.is_err(), "two writers on one segment");
         assert_eq!(records_on_disk(&machine), 0);
+    }
+
+    fn transcript_two_turns(machine: &Machine, session: &str) {
+        let project = machine.transcripts.join("-Applications-conbus");
+        fs::create_dir_all(&project).expect("project dir");
+        fs::write(
+            project.join(format!("{session}.jsonl")),
+            format!(
+                "{{\"type\":\"user\",\"sessionId\":\"{session}\",\"timestamp\":\"2026-08-31T09:33:02.222Z\",\
+                 \"version\":\"2.1.241\",\"cwd\":\"/Applications/conbus\",\"entrypoint\":\"cli\",\
+                 \"promptId\":\"P1\",\"message\":{{\"role\":\"user\",\"content\":\"Reply with OK\"}}}}\n\
+                 {{\"type\":\"assistant\",\"sessionId\":\"{session}\",\"timestamp\":\"2026-08-31T09:33:03.000Z\",\
+                 \"version\":\"2.1.241\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\
+                 \"text\":\"OK\"}}]}}}}\n\
+                 {{\"type\":\"user\",\"sessionId\":\"{session}\",\"timestamp\":\"2026-08-31T09:34:00.000Z\",\
+                 \"version\":\"2.1.241\",\"cwd\":\"/Applications/conbus\",\"entrypoint\":\"cli\",\
+                 \"promptId\":\"P2\",\"message\":{{\"role\":\"user\",\"content\":\"the turn the daemon missed\"}}}}\n\
+                 {{\"type\":\"assistant\",\"sessionId\":\"{session}\",\"timestamp\":\"2026-08-31T09:34:01.000Z\",\
+                 \"version\":\"2.1.241\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\
+                 \"text\":\"caught up\"}}]}}}}\n"
+            ),
+        )
+        .expect("write transcript");
+    }
+
+    fn live_bus(machine: &Machine) -> BusId {
+        SegmentLog::scan(machine.paths.log_dir())
+            .expect("scan")
+            .records[0]
+            .bus_id
+    }
+
+    #[test]
+    fn a_turn_missed_while_the_daemon_was_down_joins_the_live_bus() {
+        let machine = machine();
+        recorded_live(&machine, SESSION);
+        transcript_two_turns(&machine, SESSION);
+        let bus = live_bus(&machine);
+
+        let outcome = fill_gaps(&machine.paths, &machine.transcripts, true).expect("fill");
+
+        assert_eq!(outcome.gap_sessions, 1);
+        assert_eq!(outcome.gap_turns, 1);
+        assert_eq!(outcome.gap_records, 2, "the missed prompt and its reply");
+        let records = SegmentLog::scan(machine.paths.log_dir())
+            .expect("scan")
+            .records;
+        assert_eq!(records.len(), 3);
+        assert!(
+            records.iter().all(|r| r.bus_id == bus),
+            "same conversation, not a twin"
+        );
+        assert_eq!(
+            records[1].source.backfilled_from.as_deref(),
+            Some(CLAUDE_TRANSCRIPT)
+        );
+        match &records[1].event {
+            Event::TurnStarted { prompt, .. } => {
+                assert_eq!(prompt, &Body::kept("the turn the daemon missed"));
+            }
+            other => panic!("expected the missed prompt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_live_session_with_no_missing_turn_is_left_alone() {
+        let machine = machine();
+        recorded_live(&machine, SESSION);
+        transcript(&machine, SESSION);
+
+        let outcome = fill_gaps(&machine.paths, &machine.transcripts, true).expect("fill");
+
+        assert_eq!(outcome.gap_sessions, 0);
+        assert_eq!(records_on_disk(&machine), 1);
+    }
+
+    #[test]
+    fn gap_apply_refuses_while_a_daemon_is_listening() {
+        let machine = machine();
+        recorded_live(&machine, SESSION);
+        transcript_two_turns(&machine, SESSION);
+        let _daemon = UnixListener::bind(machine.paths.socket()).expect("listen");
+
+        let refused = fill_gaps(&machine.paths, &machine.transcripts, true);
+
+        assert!(refused.is_err());
+        assert_eq!(records_on_disk(&machine), 1);
     }
 }

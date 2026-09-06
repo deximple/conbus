@@ -60,6 +60,8 @@ pub struct Chapter {
     pub tool_calls: u64,
     /// A hop that has been decided but not yet edged by a successor session.
     pub pending_hop: Option<(String, Hop)>,
+    /// Last hop's view of the checkout. Absent until a hop recorded one.
+    pub code_freshness: Option<String>,
     /// Requests with no result and no refusal recorded against them.
     ///
     /// The one aggregate worth carrying. Arguments and outputs are elided
@@ -92,6 +94,7 @@ impl Chapter {
             last_prompt: None,
             last_said: None,
             pending_hop: None,
+            code_freshness: None,
             tool_calls: 0,
             tools_unanswered: 0,
         });
@@ -137,8 +140,16 @@ impl Chapter {
             | Event::Briefed { .. }
             | Event::Summarised { .. }
             | Event::Leased { .. } => {}
-            Event::Routed { next, hop, .. } => {
+            Event::Routed {
+                next,
+                hop,
+                code_freshness,
+                ..
+            } => {
                 chapter.pending_hop = Some((next.clone(), *hop));
+                if code_freshness.is_some() {
+                    chapter.code_freshness.clone_from(code_freshness);
+                }
             }
             Event::Continued { .. } => {
                 chapter.pending_hop = None;
@@ -277,6 +288,19 @@ understanding what was already done.";
 /// nonce. It is minted after every word this pack quotes was written, so quoted
 /// text cannot contain it — and quoted text is scrubbed of it anyway.
 pub fn brief(for_session: BusId, chapters: &[Chapter], now: Timestamp, budget: usize) -> Pack {
+    brief_with(for_session, chapters, &[], now, budget)
+}
+
+/// A briefing plus the arena tail — facts from this checkout and from
+/// workspaces linked to it. Facts alone are enough to speak when the
+/// checkout itself has no recent chapter.
+pub fn brief_with(
+    for_session: BusId,
+    chapters: &[Chapter],
+    facts: &[String],
+    now: Timestamp,
+    budget: usize,
+) -> Pack {
     let nonce = nonce_for(for_session);
     let open = format!("<conbus-record id=\"{nonce}\">\n{FRAME}\n");
     let close = format!("</conbus-record id=\"{nonce}\">");
@@ -286,7 +310,7 @@ pub fn brief(for_session: BusId, chapters: &[Chapter], now: Timestamp, budget: u
         return Pack {
             text: String::new(),
             units: 0,
-            dropped: chapters.len(),
+            dropped: chapters.len() + facts.len(),
         };
     }
 
@@ -300,6 +324,13 @@ pub fn brief(for_session: BusId, chapters: &[Chapter], now: Timestamp, budget: u
         }
         blocks.push(block);
     }
+    for fact in facts {
+        if floor + total(&blocks) + units(fact) > budget {
+            dropped += 1;
+            continue;
+        }
+        blocks.push(fact.clone());
+    }
 
     // Nothing fitted beside the framing. An empty fence is not a briefing, and
     // shipping one would spend the injection on a preamble about nothing.
@@ -307,7 +338,7 @@ pub fn brief(for_session: BusId, chapters: &[Chapter], now: Timestamp, budget: u
         return Pack {
             text: String::new(),
             units: 0,
-            dropped: chapters.len(),
+            dropped: chapters.len() + facts.len(),
         };
     }
 
@@ -347,7 +378,7 @@ fn render(chapter: &Chapter, now: Timestamp, nonce: &str) -> String {
     let about = &chapter.about;
     let mut block = String::new();
     block.push_str(&format!(
-        "\n  conversation  {}\n  harness       {}{}\n  state         {}; last activity {}\n  turn_state    {}\n  turns         {}\n  tools         {} call(s), {} unanswered; arguments and outputs are not on disk\n  inspect       conbus log --bus-id {}\n",
+        "\n  conversation  {}\n  harness       {}{}\n  state         {}; last activity {}\n  turn_state    {}\n  code_freshness {}\n  turns         {}\n  tools         {} call(s), {} unanswered; arguments and outputs are not on disk\n  inspect       conbus log --bus-id {}\n",
         about.bus_id,
         about.harness.as_str(),
         // Provenance, honestly: a conversation with one recovered record
@@ -360,6 +391,10 @@ fn render(chapter: &Chapter, now: Timestamp, nonce: &str) -> String {
         describe(chapter.stopped()),
         age(now.seconds_since(about.last_activity)),
         turn_state(about.last_turn.as_ref()),
+        chapter
+            .code_freshness
+            .as_deref()
+            .unwrap_or("unknown"),
         about.turns,
         chapter.tool_calls,
         chapter.tools_unanswered,
@@ -520,6 +555,7 @@ mod tests {
             last_prompt: Some("now the gate".into()),
             last_said: Some("the segment reader reads bytes".into()),
             pending_hop: None,
+            code_freshness: None,
             tool_calls: 31,
             tools_unanswered: 2,
         }
@@ -748,6 +784,45 @@ mod tests {
         // Re-encoding is the test: a lone surrogate would not survive it.
         let round_trip: Vec<u16> = clipped.encode_utf16().collect();
         assert_eq!(String::from_utf16(&round_trip).expect("valid"), clipped);
+    }
+
+    #[test]
+    fn a_linked_fact_is_named_in_the_pack() {
+        let pack = brief_with(
+            session(),
+            &[chapter()],
+            &[
+                "\n  arena         decision · /a\n  claim         minted on first prompt\n  anchor        ids.rs\n"
+                    .into(),
+            ],
+            now(),
+            PACK_BUDGET_UNITS,
+        );
+
+        assert!(
+            pack.text.contains("arena         decision"),
+            "{}",
+            pack.text
+        );
+        assert!(
+            pack.text.contains("minted on first prompt"),
+            "{}",
+            pack.text
+        );
+    }
+
+    #[test]
+    fn a_stale_checkout_is_named_in_the_pack() {
+        let pack = packed(&[Chapter {
+            code_freshness: Some("stale · gh unavailable".into()),
+            ..chapter()
+        }]);
+
+        assert!(
+            pack.text.contains("code_freshness stale · gh unavailable"),
+            "{}",
+            pack.text
+        );
     }
 
     #[test]

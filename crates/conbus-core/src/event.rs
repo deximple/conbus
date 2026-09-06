@@ -16,6 +16,9 @@ pub struct Harness(String);
 impl Harness {
     pub const CLAUDE_CODE: &'static str = "claude_code";
     pub const CODEX: &'static str = "codex";
+    /// Cursor invokes the Claude Code hook command with its own payload.
+    /// Identified by `cursor_version`, never by guessing Claude field names.
+    pub const CURSOR: &'static str = "cursor";
 
     pub fn new(slug: impl Into<String>) -> Self {
         Harness(slug.into())
@@ -468,6 +471,12 @@ pub enum Event {
         next: String,
         hop: Hop,
         reason: String,
+        /// How fresh the checkout looked when the hop was decided.
+        ///
+        /// `gh` failing must not block the hop; that case is recorded here
+        /// as stale so the next pack can say so without calling `gh` again.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code_freshness: Option<String>,
     },
     /// A session is a continuation of an earlier conversation.
     ///
@@ -487,9 +496,10 @@ pub enum Event {
     },
     /// A single writer claimed this conversation for a directed hop.
     ///
-    /// `holder` starting `warm:` names a Codex thread the bus opened. A later
-    /// `conbus hop --apply` toward Codex syncs that thread instead of
-    /// refusing. Any other holder refuses until a later `session_ended` lands.
+    /// `holder` starting `warm:` names a Codex thread the bus opened.
+    /// `warm-claude:` names a Claude session the bus opened. A later
+    /// `conbus hop --apply` syncs that leg instead of refusing. Any other
+    /// holder refuses until a later `session_ended` lands.
     Leased { holder: String },
     SessionEnded {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -501,11 +511,23 @@ impl Event {
     /// The Codex thread a `leased` holder names, when the bus opened it.
     ///
     /// Identity is known on this path: the successor session is the thread we
-    /// started, not a conversation the briefing inferred. A holder that does
+    /// started, not a conversation the briefing inferred. `warm-claude:` is
+    /// the other leg and does not alias a Codex thread. A holder that does
     /// not start `warm:` is somebody else's claim and does not alias.
     pub fn warm_thread(&self) -> Option<&str> {
         match self {
+            Event::Leased { holder } if holder.starts_with("warm-claude:") => None,
             Event::Leased { holder } => holder.strip_prefix("warm:").filter(|id| !id.is_empty()),
+            _ => None,
+        }
+    }
+
+    /// The Claude session a `leased` holder names, when the bus opened it.
+    pub fn claude_warm_session(&self) -> Option<&str> {
+        match self {
+            Event::Leased { holder } => holder
+                .strip_prefix("warm-claude:")
+                .filter(|id| !id.is_empty()),
             _ => None,
         }
     }

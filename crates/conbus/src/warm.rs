@@ -1,19 +1,23 @@
-//! The Stage 0 Codex warm leg.
+//! The warm legs.
 //!
-//! The bus opens a thread through `codex app-server` and writes history into
-//! it with `thread/inject_items`. That call is not a model turn. The thread
-//! is ours from the first RPC — we never pass a thread id the user minted.
-//! Syncing a later digest requires `thread/resume` first: inject targets a
-//! *loaded* thread, and a fresh app-server has not loaded yesterday's.
+//! Codex: the bus opens a thread through `codex app-server` and writes history
+//! with `thread/inject_items`. That call is not a model turn. The thread is
+//! ours from the first RPC — we never pass a thread id the user minted.
 //!
-//! This is not on the hook path. Starting an app-server is ~15s-bounded and
-//! would stall a prompt. `conbus hop --apply` is the writer.
+//! Claude: the bus opens a headless session with `--session-id` we minted and
+//! `--max-turns 0`, which is the CLI form of `shouldQuery: false`. Hop-back
+//! is `--resume` of that session, not a new mint. Permissions are
+//! `--permission-prompts none` (auto-deny), not skip-all.
+//!
+//! This is not on the hook path. `conbus hop --apply` is the writer.
 
 use std::io;
+use std::process::{Command, Stdio};
 
 use serde_json::json;
 
-use crate::appserver::AppServer;
+use crate::appserver::{self, AppServer};
+use crate::hook::client::INTERNAL_MARKER;
 use crate::quota::DEADLINE;
 
 /// How a `leased.holder` names a thread we opened.
@@ -24,8 +28,24 @@ pub fn holder(thread_id: &str) -> String {
 }
 
 pub fn thread_id(holder: &str) -> Option<&str> {
+    if claude_id(holder).is_some() {
+        return None;
+    }
     holder
         .strip_prefix(HOLDER_PREFIX)
+        .filter(|id| !id.is_empty())
+}
+
+/// How a `leased.holder` names a Claude session we opened.
+pub const CLAUDE_PREFIX: &str = "warm-claude:";
+
+pub fn claude_holder(session_id: &str) -> String {
+    format!("{CLAUDE_PREFIX}{session_id}")
+}
+
+pub fn claude_id(holder: &str) -> Option<&str> {
+    holder
+        .strip_prefix(CLAUDE_PREFIX)
         .filter(|id| !id.is_empty())
 }
 
@@ -82,6 +102,86 @@ fn inject(server: &mut AppServer, thread_id: &str, text: &str) -> io::Result<()>
         }),
     )?;
     Ok(())
+}
+
+fn claude_binary() -> std::ffi::OsString {
+    std::env::var_os("CONBUS_CLAUDE_BIN")
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "claude".into())
+}
+
+/// Open a headless Claude session the bus owns. Not a model turn.
+pub fn open_claude(cwd: Option<&str>, text: &str) -> io::Result<Thread> {
+    let minted = conbus_core::ids::BusId::mint().to_string();
+    let got = run_claude(cwd, Some(&minted), None, text)?;
+    Ok(Thread {
+        id: got.unwrap_or(minted),
+    })
+}
+
+/// Write a newer digest into a Claude session we opened. Still not a model turn.
+pub fn sync_claude(session_id: &str, text: &str) -> io::Result<()> {
+    if session_id.is_empty() || session_id.contains("user:") {
+        return Err(io::Error::other(
+            "refusing to inject into a Claude session the bus did not open",
+        ));
+    }
+    run_claude(None, None, Some(session_id), text).map(|_| ())
+}
+
+fn run_claude(
+    cwd: Option<&str>,
+    session_id: Option<&str>,
+    resume: Option<&str>,
+    text: &str,
+) -> io::Result<Option<String>> {
+    let mut cmd = Command::new(claude_binary());
+    cmd.args([
+        "-p",
+        "--max-turns",
+        "0",
+        "--output-format",
+        "json",
+        "--permission-prompts",
+        "none",
+        "--append-system-prompt",
+        text,
+    ]);
+    if let Some(id) = session_id {
+        cmd.args(["--session-id", id]);
+    }
+    if let Some(id) = resume {
+        cmd.args(["--resume", id]);
+    }
+    if let Some(cwd) = cwd {
+        cmd.current_dir(cwd);
+    }
+    cmd.env(INTERNAL_MARKER, "1")
+        .env("PATH", appserver::path_for_vendor())
+        .stdin(Stdio::null())
+        .arg("conbus warm");
+    let output = cmd.output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let got = serde_json::from_str::<serde_json::Value>(stdout.trim())
+        .ok()
+        .and_then(|value| {
+            value
+                .get("session_id")
+                .and_then(|id| id.as_str())
+                .map(str::to_string)
+        });
+    if got.is_some() || stdout.contains("session_id") || stdout.contains("\"type\":\"system\"") {
+        return Ok(got);
+    }
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "claude warm failed: {} {}",
+            output.status,
+            stderr.trim()
+        )));
+    }
+    Ok(got)
 }
 
 #[cfg(test)]
@@ -165,6 +265,8 @@ for line in sys.stdin:
         assert_eq!(thread_id(&holder("thr_1")), Some("thr_1"));
         assert_eq!(thread_id("thr_1"), None);
         assert_eq!(thread_id("warm:"), None);
+        assert_eq!(claude_id(&claude_holder("sess_1")), Some("sess_1"));
+        assert_eq!(thread_id(&claude_holder("sess_1")), None);
     }
 
     #[test]
@@ -187,6 +289,68 @@ for line in sys.stdin:
     #[test]
     fn a_user_named_thread_is_refused() {
         let err = sync("user:abc", "no").expect_err("must refuse");
+        assert!(err.to_string().contains("did not open"), "{err}");
+    }
+
+    const FAKE_CLAUDE: &str = r#"#!/usr/bin/env python3
+import json, os, sys
+args = sys.argv[1:]
+sid = ""
+if "--session-id" in args:
+    sid = args[args.index("--session-id") + 1]
+elif "--resume" in args:
+    sid = args[args.index("--resume") + 1]
+if log := os.environ.get("CONBUS_CLAUDE_LOG"):
+    open(log, "w").write(" ".join(args))
+print(json.dumps({"type": "result", "session_id": sid, "is_error": True}))
+sys.exit(1)
+"#;
+
+    fn fake_claude() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("claude");
+        std::fs::write(&path, FAKE_CLAUDE).expect("write");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        (dir, path)
+    }
+
+    #[test]
+    fn opening_a_claude_warm_uses_max_turns_zero() {
+        let _lock = lock_env();
+        let (dir, claude) = fake_claude();
+        let log = dir.path().join("argv");
+        let _bin = Env::set("CONBUS_CLAUDE_BIN", claude.to_str().unwrap());
+        let _log = Env::set("CONBUS_CLAUDE_LOG", log.to_str().unwrap());
+        let cwd = dir.path().to_str().unwrap();
+        let thread = open_claude(Some(cwd), "conbus digest").expect("open");
+        assert!(!thread.id.is_empty());
+        let argv = std::fs::read_to_string(&log).expect("argv");
+        assert!(argv.contains("--max-turns 0"), "{argv}");
+        assert!(argv.contains("--permission-prompts none"), "{argv}");
+        assert!(
+            argv.contains(&format!("--session-id {}", thread.id)),
+            "{argv}"
+        );
+        assert!(!argv.contains("--dangerously-skip-permissions"), "{argv}");
+    }
+
+    #[test]
+    fn syncing_a_claude_warm_resumes_the_session_we_opened() {
+        let _lock = lock_env();
+        let (dir, claude) = fake_claude();
+        let log = dir.path().join("argv");
+        let _bin = Env::set("CONBUS_CLAUDE_BIN", claude.to_str().unwrap());
+        let _log = Env::set("CONBUS_CLAUDE_LOG", log.to_str().unwrap());
+        sync_claude("sess_bus_owned", "newer digest").expect("sync");
+        let argv = std::fs::read_to_string(&log).expect("argv");
+        assert!(argv.contains("--resume sess_bus_owned"), "{argv}");
+        assert!(argv.contains("--max-turns 0"), "{argv}");
+    }
+
+    #[test]
+    fn a_user_named_claude_session_is_refused() {
+        let err = sync_claude("user:abc", "no").expect_err("must refuse");
         assert!(err.to_string().contains("did not open"), "{err}");
     }
 }
