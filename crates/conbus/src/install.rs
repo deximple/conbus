@@ -151,6 +151,14 @@ pub struct Plan {
     /// Set when the file exists but does not parse. The recorder refuses to
     /// touch it rather than replacing something it cannot read.
     pub unreadable: Option<String>,
+    /// The person's existing StatusLine command, saved beside settings so we
+    /// observe `rate_limits` without replacing their status bar.
+    pub statusline_forward: Option<String>,
+}
+
+/// Next to `settings.json`. The original StatusLine command, verbatim.
+pub fn statusline_forward_path(settings: &Path) -> PathBuf {
+    settings.with_file_name("conbus-statusline-forward")
 }
 
 pub fn plan(target: Target) -> io::Result<Plan> {
@@ -162,13 +170,46 @@ pub fn plan(target: Target) -> io::Result<Plan> {
         Err(err) if err.kind() == io::ErrorKind::NotFound => (empty_document(), None),
         Err(err) => return Err(err),
     };
-    let (document, changes) = merge(&existing, target.events, &target.command);
+    let (mut document, mut changes) = merge(&existing, target.events, &target.command);
+    let mut statusline_forward = None;
+    if target.harness == "claude_code" {
+        let command = format!("{} --statusline", target.command);
+        statusline_forward = existing
+            .get("statusLine")
+            .and_then(|line| line.get("command"))
+            .and_then(Value::as_str)
+            .filter(|cmd| !cmd.contains("hook --statusline"))
+            .map(str::to_string);
+        if let Some(change) = merge_statusline(&mut document, &command) {
+            changes.push(change);
+        }
+    }
     Ok(Plan {
         target,
         document,
         changes,
         unreadable,
+        statusline_forward,
     })
+}
+
+/// Register our StatusLine observer. One slot: wrap, never overwrite.
+fn merge_statusline(document: &mut Value, command: &str) -> Option<Change> {
+    let existing = document
+        .get("statusLine")
+        .and_then(|line| line.get("command"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    match existing {
+        Some(cmd) if cmd.contains("hook --statusline") => Some(Change::Keep("StatusLine".into())),
+        Some(_) | None => {
+            document.as_object_mut()?.insert(
+                "statusLine".into(),
+                json!({ "type": "command", "command": command }),
+            );
+            Some(Change::Add("StatusLine".into()))
+        }
+    }
 }
 
 /// Write the plan, keeping a copy of whatever was there before.
@@ -176,6 +217,9 @@ pub fn apply(plan: &Plan) -> io::Result<Option<PathBuf>> {
     let settings = &plan.target.settings;
     if let Some(parent) = settings.parent() {
         fs::create_dir_all(parent)?;
+    }
+    if let Some(original) = &plan.statusline_forward {
+        fs::write(statusline_forward_path(settings), original)?;
     }
     let backup = if settings.exists() {
         let backup = settings.with_extension("json.conbus-backup");
@@ -273,6 +317,35 @@ mod tests {
             .as_str()
             .expect("command");
         assert!(command.starts_with('/'), "{command}");
+    }
+
+    #[test]
+    fn a_statusline_the_person_already_has_is_wrapped_not_replaced() {
+        let existing = json!({
+            "statusLine": { "type": "command", "command": "their-status" }
+        });
+        let mut document = existing.clone();
+        let change = merge_statusline(&mut document, "/opt/conbus hook --statusline");
+
+        assert!(matches!(change, Some(Change::Add(name)) if name == "StatusLine"));
+        assert_eq!(
+            document["statusLine"]["command"],
+            "/opt/conbus hook --statusline"
+        );
+        assert_eq!(existing["statusLine"]["command"], "their-status");
+    }
+
+    #[test]
+    fn installing_statusline_twice_does_not_wrap_again() {
+        let mut document = json!({
+            "statusLine": { "type": "command", "command": "/opt/conbus hook --statusline" }
+        });
+        let change = merge_statusline(&mut document, "/opt/conbus hook --statusline");
+        assert!(matches!(change, Some(Change::Keep(name)) if name == "StatusLine"));
+        assert_eq!(
+            document["statusLine"]["command"],
+            "/opt/conbus hook --statusline"
+        );
     }
 }
 

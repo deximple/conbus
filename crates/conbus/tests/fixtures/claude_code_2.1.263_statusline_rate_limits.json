@@ -1,0 +1,21 @@
+{
+  "session_id": "sess_statusline_fixture",
+  "cwd": "/repo",
+  "model": {
+    "display_name": "Opus"
+  },
+  "context_window": {
+    "used_percentage": 12,
+    "remaining_percentage": 88
+  },
+  "rate_limits": {
+    "five_hour": {
+      "used_percentage": 72.4,
+      "resets_at": 1788385869
+    },
+    "seven_day": {
+      "used_percentage": 31,
+      "resets_at": 1788752527
+    }
+  }
+}

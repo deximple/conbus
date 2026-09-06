@@ -10,13 +10,18 @@
 //! Read-only. It starts an app-server, asks, and stops it; nothing about the
 //! account changes.
 
-use std::io;
+use std::io::{self, Write};
+use std::path::Path;
+use std::process::{Command, Stdio};
 use std::time::Duration;
+
+use conbus_core::event::Harness;
+use conbus_core::paths::Paths;
 
 use crate::appserver::AppServer;
 
 /// One rate-limit window.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Window {
     pub used_percent: u64,
     pub minutes: u64,
@@ -127,14 +132,182 @@ fn resets(seconds: i64) -> String {
     }
 }
 
-pub fn run() -> io::Result<()> {
-    let quota = read()?;
-    let now = std::time::SystemTime::now()
+pub fn run(paths: &Paths) -> io::Result<()> {
+    let now = now_secs();
+    match read() {
+        Ok(quota) => println!("codex     {}", describe(&quota, now)),
+        Err(err) => println!("codex     unavailable — {err}"),
+    }
+    match read_cached(paths, Harness::CLAUDE_CODE) {
+        Some(quota) => println!("claude    {}", describe(&quota, now)),
+        None => println!(
+            "claude    no StatusLine observation yet — open claude so the vendor fills rate_limits"
+        ),
+    }
+    for slug in conbus_core::attach::slugs() {
+        if slug == Harness::CLAUDE_CODE || slug == Harness::CODEX {
+            continue;
+        }
+        let Some(caps) = conbus_core::attach::caps(slug) else {
+            continue;
+        };
+        println!(
+            "{slug:<9} {}",
+            if caps.quota_signal {
+                "official remaining-quota channel captured"
+            } else {
+                "no official remaining-quota channel captured"
+            }
+        );
+    }
+    Ok(())
+}
+
+/// Claude StatusLine stdin, as the 2.1.263 binary documents it.
+///
+/// The unmodified `claude` binary fetches `/api/oauth/usage` itself and puts
+/// `rate_limits` on this payload. We persist the numbers. We never hold a
+/// token and we never call that URL.
+pub fn parse_statusline(payload: &serde_json::Value) -> Option<Quota> {
+    let limits = payload.get("rate_limits")?;
+    if !limits.is_object() {
+        return None;
+    }
+    let window = |name: &str, minutes: u64| -> Option<Window> {
+        let w = limits.get(name)?;
+        Some(Window {
+            used_percent: percent(w.get("used_percentage")?)?,
+            minutes,
+            resets_at: w.get("resets_at")?.as_i64()?,
+        })
+    };
+    let five = window("five_hour", 300);
+    let week = window("seven_day", 10080);
+    let spend = window("spend_limit", 0);
+    if five.is_none() && week.is_none() && spend.is_none() {
+        return None;
+    }
+    let reached = [&five, &week, &spend]
+        .into_iter()
+        .flatten()
+        .any(|w| w.used_percent >= 100)
+        .then(|| "rate_limit".to_string());
+    Some(Quota {
+        plan: Some("claude".into()),
+        primary: five.or(week).or(spend),
+        secondary: week.filter(|_| five.is_some()),
+        reached,
+        reset_credits: 0,
+    })
+}
+
+fn percent(value: &serde_json::Value) -> Option<u64> {
+    value
+        .as_f64()
+        .map(|n| n.round().clamp(0.0, 10_000.0) as u64)
+        .or_else(|| value.as_u64())
+}
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    println!("codex     {}", describe(&quota, now));
+        .unwrap_or(0)
+}
+
+/// Last observation the StatusLine command wrote, if any.
+pub fn read_cached(paths: &Paths, harness: &str) -> Option<Quota> {
+    let text = std::fs::read_to_string(paths.quota_cache(harness)).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let window = |name: &str| -> Option<Window> {
+        let w = value.get(name)?;
+        Some(Window {
+            used_percent: w.get("used_percent")?.as_u64()?,
+            minutes: w.get("minutes")?.as_u64()?,
+            resets_at: w.get("resets_at")?.as_i64()?,
+        })
+    };
+    Some(Quota {
+        plan: value
+            .get("plan")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        primary: window("primary"),
+        secondary: window("secondary"),
+        reached: value
+            .get("reached")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        reset_credits: 0,
+    })
+}
+
+fn write_cached(paths: &Paths, harness: &str, quota: &Quota) -> io::Result<()> {
+    let path = paths.quota_cache(harness);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let body = serde_json::json!({
+        "schema_version": 1,
+        "harness": harness,
+        "observed_at": now_secs(),
+        "plan": quota.plan,
+        "primary": quota.primary.as_ref().map(|w| serde_json::json!({
+            "used_percent": w.used_percent,
+            "minutes": w.minutes,
+            "resets_at": w.resets_at,
+        })),
+        "secondary": quota.secondary.as_ref().map(|w| serde_json::json!({
+            "used_percent": w.used_percent,
+            "minutes": w.minutes,
+            "resets_at": w.resets_at,
+        })),
+        "reached": quota.reached,
+    });
+    let tmp = path.with_extension("json.next");
+    std::fs::write(&tmp, serde_json::to_vec(&body).map_err(io::Error::other)?)?;
+    std::fs::rename(tmp, path)?;
     Ok(())
+}
+
+/// Persist `rate_limits` from StatusLine stdin, then run the person's own
+/// statusLine command if install wrapped one. Stdout is the status bar, never
+/// hook JSON.
+pub fn observe_statusline(paths: Option<&Paths>, forward: Option<&Path>, stdin: &str) -> String {
+    if let Some(paths) = paths
+        && let Ok(value) = serde_json::from_str::<serde_json::Value>(stdin)
+        && let Some(quota) = parse_statusline(&value)
+    {
+        let _ = write_cached(paths, Harness::CLAUDE_CODE, &quota);
+    }
+    if let Some(path) = forward
+        && let Ok(command) = std::fs::read_to_string(path)
+        && !command.trim().is_empty()
+    {
+        return run_forward(&command, stdin.as_bytes());
+    }
+    String::new()
+}
+
+fn run_forward(command: &str, stdin: &[u8]) -> String {
+    let mut child = match Command::new("/bin/sh")
+        .arg("-c")
+        .arg(command)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return String::new(),
+    };
+    if let Some(mut pipe) = child.stdin.take() {
+        let _ = pipe.write_all(stdin);
+    }
+    match child.wait_with_output() {
+        Ok(output) => String::from_utf8_lossy(&output.stdout).into_owned(),
+        Err(_) => String::new(),
+    }
 }
 
 #[cfg(test)]
@@ -212,5 +385,60 @@ mod tests {
     #[test]
     fn a_reply_without_limits_is_an_error_not_a_zeroed_line() {
         assert!(parse(&serde_json::json!({"nothing": true})).is_err());
+    }
+
+    #[test]
+    fn the_vendor_statusline_contract_reads_as_two_windows() {
+        let payload: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/claude_code_2.1.263_statusline_rate_limits.json"
+        ))
+        .expect("fixture");
+        let quota = parse_statusline(&payload).expect("rate_limits");
+
+        assert_eq!(
+            quota.primary,
+            Some(Window {
+                used_percent: 72,
+                minutes: 300,
+                resets_at: 1_788_385_869
+            })
+        );
+        assert_eq!(quota.secondary.as_ref().map(|w| w.used_percent), Some(31));
+        assert_eq!(quota.reached, None);
+    }
+
+    #[test]
+    fn a_full_five_hour_window_is_the_reached_signal() {
+        let payload = serde_json::json!({
+            "rate_limits": {
+                "five_hour": { "used_percentage": 100, "resets_at": 10 }
+            }
+        });
+        let quota = parse_statusline(&payload).expect("rate_limits");
+        assert_eq!(quota.reached.as_deref(), Some("rate_limit"));
+    }
+
+    #[test]
+    fn statusline_without_rate_limits_is_none() {
+        assert!(parse_statusline(&serde_json::json!({"cwd": "/repo"})).is_none());
+    }
+
+    #[test]
+    fn observe_persists_and_forwards_the_persons_status_command() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let paths =
+            Paths::from_env(root.path().join("conbus").to_str(), None, None).expect("paths");
+        std::fs::create_dir_all(paths.root()).expect("root");
+        let forward = root.path().join("forward.sh");
+        std::fs::write(&forward, "echo FORWARDED").expect("write");
+        let payload = include_str!(
+            "../tests/fixtures/claude_code_2.1.263_statusline_rate_limits.json"
+        );
+
+        let out = observe_statusline(Some(&paths), Some(&forward), payload);
+
+        assert_eq!(out.trim(), "FORWARDED");
+        let cached = read_cached(&paths, Harness::CLAUDE_CODE).expect("cache");
+        assert_eq!(cached.primary.as_ref().map(|w| w.used_percent), Some(72));
     }
 }

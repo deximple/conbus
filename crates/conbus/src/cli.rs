@@ -8,6 +8,8 @@ pub enum Command {
     /// Read a vendor hook payload on stdin and mirror it.
     Hook {
         harness: String,
+        /// Claude StatusLine stdin: persist `rate_limits`, never hook JSON.
+        statusline: bool,
     },
     Log {
         json: bool,
@@ -104,6 +106,7 @@ where
             harness: flag_value(&args, "--harness")
                 .or(env_harness)
                 .unwrap_or_else(|| DEFAULT_HARNESS.to_string()),
+            statusline: args.iter().any(|a| a == "--statusline"),
         },
         "install" => Command::Install {
             apply: args.iter().any(|a| a == "--apply"),
@@ -159,7 +162,10 @@ conbus — a conversation bus for coding agents
 
 USAGE:
     conbus daemon                 run the recorder
-    conbus hook [--harness NAME]  mirror one vendor hook payload from stdin
+    conbus hook [--harness NAME] [--statusline]
+                                  mirror one vendor hook payload from stdin;
+                                  --statusline reads Claude StatusLine JSON
+                                  and must not print hook control output
     conbus log [--json] [--bus-id ID] [--since TS] [--tail N] [--grep TEXT]
                                   read the conversation log back
     conbus install [--apply]      register the hook with Claude Code and Codex
@@ -167,13 +173,12 @@ USAGE:
                                   recover history; --gaps fills missed turns of live sessions
     conbus doctor                 report what is and is not wired up
     conbus status                 routing rules, quota, hop history, cost
-    conbus quota                  ask Codex how much of the account's quota is used
+    conbus quota                  Codex probe + Claude StatusLine cache + catalog
     conbus hop [--from ID] [--to HARNESS] [--apply]
-                                  decide the next harness; --to is a directed
-                                  routing hop; --apply records it and, when the
-                                  next leg is Codex, opens or syncs a bus-owned
-                                  thread (not a model turn)
-    conbus run [claude_code|codex]
+                                  decide the next harness; --to names any
+                                  catalog leg; --apply records it and opens
+                                  dual-warm on Claude/Codex (not a model turn)
+    conbus run [claude_code|codex|cursor|agy|opencode|grok]
                                   same TTY: start a vendor; hop execs the next
     conbus arena fact --workspace DIR --claim TEXT --anchor PATH
     conbus arena link --from DIR --to DIR
@@ -195,7 +200,8 @@ mod tests {
         assert_eq!(
             parse(["hook"], None),
             Command::Hook {
-                harness: "claude_code".into()
+                harness: "claude_code".into(),
+                statusline: false
             }
         );
     }
@@ -205,7 +211,8 @@ mod tests {
         assert_eq!(
             parse(["hook", "--harness", "codex"], Some("cursor".into())),
             Command::Hook {
-                harness: "codex".into()
+                harness: "codex".into(),
+                statusline: false
             }
         );
     }
@@ -215,7 +222,19 @@ mod tests {
         assert_eq!(
             parse(["hook"], Some("codex".into())),
             Command::Hook {
-                harness: "codex".into()
+                harness: "codex".into(),
+                statusline: false
+            }
+        );
+    }
+
+    #[test]
+    fn statusline_is_a_hook_flag() {
+        assert_eq!(
+            parse(["hook", "--statusline"], None),
+            Command::Hook {
+                harness: "claude_code".into(),
+                statusline: true
             }
         );
     }

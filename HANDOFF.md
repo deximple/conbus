@@ -215,12 +215,12 @@ and run one session; the schemas themselves come out of the binary with a search
 
 ## Next task
 
-Stage 1 observation conditions are live on this machine (quota hop + 3 Codex
-turns, gap fill, Cursor adapter, `conbus status`, arena inject, `gh` stale,
-symmetric hop-back). Uncommitted on `main`. Do not commit unless asked. Do not
-register native `~/.cursor/hooks.json` yet (would double-record). Organic
-Cursor session `fb95c3ed` still has no minted `bus_id` until
-`beforeSubmitPrompt`. Do not fire `StopFailure` at `01a07243`.
+Claude StatusLine `rate_limits` is the official remaining-quota channel
+(vendor-fed; we do not call oauth/usage). `conbus hook --statusline` persists
+it and forwards the person's existing status bar command.
+`--to` names any catalog leg; auto overflow still needs a real signal.
+Do not commit unless asked. Do not register native `~/.cursor/hooks.json`.
+Do not fire `StopFailure` at `01a07243`.
 
 `recorder-first`. One week, **recording only, no injection** — that was the plan; the briefing shipped on 2026-09-01 and is live on both harnesses as of 2026-09-03. Injection hardening is a separate item because the
 quirks above take weeks, not days.

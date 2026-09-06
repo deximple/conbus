@@ -4,6 +4,7 @@
 //! quota; `conbus hop` asks before the next turn, because that is when the
 //! Codex account signal exists — Codex hooks have no `StopFailure`.
 
+use crate::attach;
 use crate::event::{Harness, Hop, TurnState};
 
 /// Move before the window is gone, not after. The plan's example: 80% used
@@ -17,8 +18,7 @@ pub struct Leg {
     pub harness: Harness,
     /// How the last mirrored turn ended. `None` means in flight or never.
     pub last_turn: Option<TurnState>,
-    /// Primary window, when a probe has read it. Claude has no probe yet —
-    /// only `StopFailure` — so this stays `None` on that side.
+    /// Primary window, when a probe or StatusLine observation has read it.
     pub used_percent: Option<u64>,
     pub minutes_to_reset: Option<i64>,
     /// The account is already refusing work.
@@ -40,7 +40,7 @@ pub enum Decision {
     },
 }
 
-/// The other Stage 0 leg, if there is one.
+/// The other dual-warm leg, if there is one.
 pub fn opposite(harness: &Harness) -> Option<Harness> {
     match harness.as_str() {
         Harness::CLAUDE_CODE => Some(Harness::new(Harness::CODEX)),
@@ -49,9 +49,17 @@ pub fn opposite(harness: &Harness) -> Option<Harness> {
     }
 }
 
+/// Where auto overflow may land. Directed hop may name a catalog leg this
+/// does not return.
+pub fn overflow_target(harness: &Harness) -> Option<Harness> {
+    let dest = attach::overflow(harness.as_str())?;
+    let caps = attach::caps(dest)?;
+    caps.usable_as_target.then(|| Harness::new(dest))
+}
+
 /// Decide the next leg from two snapshots. No I/O.
 pub fn decide(current: &Leg, other: &Leg) -> Decision {
-    let Some(to) = opposite(&current.harness) else {
+    let Some(to) = overflow_target(&current.harness) else {
         return Decision::Stay;
     };
     if other.harness != to {
@@ -227,8 +235,12 @@ mod tests {
     #[test]
     fn an_unknown_harness_has_no_opposite() {
         assert!(opposite(&Harness::new("cursor")).is_none());
+    }
+
+    #[test]
+    fn a_quota_stop_on_an_attach_leg_overflows_to_codex() {
         let current = Leg {
-            harness: Harness::new("cursor"),
+            harness: Harness::new(Harness::CURSOR),
             last_turn: Some(TurnState::InterruptedQuota {
                 reason: "rate_limit".into(),
             }),
@@ -236,6 +248,12 @@ mod tests {
             minutes_to_reset: None,
             reached: false,
         };
-        assert_eq!(decide(&current, &codex()), Decision::Stay);
+        match decide(&current, &codex()) {
+            Decision::Hop { to, hop, .. } => {
+                assert_eq!(to.as_str(), Harness::CODEX);
+                assert_eq!(hop, Hop::Displaced);
+            }
+            other => panic!("expected overflow to Codex, got {other:?}"),
+        }
     }
 }

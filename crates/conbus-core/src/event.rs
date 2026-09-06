@@ -19,6 +19,10 @@ impl Harness {
     /// Cursor invokes the Claude Code hook command with its own payload.
     /// Identified by `cursor_version`, never by guessing Claude field names.
     pub const CURSOR: &'static str = "cursor";
+    /// Google Antigravity CLI (Agy). Not an auto-overflow destination.
+    pub const AGY: &'static str = "agy";
+    pub const OPENCODE: &'static str = "opencode";
+    pub const GROK: &'static str = "grok";
 
     pub fn new(slug: impl Into<String>) -> Self {
         Harness(slug.into())

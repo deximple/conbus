@@ -655,6 +655,19 @@ fn report_hooks(home: &Path) {
         }
         for command in commands {
             any = true;
+            if command.contains("hook --statusline") {
+                let forward = crate::install::statusline_forward_path(&target.settings);
+                println!(
+                    "statusline {:<9} observes rate_limits{}",
+                    target.harness,
+                    if forward.exists() {
+                        " · forwards existing command"
+                    } else {
+                        ""
+                    }
+                );
+                continue;
+            }
             match hook_runs(&command) {
                 Ok(()) => println!("hooks     {:<12} runs — {command}", target.harness),
                 Err(why) => println!(
@@ -932,13 +945,17 @@ pub fn doctor(paths: &Paths) -> io::Result<()> {
         Ok(quota) => println!("quota     codex {}", crate::quota::describe(&quota, now)),
         Err(err) => println!("quota     codex unavailable — {err}"),
     }
+    match crate::quota::read_cached(paths, Harness::CLAUDE_CODE) {
+        Some(quota) => println!("quota     claude {}", crate::quota::describe(&quota, now)),
+        None => println!("quota     claude no StatusLine observation yet"),
+    }
 
     let meter = conbus_core::meter::Meter::fold(&scan.records);
     println!("{}", meter.describe());
     println!("{}", meter.describe_cost());
     println!("{}", meter.describe_turns());
     println!("{}", cursor_line(&scan.records));
-    match crate::hop::decide_from(&scan.records, None) {
+    match crate::hop::decide_from(paths, &scan.records, None) {
         Ok(line) => println!("route     {line}"),
         Err(err) => println!("route     unavailable — {err}"),
     }
@@ -960,9 +977,10 @@ pub fn doctor(paths: &Paths) -> io::Result<()> {
 /// How the router decides. Kept next to the numbers so a person can see
 /// the rule and the count on one page, without opening a chat.
 const ROUTING_RULES: &str = "\
-rules     Stage 0 legs claude_code ↔ codex; hop on InterruptedQuota or account \
-reached; predictive handoff at 80% used with reset > 120m; --to is HandedOff; \
-policy/auth is Refused, not failover";
+rules     auto overflow Claude↔Codex (and attach legs → Codex) on \
+InterruptedQuota or account reached; predictive handoff at 80% used with \
+reset > 120m; --to names any catalog leg as HandedOff; policy/auth is \
+Refused, not failover";
 
 fn cursor_line(records: &[Record]) -> String {
     let n = records
@@ -997,8 +1015,12 @@ pub fn status(paths: &Paths) -> io::Result<()> {
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     match crate::quota::read() {
-        Ok(quota) => println!("quota     {}", crate::quota::describe(&quota, now)),
-        Err(err) => println!("quota     unavailable — {err}"),
+        Ok(quota) => println!("quota     codex {}", crate::quota::describe(&quota, now)),
+        Err(err) => println!("quota     codex unavailable — {err}"),
+    }
+    match crate::quota::read_cached(paths, Harness::CLAUDE_CODE) {
+        Some(quota) => println!("quota     claude {}", crate::quota::describe(&quota, now)),
+        None => println!("quota     claude no StatusLine observation yet"),
     }
     println!("{}", meter.describe());
     println!("{}", meter.describe_cost());
