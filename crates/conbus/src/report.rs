@@ -773,14 +773,16 @@ fn report_hooks(home: &Path) {
     }
     if crate::install::cursor_hooks_registered(home) {
         println!(
-            "hooks     {:<12} runs — {} stop, sessionEnd, afterAgentResponse",
+            "hooks     {:<12} runs — {} {}",
             "cursor",
-            crate::install::cursor_hooks_path(home).display()
+            crate::install::cursor_hooks_path(home).display(),
+            crate::install::CURSOR_EVENTS.join(", ")
         );
     } else {
         println!(
-            "hooks     {:<12} MISSING stop/sessionEnd/afterAgentResponse — run `conbus install --apply`",
-            "cursor"
+            "hooks     {:<12} MISSING {} — run `conbus install --apply`",
+            "cursor",
+            crate::install::CURSOR_EVENTS.join("/")
         );
     }
     report_codex_trust(home);
