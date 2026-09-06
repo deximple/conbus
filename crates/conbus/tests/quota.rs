@@ -70,10 +70,15 @@ fn quota_says_so_when_the_app_server_is_not_there() {
         .output()
         .expect("run quota");
 
-    assert!(!output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("codex"),
-        "the failure must name what could not be run"
+        output.status.success(),
+        "other legs still report when Codex is missing: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("codex") && stdout.contains("unavailable"),
+        "the Codex line must name what could not be run: {stdout}"
     );
 }
 

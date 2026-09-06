@@ -104,6 +104,14 @@ impl Paths {
     pub fn links(&self) -> PathBuf {
         self.root.join("links.jsonl")
     }
+
+    /// Last StatusLine `rate_limits` the vendor fed us, per harness.
+    ///
+    /// Derived, rebuildable, not a conversation record. Claude fills this
+    /// when its StatusLine command runs; we never call oauth/usage ourselves.
+    pub fn quota_cache(&self, harness: &str) -> PathBuf {
+        self.root.join("quota").join(format!("{harness}.json"))
+    }
 }
 
 #[cfg(test)]
@@ -163,5 +171,9 @@ mod tests {
         assert_eq!(paths.takeover(), Path::new("/tmp/bus/takeover.json"));
         assert_eq!(paths.facts(), Path::new("/tmp/bus/facts.jsonl"));
         assert_eq!(paths.links(), Path::new("/tmp/bus/links.jsonl"));
+        assert_eq!(
+            paths.quota_cache("claude_code"),
+            Path::new("/tmp/bus/quota/claude_code.json")
+        );
     }
 }

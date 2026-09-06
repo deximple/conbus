@@ -43,13 +43,14 @@ pub fn run(paths: &Paths, harness: &str) -> io::Result<()> {
 }
 
 fn normalize(name: &str) -> io::Result<String> {
-    match name {
-        "claude" | "claude_code" => Ok(Harness::CLAUDE_CODE.into()),
-        "codex" => Ok(Harness::CODEX.into()),
-        other => Err(io::Error::other(format!(
-            "conbus run starts claude_code or codex, not {other:?}"
-        ))),
-    }
+    conbus_core::attach::resolve(name)
+        .map(str::to_string)
+        .ok_or_else(|| {
+            let catalog = conbus_core::attach::slugs().collect::<Vec<_>>().join(", ");
+            io::Error::other(format!(
+                "conbus run starts a catalog leg ({catalog}), not {name:?}"
+            ))
+        })
 }
 
 fn spawn(paths: &Paths, harness: &str, takeover: Option<&Takeover>) -> io::Result<()> {
@@ -80,13 +81,14 @@ fn vendor(harness: &str, takeover: Option<&Takeover>) -> io::Result<std::process
             }
             cmd
         }
-        _ => {
+        Harness::CLAUDE_CODE => {
             let mut cmd = Command::new(claude_binary());
             if let Some(thread) = takeover.and_then(|t| t.thread.as_deref()) {
                 cmd.args(["--resume", thread]);
             }
             cmd
         }
+        _ => Command::new(leg_binary(harness)),
     };
     if let Some(cwd) = takeover.and_then(|t| t.cwd.as_deref()) {
         cmd.current_dir(cwd);
@@ -99,9 +101,23 @@ fn vendor(harness: &str, takeover: Option<&Takeover>) -> io::Result<std::process
 }
 
 fn claude_binary() -> std::ffi::OsString {
-    std::env::var_os("CONBUS_CLAUDE_BIN")
+    env_binary("CONBUS_CLAUDE_BIN", "claude")
+}
+
+fn leg_binary(harness: &str) -> std::ffi::OsString {
+    match harness {
+        Harness::CURSOR => env_binary("CONBUS_CURSOR_BIN", "agent"),
+        Harness::AGY => env_binary("CONBUS_AGY_BIN", "agy"),
+        Harness::OPENCODE => env_binary("CONBUS_OPENCODE_BIN", "opencode"),
+        Harness::GROK => env_binary("CONBUS_GROK_BIN", "grok"),
+        _ => env_binary("CONBUS_CLAUDE_BIN", "claude"),
+    }
+}
+
+fn env_binary(key: &str, default: &str) -> std::ffi::OsString {
+    std::env::var_os(key)
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "claude".into())
+        .unwrap_or_else(|| default.into())
 }
 
 #[cfg(test)]
@@ -111,6 +127,9 @@ mod tests {
     use conbus_core::paths::Paths;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::Mutex;
+
+    static ENV: Mutex<()> = Mutex::new(());
 
     fn machine() -> (tempfile::TempDir, Paths) {
         let root = tempfile::tempdir().expect("tempdir");
@@ -137,6 +156,7 @@ mod tests {
             "codex",
             &format!("echo \"$1 $2 $3\" > {}", marker.display()),
         );
+        let _guard = ENV.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::set_var("CONBUS_CLAUDE_BIN", &claude);
             std::env::set_var("CONBUS_CODEX_BIN", &codex);
@@ -166,6 +186,13 @@ mod tests {
     }
 
     #[test]
+    fn catalog_legs_are_runnable() {
+        assert_eq!(normalize("cursor").expect("ok"), Harness::CURSOR);
+        assert_eq!(normalize("antigravity").expect("ok"), Harness::AGY);
+        assert!(normalize("not_a_harness").is_err());
+    }
+
+    #[test]
     fn a_claude_takeover_resumes_the_bus_owned_session() {
         let (root, paths) = machine();
         let marker = root.path().join("claude-started");
@@ -174,6 +201,7 @@ mod tests {
             "claude",
             &format!("echo \"$1 $2\" > {}", marker.display()),
         );
+        let _guard = ENV.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::set_var("CONBUS_CLAUDE_BIN", &claude);
         }

@@ -10,6 +10,7 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use conbus_core::attach;
 use conbus_core::event::{Event, Harness, Hop, TurnState};
 use conbus_core::ids::BusId;
 use conbus_core::pack::Chapter;
@@ -23,9 +24,9 @@ use crate::quota::{self, Quota};
 use crate::warm;
 use crate::wire::{self, Request, Response};
 
-/// Decide from the log and the Codex probe. `from` is a `bus_id` prefix.
-pub fn decide_from(records: &[Record], from: Option<&str>) -> io::Result<String> {
-    let (current, other, decision) = plan(records, from)?;
+/// Decide from the log and the quota observations. `from` is a `bus_id` prefix.
+pub fn decide_from(paths: &Paths, records: &[Record], from: Option<&str>) -> io::Result<String> {
+    let (current, other, decision) = plan(paths, records, from)?;
     Ok(decision.describe(&current.harness)
         + &match (&decision, other.harness.as_str()) {
             (Decision::Stay, _) => String::new(),
@@ -35,7 +36,7 @@ pub fn decide_from(records: &[Record], from: Option<&str>) -> io::Result<String>
 
 pub fn run(paths: &Paths, from: Option<String>, to: Option<String>, apply: bool) -> io::Result<()> {
     let scan = SegmentLog::scan(paths.log_dir())?;
-    let (current, other, automatic) = plan(&scan.records, from.as_deref())?;
+    let (current, other, automatic) = plan(paths, &scan.records, from.as_deref())?;
     let decision = match to.as_deref() {
         Some(name) => directed(&current, &other, name)?,
         None => automatic,
@@ -79,14 +80,13 @@ pub fn run(paths: &Paths, from: Option<String>, to: Option<String>, apply: bool)
 
 /// A person named the next leg. That is a routing hop, not a failover.
 fn directed(current: &Leg, other: &Leg, name: &str) -> io::Result<Decision> {
-    let to = Harness::new(name);
+    let slug = attach::resolve(name).ok_or_else(|| {
+        let catalog = attach::slugs().collect::<Vec<_>>().join(", ");
+        io::Error::other(format!("unknown harness {name}; catalog is {catalog}"))
+    })?;
+    let to = Harness::new(slug);
     if current.harness.as_str() == to.as_str() {
         return Ok(Decision::Stay);
-    }
-    if route::opposite(&current.harness).as_ref() != Some(&to) {
-        return Err(io::Error::other(format!(
-            "can only hop to the other Stage 0 leg, not {name}"
-        )));
     }
     if other.harness == to && other.reached {
         return Ok(Decision::Wait {
@@ -100,23 +100,21 @@ fn directed(current: &Leg, other: &Leg, name: &str) -> io::Result<Decision> {
     })
 }
 
-fn plan(records: &[Record], from: Option<&str>) -> io::Result<(Leg, Leg, Decision)> {
+fn plan(
+    paths: &Paths,
+    records: &[Record],
+    from: Option<&str>,
+) -> io::Result<(Leg, Leg, Decision)> {
     let focus = focus(records, from).ok_or_else(|| {
         io::Error::other("no conversation to route — pass --from <bus_id> or record a turn first")
     })?;
     let now = now_secs();
-    let quota = quota::read().ok();
-    let current = leg(
-        records,
-        &focus.harness,
-        focus.last_turn.clone(),
-        quota.as_ref(),
-        now,
-    );
-    let other_harness =
-        route::opposite(&focus.harness).unwrap_or_else(|| Harness::new(Harness::CODEX));
+    let current = leg(paths, &focus.harness, focus.last_turn.clone(), now);
+    let other_harness = route::overflow_target(&focus.harness)
+        .or_else(|| route::opposite(&focus.harness))
+        .unwrap_or_else(|| Harness::new(Harness::CODEX));
     let other_turn = latest_turn(records, other_harness.as_str());
-    let other = leg(records, &other_harness, other_turn, quota.as_ref(), now);
+    let other = leg(paths, &other_harness, other_turn, now);
     let decision = route::decide(&current, &other);
     Ok((current, other, decision))
 }
@@ -182,19 +180,19 @@ fn latest_turn_on(records: &[Record], bus_id: BusId) -> Option<TurnState> {
         })
 }
 
-fn leg(
-    _records: &[Record],
-    harness: &Harness,
-    last_turn: Option<TurnState>,
-    quota: Option<&Quota>,
-    now: i64,
-) -> Leg {
+fn observed_quota(paths: &Paths, harness: &str) -> Option<Quota> {
+    match harness {
+        Harness::CODEX => quota::read().ok(),
+        Harness::CLAUDE_CODE => quota::read_cached(paths, Harness::CLAUDE_CODE),
+        _ => None,
+    }
+}
+
+fn leg(paths: &Paths, harness: &Harness, last_turn: Option<TurnState>, now: i64) -> Leg {
     let mut used_percent = None;
     let mut minutes_to_reset = None;
     let mut reached = false;
-    if harness.as_str() == Harness::CODEX
-        && let Some(quota) = quota
-    {
+    if let Some(quota) = observed_quota(paths, harness.as_str()) {
         used_percent = quota.primary.as_ref().map(|w| w.used_percent);
         minutes_to_reset = quota.primary.as_ref().map(|w| (w.resets_at - now) / 60);
         reached = quota.reached.is_some();
@@ -238,19 +236,27 @@ fn apply_hop(
         lease_only(paths, &focus, &warm::holder(&codex))?;
     }
 
-    let (holder, thread) = if to.as_str() == Harness::CODEX {
-        (warm::holder(&codex), codex)
-    } else {
-        (warm::claude_holder(&claude), claude)
+    let (holder, thread) = match to.as_str() {
+        Harness::CODEX => (Some(warm::holder(&codex)), Some(codex)),
+        Harness::CLAUDE_CODE => (Some(warm::claude_holder(&claude)), Some(claude)),
+        _ => (None, None),
     };
 
     if routed_to(records, focus.bus_id, to) {
-        handoff(paths, &focus, to.as_str(), Some(&thread))?;
+        handoff(paths, &focus, to.as_str(), thread.as_deref())?;
         return Ok(());
     }
-    record_hop(paths, &focus, to, hop, reason, &holder, code_freshness)?;
+    record_hop(
+        paths,
+        &focus,
+        to,
+        hop,
+        reason,
+        holder.as_deref(),
+        code_freshness,
+    )?;
     println!("recorded  routed {kind}");
-    handoff(paths, &focus, to.as_str(), Some(&thread))?;
+    handoff(paths, &focus, to.as_str(), thread.as_deref())?;
     Ok(())
 }
 
@@ -431,7 +437,7 @@ fn record_hop(
     to: &Harness,
     hop: Hop,
     reason: &str,
-    holder: &str,
+    holder: Option<&str>,
     code_freshness: Option<String>,
 ) -> io::Result<()> {
     let event = Event::Routed {
@@ -460,16 +466,18 @@ fn record_hop(
     };
     match submit(paths, &request) {
         Ok(Response::Recorded { .. } | Response::Briefed { .. }) => {
-            let _ = submit(
-                paths,
-                &Request {
-                    event: Event::Leased {
-                        holder: holder.into(),
+            if let Some(holder) = holder {
+                let _ = submit(
+                    paths,
+                    &Request {
+                        event: Event::Leased {
+                            holder: holder.into(),
+                        },
+                        brief: false,
+                        ..request.clone()
                     },
-                    brief: false,
-                    ..request.clone()
-                },
-            );
+                );
+            }
             Ok(())
         }
         Ok(Response::Orphaned) => Err(io::Error::other(
@@ -642,8 +650,20 @@ mod tests {
 
     #[test]
     fn directing_at_an_unknown_harness_is_refused() {
-        let err = directed(&claude(), &codex(), "cursor").expect_err("must refuse");
-        assert!(err.to_string().contains("Stage 0"), "{err}");
+        let err = directed(&claude(), &codex(), "not_a_harness").expect_err("must refuse");
+        assert!(err.to_string().contains("unknown harness"), "{err}");
+    }
+
+    #[test]
+    fn directing_at_a_catalog_leg_is_a_handshake() {
+        match directed(&claude(), &codex(), "cursor").expect("ok") {
+            Decision::Hop { to, hop, reason } => {
+                assert_eq!(to.as_str(), Harness::CURSOR);
+                assert_eq!(hop, Hop::HandedOff);
+                assert_eq!(reason, "directed");
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     fn rec(bus_id: BusId, session: &str, event: Event) -> Record {

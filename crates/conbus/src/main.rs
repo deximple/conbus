@@ -17,6 +17,7 @@ mod takeover;
 mod warm;
 mod wire;
 
+use std::io::Read;
 use std::process::ExitCode;
 
 use conbus_core::paths::Paths;
@@ -29,7 +30,31 @@ fn main() -> ExitCode {
     match cli::parse(&args, std::env::var("CONBUS_HARNESS").ok()) {
         // A hook must never fail the turn it is attached to, so every failure
         // below leaves on stderr and exits zero.
-        Command::Hook { harness } => {
+        Command::Hook {
+            harness,
+            statusline,
+        } => {
+            if statusline {
+                // StatusLine stdout is the status bar. Hook JSON here would
+                // paint `{"continue":true}` into the TUI.
+                let mut stdin = String::new();
+                let _ = std::io::stdin().read_to_string(&mut stdin);
+                let paths = Paths::resolve().ok();
+                let forward = std::env::var_os("HOME").map(|home| {
+                    std::path::PathBuf::from(home)
+                        .join(".claude")
+                        .join("conbus-statusline-forward")
+                });
+                print!(
+                    "{}",
+                    quota::observe_statusline(
+                        paths.as_ref(),
+                        forward.as_deref(),
+                        &stdin
+                    )
+                );
+                return ExitCode::SUCCESS;
+            }
             // Say something well-formed, always — and say it whatever went
             // wrong, which is why the failure path falls back to the silent
             // reply rather than to nothing.
@@ -72,7 +97,7 @@ fn main() -> ExitCode {
         }),
         Command::Doctor => run(report::doctor),
         Command::Status => run(report::status),
-        Command::Quota => run(|_| quota::run()),
+        Command::Quota => run(quota::run),
         Command::Hop { from, to, apply } => run(|paths| hop::run(paths, from, to, apply)),
         Command::Run { harness } => run(|paths| runner::run(paths, &harness)),
         Command::Arena {
