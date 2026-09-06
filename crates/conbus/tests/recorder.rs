@@ -712,6 +712,86 @@ fn the_hook_always_says_something_well_formed_on_stdout() {
 }
 
 #[test]
+fn an_inference_hook_frame_attaches_claude_chat_and_allows() {
+    // Official prompt frame from the Inference hooks endpoint docs.
+    // Desktop Chat still disableAllHooks; this is the live UUID+turns channel.
+    let home = tempfile::tempdir().expect("tempdir");
+    let daemon = start_daemon(home.path());
+    let frame = include_str!("fixtures/claude_inference_hook_prompt.json");
+    let (code, stdout, stderr) = run_hook_full(home.path(), frame, &[]);
+    assert_eq!(
+        code, 0,
+        "inference hook must not fail the Chat turn: {stderr}"
+    );
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("not json ({e}): {stdout:?}"));
+    assert_eq!(parsed["action"], "allow", "{stdout}");
+    assert!(parsed.get("continue").is_none(), "{stdout}");
+
+    let lines = log_lines(home.path());
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines[0]["harness"], "claude_chat");
+    assert_eq!(
+        lines[0]["vendor_session_id"],
+        "22222222-2222-2222-2222-222222222222"
+    );
+    assert_eq!(lines[0]["entrypoint"], "claude_ai_chat");
+    assert_eq!(lines[0]["event"], "turn_started");
+    assert!(!lines[0].to_string().contains("alice@example.com"));
+    daemon.stop();
+}
+
+#[test]
+fn an_inference_listen_post_attaches_claude_chat() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let daemon = start_daemon(home.path());
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr").to_string();
+    drop(listener);
+    let mut child = Command::new(bin())
+        .args(["hook", "--inference-listen", &addr])
+        .env("CONBUS_HOME", home.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("listen");
+    let frame = include_str!("fixtures/claude_inference_hook_prompt.json");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut reply = String::new();
+    while Instant::now() < deadline {
+        if let Ok(mut stream) = std::net::TcpStream::connect(&addr) {
+            let req = format!(
+                "POST / HTTP/1.1\r\nHost: conbus\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{frame}",
+                frame.len()
+            );
+            if stream.write_all(req.as_bytes()).is_ok() {
+                let _ = stream.shutdown(std::net::Shutdown::Write);
+                let mut buf = String::new();
+                if std::io::Read::read_to_string(&mut stream, &mut buf).is_ok()
+                    && buf.contains("allow")
+                {
+                    reply = buf;
+                    break;
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(reply.contains("\"action\":\"allow\""), "{reply}");
+    let lines = log_lines(home.path());
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines[0]["harness"], "claude_chat");
+    assert_eq!(
+        lines[0]["vendor_session_id"],
+        "22222222-2222-2222-2222-222222222222"
+    );
+    daemon.stop();
+}
+
+#[test]
 fn concurrent_hooks_do_not_shred_the_drop_log() {
     // Every hook is its own process, and the vendor's own contract says tool
     // hooks "may run concurrently for parallel tool calls", so simultaneous

@@ -11,7 +11,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use conbus_core::backfill::{
-    CLAUDE_TRANSCRIPT, CODEX_THREAD, Recovered, parse_claude_transcript, parse_codex_thread,
+    CLAUDE_CHAT_EXPORT, CLAUDE_TRANSCRIPT, CODEX_THREAD, Recovered, parse_claude_chat_export,
+    parse_claude_transcript, parse_codex_thread,
 };
 
 use crate::appserver::AppServer;
@@ -143,24 +144,327 @@ pub fn run_gaps(paths: &Paths, apply: bool) -> io::Result<()> {
     Ok(())
 }
 
+/// Official Claude.ai / Desktop data export. Keeps the Chat conversation
+/// uuid. `import-conversations` hashes that id into a Code session; this
+/// path does not.
+pub fn run_chat_export(paths: &Paths, export: &str, apply: bool) -> io::Result<()> {
+    if apply && std::os::unix::net::UnixStream::connect(paths.socket()).is_ok() {
+        return Err(io::Error::other(format!(
+            "a daemon is listening on {}; stop it before backfilling, because both would \
+             append to the same segment",
+            paths.socket().display()
+        )));
+    }
+    let path = PathBuf::from(export);
+    let text = read_chat_export(&path)?;
+    let held = SegmentLog::scan(paths.log_dir())?.records;
+    let mut log = apply
+        .then(|| SegmentLog::open(paths.log_dir(), Retention::default()))
+        .transpose()?;
+    let outcome = ingest_chat_text(&held, &text, log.as_mut())?;
+
+    println!("export    {}", path.display());
+    println!(
+        "recovered {} conversation(s), {} turn(s), {} record(s){}",
+        outcome.sessions,
+        outcome.turns,
+        outcome.records,
+        if outcome.already_backfilled > 0 {
+            format!("; {} already complete", outcome.already_backfilled)
+        } else {
+            String::new()
+        }
+    );
+    if outcome.gap_records > 0 {
+        println!(
+            "filled    {} conversation(s), {} new turn(s), {} record(s)",
+            outcome.gap_sessions, outcome.gap_turns, outcome.gap_records
+        );
+    }
+    if outcome.recorded_live > 0 {
+        println!(
+            "live      {} conversation(s) the recorder already saw, left alone",
+            outcome.recorded_live
+        );
+    }
+    println!("not read  {}", summarise_unread(&outcome.unread));
+    if apply {
+        println!("written to {}", paths.log_dir().display());
+    } else {
+        println!("\nNothing was written. Re-run with --apply to record it.");
+    }
+    Ok(())
+}
+
+/// Official Chat export: first sighting is a new conversation; a later
+/// export of the same uuid appends only the turns the log does not hold.
+fn ingest_chat_text(
+    held: &[Record],
+    text: &str,
+    mut log: Option<&mut SegmentLog>,
+) -> io::Result<Outcome> {
+    let known = known_from(held.iter());
+    let mut outcome = Outcome::default();
+    for recovered in parse_claude_chat_export(text) {
+        for (reason, count) in &recovered.skipped {
+            *outcome.unread.entry(reason.clone()).or_default() += count;
+        }
+        let Some(session) = recovered
+            .vendor_session_id
+            .as_deref()
+            .and_then(|id| id.parse::<BusId>().ok())
+        else {
+            continue;
+        };
+        let already = known.live.contains(&session) || known.backfilled.contains_key(&session);
+        if already {
+            let sid = session.to_string();
+            let mine: Vec<&Record> = held
+                .iter()
+                .filter(|record| {
+                    record.bus_id == session
+                        || record.source.vendor_session_id.as_deref() == Some(sid.as_str())
+                })
+                .collect();
+            let missing = missing_from(mine, recovered);
+            if missing.is_empty() {
+                if known.live.contains(&session) {
+                    outcome.recorded_live += 1;
+                } else {
+                    outcome.already_backfilled += 1;
+                }
+                continue;
+            }
+            outcome.gap_sessions += 1;
+            outcome.gap_turns += missing
+                .iter()
+                .filter(|entry| matches!(entry.event, Event::TurnStarted { .. }))
+                .count() as u64;
+            outcome.gap_records += missing.len() as u64;
+            if let Some(log) = log.as_mut() {
+                for entry in missing {
+                    log.append(entry)?;
+                }
+            }
+            continue;
+        }
+        if recovered.entries.is_empty() {
+            continue;
+        }
+        outcome.sessions += 1;
+        outcome.turns += recovered
+            .entries
+            .iter()
+            .filter(|e| matches!(e.event, Event::TurnStarted { .. }))
+            .count() as u64;
+        outcome.records += recovered.entries.len() as u64;
+        if let Some(log) = log.as_mut() {
+            for entry in recovered.entries {
+                log.append(entry)?;
+            }
+        }
+    }
+    Ok(outcome)
+}
+
+fn read_chat_export(path: &Path) -> io::Result<String> {
+    if path.is_dir() {
+        return fs::read_to_string(path.join("conversations.json"));
+    }
+    let ext = path.extension().and_then(|ext| ext.to_str());
+    if ext == Some("json")
+        || path.file_name().and_then(|n| n.to_str()) == Some("conversations.json")
+    {
+        return fs::read_to_string(path);
+    }
+    if ext == Some("zip") {
+        return unzip_conversations(path);
+    }
+    Err(io::Error::other(
+        "chat export must be conversations.json, a directory containing it, or a zip",
+    ))
+}
+
+/// Official Privacy export zip puts `conversations.json` at the root.
+/// Some mailed archives nest it one folder down. First match only.
+fn unzip_conversations(path: &Path) -> io::Result<String> {
+    let listing = std::process::Command::new("/usr/bin/unzip")
+        .args(["-Z", "-1"])
+        .arg(path)
+        .output()?;
+    if !listing.status.success() {
+        return Err(io::Error::other("zip is unreadable"));
+    }
+    let names = String::from_utf8_lossy(&listing.stdout);
+    let member = names.lines().find(|name| {
+        Path::new(name)
+            .file_name()
+            .is_some_and(|n| n == "conversations.json")
+            && !name.contains("..")
+    });
+    let Some(member) = member else {
+        return Err(io::Error::other("zip has no conversations.json"));
+    };
+    let out = std::process::Command::new("/usr/bin/unzip")
+        .args(["-p"])
+        .arg(path)
+        .arg(member)
+        .output()?;
+    if out.status.success() && !out.stdout.is_empty() {
+        return String::from_utf8(out.stdout)
+            .map_err(|err| io::Error::other(format!("conversations.json is not utf-8: {err}")));
+    }
+    Err(io::Error::other("zip conversations.json is empty"))
+}
+
 /// Daemon start: fill gaps into a log the daemon already owns.
 ///
 /// The socket is bound but the accept loop has not started, so this is not
 /// racing hook writes. A failure here must not stop the daemon recording.
 pub fn append_gaps_at_start(
-    _paths: &Paths,
+    paths: &Paths,
     held: &[Record],
     log: &mut SegmentLog,
 ) -> io::Result<u64> {
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
-        return Ok(0);
+    let mut n = 0;
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        let transcripts = home.join(".claude").join("projects");
+        if transcripts.is_dir() {
+            n += append_gaps(&transcripts, held, Some(log))?.gap_records;
+        }
+    }
+    // Codex.app burns the same account and never hits CLI hooks. Official
+    // thread/turns/list on threads we already bound fills those turns under
+    // the live `bus_id` — not a second conversation.
+    n += fill_live_codex_gaps(held, log)?;
+    n += ingest_chat_exports(&paths.chat_export(), held, log)?;
+    Ok(n)
+}
+
+/// Vendor Privacy → Export data names the zip `data-export-*.zip`.
+/// Desktop session export uses `claude-desktop-export-*.zip`.
+/// The drop folder also accepts a bare `conversations.json`.
+pub fn is_official_privacy_export(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
     };
-    let transcripts = home.join(".claude").join("projects");
-    if !transcripts.is_dir() {
+    if name == "conversations.json" {
+        return true;
+    }
+    let lower = name.to_ascii_lowercase();
+    lower.ends_with(".zip")
+        && (lower.starts_with("data-export") || lower.starts_with("claude-desktop-export"))
+}
+
+/// Names and sizes of drop-folder files. The daemon skips a full log scan
+/// when this has not changed.
+pub fn chat_export_signature(dir: &Path) -> Vec<(String, u64, u64)> {
+    chat_export_signature_filtered(dir, false)
+}
+
+pub fn chat_export_signature_filtered(dir: &Path, official_only: bool) -> Vec<(String, u64, u64)> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, u64, u64)> = entries
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let meta = entry.metadata().ok()?;
+            if !meta.is_file() && !meta.is_dir() {
+                return None;
+            }
+            if official_only && !is_official_privacy_export(&entry.path()) {
+                return None;
+            }
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            Some((
+                entry.file_name().to_string_lossy().into_owned(),
+                mtime,
+                meta.len(),
+            ))
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// Official Claude.ai / Desktop export drop folder. Chat-only windows have
+/// no hook; a newer `conversations.json` is the identity-preserving channel.
+pub fn ingest_chat_exports(dir: &Path, held: &[Record], log: &mut SegmentLog) -> io::Result<u64> {
+    ingest_chat_exports_filtered(dir, held, log, false)
+}
+
+/// `~/Downloads` after Privacy → Export data. Only vendor-named zips / JSON.
+pub fn ingest_official_privacy_exports(
+    dir: &Path,
+    held: &[Record],
+    log: &mut SegmentLog,
+) -> io::Result<u64> {
+    ingest_chat_exports_filtered(dir, held, log, true)
+}
+
+fn ingest_chat_exports_filtered(
+    dir: &Path,
+    held: &[Record],
+    log: &mut SegmentLog,
+    official_only: bool,
+) -> io::Result<u64> {
+    if !dir.is_dir() {
         return Ok(0);
     }
-    let outcome = append_gaps(&transcripts, held, Some(log))?;
-    Ok(outcome.gap_records)
+    let mut filled = 0u64;
+    let mut entries: Vec<PathBuf> = fs::read_dir(dir)?
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|path| !official_only || is_official_privacy_export(path))
+        .collect();
+    entries.sort();
+    for path in entries {
+        let Ok(text) = read_chat_export(&path) else {
+            continue;
+        };
+        let outcome = ingest_chat_text(held, &text, Some(log))?;
+        filled += outcome.records + outcome.gap_records;
+    }
+    Ok(filled)
+}
+
+/// Official app-server only. Live Codex threads the recorder already bound.
+fn fill_live_codex_gaps(held: &[Record], log: &mut SegmentLog) -> io::Result<u64> {
+    let known = known_from(held.iter());
+    if known.live_codex.is_empty() {
+        return Ok(0);
+    }
+    // Restart must not wait out the 10-minute backfill budget: the socket
+    // is already bound, so a wedged initialize leaves every hook as EAGAIN.
+    let mut server = match AppServer::start(std::time::Duration::from_secs(8)) {
+        Ok(server) => server,
+        Err(_) => return Ok(0),
+    };
+    let mut filled = 0u64;
+    for session in &known.live_codex {
+        let Some(&bus_id) = known.live_codex_bus.get(session) else {
+            continue;
+        };
+        let turns = match list_turns(&mut server, &session.to_string()) {
+            Ok(turns) => turns,
+            Err(_) => continue,
+        };
+        let thread =
+            serde_json::json!({"id": session.to_string(), "sessionId": session.to_string()});
+        let recovered = parse_codex_thread(&thread, &turns);
+        let mine: Vec<&Record> = held.iter().filter(|r| r.bus_id == bus_id).collect();
+        for entry in missing_from(mine, recovered) {
+            if log.append(entry)?.is_some() {
+                filled += 1;
+            }
+        }
+    }
+    Ok(filled)
 }
 
 /// Read live sessions' official transcripts and, when `apply`, append the
@@ -241,7 +545,7 @@ fn missing_from<'a>(
 fn prompt_text(body: &Body) -> Option<String> {
     match body {
         Body::Kept { text } | Body::Clipped { text, .. } => Some(text.clone()),
-        Body::Elided { .. } => None,
+        Body::Elided { .. } | Body::Sealed { .. } => None,
     }
 }
 
@@ -540,6 +844,9 @@ struct Known {
     /// Codex sessions the recorder mirrored, by the vendor's session id —
     /// which is the thread id the app-server lists.
     live_codex: HashSet<BusId>,
+    /// The live `bus_id` for each Codex thread, so gap fill writes under the
+    /// conversation the recorder already minted.
+    live_codex_bus: HashMap<BusId, BusId>,
     /// Live Claude Code session ids that are not UUIDs, so cannot be matched
     /// to a transcript and cannot be protected from a copy either. None have
     /// been seen; counted so that the first one is not a silent gap.
@@ -558,6 +865,7 @@ fn known_from<'a>(records: impl IntoIterator<Item = &'a Record>) -> Known {
         live: HashSet::new(),
         live_bus: HashMap::new(),
         live_codex: HashSet::new(),
+        live_codex_bus: HashMap::new(),
         unreadable_live: HashSet::new(),
     };
     for record in records {
@@ -566,21 +874,26 @@ fn known_from<'a>(records: impl IntoIterator<Item = &'a Record>) -> Known {
                 continue;
             };
             match (record.source.harness.as_str(), session.parse::<BusId>()) {
-                (Harness::CLAUDE_CODE, Ok(session)) => {
+                (Harness::CLAUDE_CODE | Harness::CLAUDE_CHAT, Ok(session)) => {
                     known.live.insert(session);
                     known.live_bus.insert(session, record.bus_id);
                 }
-                (Harness::CLAUDE_CODE, Err(_)) => {
+                (Harness::CLAUDE_CODE | Harness::CLAUDE_CHAT, Err(_)) => {
                     known.unreadable_live.insert(session.to_string());
                 }
                 (Harness::CODEX, Ok(session)) => {
                     known.live_codex.insert(session);
+                    known.live_codex_bus.insert(session, record.bus_id);
                 }
                 _ => {}
             }
             continue;
         }
         if record.source.backfilled_from.as_deref() == Some(CODEX_THREAD) {
+            known.backfilled.insert(record.bus_id, true);
+            continue;
+        }
+        if record.source.backfilled_from.as_deref() == Some(CLAUDE_CHAT_EXPORT) {
             known.backfilled.insert(record.bus_id, true);
             continue;
         }
@@ -904,5 +1217,203 @@ mod tests {
 
         assert!(refused.is_err());
         assert_eq!(records_on_disk(&machine), 1);
+    }
+
+    #[test]
+    fn a_live_codex_thread_receives_official_turns_the_hooks_missed() {
+        // Codex.app burns the account without CLI hooks. Official turns join
+        // the live bus_id — they do not mint a twin. App-server I/O is the
+        // recover suite; this pins the join.
+        let live_thread = "01a06307-cc6a-7702-8533-d02e159b951d";
+        let machine = machine();
+        let bus = BusId::mint();
+        let mut log =
+            SegmentLog::open(machine.paths.log_dir(), Retention::default()).expect("open");
+        log.append(Entry {
+            bus_id: bus,
+            observed_at: None,
+            source: Source {
+                harness: Harness::new(Harness::CODEX),
+                harness_version: None,
+                vendor_session_id: Some(live_thread.into()),
+                workspace: Some("/repo".into()),
+                entrypoint: None,
+                backfilled_from: None,
+            },
+            vendor_turn_id: None,
+            vendor_agent_id: None,
+            event: Event::TurnStarted {
+                author: None,
+                prompt: Body::kept("seen live"),
+            },
+        })
+        .expect("append");
+        let held = SegmentLog::scan(machine.paths.log_dir())
+            .expect("scan")
+            .records;
+        let turns = [serde_json::json!({
+            "id": "t1",
+            "items": [
+                {"type": "userMessage", "id": "u1", "content": [{"type": "text", "text": "from the app"}]},
+                {"type": "agentMessage", "id": "a1", "text": "ok", "phase": "final_answer"}
+            ],
+            "status": "completed",
+            "startedAt": 1,
+            "completedAt": 2
+        })];
+        let recovered = parse_codex_thread(
+            &serde_json::json!({"id": live_thread, "sessionId": live_thread}),
+            &turns,
+        );
+        let mine: Vec<_> = held.iter().filter(|r| r.bus_id == bus).collect();
+        let missing = missing_from(mine, recovered);
+        assert!(
+            missing.iter().any(|e| e.bus_id == bus
+                && matches!(&e.event, Event::TurnStarted { prompt, .. } if prompt_text(prompt).as_deref() == Some("from the app"))),
+            "{missing:?}"
+        );
+    }
+
+    #[test]
+    fn a_later_chat_export_appends_only_the_new_turn() {
+        let machine = machine();
+        let first = r#"{
+            "conversations": [{
+                "uuid": "00000000-1111-2222-3333-444444444444",
+                "chat_messages": [
+                    {"uuid": "m1", "sender": "human", "text": "first", "created_at": "2026-09-06T12:00:00.000Z"},
+                    {"uuid": "m2", "sender": "assistant", "text": "ok", "created_at": "2026-09-06T12:01:00.000Z"}
+                ]
+            }]
+        }"#;
+        let later = r#"{
+            "conversations": [{
+                "uuid": "00000000-1111-2222-3333-444444444444",
+                "chat_messages": [
+                    {"uuid": "m1", "sender": "human", "text": "first", "created_at": "2026-09-06T12:00:00.000Z"},
+                    {"uuid": "m2", "sender": "assistant", "text": "ok", "created_at": "2026-09-06T12:01:00.000Z"},
+                    {"uuid": "m3", "sender": "human", "text": "next turn", "created_at": "2026-09-06T12:02:00.000Z"},
+                    {"uuid": "m4", "sender": "assistant", "text": "still the same chat", "created_at": "2026-09-06T12:03:00.000Z"}
+                ]
+            }]
+        }"#;
+        let mut log =
+            SegmentLog::open(machine.paths.log_dir(), Retention::default()).expect("open");
+        let first_out = ingest_chat_text(&[], first, Some(&mut log)).expect("first");
+        assert_eq!(first_out.sessions, 1);
+        assert!(first_out.gap_records == 0);
+        let held = SegmentLog::scan(machine.paths.log_dir())
+            .expect("scan")
+            .records;
+        let later_out = ingest_chat_text(&held, later, Some(&mut log)).expect("later");
+        assert_eq!(later_out.sessions, 0);
+        assert_eq!(later_out.already_backfilled, 0);
+        assert_eq!(later_out.gap_sessions, 1);
+        assert_eq!(later_out.gap_turns, 1);
+        let all = SegmentLog::scan(machine.paths.log_dir())
+            .expect("scan")
+            .records;
+        assert!(
+            all.iter().any(|r| matches!(
+                &r.event,
+                Event::TurnStarted { prompt, .. } if prompt_text(prompt).as_deref() == Some("next turn")
+            )),
+            "{all:?}"
+        );
+        assert!(
+            all.iter()
+                .all(|r| r.source.harness.as_str() == Harness::CLAUDE_CHAT)
+        );
+    }
+
+    #[test]
+    fn chat_export_signature_changes_only_when_a_file_lands() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let empty = chat_export_signature(dir.path());
+        assert!(empty.is_empty());
+        fs::write(dir.path().join("conversations.json"), "{}").expect("write");
+        let once = chat_export_signature(dir.path());
+        assert_eq!(once.len(), 1);
+        assert_eq!(once, chat_export_signature(dir.path()));
+        fs::write(
+            dir.path().join("conversations.json"),
+            "{\"conversations\":[]}",
+        )
+        .expect("grow");
+        assert_ne!(once, chat_export_signature(dir.path()));
+    }
+
+    #[test]
+    fn a_nested_privacy_export_zip_keeps_the_chat_uuid() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let inner = dir.path().join("mail");
+        fs::create_dir(&inner).expect("dir");
+        fs::write(
+            inner.join("conversations.json"),
+            r#"[{"uuid":"00000000-aaaa-bbbb-cccc-ddddeeeeffff","chat_messages":[
+                {"uuid":"m1","sender":"human","text":"from the mailed zip","created_at":"2026-09-06T12:00:00.000Z"},
+                {"uuid":"m2","sender":"assistant","text":"same conversation","created_at":"2026-09-06T12:01:00.000Z"}
+            ]}]"#,
+        )
+        .expect("json");
+        let zip = dir.path().join("export.zip");
+        let status = std::process::Command::new("/usr/bin/zip")
+            .args(["-q", "-r"])
+            .arg(&zip)
+            .arg("mail/conversations.json")
+            .current_dir(dir.path())
+            .status()
+            .expect("zip");
+        assert!(status.success());
+        let text = read_chat_export(&zip).expect("read");
+        let recovered = parse_claude_chat_export(&text);
+        assert_eq!(
+            recovered[0].vendor_session_id.as_deref(),
+            Some("00000000-aaaa-bbbb-cccc-ddddeeeeffff")
+        );
+        assert_eq!(
+            recovered[0].entries[0].source.harness.as_str(),
+            Harness::CLAUDE_CHAT
+        );
+    }
+
+    #[test]
+    fn downloads_ingest_only_the_vendor_named_privacy_zip() {
+        let machine = machine();
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join("conversations.json"),
+            r#"[{"uuid":"00000000-aaaa-bbbb-cccc-ddddeeeeffff","chat_messages":[
+                {"uuid":"m1","sender":"human","text":"from downloads","created_at":"2026-09-06T12:00:00.000Z"},
+                {"uuid":"m2","sender":"assistant","text":"kept","created_at":"2026-09-06T12:01:00.000Z"}
+            ]}]"#,
+        )
+        .expect("json");
+        let zip = dir.path().join("data-export-2026-09-06.zip");
+        let status = std::process::Command::new("/usr/bin/zip")
+            .args(["-q", "-j"])
+            .arg(&zip)
+            .arg(dir.path().join("conversations.json"))
+            .status()
+            .expect("zip");
+        assert!(status.success());
+        fs::write(dir.path().join("random.zip"), b"not an export").expect("noise");
+        assert!(is_official_privacy_export(&zip));
+        assert!(!is_official_privacy_export(&dir.path().join("random.zip")));
+        let mut log =
+            SegmentLog::open(machine.paths.log_dir(), Retention::default()).expect("open");
+        let filled = ingest_chat_exports_filtered(dir.path(), &[], &mut log, true).expect("ingest");
+        assert!(filled >= 2, "{filled}");
+        let all = SegmentLog::scan(machine.paths.log_dir())
+            .expect("scan")
+            .records;
+        assert!(
+            all.iter()
+                .all(|r| r.source.harness.as_str() == Harness::CLAUDE_CHAT)
+        );
+        assert!(all.iter().any(|r| matches!(
+            &r.event,
+            Event::TurnStarted { prompt, .. } if prompt_text(prompt).as_deref() == Some("from downloads")
+        )));
     }
 }

@@ -50,6 +50,20 @@ pub const CLAUDE_EVENTS: [&str; 13] = [
     "SessionEnd",
 ];
 
+/// Grok's documented Claude-compatible events. `StopFailure` is the quota
+/// substitute: remaining JSON does not exist, but `error=rate_limit` does.
+pub const GROK_EVENTS: [&str; 9] = [
+    "SessionStart",
+    "UserPromptSubmit",
+    "PreToolUse",
+    "PostToolUse",
+    "PostToolUseFailure",
+    "Stop",
+    "StopFailure",
+    "SubagentStop",
+    "SessionEnd",
+];
+
 /// The Codex events the recorder mirrors. Its hook surface is smaller: no
 /// failure, batch, denial, or notification events exist there at all.
 pub const CODEX_EVENTS: [&str; 7] = [
@@ -103,6 +117,111 @@ fn mentions(block: &Value, command: &str) -> bool {
         .any(|existing| existing == command)
 }
 
+/// Cursor's `~/.cursor/hooks.json` is flat `{ command }`, not Claude's nested
+/// `{ hooks: [{ type, command }] }`. `sessionStart` is the official briefing
+/// channel (`additional_context`). `beforeSubmitPrompt` mints. `afterAgentResponse`
+/// is the official last-bubble channel. `sessionEnd` is the official
+/// `error_message` / `final_status` quota-code channel.
+pub const CURSOR_EVENTS: [&str; 5] = [
+    "sessionStart",
+    "beforeSubmitPrompt",
+    "stop",
+    "sessionEnd",
+    "afterAgentResponse",
+];
+
+/// Cursor native hooks file. Distinct from `~/.cursor/hooks/hooks.json`,
+/// which is a Claude-schema copy some plugins write and Cursor does not run.
+pub fn cursor_hooks_path(home: &Path) -> PathBuf {
+    home.join(".cursor").join("hooks.json")
+}
+
+fn mentions_cursor(block: &Value, command: &str) -> bool {
+    block.get("command").and_then(Value::as_str) == Some(command) || mentions(block, command)
+}
+
+/// Merge into Cursor's native hooks.json. Existing entries stay first.
+pub fn merge_cursor(existing: &Value, events: &[&str], command: &str) -> (Value, Vec<Change>) {
+    let mut document = existing.as_object().cloned().unwrap_or_default();
+    document.entry("version".to_string()).or_insert(json!(1));
+    let mut hooks = document
+        .get("hooks")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let mut changes = Vec::new();
+
+    for event in events {
+        let mut blocks = hooks
+            .get(*event)
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if blocks.iter().any(|block| mentions_cursor(block, command)) {
+            changes.push(Change::Keep((*event).to_string()));
+            continue;
+        }
+        blocks.push(json!({ "command": command }));
+        hooks.insert((*event).to_string(), Value::Array(blocks));
+        changes.push(Change::Add((*event).to_string()));
+    }
+
+    document.insert("hooks".to_string(), Value::Object(hooks));
+    (Value::Object(document), changes)
+}
+
+fn cursor_event_mentions_conbus(value: &Value, event: &str) -> bool {
+    value
+        .get("hooks")
+        .and_then(|hooks| hooks.get(event))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|block| {
+            block
+                .get("command")
+                .and_then(Value::as_str)
+                .is_some_and(|cmd| cmd.contains("hook") && cmd.contains("conbus"))
+        })
+}
+
+pub fn cursor_hooks_registered(home: &Path) -> bool {
+    let Ok(text) = fs::read_to_string(cursor_hooks_path(home)) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&text) else {
+        return false;
+    };
+    CURSOR_EVENTS
+        .iter()
+        .all(|event| cursor_event_mentions_conbus(&value, event))
+}
+
+/// Register native Cursor events on hooks.json. Merge only.
+/// `true` when the file changed.
+pub fn apply_cursor_hooks(binary: &Path, home: &Path) -> io::Result<bool> {
+    let path = cursor_hooks_path(home);
+    let command = format!("{} hook --harness cursor", binary.display());
+    let existing = match fs::read_to_string(&path) {
+        Ok(text) => serde_json::from_str(&text).map_err(io::Error::other)?,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => empty_document(),
+        Err(err) => return Err(err),
+    };
+    let (document, changes) = merge_cursor(&existing, &CURSOR_EVENTS, &command);
+    if changes.iter().all(|c| matches!(c, Change::Keep(_))) {
+        return Ok(false);
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if path.exists() {
+        fs::copy(&path, path.with_extension("json.conbus-backup"))?;
+    }
+    let text = serde_json::to_string_pretty(&document).map_err(io::Error::other)?;
+    fs::write(path, format!("{text}\n"))?;
+    Ok(true)
+}
+
 /// A `Map` is what both vendors' settings files are at the top level.
 pub fn empty_document() -> Value {
     Value::Object(Map::new())
@@ -139,6 +258,12 @@ pub fn targets(binary: &Path, home: &Path) -> Vec<Target> {
             settings: codex_home.join("hooks.json"),
             events: &CODEX_EVENTS,
             command: format!("{binary} hook --harness codex"),
+        },
+        Target {
+            harness: "grok",
+            settings: home.join(".grok").join("hooks").join("conbus.json"),
+            events: &GROK_EVENTS,
+            command: format!("{binary} hook --harness grok"),
         },
     ]
 }
@@ -210,6 +335,105 @@ fn merge_statusline(document: &mut Value, command: &str) -> Option<Change> {
             Some(Change::Add("StatusLine".into()))
         }
     }
+}
+
+/// Official OpenCode plugin path. Local plugins in this directory load at startup.
+pub fn opencode_plugin_path(home: &Path) -> PathBuf {
+    home.join(".config")
+        .join("opencode")
+        .join("plugins")
+        .join("conbus.js")
+}
+
+/// Plugin that forwards official bus events to `conbus hook --harness opencode`.
+pub fn opencode_plugin_source(binary: &Path) -> String {
+    let bin = binary.display();
+    format!(
+        r#"// Written by conbus install. Forwards official plugin events; does not call vendor HTTP.
+import {{ spawn }} from "node:child_process";
+
+export const ConbusPlugin = async ({{ directory }}) => {{
+  const bin = {bin:?};
+  const send = (payload) =>
+    new Promise((resolve) => {{
+      const child = spawn(bin, ["hook", "--harness", "opencode"], {{
+        stdio: ["pipe", "pipe", "pipe"],
+      }});
+      child.on("error", () => resolve());
+      child.on("close", () => resolve());
+      child.stdin.end(JSON.stringify(payload));
+    }});
+
+  return {{
+    event: async ({{ event }}) => {{
+      const type = event?.type;
+      const props = event?.properties ?? {{}};
+      const session = props.sessionID ?? props.info?.sessionID ?? props.info?.id;
+      if (!type || !session) return;
+      if (type === "session.created") {{
+        await send({{
+          opencode_plugin: 1,
+          hook_event_name: type,
+          session_id: session,
+          cwd: directory,
+        }});
+        return;
+      }}
+      if (type === "message.updated" && props.info?.role === "user") {{
+        await send({{
+          opencode_plugin: 1,
+          hook_event_name: type,
+          session_id: session,
+          cwd: directory,
+          message_id: props.info?.id,
+          prompt: props.info?.summary?.title ?? "",
+        }});
+        return;
+      }}
+      if (type === "message.part.updated" && props.part?.type === "text" && props.part?.text) {{
+        await send({{
+          opencode_plugin: 1,
+          hook_event_name: type,
+          session_id: props.part.sessionID ?? session,
+          cwd: directory,
+          message_id: props.part.messageID,
+          prompt: props.part.text,
+        }});
+        return;
+      }}
+      if (type === "session.error") {{
+        await send({{
+          opencode_plugin: 1,
+          hook_event_name: type,
+          session_id: session,
+          cwd: directory,
+          error: props.error ?? null,
+        }});
+      }}
+    }},
+  }};
+}};
+"#
+    )
+}
+
+pub fn opencode_plugin_registered(home: &Path) -> bool {
+    std::fs::read_to_string(opencode_plugin_path(home))
+        .is_ok_and(|text| text.contains("opencode_plugin") && text.contains("session.error"))
+}
+
+/// Write the OpenCode plugin. Idempotent when the command path is unchanged.
+pub fn apply_opencode_plugin(binary: &Path, home: &Path) -> io::Result<bool> {
+    let path = opencode_plugin_path(home);
+    let source = opencode_plugin_source(binary);
+    if std::fs::read_to_string(&path).is_ok_and(|existing| existing == source) {
+        return Ok(false);
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, source)?;
+    Ok(true)
 }
 
 /// Write the plan, keeping a copy of whatever was there before.
@@ -305,6 +529,93 @@ mod tests {
 
         let text = serde_json::to_string(&merged).expect("serialise");
         assert!(!text.contains("async"), "{text}");
+    }
+
+    #[test]
+    fn grok_registers_in_its_own_hooks_dir_not_claude_settings() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let found = targets(Path::new("/opt/conbus"), home.path())
+            .into_iter()
+            .find(|t| t.harness == "grok")
+            .expect("grok target");
+        assert_eq!(
+            found.settings,
+            home.path().join(".grok").join("hooks").join("conbus.json")
+        );
+        assert!(found.command.contains("--harness grok"));
+        assert!(found.events.contains(&"StopFailure"));
+    }
+
+    #[test]
+    fn opencode_plugin_is_written_beside_other_local_plugins() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let bin = Path::new("/opt/conbus");
+        assert!(apply_opencode_plugin(bin, home.path()).expect("write"));
+        assert!(!apply_opencode_plugin(bin, home.path()).expect("idempotent"));
+        let text = std::fs::read_to_string(opencode_plugin_path(home.path())).expect("read");
+        assert!(text.contains("/opt/conbus"));
+        assert!(text.contains("session.error"));
+        assert!(opencode_plugin_registered(home.path()));
+    }
+
+    #[test]
+    fn cursor_native_hooks_append_and_leave_the_rest() {
+        let existing = json!({
+            "version": 1,
+            "hooks": {
+                "sessionEnd": [{ "command": "their-session-end" }],
+                "afterAgentResponse": [{ "command": "their-notify" }]
+            }
+        });
+        let (merged, changes) = merge_cursor(
+            &existing,
+            &CURSOR_EVENTS,
+            "/opt/conbus hook --harness cursor",
+        );
+
+        assert_eq!(
+            merged["hooks"]["sessionEnd"][0]["command"],
+            "their-session-end"
+        );
+        assert_eq!(
+            merged["hooks"]["sessionEnd"][1]["command"],
+            "/opt/conbus hook --harness cursor"
+        );
+        assert_eq!(
+            merged["hooks"]["afterAgentResponse"][0]["command"],
+            "their-notify"
+        );
+        assert_eq!(
+            merged["hooks"]["afterAgentResponse"][1]["command"],
+            "/opt/conbus hook --harness cursor"
+        );
+        assert_eq!(
+            changes.iter().map(Change::event).collect::<Vec<_>>(),
+            [
+                "sessionStart",
+                "beforeSubmitPrompt",
+                "stop",
+                "sessionEnd",
+                "afterAgentResponse",
+            ]
+        );
+        assert!(changes.iter().all(|c| matches!(c, Change::Add(_))));
+    }
+
+    #[test]
+    fn cursor_native_hooks_do_not_register_twice() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let bin = Path::new("/opt/conbus");
+        assert!(apply_cursor_hooks(bin, home.path()).expect("write"));
+        assert!(!apply_cursor_hooks(bin, home.path()).expect("idempotent"));
+        assert!(cursor_hooks_registered(home.path()));
+        let text = std::fs::read_to_string(cursor_hooks_path(home.path())).expect("read");
+        assert_eq!(text.matches("afterAgentResponse").count(), 1);
+        assert_eq!(text.matches("sessionEnd").count(), 1);
+        assert_eq!(text.matches("sessionStart").count(), 1);
+        assert_eq!(text.matches("beforeSubmitPrompt").count(), 1);
+        assert_eq!(text.matches("\"stop\"").count(), 1);
+        assert!(text.contains("/opt/conbus hook --harness cursor"));
     }
 
     #[test]

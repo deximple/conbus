@@ -47,6 +47,18 @@ pub fn silent_reply(harness: &str) -> &'static str {
     }
 }
 
+/// What to print when the record did not land.
+///
+/// Inference hooks must still allow — a Claude `continue` object is not a
+/// verdict, and a deny would block the Chat window we are attaching.
+pub fn failure_reply(harness: &str, payload: &str) -> &'static str {
+    if hook::inference::looks_like(payload) {
+        hook::inference::ALLOW
+    } else {
+        silent_reply(harness)
+    }
+}
+
 /// How long the hook will wait on the daemon before giving up on it.
 pub const REPLY_DEADLINE: std::time::Duration = std::time::Duration::from_millis(500);
 
@@ -138,6 +150,24 @@ pub type Reply = String;
 /// match, without blocking the turn, and reports that failure only once per
 /// session — so a name that drifts would be invisible after its first turn.
 pub fn briefing_reply(harness: &str, hook_event_name: &str, context: &str, message: &str) -> Reply {
+    // Per-field cap, UTF-16 units, inclusive. Past it the vendor persists the
+    // text and the model gets a preview — silent degradation. Refuse here
+    // rather than ship a pack that looks like it landed.
+    if conbus_core::pack::units(context) > conbus_core::pack::VENDOR_CAP_UNITS
+        || conbus_core::pack::units(message) > conbus_core::pack::VENDOR_CAP_UNITS
+    {
+        return silent_reply(harness).to_string();
+    }
+    if harness == Harness::CURSOR {
+        // Official Cursor inject is sessionStart `additional_context`.
+        // hookSpecificOutput is Claude's dialect and is ignored here.
+        return serde_json::json!({
+            "continue": true,
+            "suppressOutput": true,
+            "additional_context": context,
+        })
+        .to_string();
+    }
     let mut reply = serde_json::json!({
         "systemMessage": message,
         "hookSpecificOutput": {
@@ -172,6 +202,7 @@ pub fn run(harness: &str, stdin: &mut impl Read) -> Result<Reply, Dropped> {
         .read_to_string(&mut payload)
         .map_err(|err| format!("could not read the hook payload: {err}"))?;
 
+    let inference = hook::inference::looks_like(&payload);
     let normalized = hook::normalize(&Harness::new(harness), &payload).map_err(|err| err.0)?;
     let key;
     let observed;
@@ -186,8 +217,15 @@ pub fn run(harness: &str, stdin: &mut impl Read) -> Result<Reply, Dropped> {
             hook_event_name = name;
             observed = *o;
         }
-        // A decision, so nothing to say.
-        Normalized::Ignored { .. } => return Ok(silent_reply(harness).to_string()),
+        // A decision, so nothing to say. Inference frames still need the
+        // archival verdict — Claude hook JSON would fail Anthropic's parse.
+        Normalized::Ignored { .. } => {
+            return Ok(if inference {
+                hook::inference::ALLOW.to_string()
+            } else {
+                silent_reply(harness).to_string()
+            });
+        }
         // A surprise. The vendor grew an event this adapter has never seen, and
         // it is being dropped — which is the right thing to do and the wrong
         // thing to do quietly.
@@ -200,8 +238,55 @@ pub fn run(harness: &str, stdin: &mut impl Read) -> Result<Reply, Dropped> {
         }
     }
     let paths = Paths::resolve().map_err(|_| "no home directory to resolve".to_string())?;
+    if key.harness.as_str() == Harness::CURSOR
+        || key.harness.as_str() == Harness::AGY
+        || key.harness.as_str() == Harness::OPENCODE
+        || key.harness.as_str() == Harness::GROK
+        || key.harness.as_str() == Harness::CLAUDE_CHAT
+    {
+        crate::quota::observe_hook_keys(&paths, key.harness.as_str(), &payload);
+    }
     let socket = paths.socket();
-    let stream = UnixStream::connect(&socket)
+    let request = Request {
+        protocol_version: Some(crate::wire::PROTOCOL_VERSION),
+        harness: key.harness.clone(),
+        harness_version: vendor_version(harness),
+        vendor_session_id: key.vendor_session_id,
+        vendor_turn_id: observed.vendor_turn_id,
+        vendor_agent_id: observed.vendor_agent_id,
+        workspace: observed.workspace,
+        entrypoint: if inference {
+            Some(Entrypoint::new("claude_ai_chat"))
+        } else {
+            entrypoint(harness)
+        },
+        // Inference hooks only take allow/deny — a briefing object fails
+        // the Chat turn Anthropic is holding. Cursor briefs on sessionStart
+        // via additional_context; beforeSubmitPrompt still asks so a first
+        // prompt can carry the same pack if that event later grows a field.
+        brief: briefing_enabled() && !inference,
+        event: observed.event,
+    };
+    let result = match send_once(harness, &socket, &request, &hook_event_name) {
+        Err(dropped) if transient_socket(&dropped.reason) => {
+            send_once(harness, &socket, &request, &hook_event_name)
+        }
+        other => other,
+    };
+    match result {
+        Ok(_) if inference => Ok(hook::inference::ALLOW.to_string()),
+        other => other,
+    }
+}
+
+fn transient_socket(reason: &str) -> bool {
+    reason.contains("Broken pipe")
+        || reason.contains("Socket is not connected")
+        || reason.contains("Connection reset")
+}
+
+fn connect(socket: &std::path::Path) -> Result<UnixStream, Dropped> {
+    let stream = UnixStream::connect(socket)
         .map_err(|err| format!("no daemon on {}: {err}", socket.display()))?;
     // A hook must never fail the turn, and it must not delay it either. Without
     // these the read blocks forever on a daemon that is up but wedged, and the
@@ -220,22 +305,16 @@ pub fn run(harness: &str, stdin: &mut impl Read) -> Result<Reply, Dropped> {
     ] {
         limit.map_err(|err| format!("could not bound the daemon call: {err}"))?;
     }
+    Ok(stream)
+}
 
-    let request = Request {
-        protocol_version: Some(crate::wire::PROTOCOL_VERSION),
-        harness: key.harness.clone(),
-        harness_version: vendor_version(harness),
-        vendor_session_id: key.vendor_session_id,
-        vendor_turn_id: observed.vendor_turn_id,
-        vendor_agent_id: observed.vendor_agent_id,
-        workspace: observed.workspace,
-        entrypoint: entrypoint(harness),
-        // Cursor's beforeSubmitPrompt accepts `continue`, not Claude's
-        // hookSpecificOutput. A briefing reply would be a different dialect.
-        brief: briefing_enabled() && key.harness.as_str() != Harness::CURSOR,
-        event: observed.event,
-    };
-    send(harness, stream, &request, &hook_event_name)
+fn send_once(
+    harness: &str,
+    socket: &std::path::Path,
+    request: &Request,
+    hook_event_name: &str,
+) -> Result<Reply, Dropped> {
+    send(harness, connect(socket)?, request, hook_event_name)
 }
 
 fn send(
@@ -334,6 +413,19 @@ mod tests {
     }
 
     #[test]
+    fn an_inference_frame_still_allows_when_the_record_fails() {
+        let frame = include_str!("../../tests/fixtures/claude_inference_hook_prompt.json");
+        assert_eq!(
+            failure_reply(Harness::CLAUDE_CODE, frame),
+            hook::inference::ALLOW
+        );
+        assert_eq!(
+            failure_reply(Harness::CLAUDE_CODE, r#"{"session_id":"s"}"#),
+            SILENT_OK
+        );
+    }
+
+    #[test]
     fn claude_code_keeps_the_reply_that_kept_its_sessions_up() {
         // The other vendor is the reason the silent reply is not empty: a
         // zero-byte stdout on a context-injecting event took a real session
@@ -343,5 +435,41 @@ mod tests {
             briefing_reply(Harness::CLAUDE_CODE, "UserPromptSubmit", "c", "m")
                 .contains("\"suppressOutput\":true")
         );
+    }
+
+    #[test]
+    fn a_pack_over_the_vendor_cap_is_refused_not_degraded() {
+        let over = "x".repeat(conbus_core::pack::VENDOR_CAP_UNITS + 1);
+        assert_eq!(
+            briefing_reply(Harness::CLAUDE_CODE, "UserPromptSubmit", &over, "m"),
+            SILENT_OK
+        );
+        assert_eq!(
+            briefing_reply(Harness::CODEX, "UserPromptSubmit", "c", &over),
+            "{}"
+        );
+    }
+
+    #[test]
+    fn cursor_briefing_uses_additional_context_not_claude_output() {
+        let brief = briefing_reply(
+            Harness::CURSOR,
+            "sessionStart",
+            "the pack",
+            "one line",
+        );
+        assert!(brief.contains("\"additional_context\":\"the pack\""), "{brief}");
+        assert!(!brief.contains("hookSpecificOutput"), "{brief}");
+        assert!(!brief.contains("additionalContext"), "{brief}");
+        assert!(brief.contains("\"continue\":true"), "{brief}");
+    }
+
+    #[test]
+    fn broken_pipe_is_retried_once() {
+        assert!(transient_socket("could not send the record: Broken pipe (os error 32)"));
+        assert!(transient_socket(
+            "could not send the record: Socket is not connected (os error 57)"
+        ));
+        assert!(!transient_socket("no daemon on /tmp/x"));
     }
 }

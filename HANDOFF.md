@@ -5,7 +5,7 @@ recording on this machine. Read this, then read the plan.
 
 ## Where things are
 
-- Repo: `/Applications/conbus`, remote `deximple/conbus`, **private**. `main` is `069ea6c` (PR #13 merged).
+- Repo: `/Applications/conbus`, remote `deximple/conbus`, **private**. `main` tracked `be35868` then this dirty tree. Desktop dumps `index.js` / `mainView.js` / `mainWindow.js` are not product.
   Stage 1 is open (uncommitted on `main`). Cursor adapter keys on
   `cursor_version` (live drop field names). Probe
   `01a072c5-3022-7c62-b64a-578cd6177239` recorded 4 `cursor` lines

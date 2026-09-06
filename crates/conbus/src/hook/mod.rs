@@ -4,6 +4,9 @@ pub mod claude_code;
 pub mod client;
 pub mod codex;
 pub mod cursor;
+pub mod grok;
+pub mod inference;
+pub mod opencode;
 
 use conbus_core::event::Harness;
 use conbus_core::registry::{Observed, SessionKey};
@@ -55,15 +58,27 @@ pub struct HookError(pub String);
 /// dispatch is by payload (`cursor_version`), not by the argv harness. The
 /// fields were pinned by the live drop log, not by Claude's schema.
 pub fn normalize(harness: &Harness, payload: &str) -> Result<Normalized, HookError> {
+    if inference::looks_like(payload) {
+        return inference::normalize(payload);
+    }
     if cursor::looks_like(payload) {
         return cursor::normalize(&Harness::new(Harness::CURSOR), payload);
+    }
+    if grok::looks_like(payload) {
+        return grok::normalize(payload);
+    }
+    if opencode::looks_like(payload) {
+        return opencode::normalize(payload);
     }
     match harness.as_str() {
         Harness::CLAUDE_CODE => claude_code::normalize(harness, payload),
         Harness::CODEX => codex::normalize(harness, payload),
         Harness::CURSOR => cursor::normalize(harness, payload),
+        Harness::GROK => grok::normalize(payload),
+        Harness::OPENCODE => opencode::normalize(payload),
+        Harness::CLAUDE_CHAT => claude_code::normalize(harness, payload),
         other => Err(HookError(format!(
-            "no adapter for harness {other:?}; conbus reads claude_code, codex, and cursor"
+            "no adapter for harness {other:?}; conbus reads claude_code, claude_chat, codex, cursor, grok, and opencode"
         ))),
     }
 }

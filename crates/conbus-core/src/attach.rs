@@ -13,8 +13,9 @@ pub struct Caps {
     pub aliases: &'static [&'static str],
     /// Official machine-readable remaining-quota channel we have captured.
     /// `/usage` in a TUI is not this. Claude's StatusLine stdin `rate_limits`
-    /// is: the unmodified binary already fetched it. We do not call
-    /// `oauth/usage` ourselves.
+    /// is: the unmodified binary already fetched it. Agy's
+    /// `agy -p "/usage" --output-format json` is the same class. We do not
+    /// call vendor HTTP with tokens we read from disk.
     pub quota_signal: bool,
     /// History write that is not a model turn.
     pub history_inject_no_model: bool,
@@ -47,7 +48,7 @@ pub const CATALOG: &[Caps] = &[
     Caps {
         slug: Harness::AGY,
         aliases: &["antigravity"],
-        quota_signal: false,
+        quota_signal: true,
         history_inject_no_model: false,
         usable_as_target: false,
     },
@@ -65,13 +66,20 @@ pub const CATALOG: &[Caps] = &[
         history_inject_no_model: false,
         usable_as_target: false,
     },
+    Caps {
+        slug: Harness::CLAUDE_CHAT,
+        aliases: &["chat"],
+        quota_signal: false,
+        history_inject_no_model: false,
+        usable_as_target: false,
+    },
 ];
 
 pub fn resolve(name: &str) -> Option<&'static str> {
     let name = name.trim();
-    CATALOG.iter().find_map(|caps| {
-        (caps.slug == name || caps.aliases.contains(&name)).then_some(caps.slug)
-    })
+    CATALOG
+        .iter()
+        .find_map(|caps| (caps.slug == name || caps.aliases.contains(&name)).then_some(caps.slug))
 }
 
 pub fn caps(slug: &str) -> Option<&'static Caps> {
@@ -102,6 +110,7 @@ mod tests {
         assert_eq!(resolve("claude"), Some(Harness::CLAUDE_CODE));
         assert_eq!(resolve("antigravity"), Some(Harness::AGY));
         assert_eq!(resolve("cursor"), Some(Harness::CURSOR));
+        assert_eq!(resolve("chat"), Some(Harness::CLAUDE_CHAT));
         assert_eq!(resolve("not_a_harness"), None);
     }
 
@@ -118,7 +127,15 @@ mod tests {
             let caps = caps(slug).expect("pair");
             assert!(caps.quota_signal && caps.history_inject_no_model && caps.usable_as_target);
         }
-        for slug in [Harness::CURSOR, Harness::AGY, Harness::OPENCODE, Harness::GROK] {
+        let agy = caps(Harness::AGY).expect("agy");
+        assert!(agy.quota_signal, "print-mode /usage is an official channel");
+        assert!(!agy.usable_as_target, "Agy is a source, not a landing pad");
+        for slug in [
+            Harness::CURSOR,
+            Harness::OPENCODE,
+            Harness::GROK,
+            Harness::CLAUDE_CHAT,
+        ] {
             let caps = caps(slug).expect("attach");
             assert!(!caps.quota_signal);
             assert!(!caps.usable_as_target);

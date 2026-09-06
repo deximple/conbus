@@ -28,16 +28,69 @@ pub struct Stamp {
     pub build: String,
     pub pid: u32,
     pub started: String,
+    /// Set after restore+relock. Absent on a first write or an older daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub core_dumps_disabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_locked: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_lock_error: Option<String>,
 }
 
 /// Write this process's build beside the socket. Written beside and renamed,
 /// so a `doctor` reading mid-write sees the old stamp or the new one, never
 /// half of either.
 pub fn stamp(paths: &Paths) -> io::Result<()> {
+    write_stamp(paths, None)
+}
+
+/// Record what locking actually did, after restore grew the heap.
+pub fn stamp_hardening(
+    paths: &Paths,
+    core_dumps_disabled: bool,
+    memory_locked: bool,
+    memory_lock_error: Option<String>,
+) -> io::Result<()> {
+    write_stamp(
+        paths,
+        Some(HardenStamp {
+            core_dumps_disabled,
+            memory_locked,
+            memory_lock_error,
+        }),
+    )
+}
+
+struct HardenStamp {
+    core_dumps_disabled: bool,
+    memory_locked: bool,
+    memory_lock_error: Option<String>,
+}
+
+fn write_stamp(paths: &Paths, harden: Option<HardenStamp>) -> io::Result<()> {
+    let previous = std::fs::read_to_string(stamp_file(paths))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Stamp>(text.trim()).ok())
+        .filter(|seen| seen.pid == std::process::id() && seen.build == BUILD);
     let stamp = Stamp {
         build: BUILD.to_string(),
         pid: std::process::id(),
-        started: Timestamp::now().to_string(),
+        started: previous
+            .as_ref()
+            .map(|seen| seen.started.clone())
+            .unwrap_or_else(|| Timestamp::now().to_string()),
+        core_dumps_disabled: harden
+            .as_ref()
+            .map(|h| h.core_dumps_disabled)
+            .or_else(|| previous.as_ref().and_then(|s| s.core_dumps_disabled)),
+        memory_locked: harden
+            .as_ref()
+            .map(|h| h.memory_locked)
+            .or_else(|| previous.as_ref().and_then(|s| s.memory_locked)),
+        memory_lock_error: match &harden {
+            Some(h) => h.memory_lock_error.clone(),
+            None => previous.and_then(|s| s.memory_lock_error),
+        },
     };
     let text = serde_json::to_string(&stamp).map_err(io::Error::other)?;
     let file = stamp_file(paths);
@@ -118,6 +171,33 @@ mod tests {
         .expect("write");
 
         assert!(matches!(daemon_build(&paths), DaemonBuild::Stale(_)));
+    }
+
+    #[test]
+    fn hardening_is_stamped_after_the_build_and_an_old_stamp_still_reads() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::from_env(dir.path().to_str(), None, None).expect("paths");
+        std::fs::create_dir_all(paths.root()).expect("root");
+        stamp(&paths).expect("stamp");
+        match daemon_build(&paths) {
+            DaemonBuild::Running(found) => assert_eq!(found.memory_locked, None),
+            other => panic!("{other:?}"),
+        }
+
+        stamp_hardening(&paths, true, true, None).expect("harden");
+        match daemon_build(&paths) {
+            DaemonBuild::Running(found) => {
+                assert_eq!(found.core_dumps_disabled, Some(true));
+                assert_eq!(found.memory_locked, Some(true));
+                assert_eq!(found.memory_lock_error, None);
+            }
+            other => panic!("{other:?}"),
+        }
+
+        serde_json::from_str::<Stamp>(
+            r#"{"build":"abc","pid":1,"started":"2026-09-02T08:14:53.000Z"}"#,
+        )
+        .expect("old shape still reads");
     }
 
     #[test]

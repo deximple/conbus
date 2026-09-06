@@ -52,6 +52,25 @@ struct Payload {
     status: Option<String>,
     #[serde(default)]
     subagent_id: Option<String>,
+    /// `sessionEnd`. Official docs: completed | aborted | error | window_close | user_close.
+    #[serde(default)]
+    reason: Option<String>,
+    /// `sessionEnd`. Documented; the 3.19.13 emit site currently omits it.
+    /// When it carries a classified quota code, that is the overflow signal.
+    #[serde(default)]
+    error_message: Option<String>,
+    /// `sessionEnd`. Composer status; 3.19.13 sends aborted/unknown/error.
+    /// Read in case a later build puts a classified quota code here.
+    #[serde(default)]
+    final_status: Option<String>,
+    /// `afterAgentResponse`. Last assistant bubble. Overflow only when
+    /// it carries a classified proto code, not ordinary English.
+    ///
+    /// Live 2026-08-23 payload on this machine also carried
+    /// `input_tokens` / `output_tokens` / `cache_read_tokens` /
+    /// `cache_write_tokens`. Those are turn usage, not remaining quota.
+    #[serde(default)]
+    text: Option<String>,
 }
 
 /// Whether this payload is Cursor's, not Claude Code's wearing the same command.
@@ -102,14 +121,40 @@ pub fn normalize(harness: &Harness, json: &str) -> Result<Normalized, HookError>
                 output: body_of(payload.tool_output),
             },
         },
-        "stop" => Event::TurnEnded {
-            state: stop_state(payload.status.as_deref()),
+        "stop" | "subagentStop" => Event::TurnEnded {
+            state: stop_or_quota(payload.status.as_deref()),
             assistant_message: None,
         },
-        "subagentStop" => Event::TurnEnded {
-            state: stop_state(payload.status.as_deref()),
-            assistant_message: None,
-        },
+        "sessionEnd" => {
+            if let Some(message) = session_end_quota(&payload) {
+                Event::TurnEnded {
+                    state: TurnState::InterruptedQuota { reason: message },
+                    assistant_message: None,
+                }
+            } else {
+                Event::SessionEnded {
+                    reason: payload.reason,
+                }
+            }
+        }
+        "afterAgentResponse" => {
+            let text = payload.text.unwrap_or_default();
+            if classified_quota(&text) {
+                Event::TurnEnded {
+                    state: TurnState::InterruptedQuota { reason: text },
+                    assistant_message: None,
+                }
+            } else {
+                // Official last bubble. `stop` does not carry it; this event
+                // does. Completing here is what lets the live payload land
+                // and its keys get scanned — Unknown was dropping the
+                // only Cursor channel that can name a quota code.
+                Event::TurnEnded {
+                    state: TurnState::Complete,
+                    assistant_message: Some(Body::kept(text)),
+                }
+            }
+        }
         other => {
             return Ok(Normalized::Unknown {
                 hook_event_name: other.to_string(),
@@ -127,6 +172,45 @@ pub fn normalize(harness: &Harness, json: &str) -> Result<Normalized, HookError>
             event,
         }),
     })
+}
+
+/// Official Cursor error codes from the same proto `classifyTurnError` uses.
+/// They are telemetry-only on 3.19.13 `stop`. `sessionEnd` already arrives;
+/// overflow only when one of its fields carries a classified code.
+fn session_end_quota(payload: &Payload) -> Option<String> {
+    [
+        payload.error_message.as_deref(),
+        payload.final_status.as_deref(),
+        payload.reason.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|text| classified_quota(text))
+    .map(str::to_string)
+}
+
+fn classified_quota(text: &str) -> bool {
+    [
+        "FREE_USER_RATE_LIMIT_EXCEEDED",
+        "PRO_USER_RATE_LIMIT_EXCEEDED",
+        "FREE_USER_USAGE_LIMIT",
+        "PRO_USER_USAGE_LIMIT",
+        "RESOURCE_EXHAUSTED",
+        "RATE_LIMITED_CHANGEABLE",
+        "GENERIC_RATE_LIMIT_EXCEEDED",
+        "RATE_LIMITED",
+    ]
+    .iter()
+    .any(|code| text.contains(code))
+}
+
+fn stop_or_quota(status: Option<&str>) -> TurnState {
+    match status {
+        Some(code) if classified_quota(code) => TurnState::InterruptedQuota {
+            reason: code.to_string(),
+        },
+        other => stop_state(other),
+    }
 }
 
 fn stop_state(status: Option<&str>) -> TurnState {
@@ -278,6 +362,34 @@ mod tests {
     }
 
     #[test]
+    fn a_stop_with_a_classified_quota_code_overflows() {
+        let json = STOP.replace("completed", "PRO_USER_USAGE_LIMIT");
+        match event_of(&json) {
+            Event::TurnEnded {
+                state: TurnState::InterruptedQuota { reason },
+                ..
+            } => assert_eq!(reason, "PRO_USER_USAGE_LIMIT"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_error_stop_is_not_quota() {
+        // Cursor's hook stdin is status=completed|aborted|error only.
+        // The binary classifies FREE_USER_RATE_LIMIT_EXCEEDED internally
+        // and keeps that code off this payload. Promoting every error
+        // would hop on compiler failures.
+        let json = STOP.replace("completed", "error");
+        match event_of(&json) {
+            Event::TurnEnded {
+                state: TurnState::InterruptedPolicy { reason },
+                ..
+            } => assert_eq!(reason, "error"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
     fn an_unseen_cursor_event_is_unknown_not_ignored() {
         let json = r#"{"hook_event_name":"afterAgentThought","cursor_version":"2.0.0","conversation_id":"c"}"#;
         match normalize(&Harness::new(Harness::CLAUDE_CODE), json).expect("ok") {
@@ -297,5 +409,87 @@ mod tests {
             panic!("event");
         };
         assert_eq!(key.harness.as_str(), Harness::CLAUDE_CODE);
+    }
+
+    #[test]
+    fn a_session_end_without_a_quota_code_is_not_overflow() {
+        let json = r#"{
+            "hook_event_name":"sessionEnd",
+            "cursor_version":"2.0.0",
+            "conversation_id":"conv-1",
+            "reason":"error",
+            "error_message":"compile failed",
+            "final_status":"aborted"
+        }"#;
+        match event_of(json) {
+            Event::SessionEnded { reason } => assert_eq!(reason.as_deref(), Some("error")),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_session_end_with_a_classified_quota_code_overflows() {
+        let json = r#"{
+            "hook_event_name":"sessionEnd",
+            "cursor_version":"2.0.0",
+            "conversation_id":"conv-1",
+            "reason":"error",
+            "error_message":"PRO_USER_USAGE_LIMIT",
+            "final_status":"aborted"
+        }"#;
+        match event_of(json) {
+            Event::TurnEnded {
+                state: TurnState::InterruptedQuota { reason },
+                ..
+            } => assert_eq!(reason, "PRO_USER_USAGE_LIMIT"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_session_end_quota_code_in_final_status_overflows() {
+        let json = r#"{
+            "hook_event_name":"sessionEnd",
+            "cursor_version":"2.0.0",
+            "conversation_id":"conv-1",
+            "reason":"error",
+            "final_status":"RESOURCE_EXHAUSTED"
+        }"#;
+        match event_of(json) {
+            Event::TurnEnded {
+                state: TurnState::InterruptedQuota { reason },
+                ..
+            } => assert_eq!(reason, "RESOURCE_EXHAUSTED"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_after_agent_response_with_a_quota_code_overflows() {
+        let json = include_str!("../../tests/fixtures/cursor_3.19_after_agent_response.json");
+        match event_of(json) {
+            Event::TurnEnded {
+                state: TurnState::InterruptedQuota { reason },
+                ..
+            } => assert!(reason.contains("PRO_USER_USAGE_LIMIT")),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_after_agent_response_without_a_quota_code_keeps_the_bubble() {
+        let json = r#"{
+            "hook_event_name":"afterAgentResponse",
+            "cursor_version":"2.0.0",
+            "conversation_id":"conv-1",
+            "text":"the tests passed"
+        }"#;
+        match event_of(json) {
+            Event::TurnEnded {
+                state: TurnState::Complete,
+                assistant_message: Some(Body::Kept { text }),
+            } => assert_eq!(text, "the tests passed"),
+            other => panic!("{other:?}"),
+        }
     }
 }

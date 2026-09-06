@@ -15,6 +15,7 @@ mod report;
 mod runner;
 mod takeover;
 mod warm;
+mod window;
 mod wire;
 
 use std::io::Read;
@@ -33,7 +34,11 @@ fn main() -> ExitCode {
         Command::Hook {
             harness,
             statusline,
+            inference_listen,
         } => {
+            if let Some(addr) = inference_listen {
+                return run(|_| hook::inference::serve(&addr, &harness));
+            }
             if statusline {
                 // StatusLine stdout is the status bar. Hook JSON here would
                 // paint `{"continue":true}` into the TUI.
@@ -47,11 +52,7 @@ fn main() -> ExitCode {
                 });
                 print!(
                     "{}",
-                    quota::observe_statusline(
-                        paths.as_ref(),
-                        forward.as_deref(),
-                        &stdin
-                    )
+                    quota::observe_statusline(paths.as_ref(), forward.as_deref(), &stdin)
                 );
                 return ExitCode::SUCCESS;
             }
@@ -66,7 +67,9 @@ fn main() -> ExitCode {
             // it. The vendor's documented contract takes JSON on stdout, so an
             // explicit "carry on" costs nothing and cannot be mistaken for an
             // empty context block.
-            let reply = match hook::client::run(&harness, &mut std::io::stdin()) {
+            let mut payload = String::new();
+            let _ = std::io::stdin().read_to_string(&mut payload);
+            let reply = match hook::client::run(&harness, &mut payload.as_bytes()) {
                 Ok(reply) => reply,
                 Err(err) => {
                     // Durable, because the vendor swallows stderr; throttled,
@@ -75,7 +78,7 @@ fn main() -> ExitCode {
                     if drops::record(&err) {
                         eprintln!("conbus hook: record dropped: {err}");
                     }
-                    hook::client::silent_reply(&harness).to_string()
+                    hook::client::failure_reply(&harness, &payload).to_string()
                 }
             };
             // One JSON object and nothing else. The vendor's parser runs
@@ -85,11 +88,17 @@ fn main() -> ExitCode {
             println!("{reply}");
             ExitCode::SUCCESS
         }
-        Command::Daemon => run(|paths| daemon::serve(paths, Retention::default())),
+        Command::Daemon => run(|paths| daemon::serve(paths, Retention::from_env())),
         Command::Log { json, filter } => run(|paths| report::log(paths, json, &filter)),
         Command::Install { apply } => run(|_| report::install(apply)),
-        Command::Backfill { apply, gaps } => run(|paths| {
-            if gaps {
+        Command::Backfill {
+            apply,
+            gaps,
+            chat_export,
+        } => run(|paths| {
+            if let Some(export) = chat_export {
+                backfill::run_chat_export(paths, &export, apply)
+            } else if gaps {
                 backfill::run_gaps(paths, apply)
             } else {
                 backfill::run(paths, apply)

@@ -19,7 +19,7 @@ Conbus는 채팅 앱이 아니다. Claude Code / Codex TUI를 그대로 쓰면�
 
 아니다: Linux/Windows, 벤더 CLI를 직접 켜는 습관, 훅을 자주 고치는 사람, 세션 파일을 다른 도구로 lossless 이전하려고 하는 사람, 데몬/소켓/trust를 보기 싫은 사람.
 
-자동 hop은 신호가 있을 때만 한다. Claude는 StatusLine stdin의 `rate_limits`(벤더가 이미 채워 넣음)와 `StopFailure`, Codex는 `account/rateLimits/read`. 우리는 `oauth/usage`를 직접 치지 않는다. Cursor·Agy·OpenCode·Grok은 `--to`로 핸드셰이크 hop이 되고, 자동 overflow는 그쪽에 남은 퀴터 JSON이 잡히기 전에는 Codex로만 간다. TUI `/usage`를 긁지 않는다.
+자동 hop은 신호가 있을 때만 한다. Claude는 StatusLine stdin의 `rate_limits`(벤더가 이미 채워 넣음)와 `StopFailure`, Codex는 `account/rateLimits/read`, Agy는 `agy -p "/usage" --output-format json`. 우리는 토큰으로 `oauth/usage`를 치지 않는다. Cursor·OpenCode·Grok은 `--to` 핸드셰이크만. Agy는 소스로 overflow → Codex가 되고, 착지는 아니다. TUI `/usage`를 긁지 않는다.
 
 ## 같은 `bus_id` ≠ 같은 컨텍스트 창
 
@@ -34,7 +34,8 @@ Conbus는 채팅 앱이 아니다. Claude Code / Codex TUI를 그대로 쓰면�
 - 설치된 바이너리를 **그 자리에서** 덮어쓰지 않는다. 옆에 쓴 뒤 `mv`한다.
 - 사용자가 연 Codex 스레드에 쓰지 않는다. hop이 여는 `warm:` 스레드만 우리 것이다.
 - Codex 훅 trust 해시를 파일에 넣지 않는다. Codex 첫 화면에서 직접 승인한다.
-- `~/.cursor/hooks.json`에 Conbus를 등록하지 않는다. Cursor는 이미 Claude 훅 경로로 들어오며, 네이티브 등록은 이중 기록이다.
+- Desktop Chat 훅을 켜려 하지 않는다. Desktop은 Chat에서 훅을 끈다. Chat은 Settings → Privacy → Export data zip을 `~/.conbus/chat-export`에 두거나, Enterprise Inference hooks만 실시간이다.
+- `~/Downloads`를 데몬이 읽게 하지 않는다. `opendir`이 커널에서 막히면 소켓이 이미 바인드된 채 훅이 전부 떨어진다.
 
 `conbus hook`이 실패해도 프롬프트는 막히지 않는다. 떨어진 기록은 `~/.conbus/drops.jsonl`과 `conbus doctor`에만 남는다.
 
@@ -218,7 +219,13 @@ conbus backfill --apply
 launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/sh.conbus.daemon.plist
 ```
 
-라이브 세션을 백필이 다시 민트하지 않는다.  Twin이 보이면 `doctor`가 어느 쪽이 살아있는 바인딩인지 말한다.
+라이브 세션을 백필이 다시 민트하지 않는다. Twin이 보이면 `doctor`가 어느 쪽이 살아있는 바인딩인지 말한다. 둘로 갈라진 세션은 데몬 시작 때 `aliased` 기록을 남겨 `log --bus-id`가 양쪽을 따른다.
+
+Chat 창(claude.ai / Desktop Chat)은 훅이 아니다. 공식 Privacy Export zip이나 `conversations.json`을 `~/.conbus/chat-export`에 두면 `claude_chat`으로 붙는다. Enterprise만 Inference hooks(`conbus hook --inference-listen`)가 실시간이다.
+
+Cursor 브리핑은 `~/.cursor/hooks.json`의 `sessionStart` → `additional_context`다. `conbus install --apply`가 등록한다. 자동 overflow는 공식 remaining-quota가 없어서 `--to`다.
+
+툴 본문을 디스크에 두고 싶으면 `CONBUS_RETENTION=encrypted_tools`로 데몬을 켠다. 본문은 Keychain KEK로 봉인되고 `conbus log --reveal`만 연다. 기본값은 대화만 남긴다.
 
 ## 바이너리 갈아끼우기
 
@@ -268,8 +275,10 @@ conbus run claude_code
 conbus hop --from <bus_id>
 conbus hop --apply --from <bus_id> --to claude_code|codex|cursor|agy|opencode|grok
 conbus log --bus-id <bus_id> --tail 20
+conbus log --reveal --bus-id <bus_id> --tail 5
 conbus quota
 conbus install --apply
 conbus backfill --gaps
+conbus backfill --chat-export ~/.conbus/chat-export
 conbus --version
 ```

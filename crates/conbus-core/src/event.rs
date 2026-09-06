@@ -23,6 +23,10 @@ impl Harness {
     pub const AGY: &'static str = "agy";
     pub const OPENCODE: &'static str = "opencode";
     pub const GROK: &'static str = "grok";
+    /// Chat-only claude.ai / Desktop Chat. Distinct from Code: a Chat
+    /// conversation uuid is not a Code session id, and opening
+    /// `claude://code/…` discards it.
+    pub const CLAUDE_CHAT: &'static str = "claude_chat";
 
     pub fn new(slug: impl Into<String>) -> Self {
         Harness(slug.into())
@@ -505,6 +509,11 @@ pub enum Event {
     /// `conbus hop --apply` syncs that leg instead of refusing. Any other
     /// holder refuses until a later `session_ended` lands.
     Leased { holder: String },
+    /// The same vendor session was recorded live under two conversations.
+    ///
+    /// The append-only log cannot merge them. Written under both ids so a
+    /// reader following either one finds the rest.
+    Aliased { also: BusId },
     SessionEnded {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
@@ -582,6 +591,13 @@ pub enum Body {
     Clipped { text: String, original_bytes: usize },
     /// Withheld by the workspace's retention level. Only its size survives.
     Elided { bytes: usize },
+    /// Tool body sealed with the workspace KEK. Plaintext is not on disk.
+    Sealed {
+        alg: String,
+        nonce: String,
+        ciphertext: String,
+        original_bytes: usize,
+    },
 }
 
 impl Body {
@@ -596,7 +612,8 @@ impl Body {
             Body::Clipped { original_bytes, .. }
             | Body::Elided {
                 bytes: original_bytes,
-            } => *original_bytes,
+            }
+            | Body::Sealed { original_bytes, .. } => *original_bytes,
         }
     }
 }

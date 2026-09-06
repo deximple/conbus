@@ -112,6 +112,24 @@ impl Paths {
     pub fn quota_cache(&self, harness: &str) -> PathBuf {
         self.root.join("quota").join(format!("{harness}.json"))
     }
+
+    /// Last time the StatusLine command ran, even if `rate_limits` was absent.
+    pub fn quota_seen(&self, harness: &str) -> PathBuf {
+        self.root.join("quota").join(format!("{harness}.seen.json"))
+    }
+
+    /// Last hook payload field names for a harness that has no remaining-quota
+    /// JSON yet. Names only — proof we looked, never conversation content.
+    pub fn quota_keys(&self, harness: &str) -> PathBuf {
+        self.root.join("quota").join(format!("{harness}.keys.json"))
+    }
+
+    /// Official Claude.ai / Desktop `conversations.json` (or zip) drop folder.
+    /// The daemon ingests new Chat turns from here on start and again when
+    /// a newer export lands — Chat-only windows still have no hook.
+    pub fn chat_export(&self) -> PathBuf {
+        self.root.join("chat-export")
+    }
 }
 
 #[cfg(test)]
@@ -175,5 +193,14 @@ mod tests {
             paths.quota_cache("claude_code"),
             Path::new("/tmp/bus/quota/claude_code.json")
         );
+        assert_eq!(
+            paths.quota_seen("claude_code"),
+            Path::new("/tmp/bus/quota/claude_code.seen.json")
+        );
+        assert_eq!(
+            paths.quota_keys("cursor"),
+            Path::new("/tmp/bus/quota/cursor.keys.json")
+        );
+        assert_eq!(paths.chat_export(), Path::new("/tmp/bus/chat-export"));
     }
 }

@@ -238,6 +238,24 @@ mod tests {
     }
 
     #[test]
+    fn an_exhausted_agy_account_overflows_to_codex() {
+        let current = Leg {
+            harness: Harness::new(Harness::AGY),
+            last_turn: Some(TurnState::Complete),
+            used_percent: Some(100),
+            minutes_to_reset: Some(180),
+            reached: true,
+        };
+        match decide(&current, &codex()) {
+            Decision::Hop { to, hop, .. } => {
+                assert_eq!(to.as_str(), Harness::CODEX);
+                assert_eq!(hop, Hop::Displaced);
+            }
+            other => panic!("expected overflow to Codex, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn a_quota_stop_on_an_attach_leg_overflows_to_codex() {
         let current = Leg {
             harness: Harness::new(Harness::CURSOR),

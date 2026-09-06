@@ -1,8 +1,9 @@
 //! `conbus hop` — decide the next leg, and record the decision when asked.
 //!
-//! The vendor TUI stays the window. This command does not open a chat. It
-//! prints where the next turn should go, and `--apply` writes that as a
-//! `routed` line under the predecessor so the kill criteria can start counting.
+//! The vendor TUI stays the window. This command does not open a chat UI.
+//! `--apply` writes takeover for `conbus run` and, when the next leg is a
+//! bus-owned warm, opens that vendor's own app (`codex://threads/{id}`,
+//! `claude://code/continue?session={id}`).
 //! A hop opens — or syncs — a bus-owned warm on both legs so neither
 //! direction is a cold start. Those writes are not model turns.
 
@@ -100,11 +101,7 @@ fn directed(current: &Leg, other: &Leg, name: &str) -> io::Result<Decision> {
     })
 }
 
-fn plan(
-    paths: &Paths,
-    records: &[Record],
-    from: Option<&str>,
-) -> io::Result<(Leg, Leg, Decision)> {
+fn plan(paths: &Paths, records: &[Record], from: Option<&str>) -> io::Result<(Leg, Leg, Decision)> {
     let focus = focus(records, from).ok_or_else(|| {
         io::Error::other("no conversation to route — pass --from <bus_id> or record a turn first")
     })?;
@@ -184,6 +181,7 @@ fn observed_quota(paths: &Paths, harness: &str) -> Option<Quota> {
     match harness {
         Harness::CODEX => quota::read().ok(),
         Harness::CLAUDE_CODE => quota::read_cached(paths, Harness::CLAUDE_CODE),
+        Harness::AGY => quota::read_agy().ok(),
         _ => None,
     }
 }
@@ -229,35 +227,103 @@ fn apply_hop(
     }
 
     let text = digest(records, focus.bus_id);
-    let claude = ensure_claude_warm(paths, records, &focus, &text)?;
-    let had_codex = matches!(lease_of(records, focus.bus_id), Lease::Warm(_));
-    let codex = ensure_codex_warm(records, &focus, &text)?;
-    if !had_codex {
-        lease_only(paths, &focus, &warm::holder(&codex))?;
+    // Destination first. Overflow to Codex was waiting on `claude -p`
+    // (MCP spawn) before `codex://` could open. The other leg still
+    // warms after the vendor window is up; a failure there is not a
+    // failed hop.
+    match to.as_str() {
+        Harness::CODEX => {
+            let thread = take_codex_warm(paths, records, &focus, &text)?;
+            finish_hop(
+                paths,
+                records,
+                &focus,
+                to,
+                hop,
+                reason,
+                kind,
+                Some(&warm::holder(&thread)),
+                Some(&thread),
+                code_freshness,
+            )?;
+            if let Err(err) = ensure_claude_warm(paths, records, &focus, &text) {
+                println!("warm      claude skipped ({err})");
+            }
+        }
+        Harness::CLAUDE_CODE => {
+            let thread = ensure_claude_warm(paths, records, &focus, &text)?;
+            finish_hop(
+                paths,
+                records,
+                &focus,
+                to,
+                hop,
+                reason,
+                kind,
+                Some(&warm::claude_holder(&thread)),
+                Some(&thread),
+                code_freshness,
+            )?;
+            if let Err(err) = take_codex_warm(paths, records, &focus, &text) {
+                println!("warm      codex skipped ({err})");
+            }
+        }
+        _ => {
+            if let Err(err) = take_codex_warm(paths, records, &focus, &text) {
+                println!("warm      codex skipped ({err})");
+            }
+            if let Err(err) = ensure_claude_warm(paths, records, &focus, &text) {
+                println!("warm      claude skipped ({err})");
+            }
+            finish_hop(
+                paths,
+                records,
+                &focus,
+                to,
+                hop,
+                reason,
+                kind,
+                None,
+                None,
+                code_freshness,
+            )?;
+        }
     }
-
-    let (holder, thread) = match to.as_str() {
-        Harness::CODEX => (Some(warm::holder(&codex)), Some(codex)),
-        Harness::CLAUDE_CODE => (Some(warm::claude_holder(&claude)), Some(claude)),
-        _ => (None, None),
-    };
-
-    if routed_to(records, focus.bus_id, to) {
-        handoff(paths, &focus, to.as_str(), thread.as_deref())?;
-        return Ok(());
-    }
-    record_hop(
-        paths,
-        &focus,
-        to,
-        hop,
-        reason,
-        holder.as_deref(),
-        code_freshness,
-    )?;
-    println!("recorded  routed {kind}");
-    handoff(paths, &focus, to.as_str(), thread.as_deref())?;
     Ok(())
+}
+
+fn take_codex_warm(
+    paths: &Paths,
+    records: &[Record],
+    focus: &Focus,
+    text: &str,
+) -> io::Result<String> {
+    let had_codex = matches!(lease_of(records, focus.bus_id), Lease::Warm(_));
+    let codex = ensure_codex_warm(records, focus, text)?;
+    if !had_codex {
+        lease_only(paths, focus, &warm::holder(&codex))?;
+    }
+    Ok(codex)
+}
+
+fn finish_hop(
+    paths: &Paths,
+    records: &[Record],
+    focus: &Focus,
+    to: &Harness,
+    hop: Hop,
+    reason: &str,
+    kind: &str,
+    holder: Option<&str>,
+    thread: Option<&str>,
+    code_freshness: Option<String>,
+) -> io::Result<()> {
+    if routed_to(records, focus.bus_id, to) {
+        return handoff(paths, focus, to.as_str(), thread);
+    }
+    record_hop(paths, focus, to, hop, reason, holder, code_freshness)?;
+    println!("recorded  routed {kind}");
+    handoff(paths, focus, to.as_str(), thread)
 }
 
 fn ensure_claude_warm(
@@ -309,7 +375,19 @@ fn handoff(paths: &Paths, focus: &Focus, next: &str, thread: Option<&str>) -> io
             cwd: focus.workspace.clone(),
         },
     )?;
-    println!("window    takeover → {next} — conbus run execs the next leg in this TTY");
+    if let Some(id) = thread {
+        match crate::window::reveal(next, id) {
+            Ok(true) => println!("window    opened {next} · {id}"),
+            Ok(false) => {
+                println!("window    takeover → {next} — conbus run execs the next leg in this TTY")
+            }
+            Err(err) => println!(
+                "window    takeover → {next} — desktop open failed ({err}); conbus run still execs the TTY"
+            ),
+        }
+    } else {
+        println!("window    takeover → {next} — conbus run execs the next leg in this TTY");
+    }
     Ok(())
 }
 

@@ -10,6 +10,8 @@ pub enum Command {
         harness: String,
         /// Claude StatusLine stdin: persist `rate_limits`, never hook JSON.
         statusline: bool,
+        /// Official Inference hooks HTTP endpoint (Anthropic POSTs here).
+        inference_listen: Option<String>,
     },
     Log {
         json: bool,
@@ -28,6 +30,8 @@ pub enum Command {
     Backfill {
         apply: bool,
         gaps: bool,
+        /// Official Claude.ai / Desktop `conversations.json` or its zip.
+        chat_export: Option<String>,
     },
     Doctor,
     /// The control plane: routing rules, quota, hop history, cost.
@@ -89,6 +93,8 @@ pub struct LogFilter {
     pub tail: Option<usize>,
     /// A substring of the rendered line.
     pub grep: Option<String>,
+    /// Decrypt sealed tool bodies. Off by default.
+    pub reveal: bool,
 }
 
 pub fn parse<I, S>(args: I, env_harness: Option<String>) -> Command
@@ -107,6 +113,11 @@ where
                 .or(env_harness)
                 .unwrap_or_else(|| DEFAULT_HARNESS.to_string()),
             statusline: args.iter().any(|a| a == "--statusline"),
+            inference_listen: args.iter().any(|a| a == "--inference-listen").then(|| {
+                flag_value(&args, "--inference-listen")
+                    .filter(|value| !value.starts_with('-'))
+                    .unwrap_or_else(|| "127.0.0.1:8787".into())
+            }),
         },
         "install" => Command::Install {
             apply: args.iter().any(|a| a == "--apply"),
@@ -114,6 +125,7 @@ where
         "backfill" => Command::Backfill {
             apply: args.iter().any(|a| a == "--apply"),
             gaps: args.iter().any(|a| a == "--gaps"),
+            chat_export: flag_value(&args, "--chat-export"),
         },
         "log" => Command::Log {
             json: args.iter().any(|a| a == "--json"),
@@ -122,6 +134,7 @@ where
                 since: flag_value(&args, "--since"),
                 tail: flag_value(&args, "--tail").and_then(|n| n.parse().ok()),
                 grep: flag_value(&args, "--grep"),
+                reveal: args.iter().any(|a| a == "--reveal"),
             },
         },
         "doctor" => Command::Doctor,
@@ -162,15 +175,22 @@ conbus — a conversation bus for coding agents
 
 USAGE:
     conbus daemon                 run the recorder
-    conbus hook [--harness NAME] [--statusline]
+    conbus hook [--harness NAME] [--statusline] [--inference-listen [ADDR]]
                                   mirror one vendor hook payload from stdin;
                                   --statusline reads Claude StatusLine JSON
-                                  and must not print hook control output
-    conbus log [--json] [--bus-id ID] [--since TS] [--tail N] [--grep TEXT]
-                                  read the conversation log back
+                                  and must not print hook control output;
+                                  an Inference hooks prompt frame
+                                  (source.application=claude-ai) attaches as
+                                  claude_chat and prints an allow verdict;
+                                  --inference-listen is the official HTTPS
+                                  terminator target (default 127.0.0.1:8787)
+    conbus log [--json] [--bus-id ID] [--since TS] [--tail N] [--grep TEXT] [--reveal]
+                                  read the conversation log back; --reveal
+                                  decrypts sealed tool bodies (explicit only)
     conbus install [--apply]      register the hook with Claude Code and Codex
-    conbus backfill [--apply] [--gaps]
-                                  recover history; --gaps fills missed turns of live sessions
+    conbus backfill [--apply] [--gaps] [--chat-export PATH]
+                                  recover history; --gaps fills missed turns of live sessions;
+                                  --chat-export reads official Claude.ai conversations.json (or zip)
     conbus doctor                 report what is and is not wired up
     conbus status                 routing rules, quota, hop history, cost
     conbus quota                  Codex probe + Claude StatusLine cache + catalog
@@ -201,7 +221,8 @@ mod tests {
             parse(["hook"], None),
             Command::Hook {
                 harness: "claude_code".into(),
-                statusline: false
+                statusline: false,
+                inference_listen: None
             }
         );
     }
@@ -212,7 +233,8 @@ mod tests {
             parse(["hook", "--harness", "codex"], Some("cursor".into())),
             Command::Hook {
                 harness: "codex".into(),
-                statusline: false
+                statusline: false,
+                inference_listen: None
             }
         );
     }
@@ -223,7 +245,28 @@ mod tests {
             parse(["hook"], Some("codex".into())),
             Command::Hook {
                 harness: "codex".into(),
-                statusline: false
+                statusline: false,
+                inference_listen: None
+            }
+        );
+    }
+
+    #[test]
+    fn inference_listen_defaults_the_official_loopback() {
+        assert_eq!(
+            parse(["hook", "--inference-listen"], None),
+            Command::Hook {
+                harness: "claude_code".into(),
+                statusline: false,
+                inference_listen: Some("127.0.0.1:8787".into())
+            }
+        );
+        assert_eq!(
+            parse(["hook", "--inference-listen", "127.0.0.1:0"], None),
+            Command::Hook {
+                harness: "claude_code".into(),
+                statusline: false,
+                inference_listen: Some("127.0.0.1:0".into())
             }
         );
     }
@@ -234,7 +277,8 @@ mod tests {
             parse(["hook", "--statusline"], None),
             Command::Hook {
                 harness: "claude_code".into(),
-                statusline: true
+                statusline: true,
+                inference_listen: None
             }
         );
     }
@@ -297,14 +341,27 @@ mod tests {
             parse(["backfill"], None),
             Command::Backfill {
                 apply: false,
-                gaps: false
+                gaps: false,
+                chat_export: None
             }
         );
         assert_eq!(
             parse(["backfill", "--gaps", "--apply"], None),
             Command::Backfill {
                 apply: true,
-                gaps: true
+                gaps: true,
+                chat_export: None
+            }
+        );
+        assert_eq!(
+            parse(
+                ["backfill", "--chat-export", "/tmp/conversations.json"],
+                None
+            ),
+            Command::Backfill {
+                apply: false,
+                gaps: false,
+                chat_export: Some("/tmp/conversations.json".into())
             }
         );
     }

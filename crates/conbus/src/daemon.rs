@@ -3,17 +3,20 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use conbus_core::continuation::{
     Asking, Decision, Stopped, decide, machine_authored, opening_units, stopped, unattended,
 };
-use conbus_core::event::{Event, Hop, Source, TurnState};
+use conbus_core::clock::Timestamp;
+use conbus_core::event::{Event, Harness, Hop, Source, TurnState};
 use conbus_core::ids::BusId;
+use conbus_core::identity;
 use conbus_core::pack::{self, Chapter};
 use conbus_core::paths::Paths;
 use conbus_core::record::{Entry, Record};
@@ -48,6 +51,21 @@ pub struct Daemon {
     /// Conbus root, so a briefing can load linked facts. Tests leave this
     /// unset so they do not read the machine's arena files.
     arena_root: Option<std::path::PathBuf>,
+    /// Official Chat export drop folder. `None` in tests that do not watch.
+    chat_watch: Option<ChatWatch>,
+}
+
+/// One directory the daemon polls for Chat exports.
+struct ChatWatchDir {
+    dir: PathBuf,
+    official_only: bool,
+    signature: Vec<(String, u64, u64)>,
+}
+
+/// Watch official Chat export drops without a log scan on every connection.
+struct ChatWatch {
+    dirs: Vec<ChatWatchDir>,
+    log_dir: PathBuf,
 }
 
 impl Daemon {
@@ -66,12 +84,89 @@ impl Daemon {
             home: std::env::var("HOME").ok(),
             pending_warm: None,
             arena_root: None,
+            chat_watch: None,
         }
     }
 
     pub fn with_arena(mut self, root: std::path::PathBuf) -> Self {
         self.arena_root = Some(root);
         self
+    }
+
+    /// Ingest Chat exports that land after start. Signature is the files
+    /// already consumed by `append_gaps_at_start`.
+    pub fn watch_chat_exports(self, paths: &Paths) -> Self {
+        // Do not readdir ~/Downloads here. On this machine opendir of that
+        // folder blocks in the kernel and the socket is already bound, so
+        // every hook becomes EAGAIN until it returns.
+        self.watch_chat_export_sources(paths, None)
+    }
+
+    fn watch_chat_export_sources(mut self, paths: &Paths, downloads: Option<PathBuf>) -> Self {
+        let export_dir = paths.chat_export();
+        let _ = fs::create_dir_all(&export_dir);
+        let mut dirs = vec![ChatWatchDir {
+            signature: crate::backfill::chat_export_signature(&export_dir),
+            dir: export_dir,
+            official_only: false,
+        }];
+        if let Some(downloads) = downloads {
+            dirs.push(ChatWatchDir {
+                signature: crate::backfill::chat_export_signature_filtered(&downloads, true),
+                dir: downloads,
+                official_only: true,
+            });
+        }
+        self.chat_watch = Some(ChatWatch {
+            dirs,
+            log_dir: paths.log_dir(),
+        });
+        self
+    }
+
+    /// Append new Chat-export turns and rebuild derived state when a watched
+    /// folder changed. No-op when every signature is unchanged.
+    pub fn absorb_chat_exports(&mut self) -> io::Result<u64> {
+        let Some(watch) = self.chat_watch.as_ref() else {
+            return Ok(0);
+        };
+        let mut changed = Vec::new();
+        for (i, dir) in watch.dirs.iter().enumerate() {
+            let signature =
+                crate::backfill::chat_export_signature_filtered(&dir.dir, dir.official_only);
+            if signature != dir.signature {
+                changed.push((i, dir.dir.clone(), dir.official_only, signature));
+            }
+        }
+        if changed.is_empty() {
+            return Ok(0);
+        }
+        let log_dir = watch.log_dir.clone();
+        let mut held = SegmentLog::scan(&log_dir)?.records;
+        let mut n = 0u64;
+        for (_i, dir, official_only, _signature) in &changed {
+            n += if *official_only {
+                crate::backfill::ingest_official_privacy_exports(dir, &held, &mut self.log)?
+            } else {
+                crate::backfill::ingest_chat_exports(dir, &held, &mut self.log)?
+            };
+            if n > 0 {
+                held = SegmentLog::scan(&log_dir)?.records;
+            }
+        }
+        if n > 0 {
+            if let Ok(scan) = SegmentLog::scan(&log_dir) {
+                self.registry = Registry::restore(&scan.records);
+                self.chapters = Self::chapters(&scan.records);
+            }
+            eprintln!("conbus daemon: filled {n} chat export record(s)");
+        }
+        if let Some(watch) = self.chat_watch.as_mut() {
+            for (i, _dir, _official_only, signature) in changed {
+                watch.dirs[i].signature = signature;
+            }
+        }
+        Ok(n)
     }
 
     /// Fold the log into the per-conversation state the briefing reads.
@@ -118,11 +213,13 @@ impl Daemon {
         let observed = Observed {
             vendor_turn_id: request.vendor_turn_id,
             vendor_agent_id: request.vendor_agent_id,
-            workspace: request.workspace,
+            workspace: request.workspace.clone(),
             event: request.event,
         };
         match self.registry.observe(&key, observed) {
-            Disposition::Deferred => Response::Deferred,
+            Disposition::Deferred => {
+                self.maybe_brief_candidate(brief, &request.harness, request.workspace.as_deref())
+            }
             Disposition::Orphaned => Response::Orphaned,
             Disposition::Write { bus_id, observed } => {
                 let source = conbus_core::event::Source {
@@ -199,9 +296,7 @@ impl Daemon {
                 // Not after `/clear`: the person just said "forget it", and
                 // the vendor names that moment on the session start flushed
                 // behind this prompt. And not when the person switched it off.
-                let cleared = written.iter().any(|record| {
-                    matches!(&record.event, Event::SessionCandidate { trigger: Some(t) } if t == "clear")
-                });
+                let cleared = session_was_cleared(&written);
                 let briefing = (first_prompt && brief && !cleared)
                     .then(|| self.brief(bus_id, &written))
                     .flatten();
@@ -332,7 +427,7 @@ impl Daemon {
         }) else {
             return;
         };
-        let Some(next) = conbus_core::route::opposite(&source.harness) else {
+        let Some(next) = conbus_core::route::overflow_target(&source.harness) else {
             return;
         };
         let bus_id = written.last().map(|r| r.bus_id);
@@ -550,6 +645,83 @@ impl Daemon {
         Some((packed.text, message, event))
     }
 
+    /// Cursor's inject channel is sessionStart, which is Deferred — no mint.
+    /// Brief the checkout anyway so a new composer gets the pack.
+    fn maybe_brief_candidate(
+        &self,
+        brief: bool,
+        harness: &Harness,
+        workspace: Option<&str>,
+    ) -> Response {
+        if !brief || harness.as_str() != Harness::CURSOR {
+            return Response::Deferred;
+        }
+        let asking = Asking {
+            harness: harness.clone(),
+            workspace: workspace.map(str::to_string),
+            first_prompt: true,
+            unattended: false,
+            machine_authored: false,
+            prompt_units: 0,
+        };
+        let now = Timestamp::now();
+        let candidates: Vec<_> = self
+            .chapters
+            .values()
+            .map(|chapter| chapter.about.clone())
+            .collect();
+        let decision = decide(&asking, &candidates, self.home.as_deref(), now);
+        let facts = self.arena_facts(asking.workspace.as_deref());
+        let chapters: Vec<Chapter> = match &decision {
+            Decision::Brief { recent } => recent
+                .iter()
+                .filter_map(|id| self.chapters.get(id).cloned())
+                .collect(),
+            Decision::Silent(silent)
+                if matches!(silent, conbus_core::continuation::Silent::NothingToSay)
+                    && !facts.is_empty() =>
+            {
+                Vec::new()
+            }
+            _ => return Response::Deferred,
+        };
+        let Some(named) = chapters.first().map(|chapter| chapter.about.bus_id) else {
+            return Response::Deferred;
+        };
+        let packed = pack::brief_with(
+            named,
+            &chapters,
+            &facts,
+            now,
+            pack::PACK_BUDGET_UNITS,
+        );
+        if packed.is_empty() {
+            return Response::Deferred;
+        }
+        let label = named.to_string();
+        let hop = chapters
+            .first()
+            .filter(|chapter| stopped(&chapter.about) == Stopped::Displaced)
+            .map(|_| " · conbus hop")
+            .unwrap_or("");
+        let message = format!(
+            "conbus · {} earlier session{} in this checkout · conbus log --bus-id {}{}{hop}",
+            chapters.len(),
+            if chapters.len() == 1 { "" } else { "s" },
+            label.get(..13).unwrap_or(&label),
+            match chapters.len() {
+                0 | 1 => String::new(),
+                n => format!(" (+{} more)", n - 1),
+            },
+        );
+        Response::Briefed {
+            bus_id: named,
+            seqs: vec![],
+            context: packed.text,
+            message,
+        }
+    }
+
     fn arena_facts(&self, workspace: Option<&str>) -> Vec<String> {
         let Some(root) = &self.arena_root else {
             return Vec::new();
@@ -587,9 +759,52 @@ pub fn bind(socket: &Path) -> io::Result<UnixListener> {
     Ok(listener)
 }
 
+/// Write `aliased` records so a reader following either split id sees both.
+fn repair_splits(held: &[Record], log: &mut SegmentLog) -> io::Result<u64> {
+    let mut n = 0;
+    for (key, conversations) in identity::live_splits(held) {
+        let mut ids: Vec<BusId> = conversations.into_iter().collect();
+        ids.sort();
+        let Some((canonical, rest)) = ids.split_first() else {
+            continue;
+        };
+        for other in rest {
+            if identity::already_aliased(held, *canonical, *other) {
+                continue;
+            }
+            let source = Source {
+                harness: key.harness.clone(),
+                harness_version: None,
+                vendor_session_id: Some(key.vendor_session_id.clone()),
+                workspace: None,
+                entrypoint: None,
+                backfilled_from: None,
+            };
+            log.append(Entry {
+                bus_id: *canonical,
+                observed_at: None,
+                source: source.clone(),
+                vendor_turn_id: None,
+                vendor_agent_id: None,
+                event: Event::Aliased { also: *other },
+            })?;
+            log.append(Entry {
+                bus_id: *other,
+                observed_at: None,
+                source,
+                vendor_turn_id: None,
+                vendor_agent_id: None,
+                event: Event::Aliased { also: *canonical },
+            })?;
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
 /// Run the daemon until the process is stopped.
 pub fn serve(paths: &Paths, retention: Retention) -> io::Result<()> {
-    let report = harden::harden();
+    let _ = harden::harden();
     let listener = bind(&paths.socket())?;
     // The registry is derived state, so it is rebuilt from the segments rather
     // than starting empty — otherwise a restart forks every live conversation.
@@ -616,14 +831,38 @@ pub fn serve(paths: &Paths, retention: Retention) -> io::Result<()> {
         }
         Err(err) => eprintln!("conbus daemon: gap fill skipped ({err})"),
     }
+    match repair_splits(&scan.records, &mut log) {
+        Ok(0) => {}
+        Ok(n) => {
+            eprintln!("conbus daemon: aliased {n} split conversation pair(s)");
+            scan = SegmentLog::scan(paths.log_dir()).unwrap_or(scan);
+        }
+        Err(err) => eprintln!("conbus daemon: split alias skipped ({err})"),
+    }
     let registry = Registry::restore(&scan.records);
     let chapters = Daemon::chapters(&scan.records);
-    let mut daemon = Daemon::new(log, registry, chapters).with_arena(paths.root().to_path_buf());
+    let mut daemon = Daemon::new(log, registry, chapters)
+        .with_arena(paths.root().to_path_buf())
+        .watch_chat_exports(paths);
 
     // Left beside the socket so `doctor` can compare the daemon's build with
     // its own — the drift a rename without a restart leaves behind.
     if let Err(err) = crate::build_info::stamp(paths) {
         eprintln!("conbus daemon: could not write the build stamp: {err}");
+    }
+
+    // Restore grew the heap. Darwin's first `mlockall` is ENOSYS; lock the
+    // pages that now hold the bindings and chapters, not the empty start heap.
+    // Stamp first so doctor can name the build while mlock walks; then stamp
+    // the lock result so doctor does not report its own heap.
+    let report = harden::relock_derived();
+    if let Err(err) = crate::build_info::stamp_hardening(
+        paths,
+        report.core_dumps_disabled,
+        report.memory_locked,
+        report.memory_lock_error.clone(),
+    ) {
+        eprintln!("conbus daemon: could not stamp hardening: {err}");
     }
 
     eprintln!(
@@ -642,9 +881,30 @@ pub fn serve(paths: &Paths, retention: Retention) -> io::Result<()> {
             .unwrap_or_default(),
     );
 
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
+    listener.set_nonblocking(true)?;
+    loop {
+        let mut fds = [libc::pollfd {
+            fd: listener.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        }];
+        let n = unsafe { libc::poll(fds.as_mut_ptr(), 1, 2000) };
+        if n < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            eprintln!("conbus daemon: poll failed: {err}");
+            continue;
+        }
+        if n == 0 {
+            if let Err(err) = daemon.absorb_chat_exports() {
+                eprintln!("conbus daemon: chat export ingest skipped ({err})");
+            }
+            continue;
+        }
+        match listener.accept() {
+            Ok((stream, _)) => {
                 if let Err(err) = handle_connection(&mut daemon, stream) {
                     eprintln!("conbus daemon: connection failed: {err}");
                 }
@@ -652,10 +912,10 @@ pub fn serve(paths: &Paths, retention: Retention) -> io::Result<()> {
                     spawn_warm_apply(bus_id);
                 }
             }
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
             Err(err) => eprintln!("conbus daemon: accept failed: {err}"),
         }
     }
-    Ok(())
 }
 
 /// Open the Codex warm thread after a quota hop, out of the hook's deadline.
@@ -779,10 +1039,27 @@ fn went_silent(err: &io::Error) -> bool {
     )
 }
 
+/// `/clear` means forget. CLI names it on the flushed session start. Desktop
+/// `#76704` omits `source`; inventing one would be a workaround. Treating a
+/// desktop start with no trigger as that gesture is reading the omission.
+fn session_was_cleared(written: &[Record]) -> bool {
+    written.iter().any(|record| match &record.event {
+        Event::SessionCandidate { trigger: Some(t) } if t == "clear" => true,
+        Event::SessionCandidate { trigger: None } => record
+            .source
+            .entrypoint
+            .as_ref()
+            .is_some_and(|e| e.as_str() == conbus_core::event::Entrypoint::CLAUDE_DESKTOP),
+        _ => false,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use conbus_core::event::{Body, Event, Harness, Hop, TurnState, VendorTurnId};
+    use conbus_core::event::{Body, Event, Harness, Hop, Source, TurnState, VendorTurnId};
+    use conbus_core::ids::BusId;
+    use conbus_core::record::Record;
     use conbus_core::segment::SegmentLog;
 
     fn request(event: Event) -> Request {
@@ -926,6 +1203,104 @@ mod tests {
             Some(scan.records[0].bus_id),
             "the warm thread is opened after the hook is answered"
         );
+    }
+
+    #[test]
+    fn an_opencode_quota_stop_overflows_to_codex() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = SegmentLog::open(dir.path(), Retention::default()).expect("open");
+        let mut daemon = Daemon::new(log, Registry::new(), HashMap::new());
+        let mut req = request(Event::TurnStarted {
+            author: None,
+            prompt: Body::kept("keep going"),
+        });
+        req.harness = Harness::new(Harness::OPENCODE);
+        daemon.handle(req.clone());
+        req.event = Event::TurnEnded {
+            state: TurnState::InterruptedQuota {
+                reason: "GoUsageLimitError".into(),
+            },
+            assistant_message: None,
+        };
+        let response = daemon.handle(req);
+        let Response::Recorded { seqs, .. } = response else {
+            panic!("expected a recording, got {response:?}");
+        };
+        assert!(seqs.len() >= 2, "turn + routed: {seqs:?}");
+        let scan = SegmentLog::scan(dir.path()).expect("scan");
+        let routed = scan.records.iter().find_map(|record| match &record.event {
+            Event::Routed { next, .. } => Some(next.as_str()),
+            _ => None,
+        });
+        assert_eq!(routed, Some(Harness::CODEX));
+        assert_eq!(daemon.take_pending_warm(), Some(scan.records[0].bus_id));
+    }
+
+    #[test]
+    fn a_grok_quota_stop_overflows_to_codex() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = SegmentLog::open(dir.path(), Retention::default()).expect("open");
+        let mut daemon = Daemon::new(log, Registry::new(), HashMap::new());
+        let mut grok = request(Event::TurnStarted {
+            author: None,
+            prompt: Body::kept("keep going"),
+        });
+        grok.harness = Harness::new(Harness::GROK);
+        daemon.handle(grok.clone());
+        grok.event = Event::TurnEnded {
+            state: TurnState::InterruptedQuota {
+                reason: "rate_limit".into(),
+            },
+            assistant_message: None,
+        };
+
+        let response = daemon.handle(grok);
+        let Response::Recorded { seqs, .. } = response else {
+            panic!("expected a recording, got {response:?}");
+        };
+        assert!(seqs.len() >= 2, "turn + routed: {seqs:?}");
+
+        let scan = SegmentLog::scan(dir.path()).expect("scan");
+        let routed = scan.records.iter().find_map(|record| match &record.event {
+            Event::Routed { next, .. } => Some(next.as_str()),
+            _ => None,
+        });
+        assert_eq!(routed, Some(Harness::CODEX));
+        assert_eq!(
+            daemon.take_pending_warm(),
+            Some(scan.records[0].bus_id),
+            "attach overflow still opens the Codex warm after the hook reply"
+        );
+    }
+
+    #[test]
+    fn a_cursor_classified_quota_stop_overflows_to_codex() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = SegmentLog::open(dir.path(), Retention::default()).expect("open");
+        let mut daemon = Daemon::new(log, Registry::new(), HashMap::new());
+        let mut req = request(Event::TurnStarted {
+            author: None,
+            prompt: Body::kept("keep going"),
+        });
+        req.harness = Harness::new(Harness::CURSOR);
+        daemon.handle(req.clone());
+        req.event = Event::TurnEnded {
+            state: TurnState::InterruptedQuota {
+                reason: "PRO_USER_USAGE_LIMIT".into(),
+            },
+            assistant_message: None,
+        };
+        let response = daemon.handle(req);
+        let Response::Recorded { seqs, .. } = response else {
+            panic!("expected a recording, got {response:?}");
+        };
+        assert!(seqs.len() >= 2, "turn + routed: {seqs:?}");
+        let scan = SegmentLog::scan(dir.path()).expect("scan");
+        let routed = scan.records.iter().find_map(|record| match &record.event {
+            Event::Routed { next, .. } => Some(next.as_str()),
+            _ => None,
+        });
+        assert_eq!(routed, Some(Harness::CODEX));
     }
 
     #[test]
@@ -1131,5 +1506,195 @@ mod tests {
         let outcome = handle_connection(&mut daemon, ours).map_err(|err| err.kind());
 
         assert_eq!(outcome, Ok(()), "a peer that left is nobody to serve");
+    }
+
+    fn cleared_record(trigger: Option<&str>, desktop: bool) -> Record {
+        Record {
+            schema_version: conbus_core::record::SCHEMA_VERSION,
+            ts: "2026-09-06T12:00:00.000Z".parse().expect("ts"),
+            seq: 1,
+            bus_id: BusId::mint(),
+            vendor_turn_id: None,
+            vendor_agent_id: None,
+            source: Source {
+                harness: Harness::new(Harness::CLAUDE_CODE),
+                harness_version: None,
+                vendor_session_id: Some("s".into()),
+                workspace: Some("/repo".into()),
+                entrypoint: desktop.then(|| {
+                    conbus_core::event::Entrypoint::new(
+                        conbus_core::event::Entrypoint::CLAUDE_DESKTOP,
+                    )
+                }),
+                backfilled_from: None,
+            },
+            event: Event::SessionCandidate {
+                trigger: trigger.map(str::to_string),
+            },
+        }
+    }
+
+    #[test]
+    fn a_named_clear_and_a_desktop_omitted_source_are_both_forget() {
+        assert!(session_was_cleared(&[cleared_record(Some("clear"), false)]));
+        assert!(session_was_cleared(&[cleared_record(None, true)]));
+        assert!(!session_was_cleared(&[cleared_record(
+            Some("startup"),
+            false
+        )]));
+        assert!(!session_was_cleared(&[cleared_record(None, false)]));
+    }
+
+    #[test]
+    fn a_chat_export_dropped_after_start_is_absorbed() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::from_env(
+            Some(root.path().join("conbus").to_str().expect("utf-8")),
+            None,
+            None,
+        )
+        .expect("paths");
+        fs::create_dir_all(paths.log_dir()).expect("log");
+        let log = SegmentLog::open(paths.log_dir(), Retention::default()).expect("open");
+        let mut daemon =
+            Daemon::new(log, Registry::new(), HashMap::new()).watch_chat_exports(&paths);
+        assert_eq!(daemon.absorb_chat_exports().expect("empty"), 0);
+
+        fs::write(
+            paths.chat_export().join("conversations.json"),
+            r#"{
+                "conversations": [{
+                    "uuid": "00000000-1111-2222-3333-444444444444",
+                    "chat_messages": [
+                        {"uuid": "m1", "sender": "human", "text": "from the chat window", "created_at": "2026-09-06T12:00:00.000Z"},
+                        {"uuid": "m2", "sender": "assistant", "text": "heard", "created_at": "2026-09-06T12:01:00.000Z"}
+                    ]
+                }]
+            }"#,
+        )
+        .expect("drop");
+        let n = daemon.absorb_chat_exports().expect("absorb");
+        assert!(n >= 2, "human + assistant: {n}");
+        assert_eq!(daemon.absorb_chat_exports().expect("idempotent"), 0);
+
+        let scan = SegmentLog::scan(paths.log_dir()).expect("scan");
+        assert!(scan.records.iter().all(|r| {
+            r.source.harness.as_str() == Harness::CLAUDE_CHAT
+                && r.source.vendor_session_id.as_deref()
+                    == Some("00000000-1111-2222-3333-444444444444")
+        }));
+        assert!(scan.records.iter().any(|r| matches!(
+            &r.event,
+            Event::TurnStarted { prompt: Body::Kept { text }, .. }
+                if text == "from the chat window"
+        )));
+    }
+
+    #[test]
+    fn a_vendor_named_privacy_zip_in_the_drop_folder_is_absorbed() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::from_env(
+            Some(root.path().join("conbus").to_str().expect("utf-8")),
+            None,
+            None,
+        )
+        .expect("paths");
+        fs::create_dir_all(paths.log_dir()).expect("log");
+        let log = SegmentLog::open(paths.log_dir(), Retention::default()).expect("open");
+        let mut daemon =
+            Daemon::new(log, Registry::new(), HashMap::new()).watch_chat_exports(&paths);
+        assert_eq!(daemon.absorb_chat_exports().expect("empty"), 0);
+        fs::write(
+            paths.chat_export().join("conversations.json"),
+            r#"[{"uuid":"00000000-aaaa-bbbb-cccc-ddddeeeeffff","chat_messages":[
+                {"uuid":"m1","sender":"human","text":"privacy export","created_at":"2026-09-06T12:00:00.000Z"},
+                {"uuid":"m2","sender":"assistant","text":"first class","created_at":"2026-09-06T12:01:00.000Z"}
+            ]}]"#,
+        )
+        .expect("json");
+        let zip = paths.chat_export().join("data-export-2026-09-06.zip");
+        let status = std::process::Command::new("/usr/bin/zip")
+            .args(["-q", "-j"])
+            .arg(&zip)
+            .arg(paths.chat_export().join("conversations.json"))
+            .status()
+            .expect("zip");
+        assert!(status.success());
+        let _ = fs::remove_file(paths.chat_export().join("conversations.json"));
+        let n = daemon.absorb_chat_exports().expect("absorb");
+        assert!(n >= 2, "{n}");
+        let scan = SegmentLog::scan(paths.log_dir()).expect("scan");
+        assert!(scan.records.iter().all(|r| {
+            r.source.harness.as_str() == Harness::CLAUDE_CHAT
+                && r.source.vendor_session_id.as_deref()
+                    == Some("00000000-aaaa-bbbb-cccc-ddddeeeeffff")
+        }));
+    }
+
+    #[test]
+    fn a_vendor_named_privacy_zip_in_downloads_is_absorbed() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let downloads = root.path().join("Downloads");
+        fs::create_dir_all(&downloads).expect("downloads");
+        let paths = Paths::from_env(
+            Some(root.path().join("conbus").to_str().expect("utf-8")),
+            None,
+            None,
+        )
+        .expect("paths");
+        fs::create_dir_all(paths.log_dir()).expect("log");
+        let log = SegmentLog::open(paths.log_dir(), Retention::default()).expect("open");
+        let mut daemon = Daemon::new(log, Registry::new(), HashMap::new())
+            .watch_chat_export_sources(&paths, Some(downloads.clone()));
+        assert_eq!(daemon.absorb_chat_exports().expect("empty"), 0);
+        fs::write(
+            downloads.join("conversations.json"),
+            r#"[{"uuid":"00000000-dddd-eeee-ffff-000011112222","chat_messages":[
+                {"uuid":"m1","sender":"human","text":"from downloads","created_at":"2026-09-06T12:00:00.000Z"},
+                {"uuid":"m2","sender":"assistant","text":"kept uuid","created_at":"2026-09-06T12:01:00.000Z"}
+            ]}]"#,
+        )
+        .expect("json");
+        let zip = downloads.join("data-export-2026-09-07.zip");
+        let status = std::process::Command::new("/usr/bin/zip")
+            .args(["-q", "-j"])
+            .arg(&zip)
+            .arg(downloads.join("conversations.json"))
+            .status()
+            .expect("zip");
+        assert!(status.success());
+        let _ = fs::remove_file(downloads.join("conversations.json"));
+        fs::write(downloads.join("random.zip"), b"PK not official").expect("noise");
+        let n = daemon.absorb_chat_exports().expect("absorb");
+        assert!(n >= 2, "{n}");
+        let scan = SegmentLog::scan(paths.log_dir()).expect("scan");
+        assert!(scan.records.iter().all(|r| {
+            r.source.harness.as_str() == Harness::CLAUDE_CHAT
+                && r.source.vendor_session_id.as_deref()
+                    == Some("00000000-dddd-eeee-ffff-000011112222")
+        }));
+    }
+
+    #[test]
+    fn the_live_watch_never_opens_downloads() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::from_env(
+            Some(root.path().join("conbus").to_str().expect("utf-8")),
+            None,
+            None,
+        )
+        .expect("paths");
+        fs::create_dir_all(paths.log_dir()).expect("log");
+        let log = SegmentLog::open(paths.log_dir(), Retention::default()).expect("open");
+        let daemon = Daemon::new(log, Registry::new(), HashMap::new()).watch_chat_exports(&paths);
+        let watch = daemon.chat_watch.expect("watch");
+        assert_eq!(watch.dirs.len(), 1);
+        assert_eq!(watch.dirs[0].dir, paths.chat_export());
+        assert!(
+            !watch
+                .dirs
+                .iter()
+                .any(|dir| dir.dir.to_string_lossy().contains("Downloads"))
+        );
     }
 }

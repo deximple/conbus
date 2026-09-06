@@ -20,6 +20,16 @@ use std::fs::OpenOptions;
 pub fn log(paths: &Paths, json: bool, filter: &LogFilter) -> io::Result<()> {
     let scan = SegmentLog::scan(paths.log_dir())?;
     for record in select(&scan.records, filter) {
+        let revealed;
+        let record = if filter.reveal {
+            revealed = Record {
+                event: conbus_core::retention::reveal_event(&record.event),
+                ..record.clone()
+            };
+            &revealed
+        } else {
+            record
+        };
         if json {
             println!(
                 "{}",
@@ -46,13 +56,19 @@ pub fn log(paths: &Paths, json: bool, filter: &LogFilter) -> io::Result<()> {
 /// works — the id is a 36-character UUID and the timestamp is fixed-width, so a
 /// prefix is unambiguous in both.
 fn select<'a>(records: &'a [Record], filter: &LogFilter) -> Vec<&'a Record> {
+    let aliased = filter
+        .bus_id
+        .as_ref()
+        .map(|wanted| conbus_core::identity::expand_aliases(records, wanted));
     let matching: Vec<&Record> = records
         .iter()
         .filter(|record| {
-            filter
-                .bus_id
-                .as_ref()
-                .is_none_or(|wanted| record.bus_id.to_string().starts_with(wanted))
+            filter.bus_id.as_ref().is_none_or(|wanted| {
+                aliased
+                    .as_ref()
+                    .is_some_and(|set| !set.is_empty() && set.contains(&record.bus_id))
+                    || record.bus_id.to_string().starts_with(wanted)
+            })
                 && filter
                     .since
                     .as_ref()
@@ -188,6 +204,7 @@ fn summarise(record: &Record) -> String {
             ..
         } => format!("summarised {backend} after {covered_turns} turns"),
         Event::Leased { holder } => format!("leased by {holder}"),
+        Event::Aliased { also } => format!("aliased with {also}"),
     };
     // Parallel calls of the same tool render identically without their id, and
     // the request-to-result join would be invisible in the view people read.
@@ -211,7 +228,8 @@ fn summarise(record: &Record) -> String {
         | Event::Routed { .. }
         | Event::Continued { .. }
         | Event::Summarised { .. }
-        | Event::Leased { .. } => String::new(),
+        | Event::Leased { .. }
+        | Event::Aliased { .. } => String::new(),
     };
     // A subagent's events arrive under the parent's session id, so without
     // this marker the human view interleaves two agents with no sign of it.
@@ -275,6 +293,50 @@ pub fn install(apply: bool) -> io::Result<()> {
                 Some(path) => println!("{:<12} written; previous copy at {}", "", path.display()),
                 None => println!("{:<12} written (the file did not exist)", ""),
             }
+        }
+    }
+
+    let plugin = crate::install::opencode_plugin_path(&home);
+    if crate::install::opencode_plugin_registered(&home) {
+        println!(
+            "{:<12} {} — already registered",
+            "opencode",
+            plugin.display()
+        );
+    } else {
+        println!(
+            "{:<12} {} — would register session.created, message.updated, session.error",
+            "opencode",
+            plugin.display()
+        );
+        if apply {
+            crate::install::apply_opencode_plugin(&binary, &home)?;
+            println!(
+                "{:<12} written (official plugin bus, not remaining JSON)",
+                ""
+            );
+        }
+    }
+
+    let cursor_hooks = crate::install::cursor_hooks_path(&home);
+    if crate::install::cursor_hooks_registered(&home) {
+        println!(
+            "{:<12} {} — already registered",
+            "cursor",
+            cursor_hooks.display()
+        );
+    } else {
+        println!(
+            "{:<12} {} — would register stop, sessionEnd, afterAgentResponse",
+            "cursor",
+            cursor_hooks.display()
+        );
+        if apply {
+            crate::install::apply_cursor_hooks(&binary, &home)?;
+            println!(
+                "{:<12} written (native hooks.json; Claude settings do not carry this event)",
+                ""
+            );
         }
     }
 
@@ -697,6 +759,30 @@ fn report_hooks(home: &Path) {
     if !any {
         println!("hooks     nothing registered; run `conbus install --apply`");
     }
+    if crate::install::opencode_plugin_registered(home) {
+        println!(
+            "hooks     {:<12} runs — {} plugin",
+            "opencode",
+            crate::install::opencode_plugin_path(home).display()
+        );
+    } else {
+        println!(
+            "hooks     {:<12} MISSING plugin — run `conbus install --apply`",
+            "opencode"
+        );
+    }
+    if crate::install::cursor_hooks_registered(home) {
+        println!(
+            "hooks     {:<12} runs — {} stop, sessionEnd, afterAgentResponse",
+            "cursor",
+            crate::install::cursor_hooks_path(home).display()
+        );
+    } else {
+        println!(
+            "hooks     {:<12} MISSING stop/sessionEnd/afterAgentResponse — run `conbus install --apply`",
+            "cursor"
+        );
+    }
     report_codex_trust(home);
 }
 
@@ -721,6 +807,8 @@ struct Twins {
     /// append-only log cannot take that back, so the least that can be done
     /// is to say it happened.
     split: usize,
+    /// Split sessions whose live ids are already joined by `aliased` records.
+    split_aliased: usize,
 }
 
 fn twins(records: &[Record]) -> Twins {
@@ -744,12 +832,19 @@ fn twins(records: &[Record]) -> Twins {
         bound_live: 0,
         bound_to_copy: 0,
         split: 0,
+        split_aliased: 0,
     };
     for (key, conversations) in &live {
         // Split is a fact about the live records alone: a torn first record
         // followed by a restart forks a session with no backfill involved.
         if conversations.len() > 1 {
             summary.split += 1;
+            if let Some(first) = conversations.iter().next() {
+                let joined = conbus_core::identity::expand_aliases(records, &first.to_string());
+                if conversations.iter().all(|id| joined.contains(id)) {
+                    summary.split_aliased += 1;
+                }
+            }
         }
         if !copied.contains(key) {
             continue;
@@ -814,11 +909,19 @@ fn report_twins(records: &[Record]) {
         );
     }
     if summary.split > 0 {
-        println!(
-            "          {} recorded live under more than one conversation; a reader following one \
-             id misses the rest",
-            summary.split
-        );
+        if summary.split_aliased == summary.split {
+            println!(
+                "          {} recorded live under more than one conversation; aliased — \
+                 `conbus log --bus-id` follows either id",
+                summary.split
+            );
+        } else {
+            println!(
+                "          {} recorded live under more than one conversation; {} aliased so a \
+                 reader following one id finds the rest",
+                summary.split, summary.split_aliased
+            );
+        }
     }
 }
 
@@ -865,17 +968,7 @@ pub fn doctor(paths: &Paths) -> io::Result<()> {
         }
     }
 
-    let report = crate::harden::harden();
-    println!(
-        "hardening core_dumps_disabled={} memory_locked={}{}",
-        report.core_dumps_disabled,
-        report.memory_locked,
-        report
-            .memory_lock_error
-            .as_deref()
-            .map(|e| format!(" ({e})"))
-            .unwrap_or_default()
-    );
+    println!("{}", describe_hardening(paths));
 
     println!("writable  {}", describe_appendable(&appendable(paths)));
 
@@ -883,6 +976,13 @@ pub fn doctor(paths: &Paths) -> io::Result<()> {
         Some(home) => report_hooks(&home),
         None => println!("hooks     no HOME to read registrations from"),
     }
+    // Chat LAM hard-disables hooks. The official export is the identity-
+    // preserving channel; the daemon ingests this folder on start and
+    // whenever a newer file lands.
+    println!(
+        "chat      Enterprise Inference hooks → conbus hook --inference-listen; or drop conversations.json / data-export-*.zip in {} — UUID kept as claude_chat; Desktop plugin hooks still vendor-off",
+        paths.chat_export().display()
+    );
 
     println!(
         "drops     {}",
@@ -945,10 +1045,14 @@ pub fn doctor(paths: &Paths) -> io::Result<()> {
         Ok(quota) => println!("quota     codex {}", crate::quota::describe(&quota, now)),
         Err(err) => println!("quota     codex unavailable — {err}"),
     }
-    match crate::quota::read_cached(paths, Harness::CLAUDE_CODE) {
-        Some(quota) => println!("quota     claude {}", crate::quota::describe(&quota, now)),
-        None => println!("quota     claude no StatusLine observation yet"),
+    match crate::quota::read_agy() {
+        Ok(quota) => println!("quota     agy {}", crate::quota::describe(&quota, now)),
+        Err(err) => println!("quota     agy unavailable — {err}"),
     }
+    println!(
+        "quota     claude {}",
+        crate::quota::describe_claude(paths, now)
+    );
 
     let meter = conbus_core::meter::Meter::fold(&scan.records);
     println!("{}", meter.describe());
@@ -988,8 +1092,29 @@ fn cursor_line(records: &[Record]) -> String {
         .filter(|record| record.source.harness.as_str() == Harness::CURSOR)
         .count();
     format!(
-        "cursor    adapter live — {n} record(s); identified by cursor_version, not Claude field names"
+        "cursor    adapter live — {n} record(s); briefing on sessionStart additional_context"
     )
+}
+
+/// The daemon's lock report, not this process's heap. Doctor calling
+/// `harden()` itself was true on Darwin even with the daemon down.
+fn describe_hardening(paths: &Paths) -> String {
+    match crate::build_info::daemon_build(paths) {
+        crate::build_info::DaemonBuild::Running(stamp) => match stamp.memory_locked {
+            Some(locked) => format!(
+                "hardening core_dumps_disabled={} memory_locked={}{}",
+                stamp.core_dumps_disabled.unwrap_or(false),
+                locked,
+                stamp
+                    .memory_lock_error
+                    .as_deref()
+                    .map(|e| format!(" ({e})"))
+                    .unwrap_or_default()
+            ),
+            None => "hardening unknown — this daemon did not stamp a lock report".into(),
+        },
+        _ => "hardening unknown — no live daemon stamp".into(),
+    }
 }
 
 fn hop_history(records: &[Record], limit: usize) -> Vec<String> {
@@ -1018,10 +1143,14 @@ pub fn status(paths: &Paths) -> io::Result<()> {
         Ok(quota) => println!("quota     codex {}", crate::quota::describe(&quota, now)),
         Err(err) => println!("quota     codex unavailable — {err}"),
     }
-    match crate::quota::read_cached(paths, Harness::CLAUDE_CODE) {
-        Some(quota) => println!("quota     claude {}", crate::quota::describe(&quota, now)),
-        None => println!("quota     claude no StatusLine observation yet"),
+    match crate::quota::read_agy() {
+        Ok(quota) => println!("quota     agy {}", crate::quota::describe(&quota, now)),
+        Err(err) => println!("quota     agy unavailable — {err}"),
     }
+    println!(
+        "quota     claude {}",
+        crate::quota::describe_claude(paths, now)
+    );
     println!("{}", meter.describe());
     println!("{}", meter.describe_cost());
     let hops = hop_history(&scan.records, 8);
@@ -1713,9 +1842,26 @@ mod tests {
         cursor.source.harness = Harness::new(Harness::CURSOR);
         assert_eq!(
             cursor_line(&[cursor]),
-            "cursor    adapter live — 1 record(s); identified by cursor_version, not Claude field names"
+            "cursor    adapter live — 1 record(s); briefing on sessionStart additional_context"
         );
         assert!(cursor_line(&[]).contains("0 record(s)"));
+    }
+
+    #[test]
+    fn doctor_hardening_is_the_daemon_stamp_not_this_process() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::from_env(dir.path().to_str(), None, None).expect("paths");
+        std::fs::create_dir_all(paths.root()).expect("root");
+        assert!(describe_hardening(&paths).contains("no live daemon stamp"));
+
+        crate::build_info::stamp(&paths).expect("stamp");
+        assert!(describe_hardening(&paths).contains("did not stamp a lock report"));
+
+        crate::build_info::stamp_hardening(&paths, true, true, None).expect("locked");
+        assert_eq!(
+            describe_hardening(&paths),
+            "hardening core_dumps_disabled=true memory_locked=true"
+        );
     }
 
     #[test]

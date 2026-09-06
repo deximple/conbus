@@ -28,5 +28,6 @@ names only) and match Cursor's own hook docs on types.
 
 `{"continue":true,"suppressOutput":true}` has been accepted thousands of times
 on this machine (the hook was failing the *mapping*, not the reply). Cursor's
-`beforeSubmitPrompt` does not take Claude's `hookSpecificOutput`. The bus
-records; it does not brief this leg yet.
+`beforeSubmitPrompt` does not take Claude's `hookSpecificOutput`. Official
+inject is `sessionStart` → `additional_context`. The bus briefs that event
+and records `beforeSubmitPrompt` so the conversation can mint.

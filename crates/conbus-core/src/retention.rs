@@ -109,7 +109,8 @@ fn elide_tool_bodies(event: &Event) -> Event {
         | Event::Routed { .. }
         | Event::Continued { .. }
         | Event::Summarised { .. }
-        | Event::Leased { .. } => event.clone(),
+        | Event::Leased { .. }
+        | Event::Aliased { .. } => event.clone(),
     }
 }
 
@@ -148,11 +149,23 @@ pub enum Retention {
     /// Conversation only. Tool result bodies never reach disk.
     #[default]
     ConversationOnly,
+    /// Conversation plaintext; tool bodies sealed with the workspace KEK.
+    EncryptedTools,
     /// Nothing reaches disk.
     Ephemeral,
 }
 
 impl Retention {
+    /// `CONBUS_RETENTION=full|encrypted_tools|ephemeral`. Absent is conversation only.
+    pub fn from_env() -> Self {
+        match std::env::var("CONBUS_RETENTION") {
+            Ok(value) if value.eq_ignore_ascii_case("full") => Retention::Full,
+            Ok(value) if value.eq_ignore_ascii_case("encrypted_tools") => Retention::EncryptedTools,
+            Ok(value) if value.eq_ignore_ascii_case("ephemeral") => Retention::Ephemeral,
+            _ => Retention::ConversationOnly,
+        }
+    }
+
     /// The record as it should reach disk, or `None` if nothing should.
     pub fn redact(&self, record: &Record) -> Option<Record> {
         match self {
@@ -165,7 +178,32 @@ impl Retention {
                 event: clip_bodies(&elide_tool_bodies(&record.event)),
                 ..record.clone()
             }),
+            Retention::EncryptedTools => Some(Record {
+                event: clip_bodies(&seal_tool_bodies(&record.event)),
+                ..record.clone()
+            }),
         }
+    }
+}
+
+/// Decrypt sealed bodies for an explicit `conbus log --reveal`.
+pub fn reveal_event(event: &Event) -> Event {
+    map_bodies(event, crate::seal::reveal)
+}
+
+fn seal_tool_bodies(event: &Event) -> Event {
+    match event {
+        Event::ToolRequested { .. }
+        | Event::PermissionAsked { .. }
+        | Event::ToolDenied { .. }
+        | Event::ToolUse { .. } => map_bodies(event, |body| match body {
+            Body::Kept { text } | Body::Clipped { text, .. } => crate::seal::seal_text(text)
+                .unwrap_or(Body::Elided {
+                    bytes: body.original_bytes(),
+                }),
+            other => other.clone(),
+        }),
+        _ => event.clone(),
     }
 }
 
@@ -466,6 +504,37 @@ mod tests {
                 prompt: Body::kept("ship the recorder")
             }
         );
+    }
+
+    #[test]
+    fn encrypted_tools_seals_a_tool_body_and_keeps_the_prompt() {
+        let _guard = crate::seal::KEK_ENV.lock().expect("kek env");
+        unsafe { std::env::set_var("CONBUS_KEK_HEX", "bb".repeat(32)) };
+        let sealed = Retention::EncryptedTools
+            .redact(&tool_use(Body::kept("secret-in"), Body::kept("secret-out")))
+            .expect("logged");
+        let Event::ToolUse { input, outcome, .. } = &sealed.event else {
+            panic!("kind");
+        };
+        assert!(matches!(input, Body::Sealed { .. }), "{input:?}");
+        match outcome {
+            ToolOutcome::Succeeded { output } => {
+                assert!(matches!(output, Body::Sealed { .. }), "{output:?}");
+                assert_eq!(crate::seal::open(output).as_deref(), Some("secret-out"));
+            }
+            other => panic!("{other:?}"),
+        }
+        let prompt = Retention::EncryptedTools
+            .redact(&turn_started(Body::kept("keep me")))
+            .expect("prompt");
+        assert_eq!(
+            prompt.event,
+            Event::TurnStarted {
+                author: None,
+                prompt: Body::kept("keep me")
+            }
+        );
+        unsafe { std::env::remove_var("CONBUS_KEK_HEX") };
     }
 
     #[test]

@@ -211,10 +211,14 @@ impl Registry {
             self.remember(key.clone(), observed);
             return Disposition::Deferred;
         }
-        // Unbound. Only a prompt proves a session is real enough to mint, and
-        // any prompt does — a machine-authored turn is still a conversation,
-        // and refusing to mint would drop its head permanently.
-        if !matches!(observed.event, Event::TurnStarted { .. }) {
+        // Unbound. A prompt proves a session is real enough to mint.
+        // Cursor also mints on a completed turn: its inject channel is
+        // sessionStart, and beforeSubmitPrompt was not registered on the
+        // first installs, so a live Cursor conversation would otherwise
+        // stay orphaned and have no pack to hand the next leg.
+        let cursor_turn = key.harness.as_str() == Harness::CURSOR
+            && matches!(observed.event, Event::TurnEnded { .. });
+        if !matches!(observed.event, Event::TurnStarted { .. }) && !cursor_turn {
             return Disposition::Orphaned;
         }
         let bus_id = BusId::mint();
@@ -443,6 +447,33 @@ mod tests {
             Disposition::Deferred
         );
         assert_eq!(registry.bus_id(&key()), None, "a ghost must not get an id");
+    }
+
+    #[test]
+    fn a_cursor_completed_turn_mints_when_the_prompt_was_never_seen() {
+        let key = SessionKey::new(Harness::new(Harness::CURSOR), "cursor-conv");
+        let mut registry = Registry::new();
+        let ended = Event::TurnEnded {
+            state: TurnState::Complete,
+            assistant_message: None,
+        };
+
+        let Disposition::Write { bus_id, .. } =
+            registry.observe(&key, Observed::bare(ended.clone()))
+        else {
+            panic!("a live Cursor turn must mint");
+        };
+        assert_eq!(registry.bus_id(&key), Some(bus_id));
+        assert_eq!(
+            registry.observe(&key, Observed::bare(ended)),
+            Disposition::Write {
+                bus_id,
+                observed: vec![Observed::bare(Event::TurnEnded {
+                    state: TurnState::Complete,
+                    assistant_message: None,
+                })],
+            }
+        );
     }
 
     #[test]

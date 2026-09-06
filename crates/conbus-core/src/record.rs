@@ -223,6 +223,9 @@ mod tests {
             Event::Leased {
                 holder: "conbus-hop".into(),
             },
+            Event::Aliased {
+                also: "01996b1e-2c4a-7c31-9d0e-4f2a6b8c1d3f".parse().expect("id"),
+            },
         ];
         all.extend(
             every_turn_state()
@@ -259,7 +262,8 @@ mod tests {
                 | Event::Routed { .. }
                 | Event::Continued { .. }
                 | Event::Summarised { .. }
-                | Event::Leased { .. } => {}
+                | Event::Leased { .. }
+                | Event::Aliased { .. } => {}
             }
         }
         all

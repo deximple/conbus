@@ -10,6 +10,7 @@
 //! Read-only. It starts an app-server, asks, and stops it; nothing about the
 //! account changes.
 
+use std::collections::BTreeSet;
 use std::io::{self, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -138,14 +139,13 @@ pub fn run(paths: &Paths) -> io::Result<()> {
         Ok(quota) => println!("codex     {}", describe(&quota, now)),
         Err(err) => println!("codex     unavailable — {err}"),
     }
-    match read_cached(paths, Harness::CLAUDE_CODE) {
-        Some(quota) => println!("claude    {}", describe(&quota, now)),
-        None => println!(
-            "claude    no StatusLine observation yet — open claude so the vendor fills rate_limits"
-        ),
+    match read_agy() {
+        Ok(quota) => println!("agy       {}", describe(&quota, now)),
+        Err(err) => println!("agy       unavailable — {err}"),
     }
+    println!("claude    {}", describe_claude(paths, now));
     for slug in conbus_core::attach::slugs() {
-        if slug == Harness::CLAUDE_CODE || slug == Harness::CODEX {
+        if slug == Harness::CLAUDE_CODE || slug == Harness::CODEX || slug == Harness::AGY {
             continue;
         }
         let Some(caps) = conbus_core::attach::caps(slug) else {
@@ -153,14 +153,154 @@ pub fn run(paths: &Paths) -> io::Result<()> {
         };
         println!(
             "{slug:<9} {}",
-            if caps.quota_signal {
-                "official remaining-quota channel captured"
-            } else {
-                "no official remaining-quota channel captured"
-            }
+            describe_attach(paths, slug, caps.quota_signal)
         );
     }
     Ok(())
+}
+
+/// Official print-mode JSON. Not a TUI scrape: the unmodified binary
+/// already fetched remaining quota and emits `command.data.groups`.
+pub fn read_agy() -> io::Result<Quota> {
+    let binary = agy_binary();
+    let output = Command::new(&binary)
+        .args([
+            "-p",
+            "/usage",
+            "--output-format",
+            "json",
+            "--print-timeout",
+            "15s",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|err| {
+            io::Error::other(format!(
+                "could not run `{} -p /usage`: {err}",
+                binary.to_string_lossy()
+            ))
+        })?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "`{} -p /usage` exited {}",
+            binary.to_string_lossy(),
+            output.status
+        )));
+    }
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|err| io::Error::other(format!("agy /usage was not JSON: {err}")))?;
+    parse_agy(&value)
+}
+
+fn agy_binary() -> std::ffi::OsString {
+    std::env::var_os("CONBUS_AGY_BIN")
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "agy".into())
+}
+
+/// `agy -p "/usage" --output-format json`, captured on 1.1.27.
+///
+/// `remaining_fraction` is what is left. Hop reads `used_percent`, so
+/// `round((1 - remaining) * 100)`. Primary is the tightest 5h bucket
+/// across groups — that is the window that can refuse a turn first.
+pub fn parse_agy(result: &serde_json::Value) -> io::Result<Quota> {
+    let groups = result
+        .pointer("/command/data/groups")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            io::Error::other(format!("no command.data.groups in the reply: {result}"))
+        })?;
+    let mut five: Option<Window> = None;
+    let mut week: Option<Window> = None;
+    for group in groups {
+        let Some(buckets) = group.get("buckets").and_then(serde_json::Value::as_array) else {
+            continue;
+        };
+        for bucket in buckets {
+            let Some(window) = agy_bucket(bucket) else {
+                continue;
+            };
+            match window.minutes {
+                300 => {
+                    if five.is_none_or(|cur| window.used_percent > cur.used_percent) {
+                        five = Some(window);
+                    }
+                }
+                10080 => {
+                    if week.is_none_or(|cur| window.used_percent > cur.used_percent) {
+                        week = Some(window);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    if five.is_none() && week.is_none() {
+        return Err(io::Error::other(
+            "agy /usage named groups but no 5h or weekly bucket",
+        ));
+    }
+    let reached = [five.as_ref(), week.as_ref()]
+        .into_iter()
+        .flatten()
+        .any(|w| w.used_percent >= 100)
+        .then(|| "rate_limit".to_string());
+    Ok(Quota {
+        plan: Some("agy".into()),
+        primary: five.or(week),
+        secondary: week.filter(|_| five.is_some()),
+        reached,
+        reset_credits: 0,
+    })
+}
+
+fn agy_bucket(bucket: &serde_json::Value) -> Option<Window> {
+    let remaining = bucket.get("remaining_fraction")?.as_f64()?;
+    let minutes = match bucket.get("window")?.as_str()? {
+        "5h" => 300,
+        "weekly" => 10080,
+        _ => return None,
+    };
+    let resets_at = unix_rfc3339(bucket.get("reset_time")?.as_str()?)?;
+    let used_percent = ((1.0 - remaining) * 100.0).round().clamp(0.0, 100.0) as u64;
+    Some(Window {
+        used_percent,
+        minutes,
+        resets_at,
+    })
+}
+
+/// `2026-09-06T13:47:28Z` — the only shape Agy 1.1.27 sent.
+fn unix_rfc3339(stamp: &str) -> Option<i64> {
+    let stamp = stamp.strip_suffix('Z')?;
+    let (date, time) = stamp.split_once('T')?;
+    let mut date = date.split('-');
+    let year: i32 = date.next()?.parse().ok()?;
+    let month: u32 = date.next()?.parse().ok()?;
+    let day: u32 = date.next()?.parse().ok()?;
+    let time = time.split('.').next()?;
+    let mut time = time.split(':');
+    let hour: u32 = time.next()?.parse().ok()?;
+    let min: u32 = time.next()?.parse().ok()?;
+    let sec: u32 = time.next()?.parse().ok()?;
+    let days = days_from_civil(year, month, day)?;
+    Some(days * 86_400 + i64::from(hour) * 3_600 + i64::from(min) * 60 + i64::from(sec))
+}
+
+/// Howard Hinnant's civil-from-days inverse, days since Unix epoch.
+fn days_from_civil(year: i32, month: u32, day: u32) -> Option<i64> {
+    if !(1..=12).contains(&month) || day == 0 || day > 31 {
+        return None;
+    }
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let yoe = (year - era * 400) as u32;
+    let mp = if month > 2 { month - 3 } else { month + 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Some(i64::from(era) * 146_097 + i64::from(doe) - 719_468)
 }
 
 /// Claude StatusLine stdin, as the 2.1.263 binary documents it.
@@ -270,15 +410,125 @@ fn write_cached(paths: &Paths, harness: &str, quota: &Quota) -> io::Result<()> {
     Ok(())
 }
 
+/// Names-only scan of a hook payload. Used for attach legs that have no
+/// remaining-quota JSON yet: we record that we looked, never the values.
+pub fn observe_hook_keys(paths: &Paths, harness: &str, stdin: &str) {
+    let Ok(serde_json::Value::Object(fields)) = serde_json::from_str::<serde_json::Value>(stdin)
+    else {
+        return;
+    };
+    let path = paths.quota_keys(harness);
+    let mut names: BTreeSet<String> = fields.keys().cloned().collect();
+    let mut quota_named = names.iter().any(|n| looks_like_quota_key(n));
+    if let Ok(prev) = std::fs::read_to_string(&path)
+        && let Ok(value) = serde_json::from_str::<serde_json::Value>(&prev)
+    {
+        if let Some(arr) = value.get("keys").and_then(|v| v.as_array()) {
+            for key in arr {
+                if let Some(name) = key.as_str() {
+                    names.insert(name.to_string());
+                }
+            }
+        }
+        if value.get("quota_named").and_then(|v| v.as_bool()) == Some(true) {
+            quota_named = true;
+        }
+    }
+    let names: Vec<String> = names.into_iter().collect();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let body = serde_json::json!({
+        "schema_version": 1,
+        "harness": harness,
+        "observed_at": now_secs(),
+        "keys": names,
+        "quota_named": quota_named,
+    });
+    let tmp = path.with_extension("json.next");
+    if std::fs::write(&tmp, serde_json::to_vec(&body).unwrap_or_default()).is_ok() {
+        let _ = std::fs::rename(tmp, path);
+    }
+}
+
+fn looks_like_quota_key(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n.contains("rate_limit")
+        || n.contains("ratelimit")
+        || n.contains("used_percent")
+        || n.contains("usedpercent")
+        || n == "quota"
+        || n == "remaining"
+        || n == "usage"
+}
+
+fn describe_attach(paths: &Paths, slug: &str, quota_signal: bool) -> String {
+    if quota_signal {
+        return "official remaining-quota channel captured".into();
+    }
+    let Ok(text) = std::fs::read_to_string(paths.quota_keys(slug)) else {
+        return "no official remaining-quota channel captured".into();
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return "no official remaining-quota channel captured".into();
+    };
+    if value.get("quota_named").and_then(|v| v.as_bool()) == Some(true) {
+        return "hook named a quota-like field — not parsed; we do not read vendor tokens to fetch one".into();
+    }
+    "hook keys scanned, no remaining-quota field".into()
+}
+
+/// What doctor/quota say about the Claude StatusLine channel.
+pub fn describe_claude(paths: &Paths, now: i64) -> String {
+    if let Some(quota) = read_cached(paths, Harness::CLAUDE_CODE) {
+        return describe(&quota, now);
+    }
+    match read_seen(paths, Harness::CLAUDE_CODE) {
+        Some(_) => {
+            "StatusLine fired, no rate_limits yet — vendor fills them after the first API response"
+                .into()
+        }
+        None => {
+            "StatusLine never fired — restart claude so it loads the wrapped statusLine command"
+                .into()
+        }
+    }
+}
+
+fn read_seen(paths: &Paths, harness: &str) -> Option<i64> {
+    let text = std::fs::read_to_string(paths.quota_seen(harness)).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    value.get("observed_at")?.as_i64()
+}
+
+fn write_seen(paths: &Paths, harness: &str, has_rate_limits: bool) -> io::Result<()> {
+    let path = paths.quota_seen(harness);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let body = serde_json::json!({
+        "schema_version": 1,
+        "harness": harness,
+        "observed_at": now_secs(),
+        "has_rate_limits": has_rate_limits,
+    });
+    let tmp = path.with_extension("json.next");
+    std::fs::write(&tmp, serde_json::to_vec(&body).map_err(io::Error::other)?)?;
+    std::fs::rename(tmp, path)?;
+    Ok(())
+}
+
 /// Persist `rate_limits` from StatusLine stdin, then run the person's own
 /// statusLine command if install wrapped one. Stdout is the status bar, never
 /// hook JSON.
 pub fn observe_statusline(paths: Option<&Paths>, forward: Option<&Path>, stdin: &str) -> String {
-    if let Some(paths) = paths
-        && let Ok(value) = serde_json::from_str::<serde_json::Value>(stdin)
-        && let Some(quota) = parse_statusline(&value)
-    {
-        let _ = write_cached(paths, Harness::CLAUDE_CODE, &quota);
+    if let Some(paths) = paths {
+        let parsed = serde_json::from_str::<serde_json::Value>(stdin).ok();
+        let quota = parsed.as_ref().and_then(parse_statusline);
+        let _ = write_seen(paths, Harness::CLAUDE_CODE, quota.is_some());
+        if let Some(quota) = quota {
+            let _ = write_cached(paths, Harness::CLAUDE_CODE, &quota);
+        }
     }
     if let Some(path) = forward
         && let Ok(command) = std::fs::read_to_string(path)
@@ -431,14 +681,142 @@ mod tests {
         std::fs::create_dir_all(paths.root()).expect("root");
         let forward = root.path().join("forward.sh");
         std::fs::write(&forward, "echo FORWARDED").expect("write");
-        let payload = include_str!(
-            "../tests/fixtures/claude_code_2.1.263_statusline_rate_limits.json"
-        );
+        let payload =
+            include_str!("../tests/fixtures/claude_code_2.1.263_statusline_rate_limits.json");
 
         let out = observe_statusline(Some(&paths), Some(&forward), payload);
 
         assert_eq!(out.trim(), "FORWARDED");
         let cached = read_cached(&paths, Harness::CLAUDE_CODE).expect("cache");
         assert_eq!(cached.primary.as_ref().map(|w| w.used_percent), Some(72));
+        assert!(read_seen(&paths, Harness::CLAUDE_CODE).is_some());
+    }
+
+    #[test]
+    fn a_statusline_without_limits_is_still_seen() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let paths =
+            Paths::from_env(root.path().join("conbus").to_str(), None, None).expect("paths");
+        std::fs::create_dir_all(paths.root()).expect("root");
+        observe_statusline(Some(&paths), None, r#"{"cwd":"/repo"}"#);
+        assert!(read_cached(&paths, Harness::CLAUDE_CODE).is_none());
+        assert!(read_seen(&paths, Harness::CLAUDE_CODE).is_some());
+        assert!(describe_claude(&paths, 0).contains("no rate_limits yet"));
+    }
+
+    #[test]
+    fn attach_hook_keys_are_names_only_and_do_not_invent_a_signal() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let paths =
+            Paths::from_env(root.path().join("conbus").to_str(), None, None).expect("paths");
+        std::fs::create_dir_all(paths.root()).expect("root");
+        observe_hook_keys(
+            &paths,
+            Harness::CURSOR,
+            r#"{"cursor_version":"2","prompt":"secret","conversation_id":"c"}"#,
+        );
+        let text = std::fs::read_to_string(paths.quota_keys(Harness::CURSOR)).expect("keys");
+        assert!(text.contains("cursor_version"));
+        assert!(!text.contains("secret"));
+        assert!(
+            describe_attach(&paths, Harness::CURSOR, false).contains("no remaining-quota field")
+        );
+    }
+
+    #[test]
+    fn attach_hook_keys_keep_fields_seen_on_an_earlier_event() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let paths =
+            Paths::from_env(root.path().join("conbus").to_str(), None, None).expect("paths");
+        std::fs::create_dir_all(paths.root()).expect("root");
+        observe_hook_keys(
+            &paths,
+            Harness::CURSOR,
+            r#"{"hook_event_name":"afterAgentResponse","text":"secret","cursor_version":"2"}"#,
+        );
+        observe_hook_keys(
+            &paths,
+            Harness::CURSOR,
+            r#"{"hook_event_name":"preToolUse","tool_name":"Shell","cursor_version":"2"}"#,
+        );
+        let text = std::fs::read_to_string(paths.quota_keys(Harness::CURSOR)).expect("keys");
+        assert!(text.contains("\"text\""), "{text}");
+        assert!(text.contains("tool_name"), "{text}");
+        assert!(!text.contains("secret"), "{text}");
+    }
+
+    #[test]
+    fn the_agy_print_mode_contract_reads_as_two_windows() {
+        let payload: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/agy_1.1.27_usage.json"))
+                .expect("fixture");
+        let quota = parse_agy(&payload).expect("groups");
+
+        assert_eq!(quota.plan.as_deref(), Some("agy"));
+        assert_eq!(
+            quota.primary,
+            Some(Window {
+                used_percent: 72,
+                minutes: 300,
+                resets_at: unix_rfc3339("2026-09-06T13:47:28Z").expect("stamp"),
+            })
+        );
+        assert_eq!(quota.secondary.as_ref().map(|w| w.used_percent), Some(31));
+        assert_eq!(quota.reached, None);
+    }
+
+    #[test]
+    fn a_full_agy_week_is_reached_even_when_five_hours_remain() {
+        let payload = serde_json::json!({
+            "command": {"data": {"groups": [{
+                "name": "Gemini Models",
+                "buckets": [
+                    {
+                        "id": "gemini-5h",
+                        "window": "5h",
+                        "remaining_fraction": 0.5,
+                        "reset_time": "2026-09-06T13:47:28Z"
+                    },
+                    {
+                        "id": "gemini-weekly",
+                        "window": "weekly",
+                        "remaining_fraction": 0.0,
+                        "reset_time": "2026-09-11T11:13:03Z"
+                    }
+                ]
+            }]}}
+        });
+        let quota = parse_agy(&payload).expect("groups");
+        assert_eq!(quota.primary.as_ref().map(|w| w.used_percent), Some(50));
+        assert_eq!(quota.secondary.as_ref().map(|w| w.used_percent), Some(100));
+        assert_eq!(quota.reached.as_deref(), Some("rate_limit"));
+    }
+
+    #[test]
+    fn a_zero_agy_fraction_is_the_reached_signal() {
+        let payload = serde_json::json!({
+            "command": {"data": {"groups": [{
+                "name": "Gemini Models",
+                "buckets": [{
+                    "id": "gemini-5h",
+                    "window": "5h",
+                    "remaining_fraction": 0.0,
+                    "reset_time": "2026-09-06T13:47:28Z"
+                }]
+            }]}}
+        });
+        let quota = parse_agy(&payload).expect("groups");
+        assert_eq!(quota.primary.as_ref().map(|w| w.used_percent), Some(100));
+        assert_eq!(quota.reached.as_deref(), Some("rate_limit"));
+    }
+
+    #[test]
+    fn agy_without_groups_is_an_error_not_a_zeroed_line() {
+        assert!(parse_agy(&serde_json::json!({"command": {"name": "usage"}})).is_err());
+    }
+
+    #[test]
+    fn rfc3339_z_is_unix_seconds() {
+        assert_eq!(unix_rfc3339("2026-09-06T13:47:28Z"), Some(1_788_702_448));
     }
 }

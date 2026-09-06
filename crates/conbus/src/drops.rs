@@ -165,9 +165,17 @@ fn should_speak(paths: &Paths, reason: &str) -> bool {
 #[derive(Debug, PartialEq, Eq)]
 pub struct Summary {
     pub count: usize,
+    /// Broken pipe / ENOTCONN during a daemon restart, not a standing fault.
+    pub transient: usize,
     /// True once the file stopped growing, so `count` is a floor.
     pub capped: bool,
     pub last: Option<(String, String)>,
+}
+
+pub fn is_transient(reason: &str) -> bool {
+    reason.contains("Broken pipe")
+        || reason.contains("Socket is not connected")
+        || reason.contains("Connection reset")
 }
 
 pub fn summary(paths: &Paths) -> Summary {
@@ -175,11 +183,13 @@ pub fn summary(paths: &Paths) -> Summary {
     let Ok(text) = fs::read_to_string(&file) else {
         return Summary {
             count: 0,
+            transient: 0,
             capped: false,
             last: None,
         };
     };
     let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    let mut transient = 0;
     let last = lines.last().and_then(|line| {
         let value: serde_json::Value = serde_json::from_str(line).ok()?;
         let reason = value.get("reason")?.as_str()?.to_string();
@@ -190,8 +200,21 @@ pub fn summary(paths: &Paths) -> Summary {
         };
         Some((value.get("ts")?.as_str()?.to_string(), reason))
     });
+    for line in &lines {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if value
+            .get("reason")
+            .and_then(|r| r.as_str())
+            .is_some_and(is_transient)
+        {
+            transient += 1;
+        }
+    }
     Summary {
         count: lines.len(),
+        transient,
         capped: text.len() as u64 >= CAP_BYTES,
         last,
     }
@@ -203,9 +226,13 @@ pub fn describe(summary: &Summary) -> String {
         (0, _) => "none recorded".to_string(),
         (n, last) => {
             let at_least = if summary.capped { "at least " } else { "" };
-            match last {
-                Some((ts, reason)) => format!("{at_least}{n} recorded; last {ts}: {reason}"),
-                None => format!("{at_least}{n} recorded"),
+            let standing = n.saturating_sub(summary.transient);
+            match (last, summary.transient) {
+                (Some((ts, reason)), t) if t > 0 => format!(
+                    "{at_least}{n} recorded ({standing} standing, {t} transient connection; last {ts}: {reason})"
+                ),
+                (Some((ts, reason)), _) => format!("{at_least}{n} recorded; last {ts}: {reason}"),
+                (None, _) => format!("{at_least}{n} recorded"),
             }
         }
     }
@@ -335,5 +362,24 @@ mod tests {
         let dir = home();
 
         assert_eq!(describe(&summary(&paths_at(dir.path()))), "none recorded");
+    }
+
+    #[test]
+    fn transient_connection_drops_are_counted_apart_from_standing_faults() {
+        let dir = home();
+        let paths = paths_at(dir.path());
+        append(
+            &paths,
+            &Dropped::new("could not send the record: Broken pipe (os error 32)"),
+        );
+        append(&paths, &Dropped::new("no daemon on /tmp/x"));
+        let summary = summary(&paths);
+        assert_eq!(summary.count, 2);
+        assert_eq!(summary.transient, 1);
+        assert!(
+            describe(&summary).contains("1 standing, 1 transient connection"),
+            "{}",
+            describe(&summary)
+        );
     }
 }

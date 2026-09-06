@@ -150,6 +150,43 @@ for line in sys.stdin:
 }
 
 #[test]
+fn quota_reads_agy_print_mode_json() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("agy");
+    let reply = include_str!("fixtures/agy_1.1.27_usage.json");
+    let script = format!(
+        r#"#!/usr/bin/env python3
+import json, sys
+print(json.dumps(json.loads({reply:?})), flush=True)
+"#
+    );
+    std::fs::write(&path, script).expect("write");
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_conbus"))
+        .arg("quota")
+        .env("CONBUS_CODEX_BIN", "/nonexistent/codex")
+        .env("CONBUS_AGY_BIN", &path)
+        .output()
+        .expect("run quota");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(stdout.contains("agy"), "{stdout}");
+    assert!(stdout.contains("72%"), "the five-hour window: {stdout}");
+    assert!(stdout.contains("31%"), "the weekly window: {stdout}");
+    assert!(
+        stdout.contains("not exhausted"),
+        "the router's signal: {stdout}"
+    );
+}
+
+#[test]
 fn doctor_says_when_the_quota_cannot_be_read() {
     let home = tempfile::tempdir().expect("tempdir");
 

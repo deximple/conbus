@@ -265,7 +265,8 @@ impl Candidate {
             | Event::Routed { .. }
             | Event::Continued { .. }
             | Event::Summarised { .. }
-            | Event::Leased { .. } => {}
+            | Event::Leased { .. }
+            | Event::Aliased { .. } => {}
             // Tool traffic means a turn is in flight, whatever came before.
             Event::ToolRequested { .. }
             | Event::PermissionAsked { .. }
@@ -436,7 +437,8 @@ pub fn opening_units(prompt: &crate::event::Body) -> usize {
         crate::event::Body::Clipped { original_bytes, .. }
         | crate::event::Body::Elided {
             bytes: original_bytes,
-        } => *original_bytes,
+        }
+        | crate::event::Body::Sealed { original_bytes, .. } => *original_bytes,
     }
 }
 
@@ -455,7 +457,9 @@ pub fn machine_authored(prompt: &crate::event::Body) -> bool {
             let head = text.trim_start();
             TELLS.iter().any(|tell| head.starts_with(tell))
         }
-        crate::event::Body::Clipped { .. } | crate::event::Body::Elided { .. } => false,
+        crate::event::Body::Clipped { .. }
+        | crate::event::Body::Elided { .. }
+        | crate::event::Body::Sealed { .. } => false,
     }
 }
 

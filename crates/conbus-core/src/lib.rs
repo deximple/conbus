@@ -7,6 +7,8 @@ pub mod clock;
 pub mod continuation;
 pub mod event;
 pub mod ids;
+pub mod identity;
+pub mod seal;
 pub mod meter;
 pub mod pack;
 pub mod paths;

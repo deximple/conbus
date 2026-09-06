@@ -16,6 +16,7 @@
 use std::collections::BTreeMap;
 
 use serde::Deserialize;
+use serde_json::Value;
 
 use crate::clock::Timestamp;
 use crate::event::{Author, Body, Entrypoint, Event, Harness, Source, TurnState, VendorTurnId};
@@ -467,6 +468,152 @@ fn close(out: &mut Recovered, bus_id: BusId, open: Option<OpenTurn>) {
     });
 }
 
+/// Official Claude.ai / Desktop data-export archive (`conversations.json`).
+///
+/// Desktop and `claude import-conversations` both read this shape. The
+/// importer hashes `uuid` into a new Code session id; we keep the Chat
+/// uuid so the window's conversation stays itself.
+pub const CLAUDE_CHAT_EXPORT: &str = "claude_chat_export";
+
+/// One official export file. Unknown schemas are counted, not guessed.
+///
+/// Privacy → Export data writes a top-level array. Desktop / some wrappers
+/// wrap the same objects as `{ "conversations": [...] }`. Both keep `uuid`.
+pub fn parse_claude_chat_export(text: &str) -> Vec<Recovered> {
+    let Ok(root) = serde_json::from_str::<Value>(text) else {
+        let mut out = Recovered::default();
+        out.skip("unreadable json");
+        return vec![out];
+    };
+    let Some(conversations) = chat_export_conversations(&root) else {
+        let mut out = Recovered::default();
+        out.skip("unknown schema");
+        return vec![out];
+    };
+    conversations.iter().map(parse_chat_conversation).collect()
+}
+
+fn chat_export_conversations(root: &Value) -> Option<&Vec<Value>> {
+    match root {
+        Value::Array(conversations) => Some(conversations),
+        Value::Object(_) => root.get("conversations").and_then(Value::as_array),
+        _ => None,
+    }
+}
+
+/// Official export puts the body on `text`, and also on `content[].text`.
+fn chat_message_text(message: &Value) -> Option<&str> {
+    message
+        .get("text")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .or_else(|| {
+            message
+                .get("content")
+                .and_then(Value::as_array)
+                .and_then(|blocks| {
+                    blocks.iter().find_map(|block| {
+                        (block.get("type").and_then(Value::as_str) == Some("text"))
+                            .then(|| block.get("text").and_then(Value::as_str))
+                            .flatten()
+                            .map(str::trim)
+                            .filter(|text| !text.is_empty())
+                    })
+                })
+        })
+}
+
+fn parse_chat_conversation(conversation: &Value) -> Recovered {
+    let mut out = Recovered::default();
+    let Some(uuid) = conversation.get("uuid").and_then(Value::as_str) else {
+        out.skip("conversation has no uuid");
+        return out;
+    };
+    let Some(bus_id) = uuid.parse::<BusId>().ok() else {
+        out.skip("conversation uuid is not a uuid");
+        return out;
+    };
+    out.vendor_session_id = Some(uuid.to_string());
+    let vendor_session_id = out.vendor_session_id.clone();
+    let source = || Source {
+        harness: Harness::new(Harness::CLAUDE_CHAT),
+        harness_version: None,
+        vendor_session_id: vendor_session_id.clone(),
+        workspace: None,
+        entrypoint: Some(Entrypoint::new("claude_ai_chat")),
+        backfilled_from: Some(CLAUDE_CHAT_EXPORT.to_string()),
+    };
+    let Some(messages) = conversation.get("chat_messages").and_then(Value::as_array) else {
+        out.skip("conversation has no chat_messages");
+        return out;
+    };
+    let mut open: Option<OpenTurn> = None;
+    for message in messages {
+        let sender = message.get("sender").and_then(Value::as_str).unwrap_or("");
+        let text = chat_message_text(message);
+        let at = message
+            .get("created_at")
+            .and_then(Value::as_str)
+            .and_then(|text| text.parse::<Timestamp>().ok());
+        match sender {
+            "human" => {
+                let Some(text) = text else {
+                    out.skip("human message with no text");
+                    continue;
+                };
+                close(&mut out, bus_id, open.take());
+                out.entries.push(Entry {
+                    bus_id,
+                    observed_at: at,
+                    source: source(),
+                    vendor_turn_id: message
+                        .get("uuid")
+                        .and_then(Value::as_str)
+                        .map(VendorTurnId::new),
+                    vendor_agent_id: None,
+                    event: Event::TurnStarted {
+                        author: Some(Author::new("human")),
+                        prompt: Body::kept(text.to_string()),
+                    },
+                });
+                open = Some(OpenTurn { last_reply: None });
+            }
+            "assistant" => {
+                let Some(text) = text else {
+                    out.skip("assistant message with no text");
+                    continue;
+                };
+                match open.as_mut() {
+                    Some(turn) => turn.last_reply = Some((at, text.to_string(), source())),
+                    None => out.skip("assistant line before any prompt"),
+                }
+            }
+            other => out.skip(if other.is_empty() {
+                "message with no sender"
+            } else {
+                other
+            }),
+        }
+    }
+    close(&mut out, bus_id, open.take());
+    if !out.entries.is_empty() {
+        let observed_at = out.entries[0].observed_at;
+        out.entries.insert(
+            0,
+            Entry {
+                bus_id,
+                observed_at,
+                source: source(),
+                vendor_turn_id: None,
+                vendor_agent_id: None,
+                event: Event::SessionCandidate { trigger: None },
+            },
+        );
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -902,5 +1049,99 @@ mod codex_tests {
 
         assert!(out.entries.is_empty());
         assert_eq!(out.skipped.get("reply before any prompt"), Some(&1));
+    }
+}
+
+#[cfg(test)]
+mod chat_export_tests {
+    use super::*;
+
+    /// Field names from `claude import-conversations` 2.1.263, which reads
+    /// the official Claude.ai / Desktop data-export `conversations.json`.
+    const EXPORT: &str = r#"{
+        "conversations": [{
+            "uuid": "00000000-1111-2222-3333-444444444444",
+            "name": "a chat",
+            "created_at": "2026-09-06T12:00:00.000Z",
+            "updated_at": "2026-09-06T12:01:00.000Z",
+            "chat_messages": [
+                {"uuid": "m1", "sender": "human", "text": "from the chat window", "created_at": "2026-09-06T12:00:00.000Z"},
+                {"uuid": "m2", "sender": "assistant", "text": "kept the same conversation", "created_at": "2026-09-06T12:01:00.000Z"}
+            ]
+        }]
+    }"#;
+
+    #[test]
+    fn a_chat_export_keeps_the_conversation_uuid_as_claude_chat() {
+        let recovered = parse_claude_chat_export(EXPORT);
+        assert_eq!(recovered.len(), 1);
+        let out = &recovered[0];
+        assert_eq!(
+            out.vendor_session_id.as_deref(),
+            Some("00000000-1111-2222-3333-444444444444")
+        );
+        assert_eq!(out.entries[0].source.harness.as_str(), Harness::CLAUDE_CHAT);
+        assert_eq!(
+            out.entries[0].source.backfilled_from.as_deref(),
+            Some(CLAUDE_CHAT_EXPORT)
+        );
+        match &out.entries[1].event {
+            Event::TurnStarted { prompt, .. } => {
+                assert_eq!(*prompt, Body::kept("from the chat window"));
+            }
+            other => panic!("{other:?}"),
+        }
+        match &out.entries[2].event {
+            Event::TurnEnded {
+                assistant_message: Some(message),
+                ..
+            } => assert_eq!(*message, Body::kept("kept the same conversation")),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unknown_export_schema_is_skipped_not_guessed() {
+        let recovered = parse_claude_chat_export(r#"{"threads":[]}"#);
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].skipped.get("unknown schema"), Some(&1));
+        assert!(recovered[0].entries.is_empty());
+    }
+
+    /// Privacy → Export data writes the conversation objects as a JSON array.
+    const ARRAY_EXPORT: &str = r#"[
+        {
+            "uuid": "00000000-aaaa-bbbb-cccc-ddddeeeeffff",
+            "name": "privacy export",
+            "chat_messages": [
+                {"uuid": "m1", "sender": "human", "text": "", "content": [{"type": "text", "text": "typed in chat"}], "created_at": "2026-09-06T12:00:00.000Z"},
+                {"uuid": "m2", "sender": "assistant", "text": "", "content": [{"type": "text", "text": "same uuid"}], "created_at": "2026-09-06T12:01:00.000Z"}
+            ]
+        }
+    ]"#;
+
+    #[test]
+    fn a_privacy_export_array_keeps_the_chat_uuid() {
+        let recovered = parse_claude_chat_export(ARRAY_EXPORT);
+        assert_eq!(recovered.len(), 1);
+        let out = &recovered[0];
+        assert_eq!(
+            out.vendor_session_id.as_deref(),
+            Some("00000000-aaaa-bbbb-cccc-ddddeeeeffff")
+        );
+        assert_eq!(out.entries[0].source.harness.as_str(), Harness::CLAUDE_CHAT);
+        match &out.entries[1].event {
+            Event::TurnStarted { prompt, .. } => {
+                assert_eq!(*prompt, Body::kept("typed in chat"));
+            }
+            other => panic!("{other:?}"),
+        }
+        match &out.entries[2].event {
+            Event::TurnEnded {
+                assistant_message: Some(message),
+                ..
+            } => assert_eq!(*message, Body::kept("same uuid")),
+            other => panic!("{other:?}"),
+        }
     }
 }

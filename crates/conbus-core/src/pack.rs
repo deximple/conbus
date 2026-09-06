@@ -139,7 +139,8 @@ impl Chapter {
             // built from one would be the bus reading itself aloud.
             | Event::Briefed { .. }
             | Event::Summarised { .. }
-            | Event::Leased { .. } => {}
+            | Event::Leased { .. }
+            | Event::Aliased { .. } => {}
             Event::Routed {
                 next,
                 hop,
@@ -216,7 +217,7 @@ fn readable(body: &Body) -> Option<String> {
         // Withheld before it reached disk. There is nothing to quote and
         // inventing a paraphrase is exactly the compression loss the plan calls
         // the quietest failure.
-        Body::Elided { .. } => return None,
+        Body::Elided { .. } | Body::Sealed { .. } => return None,
     };
     let text = text.trim();
     (!text.is_empty()).then(|| text.to_string())

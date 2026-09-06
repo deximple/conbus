@@ -135,6 +135,21 @@ pub struct Payload {
     /// `Notification`.
     #[serde(default)]
     pub message: Option<String>,
+    /// Desktop Chat telemetry / hook extras. Official names from the
+    /// Desktop renderer (`conversation_uuid`, `surface`, `session_type`).
+    /// Absent on Code. When `surface` or `session_type` is `chat`, the
+    /// conversation is Chat — not a Code session we minted.
+    #[serde(default)]
+    pub conversation_uuid: Option<String>,
+    #[serde(default)]
+    pub surface: Option<String>,
+    #[serde(default)]
+    pub session_type: Option<String>,
+    /// Vendor env `CLAUDE_CODE_SESSION_ORIGIN` also lands here when a
+    /// future hook stdin copies it. The only documented value is
+    /// `claude_ai_chat`.
+    #[serde(default)]
+    pub session_origin: Option<String>,
 }
 
 /// Hook events this adapter has seen and decided not to mirror.
@@ -194,6 +209,7 @@ fn batch_ids(value: Option<Value>) -> (Vec<VendorToolUseId>, usize) {
 pub fn normalize(harness: &Harness, json: &str) -> Result<Normalized, HookError> {
     let payload: Payload = serde_json::from_str(json).map_err(|err| HookError(err.to_string()))?;
 
+    let key = chat_key(harness, &payload);
     let vendor_turn_id = turn_id_belongs_to_this_conversation(&payload)
         .then(|| payload.prompt_id.clone().map(VendorTurnId::new))
         .flatten();
@@ -291,7 +307,7 @@ pub fn normalize(harness: &Harness, json: &str) -> Result<Normalized, HookError>
     };
 
     Ok(Normalized::Event {
-        key: SessionKey::new(harness.clone(), payload.session_id),
+        key,
         hook_event_name: payload.hook_event_name,
         observed: Box::new(Observed {
             vendor_turn_id,
@@ -300,6 +316,71 @@ pub fn normalize(harness: &Harness, json: &str) -> Result<Normalized, HookError>
             event,
         }),
     })
+}
+
+/// Chat-only windows keep the Chat conversation uuid. Opening Code with
+/// that id, or minting a new Code session, is the identity break.
+fn chat_key(harness: &Harness, payload: &Payload) -> SessionKey {
+    if let Some(session) = chat_session(payload) {
+        return SessionKey::new(Harness::new(Harness::CLAUDE_CHAT), session);
+    }
+    SessionKey::new(harness.clone(), payload.session_id.clone())
+}
+
+/// Official Chat identity, in the order the vendor actually writes it.
+///
+/// Desktop's Chrome/Chat renderer scopes a session as `chat:{uuid}`.
+/// The Code binary accepts `CLAUDE_CODE_SESSION_ORIGIN=claude_ai_chat`
+/// on the hook child. Payload `surface` / `session_type` / `session_origin`
+/// are the stdin spellings of the same fact.
+fn chat_session(payload: &Payload) -> Option<String> {
+    let marked = is_chat_surface(payload) || chat_prefixed(&payload.session_id) || origin_is_chat();
+    if !marked {
+        return None;
+    }
+    payload
+        .conversation_uuid
+        .as_deref()
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .or_else(|| strip_chat_prefix(&payload.session_id))
+        .or_else(|| {
+            // Origin-only (env or stdin field) without a Chat uuid is
+            // Continue-in-Code: a new Code session, not the Chat window.
+            if origin_only(payload) {
+                None
+            } else {
+                Some(payload.session_id.clone())
+            }
+        })
+}
+
+fn is_chat_surface(payload: &Payload) -> bool {
+    payload.surface.as_deref() == Some("chat")
+        || payload.session_type.as_deref() == Some("chat")
+        || payload.session_origin.as_deref() == Some("claude_ai_chat")
+}
+
+fn origin_only(payload: &Payload) -> bool {
+    (origin_is_chat() || payload.session_origin.as_deref() == Some("claude_ai_chat"))
+        && payload.surface.as_deref() != Some("chat")
+        && payload.session_type.as_deref() != Some("chat")
+        && !chat_prefixed(&payload.session_id)
+}
+
+/// Vendor-set on the hook child when Desktop starts Code from Chat.
+pub fn origin_is_chat() -> bool {
+    std::env::var("CLAUDE_CODE_SESSION_ORIGIN").as_deref() == Ok("claude_ai_chat")
+}
+
+fn chat_prefixed(id: &str) -> bool {
+    id.starts_with("chat:") && id.len() > "chat:".len()
+}
+
+fn strip_chat_prefix(id: &str) -> Option<String> {
+    id.strip_prefix("chat:")
+        .filter(|rest| !rest.is_empty())
+        .map(str::to_string)
 }
 
 /// Read a duration without ever failing the payload.
@@ -1124,5 +1205,127 @@ mod tests {
                 prompt: Body::kept("hi")
             }
         );
+    }
+
+    #[test]
+    fn a_chat_surface_keeps_the_conversation_uuid_not_a_code_session() {
+        let Normalized::Event { key, observed, .. } = normalize(
+            &Harness::new(Harness::CLAUDE_CODE),
+            r#"{
+                "session_id":"code-session-we-must-not-keep",
+                "hook_event_name":"UserPromptSubmit",
+                "prompt":"from desktop chat",
+                "surface":"chat",
+                "conversation_uuid":"00000000-1111-2222-3333-444444444444"
+            }"#,
+        )
+        .expect("ok") else {
+            panic!("event");
+        };
+        assert_eq!(key.harness.as_str(), Harness::CLAUDE_CHAT);
+        assert_eq!(
+            key.vendor_session_id,
+            "00000000-1111-2222-3333-444444444444"
+        );
+        assert_eq!(
+            observed.event,
+            Event::TurnStarted {
+                author: None,
+                prompt: Body::kept("from desktop chat")
+            }
+        );
+    }
+
+    #[test]
+    fn a_desktop_chat_prefix_is_the_conversation_not_a_code_session() {
+        // Desktop Chrome/Chat renderer: sessionId = `chat:` + conversation uuid.
+        let Normalized::Event { key, .. } = normalize(
+            &Harness::new(Harness::CLAUDE_CODE),
+            r#"{
+                "session_id":"chat:00000000-1111-2222-3333-444444444444",
+                "hook_event_name":"UserPromptSubmit",
+                "prompt":"from chrome chat"
+            }"#,
+        )
+        .expect("ok") else {
+            panic!("event");
+        };
+        assert_eq!(key.harness.as_str(), Harness::CLAUDE_CHAT);
+        assert_eq!(
+            key.vendor_session_id,
+            "00000000-1111-2222-3333-444444444444"
+        );
+    }
+
+    #[test]
+    fn a_session_origin_field_is_chat_not_code() {
+        let Normalized::Event { key, .. } = normalize(
+            &Harness::new(Harness::CLAUDE_CODE),
+            r#"{
+                "session_id":"code-session-we-must-not-keep",
+                "hook_event_name":"UserPromptSubmit",
+                "prompt":"from chat origin",
+                "session_origin":"claude_ai_chat",
+                "conversation_uuid":"00000000-aaaa-bbbb-cccc-ddddeeeeffff"
+            }"#,
+        )
+        .expect("ok") else {
+            panic!("event");
+        };
+        assert_eq!(key.harness.as_str(), Harness::CLAUDE_CHAT);
+        assert_eq!(
+            key.vendor_session_id,
+            "00000000-aaaa-bbbb-cccc-ddddeeeeffff"
+        );
+    }
+
+    #[test]
+    fn origin_is_chat_reads_the_vendor_env() {
+        use std::sync::Mutex;
+        static ENV: Mutex<()> = Mutex::new(());
+        let _guard = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::remove_var("CLAUDE_CODE_SESSION_ORIGIN");
+        }
+        assert!(!super::origin_is_chat());
+        unsafe {
+            std::env::set_var("CLAUDE_CODE_SESSION_ORIGIN", "claude_ai_chat");
+        }
+        let yes = super::origin_is_chat();
+        let Normalized::Event { key, .. } = normalize(
+            &Harness::new(Harness::CLAUDE_CODE),
+            r#"{
+                "session_id":"code-session-we-must-not-keep",
+                "hook_event_name":"UserPromptSubmit",
+                "prompt":"continue in code"
+            }"#,
+        )
+        .expect("ok") else {
+            panic!("event");
+        };
+        unsafe {
+            std::env::remove_var("CLAUDE_CODE_SESSION_ORIGIN");
+        }
+        assert!(yes);
+        assert_eq!(key.harness.as_str(), Harness::CLAUDE_CODE);
+        assert_eq!(key.vendor_session_id, "code-session-we-must-not-keep");
+    }
+
+    #[test]
+    fn a_session_origin_field_without_a_chat_uuid_stays_code() {
+        let Normalized::Event { key, .. } = normalize(
+            &Harness::new(Harness::CLAUDE_CODE),
+            r#"{
+                "session_id":"code-session-we-must-not-keep",
+                "hook_event_name":"UserPromptSubmit",
+                "prompt":"continue in code",
+                "session_origin":"claude_ai_chat"
+            }"#,
+        )
+        .expect("ok") else {
+            panic!("event");
+        };
+        assert_eq!(key.harness.as_str(), Harness::CLAUDE_CODE);
+        assert_eq!(key.vendor_session_id, "code-session-we-must-not-keep");
     }
 }
