@@ -176,6 +176,8 @@ pub fn is_transient(reason: &str) -> bool {
     reason.contains("Broken pipe")
         || reason.contains("Socket is not connected")
         || reason.contains("Connection reset")
+        || reason.contains("Resource temporarily unavailable")
+        || reason.contains("unreadable reply \"\"")
 }
 
 pub fn summary(paths: &Paths) -> Summary {
@@ -381,5 +383,16 @@ mod tests {
             "{}",
             describe(&summary)
         );
+    }
+
+    #[test]
+    fn an_empty_reply_is_a_transient_drop() {
+        assert!(is_transient(
+            "unreadable reply \"\": EOF while parsing a value at line 1 column 0"
+        ));
+        assert!(is_transient(
+            "could not send the record: Resource temporarily unavailable (os error 35)"
+        ));
+        assert!(!is_transient("no conversation for this session"));
     }
 }

@@ -1233,6 +1233,58 @@ fn a_silent_connection_does_not_hold_the_hooks_behind_it() {
 }
 
 #[test]
+fn a_burst_of_hooks_does_not_lose_records_to_a_full_backlog() {
+    // Cursor fires tool hooks in parallel into one accept loop. A short
+    // listen backlog RSTs the overflow; those hooks see Broken pipe.
+    let home = tempfile::tempdir().expect("tempdir");
+    let daemon = start_daemon(home.path());
+    run_hook(
+        home.path(),
+        r#"{"session_id":"s-burst","hook_event_name":"UserPromptSubmit","cwd":"/repo",
+            "prompt":"many tools"}"#,
+        ATTENDED,
+    );
+
+    const HOOKS: usize = 32;
+    let mut children: Vec<Child> = Vec::with_capacity(HOOKS);
+    let mut pipes: Vec<std::process::ChildStdin> = Vec::with_capacity(HOOKS);
+    for i in 0..HOOKS {
+        let payload = format!(
+            r#"{{"session_id":"s-burst","hook_event_name":"PreToolUse","cwd":"/repo",
+                "tool_name":"Read","tool_input":{{"n":"{i}"}},"tool_use_id":"burst_{i}"}}"#
+        );
+        let mut child = Command::new(bin())
+            .arg("hook")
+            .env("CONBUS_HOME", home.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn hook");
+        let mut pipe = child.stdin.take().expect("stdin");
+        pipe.write_all(payload.as_bytes()).expect("write");
+        children.push(child);
+        pipes.push(pipe);
+    }
+    drop(pipes);
+    for child in &mut children {
+        let status = child.wait().expect("hook exit");
+        assert!(status.success(), "hook failed the turn: {status}");
+    }
+
+    let requested = log_lines(home.path())
+        .into_iter()
+        .filter(|line| line["event"] == "tool_requested")
+        .count();
+    assert_eq!(
+        requested, HOOKS,
+        "a parallel burst lost records; drops={}",
+        std::fs::read_to_string(home.path().join("drops.jsonl")).unwrap_or_default()
+    );
+    daemon.stop();
+}
+
+#[test]
 fn a_codex_hook_says_only_what_codex_accepts() {
     // Codex 0.152.1, first session with trusted hooks: "PreToolUse hook
     // (failed) — error: PreToolUse hook returned unsupported suppressOutput",

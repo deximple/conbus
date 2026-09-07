@@ -755,6 +755,12 @@ pub fn bind(socket: &Path) -> io::Result<UnixListener> {
         fs::create_dir_all(parent)?;
     }
     let listener = UnixListener::bind(socket)?;
+    // Raise the backlog before any client can connect. Doing this later,
+    // after set_nonblocking, has been observed to hand the next hook a
+    // dead accepted fd — write fails with Broken pipe, or the read comes
+    // back empty. Cursor fires tool hooks in parallel; 128 is the std
+    // default and is too short once a few of those land together.
+    let _ = unsafe { libc::listen(listener.as_raw_fd(), 256) };
     fs::set_permissions(socket, fs::Permissions::from_mode(0o600))?;
     Ok(listener)
 }
@@ -903,17 +909,22 @@ pub fn serve(paths: &Paths, retention: Retention) -> io::Result<()> {
             }
             continue;
         }
-        match listener.accept() {
-            Ok((stream, _)) => {
-                if let Err(err) = handle_connection(&mut daemon, stream) {
-                    eprintln!("conbus daemon: connection failed: {err}");
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    if let Err(err) = handle_connection(&mut daemon, stream) {
+                        eprintln!("conbus daemon: connection failed: {err}");
+                    }
+                    if let Some(bus_id) = daemon.take_pending_warm() {
+                        spawn_warm_apply(bus_id);
+                    }
                 }
-                if let Some(bus_id) = daemon.take_pending_warm() {
-                    spawn_warm_apply(bus_id);
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
+                Err(err) => {
+                    eprintln!("conbus daemon: accept failed: {err}");
+                    break;
                 }
             }
-            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
-            Err(err) => eprintln!("conbus daemon: accept failed: {err}"),
         }
     }
 }
@@ -966,6 +977,16 @@ pub const SILENCE_BOUND: Duration = Duration::from_millis(200);
 const _: () = assert!(SILENCE_BOUND.as_millis() < crate::hook::client::REPLY_DEADLINE.as_millis());
 
 fn handle_connection(daemon: &mut Daemon, stream: UnixStream) -> io::Result<()> {
+    // The listener is non-blocking so poll can sleep. An accepted fd may
+    // inherit that; a read then returns WouldBlock before the hook writes,
+    // and we drop a live client as if it had gone silent.
+    if let Err(err) = stream.set_nonblocking(false) {
+        return if err.raw_os_error() == Some(libc::EINVAL) {
+            Ok(())
+        } else {
+            Err(err)
+        };
+    }
     if let Err(err) = bound(&stream) {
         // A peer that connected and left before it was served — the doctor's
         // liveness probe, the daemon's own bind check. Darwin refuses to set

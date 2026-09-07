@@ -31,6 +31,8 @@ These are legal or structural, not preferences.
 
 State assumptions before implementing, and say so when a simpler approach exists. Keep changes surgical: touch only what the task requires, and match the surrounding style. Verify with evidence rather than declaring success — for this project that usually means a real vendor session, because hook failures here are silent by default.
 
+Self-improve is `docs/self-improve.md`. Observe the live bus, pick one live defect, fix it, verify, ledger, repeat. Do not treat a stale HANDOFF paragraph as current.
+
 
 
 
