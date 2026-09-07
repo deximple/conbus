@@ -215,12 +215,13 @@ and run one session; the schemas themselves come out of the binary with a search
 
 ## Next task
 
-Claude StatusLine `rate_limits` is the official remaining-quota channel
-(vendor-fed; we do not call oauth/usage). `conbus hook --statusline` persists
-it and forwards the person's existing status bar command.
-`--to` names any catalog leg; auto overflow still needs a real signal.
-Do not commit unless asked. Do not register native `~/.cursor/hooks.json`.
-Do not fire `StopFailure` at `01a07243`.
+Run `docs/self-improve.md` from current evidence, not this file's memory.
+Cycle 1 shipped: accepted fds forced blocking, listen backlog 256 at
+bind, write-failure retry after 40ms, empty EOF counted transient and
+not resent. Next live cost is whatever `drops.jsonl` is still appending,
+not the historical orphan pile. Cursor native hooks *are* registered.
+Do not fire `StopFailure` at `01a07243`. Do not readdir `~/Downloads`.
+Atomic install only.
 
 `recorder-first`. One week, **recording only, no injection** — that was the plan; the briefing shipped on 2026-09-01 and is live on both harnesses as of 2026-09-03. Injection hardening is a separate item because the
 quirks above take weeks, not days.

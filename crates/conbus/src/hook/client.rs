@@ -268,7 +268,13 @@ pub fn run(harness: &str, stdin: &mut impl Read) -> Result<Reply, Dropped> {
         event: observed.event,
     };
     let result = match send_once(harness, &socket, &request, &hook_event_name) {
-        Err(dropped) if transient_socket(&dropped.reason) => {
+        Err(dropped) if write_failed(&dropped.reason) => {
+            // The daemon is single-threaded. A write that hits a closing
+            // peer is usually the previous hook still being served; wait
+            // once, then try a new connection. An empty reply after a
+            // successful write is not retried: the daemon may already
+            // have appended.
+            std::thread::sleep(std::time::Duration::from_millis(40));
             send_once(harness, &socket, &request, &hook_event_name)
         }
         other => other,
@@ -279,11 +285,6 @@ pub fn run(harness: &str, stdin: &mut impl Read) -> Result<Reply, Dropped> {
     }
 }
 
-fn transient_socket(reason: &str) -> bool {
-    reason.contains("Broken pipe")
-        || reason.contains("Socket is not connected")
-        || reason.contains("Connection reset")
-}
 
 fn connect(socket: &std::path::Path) -> Result<UnixStream, Dropped> {
     let stream = UnixStream::connect(socket)
@@ -315,6 +316,16 @@ fn send_once(
     hook_event_name: &str,
 ) -> Result<Reply, Dropped> {
     send(harness, connect(socket)?, request, hook_event_name)
+}
+
+/// Retry is safe only when the write itself failed. The daemon may already
+/// have appended if we got as far as an empty read.
+fn write_failed(reason: &str) -> bool {
+    reason.contains("could not send the record:")
+        && (reason.contains("Broken pipe")
+            || reason.contains("Socket is not connected")
+            || reason.contains("Connection reset")
+            || reason.contains("Resource temporarily unavailable"))
 }
 
 fn send(
@@ -465,11 +476,19 @@ mod tests {
     }
 
     #[test]
-    fn broken_pipe_is_retried_once() {
-        assert!(transient_socket("could not send the record: Broken pipe (os error 32)"));
-        assert!(transient_socket(
+    fn a_failed_write_is_retried_an_empty_reply_is_not() {
+        assert!(write_failed(
+            "could not send the record: Broken pipe (os error 32)"
+        ));
+        assert!(write_failed(
             "could not send the record: Socket is not connected (os error 57)"
         ));
-        assert!(!transient_socket("no daemon on /tmp/x"));
+        assert!(!write_failed(
+            "unreadable reply \"\": EOF while parsing a value at line 1 column 0"
+        ));
+        assert!(!write_failed("no daemon on /tmp/x"));
+        assert!(crate::drops::is_transient(
+            "unreadable reply \"\": EOF while parsing a value at line 1 column 0"
+        ));
     }
 }
