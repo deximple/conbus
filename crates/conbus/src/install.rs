@@ -218,7 +218,7 @@ pub fn apply_cursor_hooks(binary: &Path, home: &Path) -> io::Result<bool> {
         fs::copy(&path, path.with_extension("json.conbus-backup"))?;
     }
     let text = serde_json::to_string_pretty(&document).map_err(io::Error::other)?;
-    fs::write(path, format!("{text}\n"))?;
+    write_atomically(&path, &format!("{text}\n"))?;
     Ok(true)
 }
 
@@ -429,10 +429,7 @@ pub fn apply_opencode_plugin(binary: &Path, home: &Path) -> io::Result<bool> {
     if std::fs::read_to_string(&path).is_ok_and(|existing| existing == source) {
         return Ok(false);
     }
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(path, source)?;
+    write_atomically(&path, &source)?;
     Ok(true)
 }
 
@@ -443,7 +440,7 @@ pub fn apply(plan: &Plan) -> io::Result<Option<PathBuf>> {
         fs::create_dir_all(parent)?;
     }
     if let Some(original) = &plan.statusline_forward {
-        fs::write(statusline_forward_path(settings), original)?;
+        write_atomically(&statusline_forward_path(settings), original)?;
     }
     let backup = if settings.exists() {
         let backup = settings.with_extension("json.conbus-backup");
@@ -453,7 +450,7 @@ pub fn apply(plan: &Plan) -> io::Result<Option<PathBuf>> {
         None
     };
     let text = serde_json::to_string_pretty(&plan.document).map_err(io::Error::other)?;
-    fs::write(settings, format!("{text}\n"))?;
+    write_atomically(settings, &format!("{text}\n"))?;
     Ok(backup)
 }
 
@@ -466,6 +463,44 @@ pub fn launch_agent_path(home: &Path) -> PathBuf {
     home.join("Library")
         .join("LaunchAgents")
         .join("sh.conbus.daemon.plist")
+}
+
+/// Replace a file's contents without ever leaving it half written.
+///
+/// The binary has been placed beside-then-renamed since the two-hour outage;
+/// the settings files a person already owned were still truncated in place. A
+/// crash, a kill, or a full disk between the truncate and the last byte leaves
+/// somebody's `settings.json` unparseable and their CLI will not start — on an
+/// install path written for a stranger who does not know a `.conbus-backup`
+/// sits beside it. The temp file is made in the target's own directory so the
+/// rename stays a rename, the mode the file already had is carried over so
+/// replacing an executable does not disarm it, and nothing is left behind when
+/// a step fails.
+pub fn write_atomically(path: &Path, contents: &str) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("conbus");
+    let temp = path.with_file_name(format!("{name}.conbus-next"));
+    let written = fs::write(&temp, contents)
+        .and_then(|()| keep_mode(path, &temp))
+        .and_then(|()| fs::rename(&temp, path));
+    if written.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    written
+}
+
+/// Carry the target's existing mode onto its replacement. A file that is not
+/// there yet keeps the default.
+fn keep_mode(path: &Path, temp: &Path) -> io::Result<()> {
+    let Ok(existing) = fs::metadata(path) else {
+        return Ok(());
+    };
+    fs::set_permissions(temp, existing.permissions())
 }
 
 /// Atomic place: write beside, then rename. Overwriting the live inode
@@ -754,6 +789,92 @@ mod tests {
             document["statusLine"]["command"],
             "/opt/conbus hook --statusline"
         );
+    }
+
+    #[test]
+    fn a_replaced_file_is_never_observed_half_written() {
+        // The reason the binary has been renamed into place since the
+        // two-hour outage, applied to the files a person already owned. A
+        // truncating write is visible to a reader in the middle; a rename is
+        // not. The reader below only ever misses a defect, it cannot invent
+        // one, so a green run is weak evidence and a red run is proof.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+        let old = "o".repeat(512 * 1024);
+        let new = "n".repeat(512 * 1024);
+        fs::write(&path, &old).expect("seed");
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let watching = Arc::clone(&stop);
+        let watched = path.clone();
+        let (was_old, was_new) = (old.clone(), new.clone());
+        let reader = std::thread::spawn(move || {
+            let mut torn = 0usize;
+            while !watching.load(Ordering::Relaxed) {
+                if let Ok(seen) = fs::read_to_string(&watched)
+                    && seen != was_old
+                    && seen != was_new
+                {
+                    torn += 1;
+                }
+            }
+            torn
+        });
+
+        for round in 0..8 {
+            let contents = if round % 2 == 0 { &new } else { &old };
+            write_atomically(&path, contents).expect("replace");
+        }
+        stop.store(true, Ordering::Relaxed);
+
+        assert_eq!(
+            reader.join().expect("reader"),
+            0,
+            "a reader saw the file part-written"
+        );
+    }
+
+    #[test]
+    fn a_replace_that_fails_leaves_the_original_and_nothing_beside_it() {
+        // Something already sitting where the temp file goes is the cheapest
+        // failure to arrange, and it exercises the path that matters: the
+        // target must not be touched, and the run must not leave litter for
+        // the next one to trip over.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+        fs::write(&path, "{\"kept\": true}").expect("seed");
+        let blocked = dir.path().join("settings.json.conbus-next");
+        fs::create_dir(&blocked).expect("block the temp name");
+
+        let outcome = write_atomically(&path, "{\"replaced\": true}");
+
+        assert!(outcome.is_err(), "the write cannot have succeeded");
+        assert_eq!(
+            fs::read_to_string(&path).expect("still there"),
+            "{\"kept\": true}",
+            "a failed replace must not touch the target"
+        );
+        assert!(blocked.is_dir(), "the obstruction is not ours to delete");
+    }
+
+    #[test]
+    fn a_replaced_file_keeps_the_mode_it_had() {
+        // The StatusLine forward is a script. Replacing it with a fresh file
+        // would silently take its execute bit away.
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("conbus-statusline-forward");
+        fs::write(&path, "#!/bin/sh\nexit 0\n").expect("seed");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        write_atomically(&path, "#!/bin/sh\nexit 1\n").expect("replace");
+
+        let mode = fs::metadata(&path).expect("stat").permissions().mode();
+        assert_eq!(mode & 0o777, 0o755, "the execute bit was dropped");
     }
 
     #[test]

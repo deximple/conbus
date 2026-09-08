@@ -60,7 +60,13 @@ pub struct Thread {
 /// `cwd` is the checkout being continued, when we know it. Codex assigns the
 /// id; we do not send one.
 pub fn open(cwd: Option<&str>, text: &str) -> io::Result<Thread> {
-    let mut server = AppServer::start(DEADLINE)?;
+    open_with(&appserver::codex_binary(), cwd, text)
+}
+
+/// As [`open`], with the app-server binary named rather than resolved from
+/// the environment — see [`AppServer::start_with`] for why tests must.
+fn open_with(binary: &std::ffi::OsStr, cwd: Option<&str>, text: &str) -> io::Result<Thread> {
+    let mut server = AppServer::start_with(binary, DEADLINE)?;
     let mut params = json!({});
     if let Some(cwd) = cwd {
         params["cwd"] = json!(cwd);
@@ -84,7 +90,11 @@ pub fn sync(thread_id: &str, text: &str) -> io::Result<()> {
             "refusing to inject into a thread the bus did not open",
         ));
     }
-    let mut server = AppServer::start(DEADLINE)?;
+    sync_with(&appserver::codex_binary(), thread_id, text)
+}
+
+fn sync_with(binary: &std::ffi::OsStr, thread_id: &str, text: &str) -> io::Result<()> {
+    let mut server = AppServer::start_with(binary, DEADLINE)?;
     server.call("thread/resume", json!({ "threadId": thread_id }))?;
     inject(&mut server, thread_id, text)
 }
@@ -112,8 +122,17 @@ fn claude_binary() -> std::ffi::OsString {
 
 /// Open a headless Claude session the bus owns. Not a model turn.
 pub fn open_claude(cwd: Option<&str>, text: &str) -> io::Result<Thread> {
+    open_claude_with(&claude_binary(), cwd, text)
+}
+
+/// As [`open_claude`], with the binary named rather than read from the
+/// environment. The environment is process-global and `cargo test` runs tests
+/// in threads, so a test that pointed `CONBUS_CLAUDE_BIN` at its own stub
+/// could be answered by another module's — which is what happened here and in
+/// `runner`, under two separate locks.
+fn open_claude_with(binary: &std::ffi::OsStr, cwd: Option<&str>, text: &str) -> io::Result<Thread> {
     let minted = conbus_core::ids::BusId::mint().to_string();
-    let got = run_claude(cwd, Some(&minted), None, text)?;
+    let got = run_claude(binary, cwd, Some(&minted), None, text)?;
     Ok(Thread {
         id: got.unwrap_or(minted),
     })
@@ -121,21 +140,26 @@ pub fn open_claude(cwd: Option<&str>, text: &str) -> io::Result<Thread> {
 
 /// Write a newer digest into a Claude session we opened. Still not a model turn.
 pub fn sync_claude(session_id: &str, text: &str) -> io::Result<()> {
+    sync_claude_with(&claude_binary(), session_id, text)
+}
+
+fn sync_claude_with(binary: &std::ffi::OsStr, session_id: &str, text: &str) -> io::Result<()> {
     if session_id.is_empty() || session_id.contains("user:") {
         return Err(io::Error::other(
             "refusing to inject into a Claude session the bus did not open",
         ));
     }
-    run_claude(None, None, Some(session_id), text).map(|_| ())
+    run_claude(binary, None, None, Some(session_id), text).map(|_| ())
 }
 
 fn run_claude(
+    binary: &std::ffi::OsStr,
     cwd: Option<&str>,
     session_id: Option<&str>,
     resume: Option<&str>,
     text: &str,
 ) -> io::Result<Option<String>> {
-    let mut cmd = Command::new(claude_binary());
+    let mut cmd = Command::new(binary);
     cmd.args([
         "-p",
         "--max-turns",
@@ -187,7 +211,6 @@ fn run_claude(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
     const FAKE: &str = r#"#!/usr/bin/env python3
 import json, sys
@@ -223,8 +246,7 @@ for line in sys.stdin:
             print(json.dumps({"jsonrpc": "2.0", "id": i, "result": {}}), flush=True)
 "#;
 
-    static ENV: Mutex<()> = Mutex::new(());
-
+    /// A stand-in `codex app-server` in its own directory.
     fn fake() -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("codex");
@@ -232,32 +254,6 @@ for line in sys.stdin:
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         (dir, path)
-    }
-
-    struct Env {
-        key: &'static str,
-        previous: Option<std::ffi::OsString>,
-    }
-
-    impl Env {
-        fn set(key: &'static str, value: &str) -> Self {
-            let previous = std::env::var_os(key);
-            unsafe { std::env::set_var(key, value) };
-            Env { key, previous }
-        }
-    }
-
-    impl Drop for Env {
-        fn drop(&mut self) {
-            match &self.previous {
-                Some(value) => unsafe { std::env::set_var(self.key, value) },
-                None => unsafe { std::env::remove_var(self.key) },
-            }
-        }
-    }
-
-    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
-        ENV.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     #[test]
@@ -271,19 +267,15 @@ for line in sys.stdin:
 
     #[test]
     fn opening_a_warm_thread_injects_without_starting_a_turn() {
-        let _lock = lock_env();
         let (_dir, codex) = fake();
-        let _env = Env::set("CONBUS_CODEX_BIN", codex.to_str().unwrap());
-        let thread = open(Some("/repo"), "conbus digest").expect("open");
+        let thread = open_with(codex.as_os_str(), Some("/repo"), "conbus digest").expect("open");
         assert_eq!(thread.id, "thr_bus_owned");
     }
 
     #[test]
     fn syncing_resumes_the_thread_we_opened() {
-        let _lock = lock_env();
         let (_dir, codex) = fake();
-        let _env = Env::set("CONBUS_CODEX_BIN", codex.to_str().unwrap());
-        sync("thr_bus_owned", "newer digest").expect("sync");
+        sync_with(codex.as_os_str(), "thr_bus_owned", "newer digest").expect("sync");
     }
 
     #[test]
@@ -292,38 +284,43 @@ for line in sys.stdin:
         assert!(err.to_string().contains("did not open"), "{err}");
     }
 
+    /// A stand-in `claude` that records the argv it was given. The log path
+    /// is written into the script rather than read from the environment, so
+    /// two of these can run at once without meeting.
     const FAKE_CLAUDE: &str = r#"#!/usr/bin/env python3
-import json, os, sys
+import json, sys
 args = sys.argv[1:]
 sid = ""
 if "--session-id" in args:
     sid = args[args.index("--session-id") + 1]
 elif "--resume" in args:
     sid = args[args.index("--resume") + 1]
-if log := os.environ.get("CONBUS_CLAUDE_LOG"):
-    open(log, "w").write(" ".join(args))
+open("__LOG__", "w").write(" ".join(args))
 print(json.dumps({"type": "result", "session_id": sid, "is_error": True}))
 sys.exit(1)
 "#;
 
-    fn fake_claude() -> (tempfile::TempDir, std::path::PathBuf) {
+    /// A fake `claude` in its own directory, and the file it logs argv to.
+    fn fake_claude() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("claude");
-        std::fs::write(&path, FAKE_CLAUDE).expect("write");
+        let log = dir.path().join("argv");
+        std::fs::write(
+            &path,
+            FAKE_CLAUDE.replace("__LOG__", log.to_str().expect("utf-8")),
+        )
+        .expect("write");
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-        (dir, path)
+        (dir, path, log)
     }
 
     #[test]
     fn opening_a_claude_warm_uses_max_turns_zero() {
-        let _lock = lock_env();
-        let (dir, claude) = fake_claude();
-        let log = dir.path().join("argv");
-        let _bin = Env::set("CONBUS_CLAUDE_BIN", claude.to_str().unwrap());
-        let _log = Env::set("CONBUS_CLAUDE_LOG", log.to_str().unwrap());
+        let (dir, claude, log) = fake_claude();
         let cwd = dir.path().to_str().unwrap();
-        let thread = open_claude(Some(cwd), "conbus digest").expect("open");
+        let thread =
+            open_claude_with(claude.as_os_str(), Some(cwd), "conbus digest").expect("open");
         assert!(!thread.id.is_empty());
         let argv = std::fs::read_to_string(&log).expect("argv");
         assert!(argv.contains("--max-turns 0"), "{argv}");
@@ -337,15 +334,44 @@ sys.exit(1)
 
     #[test]
     fn syncing_a_claude_warm_resumes_the_session_we_opened() {
-        let _lock = lock_env();
-        let (dir, claude) = fake_claude();
-        let log = dir.path().join("argv");
-        let _bin = Env::set("CONBUS_CLAUDE_BIN", claude.to_str().unwrap());
-        let _log = Env::set("CONBUS_CLAUDE_LOG", log.to_str().unwrap());
-        sync_claude("sess_bus_owned", "newer digest").expect("sync");
+        let (_dir, claude, log) = fake_claude();
+        sync_claude_with(claude.as_os_str(), "sess_bus_owned", "newer digest").expect("sync");
         let argv = std::fs::read_to_string(&log).expect("argv");
         assert!(argv.contains("--resume sess_bus_owned"), "{argv}");
         assert!(argv.contains("--max-turns 0"), "{argv}");
+    }
+
+    #[test]
+    fn two_claude_warms_opened_at_once_each_get_their_own_binary() {
+        // The regression this seam exists for: both of these used to point
+        // the process-global `CONBUS_CLAUDE_BIN` at their own stub, and this
+        // module's lock did not stop `runner` from doing the same under its
+        // own. Running the two modules together failed five times in eight.
+        let opened: Vec<_> = ["alpha", "beta"]
+            .into_iter()
+            .map(|name| {
+                std::thread::spawn(move || {
+                    let (dir, claude, log) = fake_claude();
+                    let cwd = dir.path().to_str().expect("utf-8").to_string();
+                    let thread =
+                        open_claude_with(claude.as_os_str(), Some(&cwd), name).expect("open");
+                    (thread.id, std::fs::read_to_string(&log).expect("argv"))
+                })
+            })
+            .collect();
+
+        let seen: Vec<(String, String)> = opened
+            .into_iter()
+            .map(|handle| handle.join().expect("thread"))
+            .collect();
+
+        for (id, argv) in &seen {
+            assert!(
+                argv.contains(&format!("--session-id {id}")),
+                "a warm was answered by the other thread's binary: {seen:?}"
+            );
+        }
+        assert_ne!(seen[0].0, seen[1].0, "each warm mints its own session");
     }
 
     #[test]

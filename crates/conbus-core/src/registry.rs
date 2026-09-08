@@ -7,6 +7,7 @@
 //! (anthropics/claude-code#78455). Minting there would pile up ids that no
 //! conversation ever uses, and can leave a real session aliased to a ghost.
 
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 
 use crate::event::{Event, Harness, VendorAgentId, VendorTurnId};
@@ -75,6 +76,18 @@ pub enum Disposition {
     Orphaned,
 }
 
+/// Who a directed hop reserved a leg for, in one checkout.
+///
+/// Claimed is an identity claim, and this codebase only makes one where the
+/// identity is known. Two conversations claiming the same leg in the same
+/// checkout is exactly the case where it is not, so the seat holds nobody
+/// rather than the last writer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Seat {
+    Claimed(BusId),
+    Contested,
+}
+
 /// The vendor-session-to-conversation map. Lives in the daemon's memory.
 #[derive(Default)]
 pub struct Registry {
@@ -96,7 +109,7 @@ pub struct Registry {
     remembered: u64,
     /// A hop to a catalog leg that cannot keep a warm session. The next
     /// unbound prompt in that checkout claims this conversation.
-    pending: HashMap<(String, String), BusId>,
+    pending: HashMap<(String, String), Seat>,
 }
 
 impl Registry {
@@ -182,7 +195,8 @@ impl Registry {
     }
 
     fn clear_pending_bus(&mut self, bus_id: BusId) {
-        self.pending.retain(|_, id| *id != bus_id);
+        self.pending
+            .retain(|_, seat| !matches!(seat, Seat::Claimed(id) if *id == bus_id));
     }
 
     fn note_route(&mut self, bus_id: BusId, observed: &Observed) {
@@ -200,7 +214,24 @@ impl Registry {
         else {
             return;
         };
-        self.pending.insert((next.clone(), workspace), bus_id);
+        // Two conversations in one checkout can be directed at the same
+        // attach leg before either has said a word there — parallel sessions
+        // or worktrees in one repo make that ordinary, not exotic. A plain
+        // insert let the second silently take the first's seat, and the next
+        // prompt in that checkout then bound to the wrong conversation and
+        // the first was split a second time. A seat two conversations claim
+        // belongs to neither: minting a fresh id is a recoverable
+        // disappointment, and binding to the wrong one is not.
+        match self.pending.entry((next.clone(), workspace)) {
+            Entry::Vacant(seat) => {
+                seat.insert(Seat::Claimed(bus_id));
+            }
+            Entry::Occupied(mut seat) => {
+                if !matches!(seat.get(), Seat::Claimed(id) if *id == bus_id) {
+                    seat.insert(Seat::Contested);
+                }
+            }
+        }
     }
 
     fn note_route_record(&mut self, record: &Record) {
@@ -217,16 +248,22 @@ impl Registry {
             record.event,
             Event::TurnStarted { .. } | Event::TurnEnded { .. }
         ) {
-            self.pending.retain(|(harness, _), id| {
-                !(*id == record.bus_id && harness == record.source.harness.as_str())
+            self.pending.retain(|(harness, _), seat| {
+                !(matches!(seat, Seat::Claimed(id) if *id == record.bus_id)
+                    && harness == record.source.harness.as_str())
             });
         }
     }
 
     fn take_seat(&mut self, harness: &Harness, workspace: Option<&str>) -> Option<BusId> {
         let workspace = Self::normalize_workspace(workspace?)?;
-        self.pending
+        match self
+            .pending
             .remove(&(harness.as_str().to_string(), workspace))
+        {
+            Some(Seat::Claimed(bus_id)) => Some(bus_id),
+            Some(Seat::Contested) | None => None,
+        }
     }
 
     /// The most session starts held at once before the oldest is forgotten.
@@ -277,13 +314,23 @@ impl Registry {
             return Disposition::Deferred;
         }
         // Unbound. A prompt proves a session is real enough to mint.
-        // Cursor also mints on a completed turn: its inject channel is
-        // sessionStart, and beforeSubmitPrompt was not registered on the
-        // first installs, so a live Cursor conversation would otherwise
-        // stay orphaned and have no pack to hand the next leg.
-        let cursor_turn = key.harness.as_str() == Harness::CURSOR
-            && matches!(observed.event, Event::TurnEnded { .. });
-        if !matches!(observed.event, Event::TurnStarted { .. }) && !cursor_turn {
+        //
+        // Cursor also mints on work it can be seen doing — a completed turn
+        // or a tool call. Its prompt hook lives in Cursor's own hooks file
+        // while its tool hooks arrive through Claude Code's settings file,
+        // and the two do not always both fire: on 2026-09-08, 42 Cursor
+        // conversations existed only as 4,229 orphaned `preToolUse` /
+        // `postToolUse` drops, present nowhere in the log under any harness,
+        // because no `beforeSubmitPrompt` ever reached the bus for them. A
+        // tool call is proof of a live session in exactly the way a ghost
+        // `SessionStart` is not, which is why this exception is Cursor's
+        // alone and why a session that only *ends* still orphans.
+        let cursor_proof = key.harness.as_str() == Harness::CURSOR
+            && matches!(
+                observed.event,
+                Event::TurnEnded { .. } | Event::ToolRequested { .. } | Event::ToolUse { .. }
+            );
+        if !matches!(observed.event, Event::TurnStarted { .. }) && !cursor_proof {
             return Disposition::Orphaned;
         }
         // A directed hop to a leg without a bus-owned warm has no vendor
@@ -518,6 +565,78 @@ mod tests {
             Disposition::Deferred
         );
         assert_eq!(registry.bus_id(&key()), None, "a ghost must not get an id");
+    }
+
+    #[test]
+    fn a_cursor_tool_call_mints_the_conversation_its_prompt_never_reached() {
+        // Measured 2026-09-08: 4,229 orphan drops since 09-05 carried
+        // `preToolUse` / `postToolUse` for 42 Cursor conversation ids that
+        // appear nowhere in the log, under any harness. Cursor's tool hooks
+        // arrive through Claude Code's settings file; `beforeSubmitPrompt`
+        // and `stop` come from Cursor's own hooks file and never fired for
+        // these — so every one of those conversations was thrown away whole.
+        // A tool call proves a session is real for the same reason a
+        // completed turn does, which this module already accepts.
+        let key = SessionKey::new(Harness::new(Harness::CURSOR), "worker-conv");
+        let mut registry = Registry::new();
+        let requested = Event::ToolRequested {
+            tool: "Read".into(),
+            tool_use_id: None,
+            input: Body::kept("{}"),
+        };
+
+        let Disposition::Write { bus_id, .. } =
+            registry.observe(&key, Observed::bare(requested.clone()))
+        else {
+            panic!("a live Cursor tool call must mint");
+        };
+
+        assert_eq!(registry.bus_id(&key), Some(bus_id));
+        assert_eq!(
+            registry.observe(&key, Observed::bare(requested)),
+            Disposition::Write {
+                bus_id,
+                observed: vec![Observed::bare(Event::ToolRequested {
+                    tool: "Read".into(),
+                    tool_use_id: None,
+                    input: Body::kept("{}"),
+                })],
+            },
+            "the second call joins the conversation the first one minted"
+        );
+    }
+
+    #[test]
+    fn only_cursor_mints_on_a_tool_call() {
+        // The rule is Cursor's alone. Claude Code fires ghost session starts
+        // and a tool call under an unbound Claude session is the ordinary
+        // shape of a daemon restart mid-turn, which must stay an orphan.
+        let mut registry = Registry::new();
+        let requested = Event::ToolRequested {
+            tool: "Read".into(),
+            tool_use_id: None,
+            input: Body::kept("{}"),
+        };
+
+        assert_eq!(
+            registry.observe(&key(), Observed::bare(requested)),
+            Disposition::Orphaned
+        );
+        assert_eq!(registry.bus_id(&key()), None);
+    }
+
+    #[test]
+    fn a_cursor_session_that_only_ends_is_still_an_orphan() {
+        // A `sessionEnd` with nothing before it proves a session existed, not
+        // that a conversation happened. Minting there would put ghosts in the
+        // log, which is what the deferral rule exists to prevent.
+        let key = SessionKey::new(Harness::new(Harness::CURSOR), "closed-empty");
+        let mut registry = Registry::new();
+
+        assert_eq!(
+            registry.observe(&key, Observed::bare(Event::SessionEnded { reason: None })),
+            Disposition::Orphaned
+        );
     }
 
     #[test]
@@ -847,6 +966,84 @@ mod tests {
     }
 
     #[test]
+    fn two_conversations_directed_at_one_leg_in_one_checkout_seat_neither() {
+        // Parallel sessions or worktrees in one repo make this ordinary. A
+        // plain insert let the second hop take the first's seat with no
+        // trace, and the next Cursor prompt then bound to the wrong
+        // conversation — splitting the first a second time, in a log that
+        // cannot be rewritten. A fresh id is a recoverable disappointment;
+        // the wrong id is not.
+        let mut registry = Registry::new();
+        let first = key();
+        let second = SessionKey::new(Harness::new(Harness::CLAUDE_CODE), "vendor-def");
+        let Disposition::Write { bus_id: a, .. } =
+            registry.observe(&first, Observed::bare(prompt("work")))
+        else {
+            panic!("mint");
+        };
+        let Disposition::Write { bus_id: b, .. } =
+            registry.observe(&second, Observed::bare(prompt("other work")))
+        else {
+            panic!("mint");
+        };
+        for who in [&first, &second] {
+            let mut routed = Observed::bare(Event::Routed {
+                next: Harness::CURSOR.into(),
+                hop: crate::event::Hop::HandedOff,
+                reason: "directed".into(),
+                code_freshness: None,
+                provenance: None,
+            });
+            routed.workspace = Some("/repo".into());
+            registry.observe(who, routed);
+        }
+
+        let cursor = SessionKey::new(Harness::new(Harness::CURSOR), "composer-1");
+        let mut arriving = Observed::bare(prompt("continue"));
+        arriving.workspace = Some("/repo".into());
+        let Disposition::Write { bus_id: seated, .. } = registry.observe(&cursor, arriving) else {
+            panic!("mint");
+        };
+
+        assert_ne!(seated, a, "a contested seat must not hand out the first");
+        assert_ne!(seated, b, "nor the second");
+    }
+
+    #[test]
+    fn one_conversation_hopping_twice_keeps_its_seat() {
+        // The companion guard: the contested rule must not fire on a
+        // conversation that simply hops to the same leg again, which would
+        // silently disable directed hops for everybody.
+        let mut registry = Registry::new();
+        let claude = key();
+        let Disposition::Write { bus_id, .. } =
+            registry.observe(&claude, Observed::bare(prompt("work")))
+        else {
+            panic!("mint");
+        };
+        for _ in 0..2 {
+            let mut routed = Observed::bare(Event::Routed {
+                next: Harness::CURSOR.into(),
+                hop: crate::event::Hop::HandedOff,
+                reason: "directed".into(),
+                code_freshness: None,
+                provenance: None,
+            });
+            routed.workspace = Some("/repo".into());
+            registry.observe(&claude, routed);
+        }
+
+        let cursor = SessionKey::new(Harness::new(Harness::CURSOR), "composer-2");
+        let mut arriving = Observed::bare(prompt("continue"));
+        arriving.workspace = Some("/repo".into());
+        let Disposition::Write { bus_id: seated, .. } = registry.observe(&cursor, arriving) else {
+            panic!("mint");
+        };
+
+        assert_eq!(seated, bus_id, "its own second hop is not a contest");
+    }
+
+    #[test]
     fn a_directed_hop_seat_is_claimed_by_the_next_prompt_in_that_checkout() {
         let mut registry = Registry::new();
         let claude = key();
@@ -861,6 +1058,7 @@ mod tests {
             hop: crate::event::Hop::HandedOff,
             reason: "directed".into(),
             code_freshness: None,
+            provenance: None,
         });
         routed.workspace = Some("/repo".into());
         registry.observe(&claude, routed);
@@ -903,6 +1101,7 @@ mod tests {
                 hop: crate::event::Hop::HandedOff,
                 reason: "directed".into(),
                 code_freshness: None,
+                provenance: None,
             },
         );
         routed.source.workspace = Some("/repo".into());

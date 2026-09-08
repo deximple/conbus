@@ -16,14 +16,53 @@ use conbus_core::paths::Paths;
 use crate::appserver;
 use crate::takeover::{self, Takeover};
 
+/// Which binary answers for a leg.
+///
+/// Production resolves from the environment, exactly as it always has. Tests
+/// pass explicit paths instead, because the environment is process-global and
+/// `cargo test` runs tests in threads: a test that pointed `CONBUS_CLAUDE_BIN`
+/// at its own stub could be answered by another test's stub, and was — this
+/// module and `warm` each held a lock of their own over the same variable.
+pub enum Bins {
+    /// Read the environment, one resolver per leg, the way `conbus run` does.
+    Env,
+    /// Explicit answers, keyed by harness. Anything unnamed resolves to a
+    /// binary that fails rather than to a real vendor CLI.
+    #[cfg(test)]
+    Fixed(Vec<(String, std::ffi::OsString)>),
+}
+
+impl Bins {
+    fn get(&self, harness: &str) -> std::ffi::OsString {
+        match self {
+            Bins::Env => match harness {
+                Harness::CODEX => appserver::codex_binary(),
+                Harness::CLAUDE_CODE => claude_binary(),
+                Harness::CURSOR => crate::landing::cursor_app_cli().into_os_string(),
+                other => leg_binary(other),
+            },
+            #[cfg(test)]
+            Bins::Fixed(pairs) => pairs
+                .iter()
+                .find(|(named, _)| named == harness)
+                .map(|(_, binary)| binary.clone())
+                .unwrap_or_else(|| "/nonexistent/conbus-test-leg".into()),
+        }
+    }
+}
+
 pub fn run(paths: &Paths, harness: &str) -> io::Result<()> {
+    run_with(paths, harness, &Bins::Env)
+}
+
+fn run_with(paths: &Paths, harness: &str, bins: &Bins) -> io::Result<()> {
     let mut pending = takeover::take(paths)?;
     let mut current = match pending.as_ref() {
         Some(next) => normalize(&next.next)?,
         None => normalize(harness)?,
     };
     loop {
-        spawn(paths, &current, pending.as_ref())?;
+        spawn(paths, &current, pending.as_ref(), bins)?;
         pending = takeover::take(paths)?;
         match pending.as_ref() {
             Some(next) => {
@@ -53,8 +92,8 @@ fn normalize(name: &str) -> io::Result<String> {
         })
 }
 
-fn spawn(paths: &Paths, harness: &str, takeover: Option<&Takeover>) -> io::Result<()> {
-    let mut child = vendor(harness, takeover)?;
+fn spawn(paths: &Paths, harness: &str, takeover: Option<&Takeover>, bins: &Bins) -> io::Result<()> {
+    let mut child = vendor(harness, takeover, bins)?;
     loop {
         if let Some(status) = child.try_wait()? {
             return if status.success() {
@@ -72,32 +111,31 @@ fn spawn(paths: &Paths, harness: &str, takeover: Option<&Takeover>) -> io::Resul
     }
 }
 
-fn vendor(harness: &str, takeover: Option<&Takeover>) -> io::Result<std::process::Child> {
-    let mut cmd = match harness {
+fn vendor(
+    harness: &str,
+    takeover: Option<&Takeover>,
+    bins: &Bins,
+) -> io::Result<std::process::Child> {
+    let mut cmd = Command::new(bins.get(harness));
+    match harness {
         Harness::CODEX => {
-            let mut cmd = Command::new(appserver::codex_binary());
             if let Some(thread) = takeover.and_then(|t| t.thread.as_deref()) {
                 cmd.args(["exec", "resume", thread, "continue"]);
             }
-            cmd
         }
         Harness::CLAUDE_CODE => {
-            let mut cmd = Command::new(claude_binary());
             if let Some(thread) = takeover.and_then(|t| t.thread.as_deref()) {
                 cmd.args(["--resume", thread]);
             }
-            cmd
         }
         Harness::CURSOR => {
-            let mut cmd = Command::new(crate::landing::cursor_app_cli());
             cmd.arg("agent");
             if let Some(cwd) = takeover.and_then(|t| t.cwd.as_deref()) {
                 cmd.args(["--workspace", cwd, "--trust"]);
             }
-            cmd
         }
-        _ => Command::new(leg_binary(harness)),
-    };
+        _ => {}
+    }
     if let Some(cwd) = takeover.and_then(|t| t.cwd.as_deref())
         && harness != Harness::CURSOR
     {
@@ -137,9 +175,15 @@ mod tests {
     use conbus_core::paths::Paths;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
-    use std::sync::Mutex;
 
-    static ENV: Mutex<()> = Mutex::new(());
+    fn bins(pairs: &[(&str, &std::path::Path)]) -> Bins {
+        Bins::Fixed(
+            pairs
+                .iter()
+                .map(|(harness, path)| ((*harness).to_string(), path.as_os_str().to_owned()))
+                .collect(),
+        )
+    }
 
     fn machine() -> (tempfile::TempDir, Paths) {
         let root = tempfile::tempdir().expect("tempdir");
@@ -166,11 +210,6 @@ mod tests {
             "codex",
             &format!("echo \"$1 $2 $3\" > {}", marker.display()),
         );
-        let _guard = ENV.lock().unwrap_or_else(|e| e.into_inner());
-        unsafe {
-            std::env::set_var("CONBUS_CLAUDE_BIN", &claude);
-            std::env::set_var("CONBUS_CODEX_BIN", &codex);
-        }
         takeover::write(
             &paths,
             &Takeover {
@@ -182,17 +221,18 @@ mod tests {
         )
         .expect("takeover");
 
-        run(&paths, "claude_code").expect("run");
+        run_with(
+            &paths,
+            "claude_code",
+            &bins(&[("claude_code", &claude), ("codex", &codex)]),
+        )
+        .expect("run");
 
         let text = fs::read_to_string(&marker).expect("codex ran");
         assert!(
             text.contains("exec resume thr_bus_owned"),
             "the same process must start the warm thread, got {text:?}"
         );
-        unsafe {
-            std::env::remove_var("CONBUS_CLAUDE_BIN");
-            std::env::remove_var("CONBUS_CODEX_BIN");
-        }
     }
 
     #[test]
@@ -211,10 +251,6 @@ mod tests {
             "claude",
             &format!("echo \"$1 $2\" > {}", marker.display()),
         );
-        let _guard = ENV.lock().unwrap_or_else(|e| e.into_inner());
-        unsafe {
-            std::env::set_var("CONBUS_CLAUDE_BIN", &claude);
-        }
         takeover::write(
             &paths,
             &Takeover {
@@ -226,15 +262,64 @@ mod tests {
         )
         .expect("takeover");
 
-        run(&paths, "codex").expect("run");
+        run_with(&paths, "codex", &bins(&[("claude_code", &claude)])).expect("run");
 
         let text = fs::read_to_string(&marker).expect("claude ran");
         assert!(
             text.contains("--resume sess_bus_owned"),
             "hop-back must resume the bus-owned session, got {text:?}"
         );
-        unsafe {
-            std::env::remove_var("CONBUS_CLAUDE_BIN");
-        }
+    }
+
+    #[test]
+    fn two_runs_with_different_binaries_do_not_answer_each_other() {
+        // The defect this seam exists for. Both of these used to point the
+        // process-global `CONBUS_CLAUDE_BIN` at their own stub under a lock
+        // this module kept to itself, while `warm` did the same under a lock
+        // of its own — so running the two modules together failed five times
+        // in eight, on a different test each run. Nothing here touches the
+        // environment, so the answer cannot travel between threads.
+        let started: Vec<_> = ["alpha", "beta"]
+            .into_iter()
+            .map(|name| {
+                std::thread::spawn(move || {
+                    let (root, paths) = machine();
+                    let marker = root.path().join(format!("{name}-started"));
+                    let claude = stub(
+                        root.path(),
+                        "claude",
+                        &format!("echo \"{name} $1 $2\" > {}", marker.display()),
+                    );
+                    takeover::write(
+                        &paths,
+                        &Takeover {
+                            next: "claude_code".into(),
+                            thread: Some(format!("sess_{name}")),
+                            bus_id: "01a072d2-2e0f-7b72-8afb-b4045e646cde".into(),
+                            cwd: None,
+                        },
+                    )
+                    .expect("takeover");
+
+                    run_with(&paths, "codex", &bins(&[("claude_code", &claude)])).expect("run");
+
+                    fs::read_to_string(&marker).expect("claude ran")
+                })
+            })
+            .collect();
+
+        let seen: Vec<String> = started
+            .into_iter()
+            .map(|handle| handle.join().expect("thread"))
+            .collect();
+
+        assert!(
+            seen[0].contains("alpha --resume sess_alpha"),
+            "the first run was answered by the wrong binary: {seen:?}"
+        );
+        assert!(
+            seen[1].contains("beta --resume sess_beta"),
+            "the second run was answered by the wrong binary: {seen:?}"
+        );
     }
 }

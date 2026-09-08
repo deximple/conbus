@@ -316,6 +316,27 @@ pub enum Hop {
     HandedOff,
 }
 
+/// Who decided a hop, so a counter can tell the product's own decisions from
+/// the ones a person or a probe made for it.
+///
+/// There is deliberately no `probe_workspace` value. Which checkout is a
+/// throwaway is not decidable from anything the daemon or `conbus hop` holds,
+/// and a path heuristic would put a guess in an append-only file. A probe
+/// declares itself or it is counted as unattributed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HopProvenance {
+    /// A vendor said it could not serve the turn, or its own quota reading
+    /// said the account was spent. The only kind the kill criteria count.
+    VendorSignal,
+    /// A person typed `conbus go`, `hop --to`, or a chat line that was an
+    /// order. Real use, and not evidence that the router decides well.
+    Directed,
+    /// The run said so itself, through `CONBUS_PROVENANCE`. A synthesised
+    /// vendor failure or a probe workspace.
+    DeclaredSynthetic,
+}
+
 /// What a harness reported, normalised across vendors.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
@@ -485,6 +506,11 @@ pub enum Event {
         /// as stale so the next pack can say so without calling `gh` again.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         code_freshness: Option<String>,
+        /// Who decided. Absent on every record written before this field
+        /// existed, and absent is never read as organic — those hops are
+        /// counted in their own bucket and named as unattributed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provenance: Option<HopProvenance>,
     },
     /// A session is a continuation of an earlier conversation.
     ///

@@ -1,35 +1,359 @@
 # Handoff
 
-Operator notes for the next agent. Live bus ids, home paths, and quota
-numbers do not belong here — they live in `HANDOFF.local.md` (gitignored)
-and in `~/.conbus/`.
+Operator notes for the next agent, and the knowledge this project paid for.
+
+Live bus ids, home paths, quota numbers and probe session ids do not belong
+here — they live in `HANDOFF.local.md` (gitignored) and in `~/.conbus/`.
+Everything below is true of the code, not of one machine, which is why it is
+tracked: it took weeks to learn and a clone should not have to learn it again.
 
 ## Where things are
 
 - Repo: `deximple/conbus`, **private** until an operator flips visibility.
+  The README and the landing page open with `git clone`, which is why that
+  decision is theirs and is called out in both.
 - Design SSOT: `.cursor/plans/shared_workspace_context_3f7139b8.plan.md`.
+  The filename is a generated id and no longer matches the content; leave it
+  so the Cursor plan UI keeps its association.
 - Public name: **conbus.sh**. Landing: `docs/www/index.html`.
-- Hook contract: `docs/rfd/0001-hook-contract.md`.
+- Hook contract: `docs/rfd/0001-hook-contract.md`, pinned by the fixtures in
+  `crates/conbus/tests/fixtures/`.
 - First-time path: `docs/beginner-manual.md`. Hop walkthrough: `docs/hop-demo.md`.
-- Self-improve: `docs/self-improve.md`.
+- Fact schema: `docs/fact-schema.md`. Self-improve loop: `docs/self-improve.md`.
+- A cargo workspace: `crates/conbus` (the binary) and `crates/conbus-core`
+  (the library), edition 2024, two crates and no more.
 
 ## Constraints (do not reopen)
 
-Vendor TUIs stay the window. Never read vendor auth tokens. Never write
-`trusted_hash`. Never inject into a thread the person opened. Never send
-a rolling summary to the leg it is protecting. Never readdir `~/Downloads`.
-Atomic install only: write beside, `mv`, then `launchctl kickstart -k`.
+Vendor TUIs stay the window. Never read, store or intermediate vendor auth
+tokens — login happens only through the unmodified vendor's own flow. Never
+modify vendor binaries. Never write Codex's `trusted_hash`; conbus reads that
+record and must never write it, because `hooks/list` hands out the very value
+that would forge it. Never pool credentials or quota across people. Never
+parse vendor session files on the live path — backfill and gap fill are the
+sanctioned exceptions, and only with a fixture-protected parser that skips
+what it does not recognise. Never inject into a Codex thread the user opened
+(the rule targets `thread/inject_items`; returning `additionalContext` from a
+hook is a sanctioned channel). Never send a rolling summary to the leg it is
+protecting. Never readdir `~/Downloads`. Do not expose a secret-reading tool
+to the model. Do not use vendor trademarks in product or feature names.
+
+**Atomic install.** The binary is written beside its target and renamed, then
+`launchctl kickstart -k` — never overwritten in place, for the reason under
+"Three live-machine failures" below. Every settings file conbus merges into
+goes the same way, through `install::write_atomically`, carrying the mode the
+file already had.
+
+## Decisions that are closed — and the two that stage 1 reopened
+
+Argued through four review rounds; the reasoning is in the plan.
+
+1. **The bus owns state and id; vendor TUIs stay the window.** Stage 0 does
+   not build a chat UI. Building one is what kills the product, because the
+   vendor TUI is better than anything we would ship in four weeks.
+2. ~~**Stage 0 is Claude Code ↔ Codex only.**~~ **Reopened and reversed in
+   stage 1.** Cursor was excluded for having no structured quota signal; it
+   now has one (`sessionEnd` / `afterAgentResponse` carry the vendor's own
+   limit strings) and is a registered harness, alongside grok and opencode.
+3. ~~**Dual-warm is asymmetric — only the Codex leg stays warm.**~~
+   **Reopened and reversed in stage 1**, which delivered symmetric dual-warm:
+   the Claude warm is a CLI stand-in (`--max-turns 0` plus
+   `--permission-prompts none`, auto-deny rather than skip-all) instead of the
+   Agent SDK path the original reasoning was avoiding.
+4. **Scope is kept by cutting, not by extending.**
+5. **The rolling summary cannot be cut**, and must never run on the leg it is
+   protecting: `claude -p` draws from the subscription limit, so summarising
+   with Claude burns the quota being preserved. Summaries stay extractive;
+   hop-path model calls stay zero.
+6. **Retention** ships at "conversation only" — tool bodies are not written to
+   disk at the default level.
+7. **The name is Conbus** — conversation bus. Binary `conbus`, conversation id
+   `bus_id`.
+8. **One binary with argv dispatch**, JSONL segments as the source of truth,
+   SQLite only ever as a disposable derived index. Data lives in `~/.conbus/`,
+   respecting `$XDG_STATE_HOME`.
+
+## Known vendor quirks — already paid for, do not rediscover
+
+**Claude Code**
+
+- Hook output strings cap at **10,000 UTF-16 code units**, inclusive, applied
+  per field. Past that the content is written to a file and the model gets a
+  path plus a short preview. **The failure is silent** — it looks like it
+  worked if headers land in the preview. Assert the budget locally on every
+  emit; treat `<persisted-output>` in a transcript as a failure, and note that
+  it is the right oracle but the wrong detector (a hook cannot read the
+  model's context, and ordinary large tool results produce the same marker).
+- `SessionStart` fires several times per project within hundreds of
+  milliseconds and some are ghosts with no transcript
+  (`anthropics/claude-code#78455`). **Mint `bus_id` on the first
+  `UserPromptSubmit`, never on `SessionStart`**, which only registers a
+  candidate. A prompt mints on its own if the start never arrived, so
+  Desktop's `/clear` — which omits `source` (`#76704`) — costs no conversation.
+- `SessionStart` sources are `startup`, `resume`, `clear`, `compact`, `fork`.
+  Subagents are not a session source; they get `SubagentStart` / `SubagentStop`
+  with `agent_id` and `agent_type`.
+- The hook reply shape is
+  `{"hookSpecificOutput":{"hookEventName":"…","additionalContext":"…"}}`, and
+  `hookEventName` **must equal the firing event** or the whole result is
+  discarded — non-blocking, reported once per session and then suppressed, so
+  a drifted name would show one error and go quiet forever. Carry the event
+  through from the payload.
+- Exactly three things block the user's prompt: `"continue": false`,
+  `"decision": "block"`, and **exit code 2** regardless of what was printed.
+  A blocked turn also drops the pack.
+- **The pack lands after the user's prompt**, not before it. Recency favours
+  our text over the person's own words, so precedence has to be stated inside
+  the pack rather than inferred from position.
+- `UserPromptSubmit`'s hook timeout is **30 seconds**, not the 10-minute
+  global default, and a timed-out hook's partial stdout is parsed by nothing.
+- **`StopFailure`'s reason field is `error`**, not `failure_reason` — the
+  first adapter used the latter, produced `reason: "unspecified"` on a real
+  failure, and looked like it worked. `error` has **eleven** values;
+  only `rate_limit` and `overloaded` mean "this leg cannot serve the turn
+  right now". `invalid_request`, `model_not_found` and `max_output_tokens` are
+  faults routing does not fix, which is why the recorder keeps the vendor's
+  string verbatim and `turn_state` has `interrupted_policy` beside
+  `interrupted_quota`.
+- `Stop`, `StopFailure` and `SubagentStop` carry `last_assistant_message`, so
+  the plan's sub-2s flush barrier on `Stop` is not needed — but it is the text
+  of the **last** message only, and it collapses to absent when that message
+  is pure tool use.
+- `prompt_id` is one slot on a process-global request journal, so it is stale
+  on session-lifecycle events, and it does **not** de-interleave subagents —
+  `agent_id` is the field that does. A subagent's hooks arrive under the
+  **parent's** `session_id`.
+- `UserPromptSubmit.source` exists in the schema and is **not sent**; the
+  transcript's `promptSource` is a *larger* vocabulary (`typed`, `queued`,
+  `suggestion_accepted`), and `sdk` is stamped on hand-typed prompts. Neither
+  is a self-exclusion signal. Attendance is decided by
+  `CLAUDE_CODE_ENTRYPOINT`, and an unknown counts as a person.
+- `PermissionDenied` fires only for auto-mode classifier refusals, not for a
+  person answering no; `PermissionRequest` is the pre-decision event and
+  carries no `tool_use_id`, so it joins by tool name plus adjacency.
+- `mlockall` returns ENOSYS on macOS. `doctor` reports `memory_locked=false`
+  with the errno rather than claiming a guarantee we do not have.
+
+**Codex**
+
+- Hooks need **absolute** paths because the app-server's PATH differs.
+- **The trust gate fails silently**: a registered-but-untrusted hook is never
+  spawned and nothing is printed. A person approves inside Codex's own startup
+  dialog, which reviews every new or changed hook in every file at once — so
+  approving conbus's also approves whatever else sits untrusted beside them,
+  and `doctor` says so, because being asked to consent without being told the
+  scope is not consent. Two traps follow from the same hash: editing an entry
+  flips it to `modified` and it silently stops running, and inserting a hook
+  ahead of one shifts its group index and orphans its trust record.
+- **Codex fails a hook over fields it does not take**: `PreToolUse` rejects
+  `continue`, `stopReason` and `suppressOutput`; `PostToolUse` rejects
+  `suppressOutput`. The Claude-shaped silent reply produced "hook (failed)"
+  twice per tool call while every record still landed. Codex gets `{}`.
+- `additionalContext` is accepted on five of eleven events;
+  `UserPromptSubmit` is its only per-turn channel. Its limit is ~2,500 tokens
+  where a token is `ceil(utf8_bytes/4)`, so the real inline budget is 10,000
+  UTF-8 **bytes** — the same number as Claude's in a different unit.
+- `SessionEnd` gets **one second** — Codex's own default, the tightest
+  deadline on the whole surface, which is why the hook client bounds its call
+  to the daemon at 500ms.
+- `SessionStart` fires at the first prompt, not when the TUI opens. A session
+  closed without a prompt fires `SessionEnd` alone, which the daemon can only
+  orphan. `tool_use_id` is `exec-<uuid>`; `tool_response` is a string.
+- Codex spawns a **memory-writing agent** beside a session, with its own
+  `session_id`, no transcript, and a 50 KB instruction prompt beginning
+  `## Memory Writing Agent`.
+- Async hooks were dropped by 0.147.0 and are allowed again from 0.148.
+- Quota lives on `account/rateLimits/read` via the app-server and is
+  **account-scoped** — probe #1, and it held: a sidecar reads consumption
+  without opening a thread, regardless of which process burned it. There is no
+  `StopFailure` equivalent in Codex hooks, so a Codex exhaustion is not a log
+  event. The live `rateLimitReachedType` is `rate_limit_reached`.
+- **Desktop spends quota the hooks never see.** Same account, no hook traffic.
+  The bus is a passenger on any surface it did not spawn — the design said so;
+  this is the measurement.
+
+**Both**
+
+- Global hooks mirror our own background sessions unless marked. The
+  `CONBUS_INTERNAL_SESSION` marker makes the hook exit before reading stdin.
+- The two vendors cannot share a session id: Claude Code takes
+  `--session-id <uuid>`, Codex assigns thread ids and its `ThreadStartParams`
+  has no `threadId`. Identity is carried by the registry's alias map and never
+  by making the ids equal.
+- A command run inside a Codex session cannot learn its own thread id; Claude
+  Code sets `CLAUDE_CODE_SESSION_ID` in a child's environment and Codex sets
+  no equivalent.
+
+## Three live-machine failures worth not repeating
+
+**A hook that wrote nothing to stdout coincided with a vendor session going
+down.** Registered for real, the hook exited zero with zero bytes, and the
+client then failed with `400 … cache_control cannot be set for empty text
+blocks`. Reverting the registration fixed it. The correlation is solid and the
+mechanism is *not* confirmed — a later pass through the vendor bundle could not
+find the path that turns a zero-byte stdout into an empty text block. Two things
+outlive the fix: **"the hook writes 0 bytes" and "the vendor receives nothing"
+are different claims, and only the first was measured**; and **nothing in the
+test suite could have caught it**, because the tests drive a real binary against
+a real socket and all passed. Every path now prints
+`{"continue":true,"suppressOutput":true}`, pinned across all six paths.
+
+**The recorder went silent for two hours and every check said it was healthy.**
+The binary had been overwritten in place while the launchd daemon held that
+inode mapped; macOS taints the vnode when a signed binary changes under a
+mapping, so the kernel killed every exec of that path before `main` ran — exit
+137, no output, for `--help` as much as for `hook`. And the drop log's emptiness
+proved nothing, because the drop log is written by the hook: a hook that cannot
+start writes no drops. `doctor` now runs the registered command through a shell,
+marked internal, insists on parseable JSON, prints the most recent record by
+time, and compares the binary's build stamp against the running daemon's.
+
+**The log's own repair split two conversations, and counting found it, not
+testing.** Every `backfill --apply` runs with the daemon stopped, and every
+session open at that moment came back bound to backfill's copy of itself,
+because the copy was the newest record and restore took the newest. The suite
+was green throughout: `Registry::restore` had one test, with one record. What
+found it was a survey of the real log keyed by `(harness, vendor_session_id)`.
+Two rules follow. **A reconstruction never outranks what the recorder saw**, in
+the registry and in backfill alike. And **run the survey, not the suite, when
+the question is about the corpus** — `doctor` now carries that survey as its
+`twins` line.
+
+A fourth, smaller: **Darwin refuses to set socket options on a peer that has
+already hung up**, with `EINVAL`, and `doctor`'s liveness probe is exactly such
+a peer. A peer that left before it was served is nobody to serve.
+
+**A fifth, and both halves were found by counting rather than by reading.** On
+2026-09-08 one conversation wrote **146 `routed` records in 38 minutes** — the
+daemon answered every `InterruptedQuota` from a leg that kept refusing, spawned
+a `hop --apply` behind each, and left 32 headless Claude sessions leased. The
+guard already existed (`Chapter.pending_hop`, which `hop --apply` consults) and
+the daemon simply did not look at it. The lesson from the twin defect holds:
+**run the survey, not the suite, when the question is about the corpus** — 152
+of the log's 168 `routed` records are that one runaway, and no test was ever
+going to say so.
+
+And **"I connected" is not "somebody is serving"**. Closing a listening AF_UNIX
+socket does not tear the path down at once, so a connect to a daemon that has
+just died can still succeed — measured under load with `lsof` showing no
+process holding the path. `bind` refused the new daemon its own socket on that
+evidence, which under launchd's `KeepAlive` turns a crash into a restart loop.
+The probe now asks whether anything is *serving*: a daemon that is busy says
+nothing, because our request is what it waits for, so the read expiring is the
+positive answer; a peer that is going away hands back end-of-file at once.
+
+## What the log holds, and why it holds it that way
+
+- One flat JSON line per record, fixed-width UTC timestamp first so a text
+  sort gives append order, `v` on every line. Segments roll at 8 MiB; a line
+  torn by a crash is reported as a defect and the next append heals the
+  missing newline rather than being glued onto the wreck.
+- Retention is applied **inside the writer**, the only path to disk, so no
+  caller can write a body the workspace said to withhold.
+- `Record` flattens both the vendor stamp and the event body, which makes
+  every envelope key a reserved word for every event body, now and later. A
+  collision serialises without complaint and fails to read back as a duplicate
+  field — the line reaches the source of truth and is lost on scan, with no
+  compile error anywhere. `no_event_body_shadows_an_envelope_key` is the only
+  guard, and it only works because every field it builds is populated.
+- A tool call is two records — `tool_requested` and `tool_use` — because a
+  request and its result are two moments and the log is append-only. A denial
+  is its own event, not a third outcome, because `tool_use` means the tool
+  *ran*.
+- Backfill stamps `backfilled_from`, because a reconstructed record is a
+  weaker fact than a mirrored one and a reader that cannot tell them apart
+  will over-trust the log. Three sources: Claude transcripts, Codex threads
+  through the app-server, and the official Claude.ai conversation export.
+- The transcript carries three things the hook path does not: the vendor
+  version, `promptSource`, and when it happened.
+
+## What a person sees, and how they stop it
+
+One `systemMessage` line on the turn that was briefed, naming the conversation
+recounted and the command to inspect it — a field both vendors have, separate
+from `additionalContext`, costing no model tokens. No injection, no line, ever:
+silence is the default. A session whose flushed start says `source: clear` is
+not briefed, because `/clear` already means "forget this". A prompt that opens
+with a vendor's own tell that a program wrote it is not briefed even when the
+entrypoint calls the session attended. A conversation with both recovered and
+live records is described as "partly reconstructed", not "not observed live".
+The explicit off is `CONBUS_BRIEFING=off` in the environment the vendor runs
+hooks in, carried on the wire so the daemon neither injects nor records a
+briefing nobody received.
+
+The pack refuses three things, each for a reason that cost something: **the
+fence is not forgeable** (its nonce comes from the id of the session being
+told, minted after every word the pack quotes, and quoted text is scrubbed of
+it), **it never truncates the assembled string** (the thing at the end is the
+closing fence, so cutting the string is how a quoting problem becomes an
+injection problem — over budget it drops whole chapters, then refuses), and
+**it carries the tail, not the head**.
 
 ## Shipped user surface
 
-Stranger path: clone → build → `install --apply` → `doctor` → `hop --demo`
-→ `conbus run claude_code`. Chat orders and `conbus go <leg>` are directed
-hops. Cursor landing is `cursor -n`. Repo visibility and DNS stay operator
-actions.
+Stranger path: clone → build → `install --apply` → `doctor` → `hop --demo` →
+`conbus run claude_code`. Chat orders and `conbus go <leg>` are directed hops.
+Cursor landing is `cursor -n`. Repo visibility and DNS stay operator actions.
+
+## What the counters mean
+
+`routing_hops` and `failover_hops` are **organic only**: a vendor said it could
+not serve the turn, or its own quota reading said the account was spent. A hop
+an operator typed (`conbus go`, `hop --to`, a chat order) and a hop a run
+declared staged (`CONBUS_PROVENANCE`) are counted in buckets of their own and
+printed on an `excluded` line — hiding them would be the same lie as counting
+them. Records written before `Event::Routed` carried `provenance` are
+unattributed, which is its own bucket and never folded into organic.
+
+A closed 28-day window with no organic hop is **inconclusive**, not a kill:
+manufactured hops cannot answer the question the criteria ask, in either
+direction. On 2026-09-08 all eleven hops on the machine were manufactured and
+the dashboard read them as "routing 4 (3.35/week)" against a criterion of
+three.
+
+## Still open
+
+- `MessageDisplay` is not mirrored — the only official channel carrying every
+  assistant message rather than the last one. High volume, and it collides
+  with the "conversation only" default, so it is a retention decision first.
+- Still dropped from payloads already parsed: `agent_type`,
+  `transcript_path`, `session_title`, `model`, `permission_mode`,
+  `effort.level`.
+- `Notification`'s quota-lifted spelling is unpinned until a capture names it,
+  so the registration has no matcher and the router does not branch on it.
+- **No organic hop has ever happened.** Every hop on the log was typed or
+  staged. The first real one is the first evidence the router works, and it
+  cannot be manufactured — the same position `StopFailure` was in before
+  2026-09-05, and the reason `verdict` now refuses to score a window without
+  one.
+- **42 Cursor conversations were lost before 2026-09-09** and are not
+  recoverable: their tool events were dropped as orphans because no
+  `beforeSubmitPrompt` ever arrived for them. A Cursor tool call now mints, so
+  the loss stops there, but why that prompt hook does not fire for those
+  sessions is still unread — capture one payload rather than guessing.
+- Nothing produces `interrupted_user`; `is_interrupt` on a failed tool call is
+  the only signal anywhere that a person stopped the work.
+- An older `v` is still read as if it were current. `scan` rejects a record
+  from a *newer* build and has no opinion about an older one.
+- **The counters have to be written down with the fields.** Routing hops and
+  re-explanation savings must be filtered to human turns or a `/loop` firing
+  every five minutes manufactures a passing kill criterion; injected tokens
+  must count all turns, because that is real money; and absent `author` is its
+  own bucket in every one of them, never folded into human.
+- Kill criteria: **routing hops per week, counted separately from failover
+  hops.** Counting them together hands the verdict to how often the user hits
+  a limit, which is outside our control. Injected tokens are a **cost**
+  metric, not a success metric.
 
 ## Next task
 
-Run `docs/self-improve.md` from current evidence. Score the dogfood window
-with `conbus verdict` — do not declare the 4-week clock closed unless the
-command says it is. A model digest is `conbus summary --bus-id`; hop-path
-model calls stay zero.
+Run `docs/self-improve.md` from current evidence, not from this file's memory.
+Score the dogfood window with `conbus verdict` — do not declare the 4-week
+clock closed unless the command says it is, and note that it now refuses to
+score a window with no organic hop at all. A model digest is
+`conbus summary --bus-id`; hop-path model calls stay zero.
+
+The live defect to watch after the 2026-09-09 sweep: whether Cursor's
+`beforeSubmitPrompt` still fails to arrive for worker-shaped sessions. The
+orphan drops with a `preToolUse` detail should stop; if they do not, the
+adapter is not the whole story.

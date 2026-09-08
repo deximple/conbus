@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -14,7 +14,7 @@ use conbus_core::clock::Timestamp;
 use conbus_core::continuation::{
     Asking, Decision, Stopped, decide, machine_authored, opening_units, stopped, unattended,
 };
-use conbus_core::event::{Event, Harness, Hop, Source, TurnState};
+use conbus_core::event::{Event, Harness, Hop, HopProvenance, Source, TurnState};
 use conbus_core::identity;
 use conbus_core::ids::BusId;
 use conbus_core::pack::{self, Chapter};
@@ -167,7 +167,7 @@ impl Daemon {
                 self.registry = Registry::restore(&scan.records);
                 self.chapters = Self::chapters(&scan.records);
             }
-            eprintln!("conbus daemon: filled {n} chat export record(s)");
+            note!("filled {n} chat export record(s)");
         }
         if let Some(watch) = self.chat_watch.as_mut() {
             for (i, _dir, _official_only, signature) in changed {
@@ -202,8 +202,8 @@ impl Daemon {
         {
             // The daemon's own stderr, like every other refusal here: it is the
             // channel launchd captures, and the hook's is swallowed.
-            eprintln!(
-                "conbus daemon: refusing a hook speaking protocol v{}; this daemon speaks v{}",
+            note!(
+                "refusing a hook speaking protocol v{}; this daemon speaks v{}",
                 request.protocol_version.unwrap_or_default(),
                 crate::wire::PROTOCOL_VERSION
             );
@@ -217,6 +217,7 @@ impl Daemon {
         }
 
         let brief = request.brief;
+        let declared = request.provenance;
         let key = SessionKey::new(request.harness.clone(), request.vendor_session_id);
         let observed = Observed {
             vendor_turn_id: request.vendor_turn_id,
@@ -283,8 +284,8 @@ impl Daemon {
                 if !errors.is_empty() {
                     // The daemon's own stderr, because the hook's goes to a
                     // vendor that swallows it.
-                    eprintln!(
-                        "conbus daemon: {} of {} record(s) refused by the log: {}",
+                    note!(
+                        "{} of {} record(s) refused by the log: {}",
                         errors.len(),
                         errors.len() + seqs.len(),
                         errors.join("; ")
@@ -339,12 +340,12 @@ impl Daemon {
                             }
                             Ok(None) => {}
                             Err(err) => {
-                                eprintln!("conbus daemon: briefing sent but not recorded: {err}")
+                                note!("briefing sent but not recorded: {err}")
                             }
                         }
                         self.maybe_continue(bus_id, &source, &mut written, &mut seqs);
                         self.remember(&written);
-                        self.follow_through(bus_id, &source, &mut written, &mut seqs);
+                        self.follow_through(bus_id, &source, &mut written, &mut seqs, declared);
                         self.finish_write(
                             Response::Briefed {
                                 bus_id,
@@ -359,7 +360,7 @@ impl Daemon {
                     }
                     None => {
                         self.remember(&written);
-                        self.follow_through(bus_id, &source, &mut written, &mut seqs);
+                        self.follow_through(bus_id, &source, &mut written, &mut seqs, declared);
                         self.finish_write(
                             Response::Recorded { bus_id, seqs },
                             bus_id,
@@ -388,8 +389,9 @@ impl Daemon {
         source: &Source,
         written: &mut Vec<Record>,
         seqs: &mut Vec<u64>,
+        declared: Option<HopProvenance>,
     ) {
-        self.maybe_route(source, written, seqs);
+        self.maybe_route(source, written, seqs, declared);
         self.maybe_continue_leg(bus_id, source, written, seqs);
         self.maybe_summarise(bus_id, source, written, seqs);
     }
@@ -435,7 +437,13 @@ impl Daemon {
         );
     }
 
-    fn maybe_route(&mut self, source: &Source, written: &mut Vec<Record>, seqs: &mut Vec<u64>) {
+    fn maybe_route(
+        &mut self,
+        source: &Source,
+        written: &mut Vec<Record>,
+        seqs: &mut Vec<u64>,
+        declared: Option<HopProvenance>,
+    ) {
         let Some(reason) = written.iter().find_map(|record| match &record.event {
             Event::TurnEnded {
                 state: TurnState::InterruptedQuota { reason },
@@ -452,6 +460,21 @@ impl Daemon {
         let Some(bus_id) = bus_id else {
             return;
         };
+        // One decision per transition. A leg that keeps refusing keeps
+        // sending `InterruptedQuota`, and this used to answer every one of
+        // them: on 2026-09-08 a single conversation wrote 146 `routed`
+        // records between 16:14 and 16:52, spawned a `hop --apply` behind
+        // each, and left 32 headless Claude sessions leased. The decision
+        // stands until a `continued` edge closes it, which is the same state
+        // `hop --apply` consults before writing one by hand.
+        let already_going = self
+            .chapters
+            .get(&bus_id)
+            .and_then(|chapter| chapter.pending_hop.as_ref())
+            .is_some_and(|(pending, hop)| pending == next.as_str() && *hop == Hop::Displaced);
+        if already_going {
+            return;
+        }
         self.write_extra(
             bus_id,
             source,
@@ -460,6 +483,12 @@ impl Daemon {
                 hop: Hop::Displaced,
                 reason,
                 code_freshness: None,
+                // The daemon writes this one because a hook forwarded a
+                // vendor payload saying the turn hit a limit — the only
+                // path that is the product deciding for itself. A run that
+                // declared itself staged still overrides it, which the hook
+                // carries on the wire.
+                provenance: Some(declared.unwrap_or(HopProvenance::VendorSignal)),
             },
             written,
             seqs,
@@ -642,7 +671,7 @@ impl Daemon {
                 written.push(record);
             }
             Ok(None) => {}
-            Err(err) => eprintln!("conbus daemon: hop bookkeeping lost: {err}"),
+            Err(err) => note!("hop bookkeeping lost: {err}"),
         }
     }
 
@@ -828,10 +857,52 @@ impl Daemon {
     }
 }
 
+/// How long the liveness probe waits for the far end to say something.
+///
+/// A daemon that is serving another connection says nothing at all, so this
+/// expiring is the *positive* answer. It only has to outlast a scheduling
+/// hiccup, not any real work.
+const LIVENESS_PROBE: Duration = Duration::from_millis(50);
+
+/// Is anything actually serving this socket?
+///
+/// Connecting is not the question, though it used to be the answer. Closing a
+/// listening AF_UNIX socket does not tear the path down at once, so a
+/// connect to a daemon that has just died can still succeed — measured here
+/// under load, with `lsof` showing no process holding the path. On a machine
+/// where launchd restarts the daemon the moment it exits, "I connected"
+/// would refuse the new daemon its own socket and turn a crash into a restart
+/// loop.
+///
+/// A peer that is really there holds the line: our request is what it waits
+/// for, so the read expires. A peer that is going away hands back end-of-file
+/// straight away.
+fn someone_is_serving(socket: &Path) -> bool {
+    let Ok(stream) = UnixStream::connect(socket) else {
+        return false;
+    };
+    if stream.set_read_timeout(Some(LIVENESS_PROBE)).is_err() {
+        return false;
+    }
+    let mut byte = [0u8; 1];
+    match (&stream).read(&mut byte) {
+        // Nobody on the other end: the socket answered out of a listener
+        // that is closing, or the daemon hung up as we arrived.
+        Ok(0) => false,
+        // It spoke first, which no version of this daemon does, but anything
+        // that talks is certainly alive.
+        Ok(_) => true,
+        Err(err) => matches!(
+            err.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+        ),
+    }
+}
+
 /// Bind the control socket, refusing to steal one a live daemon still owns.
 pub fn bind(socket: &Path) -> io::Result<UnixListener> {
     if socket.exists() {
-        if UnixStream::connect(socket).is_ok() {
+        if someone_is_serving(socket) {
             return Err(io::Error::new(
                 io::ErrorKind::AddrInUse,
                 format!(
@@ -907,7 +978,7 @@ pub fn serve(paths: &Paths, retention: Retention) -> io::Result<()> {
     // Named before restore. `doctor` and the recorder tests wait on the
     // socket; a stamp that lands after a long scan looks like no daemon.
     if let Err(err) = crate::build_info::stamp(paths) {
-        eprintln!("conbus daemon: could not write the build stamp: {err}");
+        note!("could not write the build stamp: {err}");
     }
     // The registry is derived state, so it is rebuilt from the segments rather
     // than starting empty — otherwise a restart forks every live conversation.
@@ -915,8 +986,8 @@ pub fn serve(paths: &Paths, retention: Retention) -> io::Result<()> {
     // costs a forked conversation, which the vendor session id on every record
     // still makes recoverable, while refusing to start costs every future turn.
     let mut scan = SegmentLog::scan(paths.log_dir()).unwrap_or_else(|err| {
-        eprintln!(
-            "conbus daemon: could not read {} ({err}); starting with no bindings, \
+        note!(
+            "could not read {} ({err}); starting with no bindings, \
              so a session that outlived the last daemon will get a second bus_id",
             paths.log_dir().display()
         );
@@ -929,18 +1000,18 @@ pub fn serve(paths: &Paths, retention: Retention) -> io::Result<()> {
     match crate::backfill::append_gaps_at_start(paths, &scan.records, &mut log) {
         Ok(0) => {}
         Ok(n) => {
-            eprintln!("conbus daemon: filled {n} gap record(s) from official transcripts");
+            note!("filled {n} gap record(s) from official transcripts");
             scan = SegmentLog::scan(paths.log_dir()).unwrap_or(scan);
         }
-        Err(err) => eprintln!("conbus daemon: gap fill skipped ({err})"),
+        Err(err) => note!("gap fill skipped ({err})"),
     }
     match repair_splits(&scan.records, &mut log) {
         Ok(0) => {}
         Ok(n) => {
-            eprintln!("conbus daemon: aliased {n} split conversation pair(s)");
+            note!("aliased {n} split conversation pair(s)");
             scan = SegmentLog::scan(paths.log_dir()).unwrap_or(scan);
         }
-        Err(err) => eprintln!("conbus daemon: split alias skipped ({err})"),
+        Err(err) => note!("split alias skipped ({err})"),
     }
     let registry = Registry::restore(&scan.records);
     let chapters = Daemon::chapters(&scan.records);
@@ -958,11 +1029,11 @@ pub fn serve(paths: &Paths, retention: Retention) -> io::Result<()> {
         report.memory_locked,
         report.memory_lock_error.clone(),
     ) {
-        eprintln!("conbus daemon: could not stamp hardening: {err}");
+        note!("could not stamp hardening: {err}");
     }
 
-    eprintln!(
-        "conbus daemon {}: socket {} log {} ({} record(s), {} unreadable) core_dumps_disabled={} memory_locked={}{}",
+    note!(
+        "{}: socket {} log {} ({} record(s), {} unreadable) core_dumps_disabled={} memory_locked={}{}",
         crate::build_info::BUILD,
         paths.socket().display(),
         paths.log_dir().display(),
@@ -990,12 +1061,12 @@ pub fn serve(paths: &Paths, retention: Retention) -> io::Result<()> {
             if err.kind() == io::ErrorKind::Interrupted {
                 continue;
             }
-            eprintln!("conbus daemon: poll failed: {err}");
+            note!("poll failed: {err}");
             continue;
         }
         if n == 0 {
             if let Err(err) = daemon.absorb_chat_exports() {
-                eprintln!("conbus daemon: chat export ingest skipped ({err})");
+                note!("chat export ingest skipped ({err})");
             }
             continue;
         }
@@ -1003,28 +1074,56 @@ pub fn serve(paths: &Paths, retention: Retention) -> io::Result<()> {
             match listener.accept() {
                 Ok((stream, _)) => {
                     if let Err(err) = handle_connection(&mut daemon, stream) {
-                        eprintln!("conbus daemon: connection failed: {err}");
+                        note!("connection failed: {err}");
                     }
-                    if let Some(bus_id) = daemon.take_pending_warm() {
-                        spawn_hop_apply(bus_id, None);
-                    }
-                    if let Some((bus_id, dest)) = daemon.take_pending_directed() {
-                        spawn_hop_apply(bus_id, Some(dest));
-                    }
-                    if let Some((dest, workspace)) = daemon.take_pending_enter()
-                        && let Err(err) = crate::landing::enter(&dest, workspace.as_deref(), None)
-                    {
-                        eprintln!("conbus daemon: resume {dest} failed ({err})");
-                    }
+                    drain_pending(&mut daemon);
                 }
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
                 Err(err) => {
-                    eprintln!("conbus daemon: accept failed: {err}");
+                    note!("accept failed: {err}");
                     break;
                 }
             }
         }
     }
+}
+
+/// Hand off everything the connection queued, without waiting for any of it.
+///
+/// The daemon serves one connection to its end before it accepts the next, so
+/// anything done here is done in front of every hook still in the backlog.
+/// Proven from the outside: `a_landing_that_blocks_does_not_hold_the_next_hook`
+/// in the e2e suite starts a daemon whose Cursor binary sleeps, and times the
+/// hook behind it.
+fn drain_pending(daemon: &mut Daemon) {
+    if let Some(bus_id) = daemon.take_pending_warm() {
+        spawn_hop_apply(bus_id, None);
+    }
+    if let Some((bus_id, dest)) = daemon.take_pending_directed() {
+        spawn_hop_apply(bus_id, Some(dest));
+    }
+    if let Some((dest, workspace)) = daemon.take_pending_enter() {
+        spawn_enter(dest, workspace);
+    }
+}
+
+/// Bring the person to the leg they asked for, off the accept loop.
+///
+/// Its two siblings were already threads and this one was not. The daemon
+/// serves one connection to its end before it accepts the next, so anything
+/// it waits for here is a wait every hook behind it pays: `cursor -n` blocks
+/// until Cursor's own process exits, and the Terminal path blocks on
+/// `osascript` — a cold app launch, or a macOS automation prompt nobody is
+/// looking at. On 2026-09-08 sixty hooks in five minutes gave up at their
+/// 500ms deadline while the daemon was busy with something.
+fn spawn_enter(dest: String, workspace: Option<String>) {
+    std::thread::spawn(
+        move || match crate::landing::enter(&dest, workspace.as_deref(), None) {
+            Ok(true) => {}
+            Ok(false) => note!("resume {dest} had nothing to open"),
+            Err(err) => note!("resume {dest} failed ({err})"),
+        },
+    );
 }
 
 /// Open the Codex warm thread after a quota hop, out of the hook's deadline.
@@ -1050,13 +1149,13 @@ fn spawn_hop_apply(bus_id: BusId, to: Option<String>) {
             Ok(out) if out.status.success() => {}
             Ok(out) => {
                 let err = String::from_utf8_lossy(&out.stderr);
-                eprintln!(
-                    "conbus daemon: automatic hop --apply for {bus_id} exited {}: {}",
+                note!(
+                    "automatic hop --apply for {bus_id} exited {}: {}",
                     out.status,
                     err.trim()
                 );
             }
-            Err(err) => eprintln!("conbus daemon: automatic hop --apply failed: {err}"),
+            Err(err) => note!("automatic hop --apply failed: {err}"),
         }
     });
 }
@@ -1197,6 +1296,7 @@ mod tests {
             workspace: Some("/repo".into()),
             entrypoint: None,
             brief: true,
+            provenance: None,
             event,
         }
     }
@@ -1478,6 +1578,7 @@ mod tests {
             hop: Hop::HandedOff,
             reason: "directed".into(),
             code_freshness: None,
+            provenance: None,
         }));
         daemon.handle(request(Event::Leased {
             holder: "warm:thr_bus".into(),
@@ -1856,6 +1957,101 @@ mod tests {
                 .dirs
                 .iter()
                 .any(|dir| dir.dir.to_string_lossy().contains("Downloads"))
+        );
+    }
+
+    #[test]
+    fn nothing_in_the_daemon_speaks_around_the_stamped_channel() {
+        // Every line this file writes must carry the time it happened, or
+        // the next outage is again unplaceable. The needle is assembled at
+        // runtime so this assertion's own source cannot satisfy it.
+        let source = include_str!("daemon.rs");
+        let bare = format!("{}{}", "eprint", "ln!");
+
+        assert!(
+            !source.contains(&bare),
+            "the daemon must say everything through `note!`, which stamps it"
+        );
+    }
+
+    #[test]
+    fn a_leg_that_keeps_refusing_gets_one_decision_not_one_per_turn() {
+        // Measured on 2026-09-08: one conversation wrote 146 `routed`
+        // records in 38 minutes — one per `InterruptedQuota` from a leg that
+        // kept refusing — spawned a `hop --apply` behind each, and left 32
+        // headless Claude sessions leased. The decision stands until a
+        // `continued` edge closes it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = SegmentLog::open(dir.path(), Retention::default()).expect("open");
+        let mut daemon = Daemon::new(log, Registry::new(), HashMap::new());
+        daemon.handle(request(Event::TurnStarted {
+            author: None,
+            prompt: Body::kept("work"),
+        }));
+        let refused = || {
+            request(Event::TurnEnded {
+                state: TurnState::InterruptedQuota {
+                    reason: "rate_limit".into(),
+                },
+                assistant_message: None,
+            })
+        };
+
+        for _ in 0..4 {
+            daemon.handle(refused());
+        }
+
+        let scan = SegmentLog::scan(dir.path()).expect("scan");
+        let routed = scan
+            .records
+            .iter()
+            .filter(|record| matches!(record.event, Event::Routed { .. }))
+            .count();
+        assert_eq!(routed, 1, "one transition, one decision");
+    }
+
+    #[test]
+    fn a_daemon_that_is_busy_still_counts_as_serving() {
+        // The probe's positive answer is silence: a daemon serving another
+        // connection says nothing until it has our request, so the read
+        // expiring is what proves it is there.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("conbus.sock");
+        let _live = bind(&socket).expect("bind");
+
+        assert!(someone_is_serving(&socket));
+    }
+
+    #[test]
+    fn a_socket_nobody_holds_is_not_serving() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("conbus.sock");
+        std::fs::write(&socket, b"not a socket").expect("write");
+
+        assert!(!someone_is_serving(&socket));
+    }
+
+    #[test]
+    fn a_peer_that_hangs_up_as_we_arrive_is_not_serving() {
+        // What a dying daemon looks like from here, and what used to read as
+        // "already listening": the connection is accepted and then dropped.
+        // Under load, closing a listening AF_UNIX socket leaves the path
+        // answering for long enough to do exactly this.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("conbus.sock");
+        let listener = bind(&socket).expect("bind");
+        let hangs_up = std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                drop(stream);
+            }
+        });
+
+        let serving = someone_is_serving(&socket);
+        hangs_up.join().expect("accepted");
+
+        assert!(
+            !serving,
+            "a peer that hung up is nobody to refuse a bind for"
         );
     }
 }

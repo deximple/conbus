@@ -59,6 +59,16 @@ pub fn failure_reply(harness: &str, payload: &str) -> &'static str {
     }
 }
 
+/// What this run declares about itself, read from the hook child's own
+/// environment exactly as `CONBUS_BRIEFING` is. A probe sets it so its hops
+/// are not counted as the router deciding for itself; nothing else reads it,
+/// and it cannot change the reply or the exit code.
+fn declared_provenance() -> Option<conbus_core::event::HopProvenance> {
+    std::env::var_os("CONBUS_PROVENANCE")
+        .filter(|value| !value.is_empty())
+        .map(|_| conbus_core::event::HopProvenance::DeclaredSynthetic)
+}
+
 /// How long the hook will wait on the daemon before giving up on it.
 pub const REPLY_DEADLINE: std::time::Duration = std::time::Duration::from_millis(500);
 
@@ -265,6 +275,7 @@ pub fn run(harness: &str, stdin: &mut impl Read) -> Result<Reply, Dropped> {
         // via additional_context; beforeSubmitPrompt still asks so a first
         // prompt can carry the same pack if that event later grows a field.
         brief: briefing_enabled() && !inference,
+        provenance: declared_provenance(),
         event: observed.event,
     };
     let result = match send_once(harness, &socket, &request, &hook_event_name) {

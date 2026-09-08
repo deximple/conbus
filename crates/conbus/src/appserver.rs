@@ -78,7 +78,17 @@ impl AppServer {
     /// ours, and a watchdog that stops the process unblocks whatever read is
     /// waiting on it.
     pub fn start(deadline: Duration) -> io::Result<Self> {
-        let binary = codex_binary();
+        Self::start_with(&codex_binary(), deadline)
+    }
+
+    /// As [`AppServer::start`], with the binary named rather than resolved
+    /// from the environment. Tests pass a stand-in this way: `set_var` is
+    /// unsound while another thread reads the environment, and a test whose
+    /// `CONBUS_CODEX_BIN` was not seen spawns the *real* app-server, which
+    /// does not return — three of those held the suite for forty minutes on
+    /// 2026-09-08.
+    pub fn start_with(binary: &std::ffi::OsStr, deadline: Duration) -> io::Result<Self> {
+        let binary = binary.to_os_string();
         let mut child = Command::new(&binary)
             .arg("app-server")
             .env("PATH", path_for_vendor())

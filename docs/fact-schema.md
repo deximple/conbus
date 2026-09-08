@@ -1,8 +1,13 @@
 # Fact schema
 
 Stage 0 contract. Types, lifecycle, evidence, clocks, anchors, provenance,
-and how facts are derived. The arena that writes them is stage 1
-(`workspace-arena`). This file is the agreement; it is not an implementation.
+and how facts are derived.
+
+`conbus arena fact` and `conbus arena link` ship and write `id`, `type`,
+`claim`, `lifecycle`, `anchors`, `bus_id`, `seq` and `verified_at`. What this
+file describes and the code does **not** yet do: `supersedes`, `contradicts`,
+`fresh_at`, `version`, and the consent gate below — a linked workspace's facts
+reach the pack unconditionally today.
 
 Facts are derived from the log. A busy agent does not write them. Tool events
 alone do not write them.

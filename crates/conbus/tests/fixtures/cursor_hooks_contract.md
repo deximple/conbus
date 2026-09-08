@@ -1,7 +1,10 @@
 # Cursor hook contract — captured 2026-09-06
 
-Cursor invokes `conbus hook` through Claude Code's settings file. The payload
-is not Claude's. Identification is the `cursor_version` field. Field names
+Cursor invokes `conbus hook` two ways, and both are live. Its own
+`~/.cursor/hooks.json` carries the five lowercase events `conbus install`
+registers there; the tool events below still arrive through Claude Code's
+settings file, which Cursor also reads. The payload is not Claude's either
+way. Identification is the `cursor_version` field. Field names
 below were pinned by the live drop log (`no mapping for hook event "…"`,
 names only) and match Cursor's own hook docs on types.
 

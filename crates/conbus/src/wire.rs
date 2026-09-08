@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 /// this field existed ignores it, so the first deploy still needs the daemon
 /// restarted by hand. `the_wire_shape_is_pinned_to_the_protocol_version` below
 /// is what stops the constant falling behind the struct.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// One observed vendor event, on its way to the log.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -55,6 +55,11 @@ pub struct Request {
     /// before this field meant.
     #[serde(default = "yes", skip_serializing_if = "is_yes")]
     pub brief: bool,
+    /// What the run declares about itself, for the same reason `brief` rides
+    /// here: the daemon writes the `routed` line and the daemon does not run
+    /// in the probe's environment. Absent is not a claim of anything.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<conbus_core::event::HopProvenance>,
     pub event: Event,
 }
 
@@ -125,6 +130,7 @@ mod tests {
             // Off, so the field is on the wire: it is skipped when it says
             // yes, which is what every hook before it meant.
             brief: false,
+            provenance: None,
             event: Event::TurnStarted {
                 author: None,
                 prompt: Body::kept("p"),
@@ -156,6 +162,6 @@ mod tests {
             ],
             "the wire shape changed; bump PROTOCOL_VERSION (now {PROTOCOL_VERSION})"
         );
-        assert_eq!(PROTOCOL_VERSION, 4);
+        assert_eq!(PROTOCOL_VERSION, 5);
     }
 }

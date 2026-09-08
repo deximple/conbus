@@ -22,18 +22,19 @@ pub fn enter(harness: &str, workspace: Option<&str>, session: Option<&str>) -> i
             };
             window::reveal(harness, id)
         }
-        Harness::CURSOR => open_cursor(workspace),
+        Harness::CURSOR => open_cursor(&cursor_app_cli(), workspace),
         Harness::OPENCODE | Harness::GROK | Harness::AGY => open_tui(harness, workspace),
         _ => Ok(false),
     }
 }
 
-fn open_cursor(workspace: Option<&str>) -> io::Result<bool> {
+/// `bin` is named rather than read here: tests pass a stand-in, and setting
+/// the environment is unsound while another test thread reads it.
+fn open_cursor(bin: &Path, workspace: Option<&str>) -> io::Result<bool> {
     let Some(dir) = workspace.filter(|d| Path::new(d).is_dir()) else {
         return Ok(false);
     };
-    let bin = cursor_app_cli();
-    let status = Command::new(&bin)
+    let status = Command::new(bin)
         .args(["-n", dir])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -106,9 +107,6 @@ fn shell_single(value: &str) -> String {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
-    use std::sync::Mutex;
-
-    static ENV: Mutex<()> = Mutex::new(());
 
     #[test]
     fn cursor_opens_a_new_window_on_the_checkout() {
@@ -123,14 +121,7 @@ mod tests {
         std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         let workspace = dir.path().join("repo");
         std::fs::create_dir(&workspace).expect("repo");
-        let _guard = ENV.lock().unwrap_or_else(|e| e.into_inner());
-        unsafe {
-            std::env::set_var("CONBUS_CURSOR_APP_BIN", &stub);
-        }
-        let opened = enter(Harness::CURSOR, workspace.to_str(), None);
-        unsafe {
-            std::env::remove_var("CONBUS_CURSOR_APP_BIN");
-        }
+        let opened = open_cursor(&stub, workspace.to_str());
         assert!(opened.expect("open"));
         assert_eq!(
             std::fs::read_to_string(&mark).expect("args"),

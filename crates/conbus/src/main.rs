@@ -1,3 +1,8 @@
+// Declared first: `note!` is a macro_rules, so it is in scope only for the
+// modules that come after it, and the daemon is one of them.
+#[macro_use]
+mod note;
+
 mod appserver;
 mod arena;
 mod backfill;

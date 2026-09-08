@@ -357,9 +357,35 @@ fn now_secs() -> i64 {
 
 /// Last observation the StatusLine command wrote, if any.
 pub fn read_cached(paths: &Paths, harness: &str) -> Option<Quota> {
+    read_cached_at(paths, harness, now_secs())
+}
+
+/// How long a cached reading still describes the account.
+///
+/// The tight window is five hours and the rule that consumes these numbers
+/// turns on the 80% boundary, so a reading this old has had thirty per cent
+/// of its own window to go wrong. Claude's numbers arrive only when the
+/// person's StatusLine fires, which stops the moment they work anywhere else
+/// — an afternoon in Codex used to leave the router deciding on the morning.
+pub const CACHE_TTL_SECS: i64 = 90 * 60;
+
+/// The cache as of `now`, with what has gone out of date removed.
+///
+/// Two different clocks. The *numbers* expire on the TTL, because nothing
+/// refreshes them but the vendor. The *exhaustion* expires on the window's
+/// own `resets_at`, because that is the vendor telling us exactly when it
+/// stops being true — a five-hour window that reset an hour ago still read
+/// EXHAUSTED, and routing away from a leg that is free again is the same
+/// mistake as routing into one that is not.
+pub fn read_cached_at(paths: &Paths, harness: &str, now: i64) -> Option<Quota> {
     let text = std::fs::read_to_string(paths.quota_cache(harness)).ok()?;
     let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let observed_at = value.get("observed_at").and_then(|v| v.as_i64());
+    let fresh = observed_at.is_some_and(|at| now.saturating_sub(at) <= CACHE_TTL_SECS);
     let window = |name: &str| -> Option<Window> {
+        if !fresh {
+            return None;
+        }
         let w = value.get(name)?;
         Some(Window {
             used_percent: w.get("used_percent")?.as_u64()?,
@@ -367,19 +393,33 @@ pub fn read_cached(paths: &Paths, harness: &str) -> Option<Quota> {
             resets_at: w.get("resets_at")?.as_i64()?,
         })
     };
+    let primary = window("primary");
+    let still_reached = value
+        .get("primary")
+        .and_then(|w| w.get("resets_at"))
+        .and_then(|at| at.as_i64())
+        .is_none_or(|resets_at| resets_at > now);
     Some(Quota {
         plan: value
             .get("plan")
             .and_then(|v| v.as_str())
             .map(str::to_string),
-        primary: window("primary"),
+        primary,
         secondary: window("secondary"),
         reached: value
             .get("reached")
             .and_then(|v| v.as_str())
+            .filter(|_| still_reached)
             .map(str::to_string),
         reset_credits: 0,
     })
+}
+
+/// When the reading was taken, whether or not it is still current.
+fn cached_observed_at(paths: &Paths, harness: &str) -> Option<i64> {
+    let text = std::fs::read_to_string(paths.quota_cache(harness)).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    value.get("observed_at").and_then(|v| v.as_i64())
 }
 
 fn write_cached(paths: &Paths, harness: &str, quota: &Quota) -> io::Result<()> {
@@ -480,7 +520,17 @@ fn describe_attach(paths: &Paths, slug: &str, quota_signal: bool) -> String {
 
 /// What doctor/quota say about the Claude StatusLine channel.
 pub fn describe_claude(paths: &Paths, now: i64) -> String {
-    if let Some(quota) = read_cached(paths, Harness::CLAUDE_CODE) {
+    if let Some(quota) = read_cached_at(paths, Harness::CLAUDE_CODE, now) {
+        let age = cached_observed_at(paths, Harness::CLAUDE_CODE)
+            .map(|at| now.saturating_sub(at))
+            .unwrap_or_default();
+        if age > CACHE_TTL_SECS {
+            return format!(
+                "{} · StatusLine has not fired for {}m, so the numbers are not counted",
+                describe(&quota, now),
+                age / 60
+            );
+        }
         return describe(&quota, now);
     }
     match read_seen(paths, Harness::CLAUDE_CODE) {
@@ -818,5 +868,131 @@ mod tests {
     #[test]
     fn rfc3339_z_is_unix_seconds() {
         assert_eq!(unix_rfc3339("2026-09-06T13:47:28Z"), Some(1_788_702_448));
+    }
+
+    /// A cache file in `write_cached`'s shape, with a chosen age.
+    fn cached(paths: &conbus_core::paths::Paths, observed_at: i64, body: serde_json::Value) {
+        let path = paths.quota_cache(conbus_core::event::Harness::CLAUDE_CODE);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+        let mut value = body;
+        value["schema_version"] = serde_json::json!(1);
+        value["observed_at"] = serde_json::json!(observed_at);
+        std::fs::write(&path, value.to_string()).expect("write");
+    }
+
+    fn machine() -> (tempfile::TempDir, conbus_core::paths::Paths) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths =
+            conbus_core::paths::Paths::from_env(dir.path().to_str(), None, None).expect("paths");
+        (dir, paths)
+    }
+
+    #[test]
+    fn a_stale_reading_keeps_the_plan_and_drops_the_numbers() {
+        // The StatusLine only fires while the person is in Claude Code. An
+        // afternoon spent in Codex left the router deciding on the morning's
+        // percentages, and nothing said so.
+        let (_dir, paths) = machine();
+        let now = 1_800_000_000;
+        cached(
+            &paths,
+            now - 4 * 3600,
+            serde_json::json!({
+                "plan": "max",
+                "primary": {"used_percent": 95, "minutes": 300, "resets_at": now + 1800},
+            }),
+        );
+
+        let quota = read_cached_at(&paths, Harness::CLAUDE_CODE, now).expect("cache");
+
+        assert!(
+            quota.primary.is_none(),
+            "a four-hour-old number is not a number"
+        );
+        assert_eq!(
+            quota.plan.as_deref(),
+            Some("max"),
+            "the plan does not go stale"
+        );
+    }
+
+    #[test]
+    fn a_fresh_reading_is_kept_whole() {
+        let (_dir, paths) = machine();
+        let now = 1_800_000_000;
+        cached(
+            &paths,
+            now - 600,
+            serde_json::json!({
+                "plan": "max",
+                "primary": {"used_percent": 42, "minutes": 300, "resets_at": now + 1800},
+            }),
+        );
+
+        let quota = read_cached_at(&paths, Harness::CLAUDE_CODE, now).expect("cache");
+
+        assert_eq!(quota.primary.expect("window").used_percent, 42);
+    }
+
+    #[test]
+    fn a_window_that_has_since_reset_is_not_an_exhaustion() {
+        // The vendor tells us exactly when it stops being true. Routing away
+        // from a leg that is free again is the same mistake as routing into
+        // one that is not.
+        let (_dir, paths) = machine();
+        let now = 1_800_000_000;
+        cached(
+            &paths,
+            now - 6 * 3600,
+            serde_json::json!({
+                "plan": "max",
+                "reached": "rate_limit",
+                "primary": {"used_percent": 100, "minutes": 300, "resets_at": now - 3600},
+            }),
+        );
+
+        let quota = read_cached_at(&paths, Harness::CLAUDE_CODE, now).expect("cache");
+
+        assert!(quota.reached.is_none(), "the window reset an hour ago");
+    }
+
+    #[test]
+    fn an_exhaustion_whose_window_is_still_open_survives() {
+        let (_dir, paths) = machine();
+        let now = 1_800_000_000;
+        cached(
+            &paths,
+            now - 300,
+            serde_json::json!({
+                "plan": "max",
+                "reached": "rate_limit",
+                "primary": {"used_percent": 100, "minutes": 300, "resets_at": now + 1200},
+            }),
+        );
+
+        let quota = read_cached_at(&paths, Harness::CLAUDE_CODE, now).expect("cache");
+
+        assert_eq!(quota.reached.as_deref(), Some("rate_limit"));
+    }
+
+    #[test]
+    fn doctor_says_when_the_statusline_reading_stopped_being_current() {
+        let (_dir, paths) = machine();
+        let now = 1_800_000_000;
+        cached(
+            &paths,
+            now - 4 * 3600,
+            serde_json::json!({
+                "plan": "max",
+                "primary": {"used_percent": 95, "minutes": 300, "resets_at": now + 1800},
+            }),
+        );
+
+        let line = describe_claude(&paths, now);
+
+        assert!(
+            line.contains("StatusLine has not fired"),
+            "a stale reading must say so: {line}"
+        );
     }
 }

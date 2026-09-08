@@ -207,9 +207,21 @@ fn batch_ids(value: Option<Value>) -> (Vec<VendorToolUseId>, usize) {
 
 /// Read a hook payload into a bus event.
 pub fn normalize(harness: &Harness, json: &str) -> Result<Normalized, HookError> {
+    normalize_with(harness, json, origin_is_chat())
+}
+
+/// As [`normalize`], with the vendor's Chat-origin environment variable read
+/// once by the caller instead of deep inside the classification. Tests pass
+/// it: mutating the environment is unsound while another test thread reads
+/// it, and this file's tests run beside every other test in the binary.
+fn normalize_with(
+    harness: &Harness,
+    json: &str,
+    origin_is_chat: bool,
+) -> Result<Normalized, HookError> {
     let payload: Payload = serde_json::from_str(json).map_err(|err| HookError(err.to_string()))?;
 
-    let key = chat_key(harness, &payload);
+    let key = chat_key(harness, &payload, origin_is_chat);
     let vendor_turn_id = turn_id_belongs_to_this_conversation(&payload)
         .then(|| payload.prompt_id.clone().map(VendorTurnId::new))
         .flatten();
@@ -320,8 +332,8 @@ pub fn normalize(harness: &Harness, json: &str) -> Result<Normalized, HookError>
 
 /// Chat-only windows keep the Chat conversation uuid. Opening Code with
 /// that id, or minting a new Code session, is the identity break.
-fn chat_key(harness: &Harness, payload: &Payload) -> SessionKey {
-    if let Some(session) = chat_session(payload) {
+fn chat_key(harness: &Harness, payload: &Payload, origin_is_chat: bool) -> SessionKey {
+    if let Some(session) = chat_session(payload, origin_is_chat) {
         return SessionKey::new(Harness::new(Harness::CLAUDE_CHAT), session);
     }
     SessionKey::new(harness.clone(), payload.session_id.clone())
@@ -333,8 +345,8 @@ fn chat_key(harness: &Harness, payload: &Payload) -> SessionKey {
 /// The Code binary accepts `CLAUDE_CODE_SESSION_ORIGIN=claude_ai_chat`
 /// on the hook child. Payload `surface` / `session_type` / `session_origin`
 /// are the stdin spellings of the same fact.
-fn chat_session(payload: &Payload) -> Option<String> {
-    let marked = is_chat_surface(payload) || chat_prefixed(&payload.session_id) || origin_is_chat();
+fn chat_session(payload: &Payload, origin_is_chat: bool) -> Option<String> {
+    let marked = is_chat_surface(payload) || chat_prefixed(&payload.session_id) || origin_is_chat;
     if !marked {
         return None;
     }
@@ -347,7 +359,7 @@ fn chat_session(payload: &Payload) -> Option<String> {
         .or_else(|| {
             // Origin-only (env or stdin field) without a Chat uuid is
             // Continue-in-Code: a new Code session, not the Chat window.
-            if origin_only(payload) {
+            if origin_only(payload, origin_is_chat) {
                 None
             } else {
                 Some(payload.session_id.clone())
@@ -361,8 +373,8 @@ fn is_chat_surface(payload: &Payload) -> bool {
         || payload.session_origin.as_deref() == Some("claude_ai_chat")
 }
 
-fn origin_only(payload: &Payload) -> bool {
-    (origin_is_chat() || payload.session_origin.as_deref() == Some("claude_ai_chat"))
+fn origin_only(payload: &Payload, origin_is_chat: bool) -> bool {
+    (origin_is_chat || payload.session_origin.as_deref() == Some("claude_ai_chat"))
         && payload.surface.as_deref() != Some("chat")
         && payload.session_type.as_deref() != Some("chat")
         && !chat_prefixed(&payload.session_id)
@@ -370,7 +382,12 @@ fn origin_only(payload: &Payload) -> bool {
 
 /// Vendor-set on the hook child when Desktop starts Code from Chat.
 pub fn origin_is_chat() -> bool {
-    std::env::var("CLAUDE_CODE_SESSION_ORIGIN").as_deref() == Ok("claude_ai_chat")
+    origin_value_is_chat(std::env::var("CLAUDE_CODE_SESSION_ORIGIN").ok().as_deref())
+}
+
+/// The predicate, apart from where the value came from.
+fn origin_value_is_chat(value: Option<&str>) -> bool {
+    value == Some("claude_ai_chat")
 }
 
 fn chat_prefixed(id: &str) -> bool {
@@ -1280,35 +1297,38 @@ mod tests {
     }
 
     #[test]
-    fn origin_is_chat_reads_the_vendor_env() {
-        use std::sync::Mutex;
-        static ENV: Mutex<()> = Mutex::new(());
-        let _guard = ENV.lock().unwrap_or_else(|e| e.into_inner());
-        unsafe {
-            std::env::remove_var("CLAUDE_CODE_SESSION_ORIGIN");
-        }
-        assert!(!super::origin_is_chat());
-        unsafe {
-            std::env::set_var("CLAUDE_CODE_SESSION_ORIGIN", "claude_ai_chat");
-        }
-        let yes = super::origin_is_chat();
-        let Normalized::Event { key, .. } = normalize(
+    fn a_chat_origin_alone_does_not_take_the_session_away_from_code() {
+        // Continue-in-Code: Desktop starts the Code binary from a Chat window
+        // and marks the hook child with `CLAUDE_CODE_SESSION_ORIGIN`. That is
+        // a new Code session, not the Chat conversation, so the origin alone
+        // must not reclassify it. The environment is read once at the edge
+        // and passed in — setting it here would be unsound while every other
+        // test in this binary runs beside it, and one such test spawned a
+        // real vendor app-server that held the suite for forty minutes.
+        let Normalized::Event { key, .. } = normalize_with(
             &Harness::new(Harness::CLAUDE_CODE),
             r#"{
                 "session_id":"code-session-we-must-not-keep",
                 "hook_event_name":"UserPromptSubmit",
                 "prompt":"continue in code"
             }"#,
+            true,
         )
         .expect("ok") else {
             panic!("event");
         };
-        unsafe {
-            std::env::remove_var("CLAUDE_CODE_SESSION_ORIGIN");
-        }
-        assert!(yes);
+
         assert_eq!(key.harness.as_str(), Harness::CLAUDE_CODE);
         assert_eq!(key.vendor_session_id, "code-session-we-must-not-keep");
+    }
+
+    #[test]
+    fn the_vendor_env_is_what_origin_is_chat_reads() {
+        // The one fact the environment still decides, kept honest without
+        // mutating it: only the vendor's exact spelling counts.
+        assert!(origin_value_is_chat(Some("claude_ai_chat")));
+        assert!(!origin_value_is_chat(Some("claude_ai")));
+        assert!(!origin_value_is_chat(None));
     }
 
     #[test]

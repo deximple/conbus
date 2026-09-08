@@ -187,6 +187,7 @@ fn summarise(record: &Record) -> String {
             hop,
             reason,
             code_freshness,
+            ..
         } => {
             let code = code_freshness
                 .as_deref()
@@ -1114,6 +1115,7 @@ pub fn doctor(paths: &Paths) -> io::Result<()> {
 
     let meter = conbus_core::meter::Meter::fold(&scan.records);
     println!("{}", meter.describe());
+    println!("{}", meter.describe_provenance());
     println!("{}", meter.describe_cost());
     println!("{}", meter.describe_turns());
     println!("verdict   conbus verdict — 4-week dogfood score; open window is not a kill");
@@ -1209,6 +1211,7 @@ pub fn status(paths: &Paths) -> io::Result<()> {
         crate::quota::describe_claude(paths, now)
     );
     println!("{}", meter.describe());
+    println!("{}", meter.describe_provenance());
     println!("{}", meter.describe_cost());
     let hops = hop_history(&scan.records, 8);
     if hops.is_empty() {
@@ -1923,12 +1926,13 @@ mod tests {
 
     #[test]
     fn status_hop_history_matches_the_meter() {
-        use conbus_core::event::Hop;
+        use conbus_core::event::{Hop, HopProvenance};
         let routed = record(Event::Routed {
             next: Harness::CODEX.into(),
             hop: Hop::Displaced,
             reason: "rate_limit".into(),
             code_freshness: None,
+            provenance: Some(HopProvenance::VendorSignal),
         });
         let continued = record(Event::Continued {
             predecessor: routed.bus_id,
