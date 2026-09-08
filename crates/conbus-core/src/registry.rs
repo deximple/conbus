@@ -992,6 +992,7 @@ mod tests {
                 hop: crate::event::Hop::HandedOff,
                 reason: "directed".into(),
                 code_freshness: None,
+                provenance: None,
             });
             routed.workspace = Some("/repo".into());
             registry.observe(who, routed);
@@ -1026,6 +1027,7 @@ mod tests {
                 hop: crate::event::Hop::HandedOff,
                 reason: "directed".into(),
                 code_freshness: None,
+                provenance: None,
             });
             routed.workspace = Some("/repo".into());
             registry.observe(&claude, routed);
@@ -1056,6 +1058,7 @@ mod tests {
             hop: crate::event::Hop::HandedOff,
             reason: "directed".into(),
             code_freshness: None,
+            provenance: None,
         });
         routed.workspace = Some("/repo".into());
         registry.observe(&claude, routed);
@@ -1098,6 +1101,7 @@ mod tests {
                 hop: crate::event::Hop::HandedOff,
                 reason: "directed".into(),
                 code_freshness: None,
+                provenance: None,
             },
         );
         routed.source.workspace = Some("/repo".into());

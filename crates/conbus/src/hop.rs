@@ -12,7 +12,7 @@ use std::os::unix::net::UnixStream;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use conbus_core::attach;
-use conbus_core::event::{Event, Harness, Hop, TurnState};
+use conbus_core::event::{Event, Harness, Hop, HopProvenance, TurnState};
 use conbus_core::ids::BusId;
 use conbus_core::pack::Chapter;
 use conbus_core::paths::Paths;
@@ -59,9 +59,12 @@ pub fn run(paths: &Paths, from: Option<String>, to: Option<String>, apply: bool)
                 &scan.records,
                 from.as_deref(),
                 &current,
-                next,
-                *hop,
-                reason,
+                &Chosen {
+                    to: next,
+                    hop: *hop,
+                    reason,
+                    provenance: provenance_of(to.is_some()),
+                },
             )?;
         } else {
             println!(
@@ -143,6 +146,7 @@ fn demo_records() -> Vec<Record> {
                 hop: Hop::Displaced,
                 reason: "rate_limit".into(),
                 code_freshness: None,
+                provenance: Some(HopProvenance::VendorSignal),
             },
         ),
         rec(
@@ -304,15 +308,27 @@ fn leg(paths: &Paths, harness: &Harness, last_turn: Option<TurnState>, now: i64)
     }
 }
 
+/// One decision, as the log will record it: where, why, and who decided.
+struct Chosen<'a> {
+    to: &'a Harness,
+    hop: Hop,
+    reason: &'a str,
+    provenance: HopProvenance,
+}
+
 fn apply_hop(
     paths: &Paths,
     records: &[Record],
     from: Option<&str>,
     current: &Leg,
-    to: &Harness,
-    hop: Hop,
-    reason: &str,
+    chosen: &Chosen<'_>,
 ) -> io::Result<()> {
+    let Chosen {
+        to,
+        hop,
+        reason,
+        provenance,
+    } = *chosen;
     let focus = predecessor(records, from, current)?;
     let code_freshness = Some(crate::code::probe(focus.workspace.as_deref()).line());
     if matches!(lease_of(records, focus.bus_id), Lease::Held(_)) {
@@ -335,7 +351,7 @@ fn apply_hop(
     // destination then failed to open, which the log can say and a person
     // can read.
     if !routed_to(records, focus.bus_id, to) {
-        record_hop(paths, &focus, to, hop, reason, code_freshness)?;
+        record_hop(paths, &focus, to, hop, reason, code_freshness, provenance)?;
         println!("recorded  routed {kind}");
     }
 
@@ -585,6 +601,7 @@ fn lease_only(paths: &Paths, focus: &Focus, holder: &str) -> io::Result<()> {
             workspace: focus.workspace.clone(),
             entrypoint: None,
             brief: false,
+            provenance: None,
             event: Event::Leased {
                 holder: holder.into(),
             },
@@ -610,6 +627,28 @@ fn lease_only(paths: &Paths, focus: &Focus, holder: &str) -> io::Result<()> {
 /// belongs to. When it failed the log kept a `routed` with no lease, and the
 /// next `hop --apply` opened a second thread at the vendor. Both warms write
 /// their own lease where they open it, checked; this writes the decision.
+/// What a run declares about itself, through `CONBUS_PROVENANCE`.
+///
+/// Any non-empty value counts as a declaration: an unrecognised marker is
+/// still a marker, and the conservative direction is out of the organic
+/// count. A probe that provokes a real vendor 429 is still a probe, so this
+/// wins over the signal that caused the hop.
+pub fn declared_synthetic() -> bool {
+    std::env::var_os("CONBUS_PROVENANCE").is_some_and(|value| !value.is_empty())
+}
+
+/// Who decided this hop. `--to` on the command line, or a chat order, is the
+/// operator's decision and not the product's.
+fn provenance_of(directed: bool) -> HopProvenance {
+    if declared_synthetic() {
+        HopProvenance::DeclaredSynthetic
+    } else if directed {
+        HopProvenance::Directed
+    } else {
+        HopProvenance::VendorSignal
+    }
+}
+
 fn record_hop(
     paths: &Paths,
     focus: &Focus,
@@ -617,12 +656,14 @@ fn record_hop(
     hop: Hop,
     reason: &str,
     code_freshness: Option<String>,
+    provenance: HopProvenance,
 ) -> io::Result<()> {
     let event = Event::Routed {
         next: to.as_str().to_string(),
         hop,
         reason: reason.to_string(),
         code_freshness,
+        provenance: Some(provenance),
     };
     let Some(session) = focus.vendor_session_id.clone() else {
         return Err(io::Error::other(
@@ -640,6 +681,7 @@ fn record_hop(
         workspace: focus.workspace.clone(),
         entrypoint: None,
         brief: false,
+        provenance: None,
         event,
     };
     match submit(paths, &request) {
@@ -777,6 +819,7 @@ mod tests {
                 hop: Hop::Displaced,
                 reason: "rate_limit".into(),
                 code_freshness: None,
+                provenance: None,
             },
         };
         assert!(routed_to(&[routed], bus_id, &to));
@@ -1029,6 +1072,7 @@ mod tests {
             Hop::Displaced,
             "rate_limit",
             None,
+            HopProvenance::VendorSignal,
         )
         .expect("record");
 
@@ -1037,5 +1081,14 @@ mod tests {
             vec!["routed".to_string()],
             "the decision, and only the decision"
         );
+    }
+
+    #[test]
+    fn a_hop_a_person_typed_is_not_the_router_deciding() {
+        // `--to` on the command line, or a chat order, is the operator's
+        // decision. Counting it as the product's is how eleven staged hops
+        // read as "routing 4 (3.35/week)" against a kill criterion of three.
+        assert_eq!(provenance_of(true), HopProvenance::Directed);
+        assert_eq!(provenance_of(false), HopProvenance::VendorSignal);
     }
 }

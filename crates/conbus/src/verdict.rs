@@ -30,6 +30,14 @@ pub struct Verdict {
     pub failover_per_week: f64,
     pub reasks_in_3: u64,
     pub injected_units: u64,
+    /// Hops that happened and are not evidence about the router: an operator
+    /// typed them, a run declared itself staged, or they predate the field
+    /// that says which. Printed, never counted.
+    pub excluded_hops: u64,
+    pub directed_hops: u64,
+    pub synthetic_hops: u64,
+    pub unattributed_hops: u64,
+    pub duplicate_hops: u64,
 }
 
 impl Verdict {
@@ -57,6 +65,11 @@ impl Verdict {
             failover_per_week: meter.failover_hops as f64 / weeks,
             reasks_in_3: reasks_within_three(&live),
             injected_units: meter.injected_units,
+            excluded_hops: meter.directed_hops + meter.synthetic_hops + meter.unattributed_hops,
+            directed_hops: meter.directed_hops,
+            synthetic_hops: meter.synthetic_hops,
+            unattributed_hops: meter.unattributed_hops,
+            duplicate_hops: meter.duplicate_hops,
         }
     }
 }
@@ -105,8 +118,12 @@ fn print_verdict(v: &Verdict) {
         v.records
     );
     println!(
-        "hops      routing {} ({:.2}/week) · failover {} ({:.2}/week)",
+        "hops      routing {} ({:.2}/week) · failover {} ({:.2}/week) [organic only]",
         v.routing_hops, v.routing_per_week, v.failover_hops, v.failover_per_week
+    );
+    println!(
+        "excluded  directed {} · declared synthetic {} · unattributed {} · duplicate {}",
+        v.directed_hops, v.synthetic_hops, v.unattributed_hops, v.duplicate_hops
     );
     println!(
         "reask     {} human prompt(s) in the 3 turns after a continued edge",
@@ -119,6 +136,18 @@ fn print_verdict(v: &Verdict) {
     );
     if !v.window_closed {
         println!("verdict   window still open — do not apply the kill criteria");
+        return;
+    }
+    if v.routing_hops + v.failover_hops == 0 {
+        // The kill criteria ask whether the router earns its place. Hops an
+        // operator typed and hops a probe staged cannot answer that in
+        // either direction, so a window that produced none of its own is
+        // inconclusive rather than a kill.
+        println!(
+            "verdict   inconclusive — 28 days closed with no organic hop; the router never \
+             fired on its own. {} manufactured hop(s) are not evidence either way.",
+            v.excluded_hops
+        );
         return;
     }
     if v.routing_per_week < ROUTING_PER_WEEK {
@@ -138,7 +167,7 @@ fn print_verdict(v: &Verdict) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use conbus_core::event::{Author, Body, Event, Harness, Hop, Source};
+    use conbus_core::event::{Author, Body, Event, Harness, Hop, HopProvenance, Source};
     use conbus_core::ids::BusId;
     use conbus_core::record::{Record, SCHEMA_VERSION};
 
@@ -171,8 +200,9 @@ mod tests {
             Event::Routed {
                 next: "codex".into(),
                 hop: Hop::HandedOff,
-                reason: "directed".into(),
+                reason: "80% used, reset in 180m".into(),
                 code_freshness: None,
+                provenance: Some(HopProvenance::VendorSignal),
             },
         )];
         let now = "2026-09-07T00:00:00.000Z".parse().expect("now");
@@ -190,6 +220,7 @@ mod tests {
                 hop: Hop::Displaced,
                 reason: "rate_limit".into(),
                 code_freshness: None,
+                provenance: Some(HopProvenance::VendorSignal),
             },
         )];
         let now = "2026-08-29T00:00:00.000Z".parse().expect("now");
@@ -229,8 +260,9 @@ mod tests {
             Event::Routed {
                 next: "codex".into(),
                 hop: Hop::HandedOff,
-                reason: "directed".into(),
+                reason: "80% used, reset in 180m".into(),
                 code_freshness: None,
+                provenance: Some(HopProvenance::VendorSignal),
             },
         );
         let now = "2026-09-07T00:00:00.000Z".parse().expect("now");
@@ -238,5 +270,31 @@ mod tests {
         assert!(!v.window_closed);
         assert_eq!(v.routing_hops, 1);
         assert!(v.elapsed_secs < WINDOW_SECS);
+    }
+
+    #[test]
+    fn a_closed_window_with_no_organic_hop_is_inconclusive_not_a_kill() {
+        // Every hop on the live machine on 2026-09-08 was typed by an
+        // operator or staged by a probe, and the dashboard read them as the
+        // router working. A window that produced none of its own cannot
+        // answer the question the kill criteria ask.
+        let records = [rec(
+            "2026-08-01T00:00:00.000Z",
+            Event::Routed {
+                next: "codex".into(),
+                hop: Hop::HandedOff,
+                reason: "directed".into(),
+                code_freshness: None,
+                provenance: Some(HopProvenance::Directed),
+            },
+        )];
+        let now = "2026-08-29T00:00:00.000Z".parse().expect("now");
+
+        let v = Verdict::score(&records, now);
+
+        assert!(v.window_closed);
+        assert_eq!(v.routing_hops, 0, "a typed hop is not the router deciding");
+        assert_eq!(v.directed_hops, 1);
+        assert_eq!(v.excluded_hops, 1, "counted, and named, never hidden");
     }
 }

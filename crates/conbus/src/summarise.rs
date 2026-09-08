@@ -153,6 +153,7 @@ fn persist(
         workspace: last.source.workspace.clone(),
         entrypoint: None,
         brief: false,
+        provenance: None,
         event: Event::Summarised {
             backend: backend.into(),
             covered_turns,

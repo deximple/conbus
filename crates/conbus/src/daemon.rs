@@ -14,7 +14,7 @@ use conbus_core::clock::Timestamp;
 use conbus_core::continuation::{
     Asking, Decision, Stopped, decide, machine_authored, opening_units, stopped, unattended,
 };
-use conbus_core::event::{Event, Harness, Hop, Source, TurnState};
+use conbus_core::event::{Event, Harness, Hop, HopProvenance, Source, TurnState};
 use conbus_core::identity;
 use conbus_core::ids::BusId;
 use conbus_core::pack::{self, Chapter};
@@ -217,6 +217,7 @@ impl Daemon {
         }
 
         let brief = request.brief;
+        let declared = request.provenance;
         let key = SessionKey::new(request.harness.clone(), request.vendor_session_id);
         let observed = Observed {
             vendor_turn_id: request.vendor_turn_id,
@@ -344,7 +345,7 @@ impl Daemon {
                         }
                         self.maybe_continue(bus_id, &source, &mut written, &mut seqs);
                         self.remember(&written);
-                        self.follow_through(bus_id, &source, &mut written, &mut seqs);
+                        self.follow_through(bus_id, &source, &mut written, &mut seqs, declared);
                         self.finish_write(
                             Response::Briefed {
                                 bus_id,
@@ -359,7 +360,7 @@ impl Daemon {
                     }
                     None => {
                         self.remember(&written);
-                        self.follow_through(bus_id, &source, &mut written, &mut seqs);
+                        self.follow_through(bus_id, &source, &mut written, &mut seqs, declared);
                         self.finish_write(
                             Response::Recorded { bus_id, seqs },
                             bus_id,
@@ -388,8 +389,9 @@ impl Daemon {
         source: &Source,
         written: &mut Vec<Record>,
         seqs: &mut Vec<u64>,
+        declared: Option<HopProvenance>,
     ) {
-        self.maybe_route(source, written, seqs);
+        self.maybe_route(source, written, seqs, declared);
         self.maybe_continue_leg(bus_id, source, written, seqs);
         self.maybe_summarise(bus_id, source, written, seqs);
     }
@@ -435,7 +437,13 @@ impl Daemon {
         );
     }
 
-    fn maybe_route(&mut self, source: &Source, written: &mut Vec<Record>, seqs: &mut Vec<u64>) {
+    fn maybe_route(
+        &mut self,
+        source: &Source,
+        written: &mut Vec<Record>,
+        seqs: &mut Vec<u64>,
+        declared: Option<HopProvenance>,
+    ) {
         let Some(reason) = written.iter().find_map(|record| match &record.event {
             Event::TurnEnded {
                 state: TurnState::InterruptedQuota { reason },
@@ -460,6 +468,12 @@ impl Daemon {
                 hop: Hop::Displaced,
                 reason,
                 code_freshness: None,
+                // The daemon writes this one because a hook forwarded a
+                // vendor payload saying the turn hit a limit — the only
+                // path that is the product deciding for itself. A run that
+                // declared itself staged still overrides it, which the hook
+                // carries on the wire.
+                provenance: Some(declared.unwrap_or(HopProvenance::VendorSignal)),
             },
             written,
             seqs,
@@ -1225,6 +1239,7 @@ mod tests {
             workspace: Some("/repo".into()),
             entrypoint: None,
             brief: true,
+            provenance: None,
             event,
         }
     }
@@ -1506,6 +1521,7 @@ mod tests {
             hop: Hop::HandedOff,
             reason: "directed".into(),
             code_freshness: None,
+            provenance: None,
         }));
         daemon.handle(request(Event::Leased {
             holder: "warm:thr_bus".into(),
