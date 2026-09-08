@@ -10,10 +10,14 @@ mod harden;
 mod hook;
 mod hop;
 mod install;
+mod intent;
+mod landing;
 mod quota;
 mod report;
 mod runner;
+mod summarise;
 mod takeover;
+mod verdict;
 mod warm;
 mod window;
 mod wire;
@@ -107,7 +111,26 @@ fn main() -> ExitCode {
         Command::Doctor => run(report::doctor),
         Command::Status => run(report::status),
         Command::Quota => run(quota::run),
-        Command::Hop { from, to, apply } => run(|paths| hop::run(paths, from, to, apply)),
+        Command::Hop {
+            from,
+            to,
+            apply,
+            demo,
+        } => {
+            if demo {
+                match hop::demo() {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(err) => {
+                        eprintln!("conbus: {err}");
+                        ExitCode::FAILURE
+                    }
+                }
+            } else {
+                run(|paths| hop::run(paths, from, to, apply))
+            }
+        }
+        Command::Summary { bus_id } => run(|paths| summarise::run(paths, bus_id)),
+        Command::Verdict => run(verdict::run),
         Command::Run { harness } => run(|paths| runner::run(paths, &harness)),
         Command::Arena {
             action,

@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Conbus — conversation bus</title>
+  <meta name="description" content="One conversation keeps its identity while the harness underneath it changes.">
+  <style>
+    :root { color-scheme: dark; }
+    html, body { margin: 0; background: #0e1014; color: #e8e4d9; font: 18px/1.45 "Iowan Old Style", "Palatino Linotype", Palatino, serif; }
+    main { max-width: 36rem; margin: 12vh auto; padding: 0 1.5rem 4rem; }
+    h1 { font-size: 2.4rem; letter-spacing: -0.03em; margin: 0 0 0.4rem; }
+    .domain { color: #8fd0b0; font-family: ui-monospace, Menlo, monospace; font-size: 0.85rem; }
+    p { margin: 1rem 0; }
+    code, pre { font-family: ui-monospace, Menlo, monospace; font-size: 0.86rem; }
+    pre { background: #181b21; padding: 1rem 1.1rem; overflow-x: auto; border-left: 3px solid #8fd0b0; }
+    a { color: #8fd0b0; }
+    .note { color: #9a9588; font-size: 0.95rem; }
+  </style>
+</head>
+<body>
+<main>
+  <p class="domain">conbus.sh</p>
+  <h1>The conversation stays. The harness changes.</h1>
+  <p>Conbus is a local conversation bus for coding agents. Vendor TUIs stay the window. The bus owns the id, the log, and the hop.</p>
+  <p>A limit mid-task is a routing event, not a new chat. The next Claude or Codex leg opens on a bus-owned warm. A chat line that is only an order, or <code>conbus go cursor</code>, is a directed hop. Cursor opens the checkout with official <code>cursor -n</code>.</p>
+  <pre>git clone https://github.com/deximple/conbus
+cargo build --release -p conbus
+./target/release/conbus install --apply
+conbus doctor
+conbus hop --demo
+conbus run claude_code</pre>
+  <p>License: Apache-2.0. The bus never reads vendor auth tokens. Codex trust is a gesture inside Codex; we do not write that hash.</p>
+  <p class="note">Domain decision: <strong>conbus.sh</strong> is the public name. Registration is an operator action; this page is the landing that ships with the repo. Hook contract: <a href="../rfd/0001-hook-contract.md">RFD 0001</a>. First-time path: <a href="../beginner-manual.md">beginner manual</a>.</p>
+</main>
+</body>
+</html>

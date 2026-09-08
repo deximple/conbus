@@ -45,7 +45,15 @@ pub enum Command {
         from: Option<String>,
         to: Option<String>,
         apply: bool,
+        /// Print the recorded failover. Never opens a vendor window.
+        demo: bool,
     },
+    /// Opposite-leg digest. Never the protected harness.
+    Summary {
+        bus_id: Option<String>,
+    },
+    /// Four-week dogfood score from the live log.
+    Verdict,
     /// Same TTY: start a vendor, and exec the next one when a hop lands.
     Run {
         harness: String,
@@ -142,9 +150,20 @@ where
         "quota" => Command::Quota,
         "hop" => Command::Hop {
             from: flag_value(&args, "--from"),
-            to: flag_value(&args, "--to"),
+            to: flag_value(&args, "--to").or_else(|| positional_dest(&args)),
             apply: args.iter().any(|a| a == "--apply"),
+            demo: args.iter().any(|a| a == "--demo"),
         },
+        "go" => Command::Hop {
+            from: flag_value(&args, "--from"),
+            to: flag_value(&args, "--to").or_else(|| positional_dest(&args)),
+            apply: true,
+            demo: false,
+        },
+        "summary" => Command::Summary {
+            bus_id: flag_value(&args, "--bus-id"),
+        },
+        "verdict" => Command::Verdict,
         "run" => Command::Run {
             harness: args.get(1).cloned().unwrap_or_else(|| "claude_code".into()),
         },
@@ -168,6 +187,20 @@ where
 fn flag_value(args: &[String], flag: &str) -> Option<String> {
     let position = args.iter().position(|a| a == flag)?;
     args.get(position + 1).cloned()
+}
+
+/// `conbus hop cursor` and `conbus go opencode` — a catalog slug, not a flag.
+fn positional_dest(args: &[String]) -> Option<String> {
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--from" | "--to" => i += 2,
+            "--apply" | "--demo" => i += 1,
+            flag if flag.starts_with('-') => i += 1,
+            name => return Some(name.to_string()),
+        }
+    }
+    None
 }
 
 pub const USAGE: &str = "\
@@ -194,10 +227,15 @@ USAGE:
     conbus doctor                 report what is and is not wired up
     conbus status                 routing rules, quota, hop history, cost
     conbus quota                  Codex probe + Claude StatusLine cache + catalog
-    conbus hop [--from ID] [--to HARNESS] [--apply]
-                                  decide the next harness; --to names any
-                                  catalog leg; --apply records it and opens
-                                  dual-warm on Claude/Codex (not a model turn)
+    conbus hop [HARNESS] [--from ID] [--to HARNESS] [--apply] [--demo]
+                                  decide the next harness; a positional name
+                                  is --to; --apply records it and opens the
+                                  destination (dual-warm on Claude/Codex;
+                                  Cursor opens the checkout). A chat line
+                                  that is only an order does the same.
+    conbus go [HARNESS]           hop --apply for the current conversation
+    conbus summary --bus-id ID    opposite-leg digest; never the protected leg
+    conbus verdict                4-week dogfood score; open window is not a kill
     conbus run [claude_code|codex|cursor|agy|opencode|grok]
                                   same TTY: start a vendor; hop execs the next
     conbus arena fact --workspace DIR --claim TEXT --anchor PATH
@@ -284,13 +322,34 @@ mod tests {
     }
 
     #[test]
+    fn hop_demo_and_summary_and_verdict_are_commands() {
+        assert_eq!(
+            parse(["hop", "--demo"], None),
+            Command::Hop {
+                from: None,
+                to: None,
+                apply: false,
+                demo: true
+            }
+        );
+        assert_eq!(
+            parse(["summary", "--bus-id", "01a0"], None),
+            Command::Summary {
+                bus_id: Some("01a0".into())
+            }
+        );
+        assert_eq!(parse(["verdict"], None), Command::Verdict);
+    }
+
+    #[test]
     fn hop_is_a_command() {
         assert_eq!(
             parse(["hop"], None),
             Command::Hop {
                 from: None,
                 to: None,
-                apply: false
+                apply: false,
+                demo: false
             }
         );
         assert_eq!(
@@ -301,7 +360,26 @@ mod tests {
             Command::Hop {
                 from: Some("01996b1e".into()),
                 to: Some("codex".into()),
-                apply: true
+                apply: true,
+                demo: false
+            }
+        );
+        assert_eq!(
+            parse(["hop", "cursor"], None),
+            Command::Hop {
+                from: None,
+                to: Some("cursor".into()),
+                apply: false,
+                demo: false
+            }
+        );
+        assert_eq!(
+            parse(["go", "opencode"], None),
+            Command::Hop {
+                from: None,
+                to: Some("opencode".into()),
+                apply: true,
+                demo: false
             }
         );
     }

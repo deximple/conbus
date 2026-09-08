@@ -605,6 +605,14 @@ impl Body {
         Body::Kept { text: text.into() }
     }
 
+    /// Text we can still read. Sealed and elided bodies have none.
+    pub fn as_text(&self) -> Option<&str> {
+        match self {
+            Body::Kept { text } | Body::Clipped { text, .. } => Some(text),
+            Body::Elided { .. } | Body::Sealed { .. } => None,
+        }
+    }
+
     /// Bytes the body occupied before any clipping or elision.
     pub fn original_bytes(&self) -> usize {
         match self {

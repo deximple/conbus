@@ -285,7 +285,6 @@ pub fn run(harness: &str, stdin: &mut impl Read) -> Result<Reply, Dropped> {
     }
 }
 
-
 fn connect(socket: &std::path::Path) -> Result<UnixStream, Dropped> {
     let stream = UnixStream::connect(socket)
         .map_err(|err| format!("no daemon on {}: {err}", socket.display()))?;
@@ -463,13 +462,11 @@ mod tests {
 
     #[test]
     fn cursor_briefing_uses_additional_context_not_claude_output() {
-        let brief = briefing_reply(
-            Harness::CURSOR,
-            "sessionStart",
-            "the pack",
-            "one line",
+        let brief = briefing_reply(Harness::CURSOR, "sessionStart", "the pack", "one line");
+        assert!(
+            brief.contains("\"additional_context\":\"the pack\""),
+            "{brief}"
         );
-        assert!(brief.contains("\"additional_context\":\"the pack\""), "{brief}");
         assert!(!brief.contains("hookSpecificOutput"), "{brief}");
         assert!(!brief.contains("additionalContext"), "{brief}");
         assert!(brief.contains("\"continue\":true"), "{brief}");

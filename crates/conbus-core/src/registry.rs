@@ -94,6 +94,9 @@ pub struct Registry {
     /// test red.
     candidates: HashMap<SessionKey, (u64, Observed)>,
     remembered: u64,
+    /// A hop to a catalog leg that cannot keep a warm session. The next
+    /// unbound prompt in that checkout claims this conversation.
+    pending: HashMap<(String, String), BusId>,
 }
 
 impl Registry {
@@ -140,6 +143,7 @@ impl Registry {
             }
             registry.bound.insert(key, record.bus_id);
             registry.alias_warm_leg(record.bus_id, &record.event);
+            registry.note_route_record(record);
         }
         registry
     }
@@ -163,6 +167,66 @@ impl Registry {
             let alias = SessionKey::new(Harness::new(Harness::CLAUDE_CODE), session);
             self.bound.entry(alias).or_insert(bus_id);
         }
+    }
+
+    fn needs_seat(harness: &str) -> bool {
+        !matches!(harness, Harness::CLAUDE_CODE | Harness::CODEX)
+    }
+
+    fn normalize_workspace(workspace: &str) -> Option<String> {
+        let trimmed = workspace.trim().trim_end_matches('/');
+        if trimmed.is_empty() || trimmed == "/" {
+            return None;
+        }
+        Some(trimmed.to_string())
+    }
+
+    fn clear_pending_bus(&mut self, bus_id: BusId) {
+        self.pending.retain(|_, id| *id != bus_id);
+    }
+
+    fn note_route(&mut self, bus_id: BusId, observed: &Observed) {
+        let Event::Routed { next, .. } = &observed.event else {
+            return;
+        };
+        self.clear_pending_bus(bus_id);
+        if !Self::needs_seat(next) {
+            return;
+        }
+        let Some(workspace) = observed
+            .workspace
+            .as_deref()
+            .and_then(Self::normalize_workspace)
+        else {
+            return;
+        };
+        self.pending.insert((next.clone(), workspace), bus_id);
+    }
+
+    fn note_route_record(&mut self, record: &Record) {
+        self.note_route(
+            record.bus_id,
+            &Observed {
+                vendor_turn_id: record.vendor_turn_id.clone(),
+                vendor_agent_id: record.vendor_agent_id.clone(),
+                workspace: record.source.workspace.clone(),
+                event: record.event.clone(),
+            },
+        );
+        if matches!(
+            record.event,
+            Event::TurnStarted { .. } | Event::TurnEnded { .. }
+        ) {
+            self.pending.retain(|(harness, _), id| {
+                !(*id == record.bus_id && harness == record.source.harness.as_str())
+            });
+        }
+    }
+
+    fn take_seat(&mut self, harness: &Harness, workspace: Option<&str>) -> Option<BusId> {
+        let workspace = Self::normalize_workspace(workspace?)?;
+        self.pending
+            .remove(&(harness.as_str().to_string(), workspace))
     }
 
     /// The most session starts held at once before the oldest is forgotten.
@@ -202,6 +266,7 @@ impl Registry {
         // compact, and fork.
         if let Some(bus_id) = self.bound.get(key).copied() {
             self.alias_warm_leg(bus_id, &observed.event);
+            self.note_route(bus_id, &observed);
             return Disposition::Write {
                 bus_id,
                 observed: vec![observed],
@@ -221,7 +286,13 @@ impl Registry {
         if !matches!(observed.event, Event::TurnStarted { .. }) && !cursor_turn {
             return Disposition::Orphaned;
         }
-        let bus_id = BusId::mint();
+        // A directed hop to a leg without a bus-owned warm has no vendor
+        // session yet. The next real prompt in that checkout sits on the
+        // conversation that was handed off, instead of minting a twin.
+        let bus_id = match self.take_seat(&key.harness, observed.workspace.as_deref()) {
+            Some(bus_id) => bus_id,
+            None => BusId::mint(),
+        };
         self.bound.insert(key.clone(), bus_id);
         let observed = self
             .candidates
@@ -773,5 +844,80 @@ mod tests {
             claude, codex_id,
             "vendor session ids are only unique per vendor"
         );
+    }
+
+    #[test]
+    fn a_directed_hop_seat_is_claimed_by_the_next_prompt_in_that_checkout() {
+        let mut registry = Registry::new();
+        let claude = key();
+        let Disposition::Write { bus_id, .. } =
+            registry.observe(&claude, Observed::bare(prompt("work")))
+        else {
+            panic!("mint");
+        };
+
+        let mut routed = Observed::bare(Event::Routed {
+            next: Harness::CURSOR.into(),
+            hop: crate::event::Hop::HandedOff,
+            reason: "directed".into(),
+            code_freshness: None,
+        });
+        routed.workspace = Some("/repo".into());
+        registry.observe(&claude, routed);
+
+        let cursor = SessionKey::new(Harness::new(Harness::CURSOR), "new-composer");
+        let mut first = Observed::bare(prompt("continue"));
+        first.workspace = Some("/repo/".into());
+        let Disposition::Write {
+            bus_id: claimed, ..
+        } = registry.observe(&cursor, first)
+        else {
+            panic!("claim");
+        };
+        assert_eq!(
+            claimed, bus_id,
+            "the new Cursor session is this conversation"
+        );
+
+        let other = SessionKey::new(Harness::new(Harness::CURSOR), "other-folder");
+        let mut elsewhere = Observed::bare(prompt("unrelated"));
+        elsewhere.workspace = Some("/else".into());
+        let Disposition::Write { bus_id: minted, .. } = registry.observe(&other, elsewhere) else {
+            panic!("mint");
+        };
+        assert_ne!(
+            minted, bus_id,
+            "a different checkout is a different conversation"
+        );
+    }
+
+    #[test]
+    fn a_restored_hop_seat_survives_a_daemon_restart() {
+        let bus_id = BusId::mint();
+        let mut routed = logged(
+            1,
+            bus_id,
+            None,
+            Event::Routed {
+                next: Harness::CURSOR.into(),
+                hop: crate::event::Hop::HandedOff,
+                reason: "directed".into(),
+                code_freshness: None,
+            },
+        );
+        routed.source.workspace = Some("/repo".into());
+        let registry = Registry::restore(std::slice::from_ref(&routed));
+
+        let cursor = SessionKey::new(Harness::new(Harness::CURSOR), "after-restart");
+        let mut first = Observed::bare(prompt("continue"));
+        first.workspace = Some("/repo".into());
+        let mut registry = registry;
+        let Disposition::Write {
+            bus_id: claimed, ..
+        } = registry.observe(&cursor, first)
+        else {
+            panic!("claim");
+        };
+        assert_eq!(claimed, bus_id);
     }
 }
