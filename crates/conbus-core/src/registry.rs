@@ -277,13 +277,23 @@ impl Registry {
             return Disposition::Deferred;
         }
         // Unbound. A prompt proves a session is real enough to mint.
-        // Cursor also mints on a completed turn: its inject channel is
-        // sessionStart, and beforeSubmitPrompt was not registered on the
-        // first installs, so a live Cursor conversation would otherwise
-        // stay orphaned and have no pack to hand the next leg.
-        let cursor_turn = key.harness.as_str() == Harness::CURSOR
-            && matches!(observed.event, Event::TurnEnded { .. });
-        if !matches!(observed.event, Event::TurnStarted { .. }) && !cursor_turn {
+        //
+        // Cursor also mints on work it can be seen doing — a completed turn
+        // or a tool call. Its prompt hook lives in Cursor's own hooks file
+        // while its tool hooks arrive through Claude Code's settings file,
+        // and the two do not always both fire: on 2026-09-08, 42 Cursor
+        // conversations existed only as 4,229 orphaned `preToolUse` /
+        // `postToolUse` drops, present nowhere in the log under any harness,
+        // because no `beforeSubmitPrompt` ever reached the bus for them. A
+        // tool call is proof of a live session in exactly the way a ghost
+        // `SessionStart` is not, which is why this exception is Cursor's
+        // alone and why a session that only *ends* still orphans.
+        let cursor_proof = key.harness.as_str() == Harness::CURSOR
+            && matches!(
+                observed.event,
+                Event::TurnEnded { .. } | Event::ToolRequested { .. } | Event::ToolUse { .. }
+            );
+        if !matches!(observed.event, Event::TurnStarted { .. }) && !cursor_proof {
             return Disposition::Orphaned;
         }
         // A directed hop to a leg without a bus-owned warm has no vendor
@@ -518,6 +528,78 @@ mod tests {
             Disposition::Deferred
         );
         assert_eq!(registry.bus_id(&key()), None, "a ghost must not get an id");
+    }
+
+    #[test]
+    fn a_cursor_tool_call_mints_the_conversation_its_prompt_never_reached() {
+        // Measured 2026-09-08: 4,229 orphan drops since 09-05 carried
+        // `preToolUse` / `postToolUse` for 42 Cursor conversation ids that
+        // appear nowhere in the log, under any harness. Cursor's tool hooks
+        // arrive through Claude Code's settings file; `beforeSubmitPrompt`
+        // and `stop` come from Cursor's own hooks file and never fired for
+        // these — so every one of those conversations was thrown away whole.
+        // A tool call proves a session is real for the same reason a
+        // completed turn does, which this module already accepts.
+        let key = SessionKey::new(Harness::new(Harness::CURSOR), "worker-conv");
+        let mut registry = Registry::new();
+        let requested = Event::ToolRequested {
+            tool: "Read".into(),
+            tool_use_id: None,
+            input: Body::kept("{}"),
+        };
+
+        let Disposition::Write { bus_id, .. } =
+            registry.observe(&key, Observed::bare(requested.clone()))
+        else {
+            panic!("a live Cursor tool call must mint");
+        };
+
+        assert_eq!(registry.bus_id(&key), Some(bus_id));
+        assert_eq!(
+            registry.observe(&key, Observed::bare(requested)),
+            Disposition::Write {
+                bus_id,
+                observed: vec![Observed::bare(Event::ToolRequested {
+                    tool: "Read".into(),
+                    tool_use_id: None,
+                    input: Body::kept("{}"),
+                })],
+            },
+            "the second call joins the conversation the first one minted"
+        );
+    }
+
+    #[test]
+    fn only_cursor_mints_on_a_tool_call() {
+        // The rule is Cursor's alone. Claude Code fires ghost session starts
+        // and a tool call under an unbound Claude session is the ordinary
+        // shape of a daemon restart mid-turn, which must stay an orphan.
+        let mut registry = Registry::new();
+        let requested = Event::ToolRequested {
+            tool: "Read".into(),
+            tool_use_id: None,
+            input: Body::kept("{}"),
+        };
+
+        assert_eq!(
+            registry.observe(&key(), Observed::bare(requested)),
+            Disposition::Orphaned
+        );
+        assert_eq!(registry.bus_id(&key()), None);
+    }
+
+    #[test]
+    fn a_cursor_session_that_only_ends_is_still_an_orphan() {
+        // A `sessionEnd` with nothing before it proves a session existed, not
+        // that a conversation happened. Minting there would put ghosts in the
+        // log, which is what the deferral rule exists to prevent.
+        let key = SessionKey::new(Harness::new(Harness::CURSOR), "closed-empty");
+        let mut registry = Registry::new();
+
+        assert_eq!(
+            registry.observe(&key, Observed::bare(Event::SessionEnded { reason: None })),
+            Disposition::Orphaned
+        );
     }
 
     #[test]
