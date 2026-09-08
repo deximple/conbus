@@ -467,6 +467,16 @@ impl Daemon {
         // each, and left 32 headless Claude sessions leased. The decision
         // stands until a `continued` edge closes it, which is the same state
         // `hop --apply` consults before writing one by hand.
+        // A program's quota stop is not a routing decision. `route::decide_driven`
+        // turns an unattended failover into `Wait` — moving an automation to
+        // another vendor with nobody watching is its own hazard — so the
+        // `hop --apply` this would spawn declines and nothing is applied.
+        // Writing the line anyway put a decision the router refused into the
+        // log, and counted it as organic in the very number the provenance
+        // work exists to make honest.
+        if conbus_core::continuation::unattended(source.entrypoint.as_ref()) {
+            return;
+        }
         let already_going = self
             .chapters
             .get(&bus_id)
@@ -2052,6 +2062,42 @@ mod tests {
         assert!(
             !serving,
             "a peer that hung up is nobody to refuse a bind for"
+        );
+    }
+
+    #[test]
+    fn a_programs_quota_stop_is_not_a_routing_decision() {
+        // `decide_driven` makes an unattended failover `Wait`, so the
+        // `hop --apply` the daemon spawns declines and applies nothing. The
+        // log used to keep the decision anyway, and count it as organic.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = SegmentLog::open(dir.path(), Retention::default()).expect("open");
+        let mut daemon = Daemon::new(log, Registry::new(), HashMap::new());
+        let driven = |event| Request {
+            entrypoint: Some(conbus_core::event::Entrypoint::new(
+                conbus_core::event::Entrypoint::SDK_CLI,
+            )),
+            ..request(event)
+        };
+        daemon.handle(driven(Event::TurnStarted {
+            author: None,
+            prompt: Body::kept("nightly sweep"),
+        }));
+
+        daemon.handle(driven(Event::TurnEnded {
+            state: TurnState::InterruptedQuota {
+                reason: "rate_limit".into(),
+            },
+            assistant_message: None,
+        }));
+
+        let scan = SegmentLog::scan(dir.path()).expect("scan");
+        assert!(
+            !scan
+                .records
+                .iter()
+                .any(|record| matches!(record.event, Event::Routed { .. })),
+            "a program's quota stop must not record a hop nobody will take"
         );
     }
 }
