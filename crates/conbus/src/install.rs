@@ -457,6 +457,103 @@ pub fn apply(plan: &Plan) -> io::Result<Option<PathBuf>> {
     Ok(backup)
 }
 
+/// Where a stranger's hooks and launchd should point. Not the worktree binary.
+pub fn installed_binary(home: &Path) -> PathBuf {
+    home.join(".local").join("bin").join("conbus")
+}
+
+pub fn launch_agent_path(home: &Path) -> PathBuf {
+    home.join("Library")
+        .join("LaunchAgents")
+        .join("sh.conbus.daemon.plist")
+}
+
+/// Atomic place: write beside, then rename. Overwriting the live inode
+/// kills in-flight hooks with exit 137.
+pub fn place_binary(current: &Path, dest: &Path) -> io::Result<bool> {
+    if same_file(current, dest) {
+        return Ok(false);
+    }
+    if dest.is_file() && fs::read(current)? == fs::read(dest)? {
+        return Ok(false);
+    }
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let next = dest.with_file_name("conbus.next");
+    fs::copy(current, &next)?;
+    fs::rename(next, dest)?;
+    Ok(true)
+}
+
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (fs::canonicalize(a), fs::canonicalize(b)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+pub const DAEMON_LABEL: &str = "sh.conbus.daemon";
+
+/// launchd agent that keeps one daemon on the socket.
+pub fn daemon_plist(binary: &Path, log: &Path) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>{DAEMON_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{}</string>
+    <string>daemon</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>{}</string>
+  <key>StandardErrorPath</key><string>{}</string>
+</dict>
+</plist>
+"#,
+        binary.display(),
+        log.display(),
+        log.display()
+    )
+}
+
+/// Write the plist. `load` talks to launchctl; tests leave it false.
+pub fn apply_daemon(home: &Path, binary: &Path, log: &Path, load: bool) -> io::Result<bool> {
+    let path = launch_agent_path(home);
+    let body = daemon_plist(binary, log);
+    let unchanged = fs::read_to_string(&path).is_ok_and(|existing| existing == body);
+    if !unchanged {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&path, body)?;
+    }
+    if load {
+        load_launch_agent(&path)?;
+    }
+    Ok(!unchanged)
+}
+
+fn load_launch_agent(plist: &Path) -> io::Result<()> {
+    let uid = unsafe { libc::getuid() };
+    let domain = format!("gui/{uid}");
+    let target = format!("{domain}/{DAEMON_LABEL}");
+    let kick = std::process::Command::new("launchctl")
+        .args(["kickstart", "-k", &target])
+        .status();
+    if kick.is_ok_and(|s| s.success()) {
+        return Ok(());
+    }
+    let _ = std::process::Command::new("launchctl")
+        .args(["bootstrap", &domain, &plist.display().to_string()])
+        .status();
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -657,6 +754,41 @@ mod tests {
             document["statusLine"]["command"],
             "/opt/conbus hook --statusline"
         );
+    }
+
+    #[test]
+    fn placing_the_binary_writes_beside_then_renames() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let src = home.path().join("built");
+        fs::write(&src, b"conbus-bin").expect("src");
+        let dest = installed_binary(home.path());
+        assert!(place_binary(&src, &dest).expect("place"));
+        assert_eq!(fs::read(&dest).expect("dest"), b"conbus-bin");
+        assert!(!place_binary(&src, &dest).expect("same bytes"));
+    }
+
+    #[test]
+    fn the_launchd_plist_names_the_installed_binary_and_never_async() {
+        let body = daemon_plist(
+            Path::new("/Users/x/.local/bin/conbus"),
+            Path::new("/Users/x/.conbus/daemon.log"),
+        );
+        assert!(body.contains("/Users/x/.local/bin/conbus"));
+        assert!(body.contains("<string>daemon</string>"));
+        assert!(body.contains(DAEMON_LABEL));
+        assert!(body.contains("KeepAlive"));
+        assert!(!body.contains("async"));
+    }
+
+    #[test]
+    fn applying_the_daemon_is_idempotent_without_talking_to_launchctl() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let bin = Path::new("/opt/conbus");
+        let log = home.path().join(".conbus").join("daemon.log");
+        assert!(apply_daemon(home.path(), bin, &log, false).expect("write"));
+        assert!(!apply_daemon(home.path(), bin, &log, false).expect("again"));
+        let written = fs::read_to_string(launch_agent_path(home.path())).expect("plist");
+        assert_eq!(written, daemon_plist(bin, &log));
     }
 }
 

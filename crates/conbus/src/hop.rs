@@ -1,11 +1,11 @@
 //! `conbus hop` — decide the next leg, and record the decision when asked.
 //!
 //! The vendor TUI stays the window. This command does not open a chat UI.
-//! `--apply` writes takeover for `conbus run` and, when the next leg is a
-//! bus-owned warm, opens that vendor's own app (`codex://threads/{id}`,
-//! `claude://code/continue?session={id}`).
-//! A hop opens — or syncs — a bus-owned warm on both legs so neither
-//! direction is a cold start. Those writes are not model turns.
+//! `--apply` writes takeover for `conbus run` and opens the destination:
+//! bus-owned warms (`codex://threads/{id}`, `claude://code/continue?session={id}`),
+//! or Cursor's official `cursor -n <workspace>`.
+//! A hop opens — or syncs — a bus-owned warm on both Claude/Codex legs so
+//! neither direction is a cold start. Those writes are not model turns.
 
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -74,9 +74,98 @@ pub fn run(paths: &Paths, from: Option<String>, to: Option<String>, apply: bool)
                 }
             );
         }
+    } else if apply && let Some(name) = to.as_deref() {
+        resume_here(paths, &scan.records, from.as_deref(), name)?;
     }
     let _ = other;
     Ok(())
+}
+
+/// A recorded failover, not a live `--apply`. Opens no vendor window.
+pub fn demo() -> io::Result<()> {
+    let records = demo_records();
+    let meter = conbus_core::meter::Meter::fold(&records);
+    println!("demo      recorded failover (no vendor window, no --apply)");
+    println!("bus       {}", records[0].bus_id);
+    println!("from      claude_code · StopFailure rate_limit");
+    println!("route     hop to codex · displaced · rate_limit");
+    println!("next      codex");
+    println!(
+        "meter     routing {} · failover {} · edges failover {}",
+        meter.routing_hops, meter.failover_hops, meter.failover_edges
+    );
+    println!("record    conbus hop --from {} --apply", records[0].bus_id);
+    println!("then      conbus run   # same TTY; do not start the vendor yourself");
+    println!("docs      docs/hop-demo.md");
+    Ok(())
+}
+
+fn demo_records() -> Vec<Record> {
+    let bus_id = "01a072b0-5105-7243-b58e-1d9b92e5889e"
+        .parse()
+        .expect("demo bus");
+    let source = |harness: &str| conbus_core::event::Source {
+        harness: Harness::new(harness),
+        harness_version: None,
+        vendor_session_id: Some("s-demo".into()),
+        workspace: Some("/repo".into()),
+        entrypoint: None,
+        backfilled_from: None,
+    };
+    let rec = |seq, ts: &str, harness: &str, event| Record {
+        schema_version: conbus_core::record::SCHEMA_VERSION,
+        ts: ts.parse().expect("ts"),
+        seq,
+        bus_id,
+        vendor_turn_id: None,
+        vendor_agent_id: None,
+        source: source(harness),
+        event,
+    };
+    vec![
+        rec(
+            1,
+            "2026-09-03T18:00:00.000Z",
+            Harness::CLAUDE_CODE,
+            Event::TurnStarted {
+                author: Some(conbus_core::event::Author::new(
+                    conbus_core::event::Author::TYPED,
+                )),
+                prompt: conbus_core::event::Body::kept("AUTOHOP"),
+            },
+        ),
+        rec(
+            2,
+            "2026-09-03T18:00:01.000Z",
+            Harness::CLAUDE_CODE,
+            Event::Routed {
+                next: Harness::CODEX.into(),
+                hop: Hop::Displaced,
+                reason: "rate_limit".into(),
+                code_freshness: None,
+            },
+        ),
+        rec(
+            3,
+            "2026-09-03T18:00:02.000Z",
+            Harness::CODEX,
+            Event::Continued {
+                predecessor: bus_id,
+                hop: Hop::Displaced,
+            },
+        ),
+        rec(
+            4,
+            "2026-09-03T18:00:03.000Z",
+            Harness::CODEX,
+            Event::TurnStarted {
+                author: Some(conbus_core::event::Author::new(
+                    conbus_core::event::Author::TYPED,
+                )),
+                prompt: conbus_core::event::Body::kept("AUTOHOP2"),
+            },
+        ),
+    ]
 }
 
 /// A person named the next leg. That is a routing hop, not a failover.
@@ -375,20 +464,46 @@ fn handoff(paths: &Paths, focus: &Focus, next: &str, thread: Option<&str>) -> io
             cwd: focus.workspace.clone(),
         },
     )?;
-    if let Some(id) = thread {
-        match crate::window::reveal(next, id) {
-            Ok(true) => println!("window    opened {next} · {id}"),
-            Ok(false) => {
-                println!("window    takeover → {next} — conbus run execs the next leg in this TTY")
-            }
-            Err(err) => println!(
-                "window    takeover → {next} — desktop open failed ({err}); conbus run still execs the TTY"
-            ),
+    match crate::landing::enter(next, focus.workspace.as_deref(), thread) {
+        Ok(true) => match thread {
+            Some(id) => println!("window    opened {next} · {id}"),
+            None => println!("window    opened {next}"),
+        },
+        Ok(false) => {
+            println!("window    takeover → {next} — conbus run execs the next leg in this TTY")
         }
-    } else {
-        println!("window    takeover → {next} — conbus run execs the next leg in this TTY");
+        Err(err) => println!(
+            "window    takeover → {next} — desktop open failed ({err}); conbus run still execs the TTY"
+        ),
     }
     Ok(())
+}
+
+/// Same-leg resume: reopen the destination without recording a second hop.
+fn resume_here(
+    paths: &Paths,
+    records: &[Record],
+    from: Option<&str>,
+    name: &str,
+) -> io::Result<()> {
+    let slug = attach::resolve(name).ok_or_else(|| {
+        let catalog = attach::slugs().collect::<Vec<_>>().join(", ");
+        io::Error::other(format!("unknown harness {name}; catalog is {catalog}"))
+    })?;
+    let Some(chosen) = focus(records, from) else {
+        return Err(io::Error::other(
+            "no conversation to resume — pass --from <bus_id> or record a turn first",
+        ));
+    };
+    let thread = match slug {
+        Harness::CODEX => match lease_of(records, chosen.bus_id) {
+            Lease::Warm(id) => Some(id),
+            _ => None,
+        },
+        Harness::CLAUDE_CODE => claude_warm_of(records, chosen.bus_id),
+        _ => None,
+    };
+    handoff(paths, &chosen, slug, thread.as_deref())
 }
 
 fn predecessor(records: &[Record], from: Option<&str>, current: &Leg) -> io::Result<Focus> {
@@ -413,6 +528,9 @@ fn digest(records: &[Record], bus_id: BusId) -> String {
         .iter()
         .filter(|record| record.bus_id == bus_id)
         .collect();
+    if let Some(stored) = crate::summarise::latest_digest(&chapter) {
+        return stored;
+    }
     match Chapter::read(&chapter) {
         Some(chapter) => summary::extract(&chapter),
         None => format!("conbus digest · {bus_id}"),
@@ -619,7 +737,7 @@ fn lease_of(records: &[Record], bus_id: BusId) -> Lease {
     lease
 }
 
-fn submit(paths: &Paths, request: &Request) -> io::Result<Response> {
+pub(crate) fn submit(paths: &Paths, request: &Request) -> io::Result<Response> {
     let mut stream = UnixStream::connect(paths.socket())?;
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
     let _ = stream.set_write_timeout(Some(std::time::Duration::from_millis(500)));
@@ -860,5 +978,13 @@ mod tests {
             claude_warm_of(&records, bus_id).as_deref(),
             Some("sess_bus")
         );
+    }
+
+    #[test]
+    fn the_recorded_demo_is_one_failover_not_a_routing_hop() {
+        let meter = conbus_core::meter::Meter::fold(&demo_records());
+        assert_eq!(meter.failover_hops, 1);
+        assert_eq!(meter.routing_hops, 0);
+        assert_eq!(meter.failover_edges, 1);
     }
 }

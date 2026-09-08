@@ -68,11 +68,10 @@ fn select<'a>(records: &'a [Record], filter: &LogFilter) -> Vec<&'a Record> {
                     .as_ref()
                     .is_some_and(|set| !set.is_empty() && set.contains(&record.bus_id))
                     || record.bus_id.to_string().starts_with(wanted)
-            })
-                && filter
-                    .since
-                    .as_ref()
-                    .is_none_or(|from| record.ts.to_string().as_str() >= from.as_str())
+            }) && filter
+                .since
+                .as_ref()
+                .is_none_or(|from| record.ts.to_string().as_str() >= from.as_str())
                 && filter
                     .grep
                     .as_ref()
@@ -253,10 +252,34 @@ fn summarise(record: &Record) -> String {
 /// first: these are the user's own settings files and they usually already hold
 /// their own hooks.
 pub fn install(apply: bool) -> io::Result<()> {
-    let binary = std::env::current_exe()?;
+    let current = std::env::current_exe()?;
     let home = std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
         .ok_or_else(|| io::Error::other("no HOME to install into"))?;
+    let dest = crate::install::installed_binary(&home);
+    println!(
+        "{:<12} {} → {}",
+        "binary",
+        current.display(),
+        dest.display()
+    );
+    if apply {
+        if crate::install::place_binary(&current, &dest)? {
+            println!("{:<12} placed (beside, then rename)", "");
+        } else {
+            println!("{:<12} already the installed file", "");
+        }
+        if dest.parent().is_some_and(|dir| !path_lists(dir)) {
+            println!(
+                "{:<12} put {} on PATH if `conbus` is not found",
+                "path",
+                dest.parent().unwrap_or(dest.as_path()).display()
+            );
+        }
+    } else {
+        println!("{:<12} would place on --apply", "");
+    }
+    let binary = dest;
 
     for target in crate::install::targets(&binary, &home) {
         let harness = target.harness;
@@ -327,7 +350,7 @@ pub fn install(apply: bool) -> io::Result<()> {
         );
     } else {
         println!(
-            "{:<12} {} — would register stop, sessionEnd, afterAgentResponse",
+            "{:<12} {} — would register sessionStart, beforeSubmitPrompt, stop, sessionEnd, afterAgentResponse",
             "cursor",
             cursor_hooks.display()
         );
@@ -340,6 +363,34 @@ pub fn install(apply: bool) -> io::Result<()> {
         }
     }
 
+    let log = match std::env::var_os("CONBUS_HOME") {
+        Some(root) => std::path::PathBuf::from(root).join("daemon.log"),
+        None => home.join(".conbus").join("daemon.log"),
+    };
+    let agent = crate::install::launch_agent_path(&home);
+    println!(
+        "{:<12} {} — {}",
+        "daemon",
+        agent.display(),
+        crate::install::DAEMON_LABEL
+    );
+    if apply {
+        if let Some(parent) = log.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let load = std::env::var_os("CONBUS_SKIP_LAUNCHCTL").is_none();
+        if crate::install::apply_daemon(&home, &binary, &log, load)? {
+            println!("{:<12} written", "");
+        } else {
+            println!("{:<12} already loaded this file", "");
+        }
+        if load {
+            println!("{:<12} launchctl kickstart/bootstrap attempted", "");
+        }
+    } else {
+        println!("{:<12} would write the launchd agent on --apply", "");
+    }
+
     if !apply {
         println!("\nNothing was written. Re-run with --apply to register.");
     }
@@ -349,6 +400,11 @@ pub fn install(apply: bool) -> io::Result<()> {
          forge. Until you approve there, Codex hooks are registered and silently do not fire."
     );
     Ok(())
+}
+
+fn path_lists(dir: &std::path::Path) -> bool {
+    std::env::var_os("PATH")
+        .is_some_and(|path| std::env::split_paths(&path).any(|entry| entry == dir))
 }
 
 /// The conbus hook commands a vendor settings file actually registers.
@@ -1060,6 +1116,7 @@ pub fn doctor(paths: &Paths) -> io::Result<()> {
     println!("{}", meter.describe());
     println!("{}", meter.describe_cost());
     println!("{}", meter.describe_turns());
+    println!("verdict   conbus verdict — 4-week dogfood score; open window is not a kill");
     println!("{}", cursor_line(&scan.records));
     match crate::hop::decide_from(paths, &scan.records, None) {
         Ok(line) => println!("route     {line}"),
@@ -1093,9 +1150,7 @@ fn cursor_line(records: &[Record]) -> String {
         .iter()
         .filter(|record| record.source.harness.as_str() == Harness::CURSOR)
         .count();
-    format!(
-        "cursor    adapter live — {n} record(s); briefing on sessionStart additional_context"
-    )
+    format!("cursor    adapter live — {n} record(s); briefing on sessionStart additional_context")
 }
 
 /// The daemon's lock report, not this process's heap. Doctor calling

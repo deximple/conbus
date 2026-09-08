@@ -44,12 +44,26 @@ fn start_daemon(home: &Path) -> Daemon {
     let socket = home.join("conbus.sock");
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
-        if std::os::unix::net::UnixStream::connect(&socket).is_ok() {
+        if std::os::unix::net::UnixStream::connect(&socket).is_ok()
+            && daemon_stamp_is_settled(home)
+        {
             return daemon;
         }
         std::thread::sleep(Duration::from_millis(20));
     }
     panic!("daemon never started listening on {}", socket.display());
+}
+
+/// The first stamp lands at bind. Hardening rewrites it after restore.
+/// Tests that overwrite the stamp must wait until that rewrite is done.
+fn daemon_stamp_is_settled(home: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(home.join("daemon.build")) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text.trim()) else {
+        return false;
+    };
+    value.get("memory_locked").is_some()
 }
 
 /// Run `conbus hook` with a payload on stdin. Returns (exit code, stderr).
@@ -1277,7 +1291,8 @@ fn a_burst_of_hooks_does_not_lose_records_to_a_full_backlog() {
         .filter(|line| line["event"] == "tool_requested")
         .count();
     assert_eq!(
-        requested, HOOKS,
+        requested,
+        HOOKS,
         "a parallel burst lost records; drops={}",
         std::fs::read_to_string(home.path().join("drops.jsonl")).unwrap_or_default()
     );

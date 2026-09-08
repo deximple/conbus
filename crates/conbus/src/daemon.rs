@@ -10,13 +10,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+use conbus_core::clock::Timestamp;
 use conbus_core::continuation::{
     Asking, Decision, Stopped, decide, machine_authored, opening_units, stopped, unattended,
 };
-use conbus_core::clock::Timestamp;
 use conbus_core::event::{Event, Harness, Hop, Source, TurnState};
-use conbus_core::ids::BusId;
 use conbus_core::identity;
+use conbus_core::ids::BusId;
 use conbus_core::pack::{self, Chapter};
 use conbus_core::paths::Paths;
 use conbus_core::record::{Entry, Record};
@@ -48,6 +48,12 @@ pub struct Daemon {
     /// path, taken after the reply goes out — `thread/start` is too slow to
     /// run while the vendor is waiting.
     pending_warm: Option<BusId>,
+    /// A chat order naming another catalog leg. Same spawn as a quota hop,
+    /// with `--to` so the destination is the one they said.
+    pending_directed: Option<(BusId, crate::intent::Kind, String)>,
+    /// Same-leg resume from chat ("커서로 재개"). Open that window after
+    /// the hook reply; do not record a second hop.
+    pending_enter: Option<(String, Option<String>)>,
     /// Conbus root, so a briefing can load linked facts. Tests leave this
     /// unset so they do not read the machine's arena files.
     arena_root: Option<std::path::PathBuf>,
@@ -83,6 +89,8 @@ impl Daemon {
             chapters,
             home: std::env::var("HOME").ok(),
             pending_warm: None,
+            pending_directed: None,
+            pending_enter: None,
             arena_root: None,
             chat_watch: None,
         }
@@ -337,17 +345,27 @@ impl Daemon {
                         self.maybe_continue(bus_id, &source, &mut written, &mut seqs);
                         self.remember(&written);
                         self.follow_through(bus_id, &source, &mut written, &mut seqs);
-                        Response::Briefed {
+                        self.finish_write(
+                            Response::Briefed {
+                                bus_id,
+                                seqs,
+                                context,
+                                message,
+                            },
                             bus_id,
-                            seqs,
-                            context,
-                            message,
-                        }
+                            &source,
+                            &written,
+                        )
                     }
                     None => {
                         self.remember(&written);
                         self.follow_through(bus_id, &source, &mut written, &mut seqs);
-                        Response::Recorded { bus_id, seqs }
+                        self.finish_write(
+                            Response::Recorded { bus_id, seqs },
+                            bus_id,
+                            &source,
+                            &written,
+                        )
                     }
                 }
             }
@@ -457,6 +475,81 @@ impl Daemon {
         self.pending_warm.take()
     }
 
+    pub fn take_pending_directed(&mut self) -> Option<(BusId, String)> {
+        self.pending_directed
+            .take()
+            .map(|(bus_id, _kind, dest)| (bus_id, dest))
+    }
+
+    pub fn take_pending_enter(&mut self) -> Option<(String, Option<String>)> {
+        self.pending_enter.take()
+    }
+
+    fn finish_write(
+        &mut self,
+        mut response: Response,
+        bus_id: BusId,
+        source: &Source,
+        written: &[Record],
+    ) -> Response {
+        self.note_chat_order(bus_id, source, written);
+        self.announce_chat_order(&mut response);
+        response
+    }
+
+    fn note_chat_order(&mut self, bus_id: BusId, source: &Source, written: &[Record]) {
+        let Some((order, workspace)) = written.iter().find_map(|record| {
+            let Event::TurnStarted { prompt, author } = &record.event else {
+                return None;
+            };
+            if author.as_ref().is_some_and(|a| a.is_machine()) {
+                return None;
+            }
+            let order = crate::intent::parse(prompt.as_text()?)?;
+            Some((order, record.source.workspace.clone()))
+        }) else {
+            return;
+        };
+        if order.to == source.harness.as_str() {
+            self.pending_enter = Some((order.to, workspace));
+        } else {
+            self.pending_directed = Some((bus_id, order.kind, order.to));
+        }
+    }
+
+    fn announce_chat_order(&self, response: &mut Response) {
+        let (kind, dest) = if let Some((_, kind, dest)) = &self.pending_directed {
+            (kind.as_str(), dest.as_str())
+        } else if let Some((dest, _)) = &self.pending_enter {
+            ("resume", dest.as_str())
+        } else {
+            return;
+        };
+        let context = format!(
+            "conbus {kind} · the person ordered {kind} to {dest}. Acknowledge in one line. Do not start new work on this leg."
+        );
+        let message = format!("conbus · {kind} → {dest}");
+        match response {
+            Response::Briefed {
+                context: existing,
+                message: existing_msg,
+                ..
+            } => {
+                *existing = format!("{context}\n\n{existing}");
+                *existing_msg = format!("{message} · {existing_msg}");
+            }
+            Response::Recorded { bus_id, seqs } => {
+                *response = Response::Briefed {
+                    bus_id: *bus_id,
+                    seqs: seqs.clone(),
+                    context,
+                    message,
+                };
+            }
+            _ => {}
+        }
+    }
+
     fn maybe_summarise(
         &mut self,
         bus_id: BusId,
@@ -476,8 +569,13 @@ impl Daemon {
         if !conbus_core::summary::due(chapter.about.turns) {
             return;
         }
-        let digest = conbus_core::summary::extract(chapter);
         let covered_turns = chapter.about.turns;
+        if written.iter().any(|record| {
+            matches!(&record.event, Event::Summarised { covered_turns: n, .. } if *n >= covered_turns)
+        }) {
+            return;
+        }
+        let digest = conbus_core::summary::extract(chapter);
         self.write_extra(
             bus_id,
             source,
@@ -688,13 +786,7 @@ impl Daemon {
         let Some(named) = chapters.first().map(|chapter| chapter.about.bus_id) else {
             return Response::Deferred;
         };
-        let packed = pack::brief_with(
-            named,
-            &chapters,
-            &facts,
-            now,
-            pack::PACK_BUDGET_UNITS,
-        );
+        let packed = pack::brief_with(named, &chapters, &facts, now, pack::PACK_BUDGET_UNITS);
         if packed.is_empty() {
             return Response::Deferred;
         }
@@ -812,6 +904,11 @@ fn repair_splits(held: &[Record], log: &mut SegmentLog) -> io::Result<u64> {
 pub fn serve(paths: &Paths, retention: Retention) -> io::Result<()> {
     let _ = harden::harden();
     let listener = bind(&paths.socket())?;
+    // Named before restore. `doctor` and the recorder tests wait on the
+    // socket; a stamp that lands after a long scan looks like no daemon.
+    if let Err(err) = crate::build_info::stamp(paths) {
+        eprintln!("conbus daemon: could not write the build stamp: {err}");
+    }
     // The registry is derived state, so it is rebuilt from the segments rather
     // than starting empty — otherwise a restart forks every live conversation.
     // But a log we cannot read must not stop us recording: an empty registry
@@ -851,16 +948,9 @@ pub fn serve(paths: &Paths, retention: Retention) -> io::Result<()> {
         .with_arena(paths.root().to_path_buf())
         .watch_chat_exports(paths);
 
-    // Left beside the socket so `doctor` can compare the daemon's build with
-    // its own — the drift a rename without a restart leaves behind.
-    if let Err(err) = crate::build_info::stamp(paths) {
-        eprintln!("conbus daemon: could not write the build stamp: {err}");
-    }
-
     // Restore grew the heap. Darwin's first `mlockall` is ENOSYS; lock the
     // pages that now hold the bindings and chapters, not the empty start heap.
-    // Stamp first so doctor can name the build while mlock walks; then stamp
-    // the lock result so doctor does not report its own heap.
+    // The build stamp is already on disk; this only adds the lock result.
     let report = harden::relock_derived();
     if let Err(err) = crate::build_info::stamp_hardening(
         paths,
@@ -916,7 +1006,15 @@ pub fn serve(paths: &Paths, retention: Retention) -> io::Result<()> {
                         eprintln!("conbus daemon: connection failed: {err}");
                     }
                     if let Some(bus_id) = daemon.take_pending_warm() {
-                        spawn_warm_apply(bus_id);
+                        spawn_hop_apply(bus_id, None);
+                    }
+                    if let Some((bus_id, dest)) = daemon.take_pending_directed() {
+                        spawn_hop_apply(bus_id, Some(dest));
+                    }
+                    if let Some((dest, workspace)) = daemon.take_pending_enter()
+                        && let Err(err) = crate::landing::enter(&dest, workspace.as_deref(), None)
+                    {
+                        eprintln!("conbus daemon: resume {dest} failed ({err})");
                     }
                 }
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
@@ -934,11 +1032,16 @@ pub fn serve(paths: &Paths, retention: Retention) -> io::Result<()> {
 /// `conbus hop --apply` is the same path a person runs; it writes a lease
 /// and never injects into a thread they opened. The daemon must not wait
 /// for it — `thread/start` is seconds, the hook client gives up at 500ms.
-fn spawn_warm_apply(bus_id: BusId) {
+fn spawn_hop_apply(bus_id: BusId, to: Option<String>) {
     let bin = std::env::current_exe().unwrap_or_else(|_| "conbus".into());
     std::thread::spawn(move || {
-        let output = Command::new(bin)
-            .args(["hop", "--from", &bus_id.to_string(), "--apply"])
+        let id = bus_id.to_string();
+        let mut cmd = Command::new(bin);
+        cmd.args(["hop", "--from", &id, "--apply"]);
+        if let Some(dest) = to.as_deref() {
+            cmd.args(["--to", dest]);
+        }
+        let output = cmd
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -1322,6 +1425,43 @@ mod tests {
             _ => None,
         });
         assert_eq!(routed, Some(Harness::CODEX));
+    }
+
+    #[test]
+    fn a_chat_order_queues_a_directed_hop() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = SegmentLog::open(dir.path(), Retention::default()).expect("open");
+        let mut daemon = Daemon::new(log, Registry::new(), HashMap::new());
+        let mut req = request(Event::TurnStarted {
+            author: None,
+            prompt: Body::kept("이제 커서로 작업할거야"),
+        });
+        req.workspace = Some("/repo".into());
+        let response = daemon.handle(req);
+        match response {
+            Response::Briefed { message, .. } => {
+                assert!(message.contains("cursor"), "{message}");
+            }
+            other => panic!("expected a hop briefing, got {other:?}"),
+        }
+        let (_bus_id, dest) = daemon
+            .take_pending_directed()
+            .expect("the order must hop after the hook reply");
+        assert_eq!(dest, Harness::CURSOR);
+        assert!(daemon.take_pending_warm().is_none());
+    }
+
+    #[test]
+    fn a_prompt_that_is_not_an_order_does_not_hop() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = SegmentLog::open(dir.path(), Retention::default()).expect("open");
+        let mut daemon = Daemon::new(log, Registry::new(), HashMap::new());
+        daemon.handle(request(Event::TurnStarted {
+            author: None,
+            prompt: Body::kept("hand this off"),
+        }));
+        assert!(daemon.take_pending_directed().is_none());
+        assert!(daemon.take_pending_enter().is_none());
     }
 
     #[test]

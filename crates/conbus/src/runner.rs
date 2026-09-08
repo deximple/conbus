@@ -88,9 +88,19 @@ fn vendor(harness: &str, takeover: Option<&Takeover>) -> io::Result<std::process
             }
             cmd
         }
+        Harness::CURSOR => {
+            let mut cmd = Command::new(crate::landing::cursor_app_cli());
+            cmd.arg("agent");
+            if let Some(cwd) = takeover.and_then(|t| t.cwd.as_deref()) {
+                cmd.args(["--workspace", cwd, "--trust"]);
+            }
+            cmd
+        }
         _ => Command::new(leg_binary(harness)),
     };
-    if let Some(cwd) = takeover.and_then(|t| t.cwd.as_deref()) {
+    if let Some(cwd) = takeover.and_then(|t| t.cwd.as_deref())
+        && harness != Harness::CURSOR
+    {
         cmd.current_dir(cwd);
     }
     cmd.stdin(Stdio::inherit())
