@@ -223,6 +223,25 @@ A fourth, smaller: **Darwin refuses to set socket options on a peer that has
 already hung up**, with `EINVAL`, and `doctor`'s liveness probe is exactly such
 a peer. A peer that left before it was served is nobody to serve.
 
+**A fifth, and both halves were found by counting rather than by reading.** On
+2026-09-08 one conversation wrote **146 `routed` records in 38 minutes** — the
+daemon answered every `InterruptedQuota` from a leg that kept refusing, spawned
+a `hop --apply` behind each, and left 32 headless Claude sessions leased. The
+guard already existed (`Chapter.pending_hop`, which `hop --apply` consults) and
+the daemon simply did not look at it. The lesson from the twin defect holds:
+**run the survey, not the suite, when the question is about the corpus** — 152
+of the log's 168 `routed` records are that one runaway, and no test was ever
+going to say so.
+
+And **"I connected" is not "somebody is serving"**. Closing a listening AF_UNIX
+socket does not tear the path down at once, so a connect to a daemon that has
+just died can still succeed — measured under load with `lsof` showing no
+process holding the path. `bind` refused the new daemon its own socket on that
+evidence, which under launchd's `KeepAlive` turns a crash into a restart loop.
+The probe now asks whether anything is *serving*: a daemon that is busy says
+nothing, because our request is what it waits for, so the read expiring is the
+positive answer; a peer that is going away hands back end-of-file at once.
+
 ## What the log holds, and why it holds it that way
 
 - One flat JSON line per record, fixed-width UTC timestamp first so a text
