@@ -137,7 +137,7 @@ fn last_user_text(messages: &[Message]) -> Option<String> {
 fn first_text(blocks: &[Block]) -> Option<String> {
     blocks.iter().find_map(|block| {
         (block.kind.as_deref() == Some("text"))
-            .then(|| block.text.as_deref())
+            .then_some(block.text.as_deref())
             .flatten()
             .map(str::trim)
             .filter(|text| !text.is_empty())
@@ -160,9 +160,32 @@ pub fn serve(addr: &str, harness: &str) -> std::io::Result<()> {
         let Ok(mut stream) = incoming else {
             continue;
         };
+        // One connection at a time, so a client that opens a socket and never
+        // finishes its request would hold every Chat verdict behind it. Every
+        // other socket in this binary is bounded — the daemon gives an
+        // accepted connection 200ms of silence, the hook client gives the
+        // daemon 500ms — and this one was not.
+        if let Err(err) = bound(&stream, SILENCE_BOUND) {
+            eprintln!("conbus hook: inference connection not bounded ({err})");
+            continue;
+        }
         let _ = handle_http(&mut stream, harness);
     }
     Ok(())
+}
+
+/// How long one Inference connection may say nothing before it is dropped.
+///
+/// Longer than the daemon's 200ms because this peer is across a TLS
+/// terminator rather than a Unix socket on the same machine, and short enough
+/// that a stalled one cannot hold the next verdict for a person waiting in a
+/// Chat window.
+pub const SILENCE_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Bound both directions of one accepted connection.
+fn bound(stream: &std::net::TcpStream, silence: std::time::Duration) -> std::io::Result<()> {
+    stream.set_read_timeout(Some(silence))?;
+    stream.set_write_timeout(Some(silence))
 }
 
 fn handle_http(
@@ -176,7 +199,14 @@ fn handle_http(
             if crate::drops::record(&err) {
                 eprintln!("conbus hook: record dropped: {err}");
             }
-            crate::hook::client::failure_reply(harness, &body).to_string()
+            // ALLOW, not the generic failure reply. Everything that reaches
+            // this socket is Anthropic waiting on a verdict for somebody's
+            // Chat window, so a frame we could not read — a timed-out peer
+            // now among them — must still be allowed. `failure_reply` looks
+            // at the payload to decide, and an empty payload does not look
+            // like an Inference frame, so it answered with Claude Code's
+            // silent hook control JSON: not a verdict at all.
+            ALLOW.to_string()
         }
     };
     write_http_ok(stream, &reply)
@@ -368,5 +398,67 @@ mod tests {
             !dumped.contains("alice@example.com"),
             "email must not land on the bus: {dumped}"
         );
+    }
+
+    #[test]
+    fn a_frame_the_terminator_could_not_read_still_answers_allow() {
+        // A timed-out peer yields an empty body, and the reply on this socket
+        // is a verdict or it is nothing. Answering with a hook control object
+        // leaves Anthropic without one.
+        let mut mock = Mock {
+            read: std::io::Cursor::new(
+                b"POST / HTTP/1.1\r\nHost: conbus\r\nContent-Length: 0\r\n\r\n".to_vec(),
+            ),
+            write: Vec::new(),
+        };
+
+        handle_http(&mut mock, Harness::CLAUDE_CHAT).expect("answered");
+
+        let reply = String::from_utf8_lossy(&mock.write).into_owned();
+        assert!(reply.starts_with("HTTP/1.1 200 OK"), "{reply}");
+        assert!(
+            reply.contains(ALLOW),
+            "an unreadable frame must allow: {reply}"
+        );
+    }
+
+    #[test]
+    fn a_connection_that_says_nothing_is_let_go_of() {
+        // The terminator serves one connection at a time, so a client that
+        // opens a socket and never finishes its request used to hold every
+        // Chat verdict behind it for as long as it liked. A short bound here
+        // rather than the shipping five seconds, so the test costs a tenth of
+        // a second instead of ten.
+        use std::io::Read;
+        use std::time::{Duration, Instant};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let quiet = std::thread::spawn(move || {
+            let _client = std::net::TcpStream::connect(addr).expect("connect");
+            std::thread::sleep(Duration::from_secs(2));
+        });
+
+        let (mut stream, _) = listener.accept().expect("accept");
+        bound(&stream, Duration::from_millis(100)).expect("bound");
+        let began = Instant::now();
+        let mut byte = [0u8; 1];
+        let outcome = stream.read(&mut byte);
+
+        assert!(
+            began.elapsed() < Duration::from_secs(1),
+            "the read waited {:?} on a client that never spoke",
+            began.elapsed()
+        );
+        let err = outcome.expect_err("a silent client must not read as data");
+        assert!(
+            matches!(
+                err.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ),
+            "unexpected error on a bounded read: {err}"
+        );
+        drop(stream);
+        quiet.join().expect("client");
     }
 }

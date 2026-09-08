@@ -167,7 +167,7 @@ impl Daemon {
                 self.registry = Registry::restore(&scan.records);
                 self.chapters = Self::chapters(&scan.records);
             }
-            eprintln!("conbus daemon: filled {n} chat export record(s)");
+            note!("filled {n} chat export record(s)");
         }
         if let Some(watch) = self.chat_watch.as_mut() {
             for (i, _dir, _official_only, signature) in changed {
@@ -202,8 +202,8 @@ impl Daemon {
         {
             // The daemon's own stderr, like every other refusal here: it is the
             // channel launchd captures, and the hook's is swallowed.
-            eprintln!(
-                "conbus daemon: refusing a hook speaking protocol v{}; this daemon speaks v{}",
+            note!(
+                "refusing a hook speaking protocol v{}; this daemon speaks v{}",
                 request.protocol_version.unwrap_or_default(),
                 crate::wire::PROTOCOL_VERSION
             );
@@ -283,8 +283,8 @@ impl Daemon {
                 if !errors.is_empty() {
                     // The daemon's own stderr, because the hook's goes to a
                     // vendor that swallows it.
-                    eprintln!(
-                        "conbus daemon: {} of {} record(s) refused by the log: {}",
+                    note!(
+                        "{} of {} record(s) refused by the log: {}",
                         errors.len(),
                         errors.len() + seqs.len(),
                         errors.join("; ")
@@ -339,7 +339,7 @@ impl Daemon {
                             }
                             Ok(None) => {}
                             Err(err) => {
-                                eprintln!("conbus daemon: briefing sent but not recorded: {err}")
+                                note!("briefing sent but not recorded: {err}")
                             }
                         }
                         self.maybe_continue(bus_id, &source, &mut written, &mut seqs);
@@ -642,7 +642,7 @@ impl Daemon {
                 written.push(record);
             }
             Ok(None) => {}
-            Err(err) => eprintln!("conbus daemon: hop bookkeeping lost: {err}"),
+            Err(err) => note!("hop bookkeeping lost: {err}"),
         }
     }
 
@@ -907,7 +907,7 @@ pub fn serve(paths: &Paths, retention: Retention) -> io::Result<()> {
     // Named before restore. `doctor` and the recorder tests wait on the
     // socket; a stamp that lands after a long scan looks like no daemon.
     if let Err(err) = crate::build_info::stamp(paths) {
-        eprintln!("conbus daemon: could not write the build stamp: {err}");
+        note!("could not write the build stamp: {err}");
     }
     // The registry is derived state, so it is rebuilt from the segments rather
     // than starting empty — otherwise a restart forks every live conversation.
@@ -915,8 +915,8 @@ pub fn serve(paths: &Paths, retention: Retention) -> io::Result<()> {
     // costs a forked conversation, which the vendor session id on every record
     // still makes recoverable, while refusing to start costs every future turn.
     let mut scan = SegmentLog::scan(paths.log_dir()).unwrap_or_else(|err| {
-        eprintln!(
-            "conbus daemon: could not read {} ({err}); starting with no bindings, \
+        note!(
+            "could not read {} ({err}); starting with no bindings, \
              so a session that outlived the last daemon will get a second bus_id",
             paths.log_dir().display()
         );
@@ -929,18 +929,18 @@ pub fn serve(paths: &Paths, retention: Retention) -> io::Result<()> {
     match crate::backfill::append_gaps_at_start(paths, &scan.records, &mut log) {
         Ok(0) => {}
         Ok(n) => {
-            eprintln!("conbus daemon: filled {n} gap record(s) from official transcripts");
+            note!("filled {n} gap record(s) from official transcripts");
             scan = SegmentLog::scan(paths.log_dir()).unwrap_or(scan);
         }
-        Err(err) => eprintln!("conbus daemon: gap fill skipped ({err})"),
+        Err(err) => note!("gap fill skipped ({err})"),
     }
     match repair_splits(&scan.records, &mut log) {
         Ok(0) => {}
         Ok(n) => {
-            eprintln!("conbus daemon: aliased {n} split conversation pair(s)");
+            note!("aliased {n} split conversation pair(s)");
             scan = SegmentLog::scan(paths.log_dir()).unwrap_or(scan);
         }
-        Err(err) => eprintln!("conbus daemon: split alias skipped ({err})"),
+        Err(err) => note!("split alias skipped ({err})"),
     }
     let registry = Registry::restore(&scan.records);
     let chapters = Daemon::chapters(&scan.records);
@@ -958,11 +958,11 @@ pub fn serve(paths: &Paths, retention: Retention) -> io::Result<()> {
         report.memory_locked,
         report.memory_lock_error.clone(),
     ) {
-        eprintln!("conbus daemon: could not stamp hardening: {err}");
+        note!("could not stamp hardening: {err}");
     }
 
-    eprintln!(
-        "conbus daemon {}: socket {} log {} ({} record(s), {} unreadable) core_dumps_disabled={} memory_locked={}{}",
+    note!(
+        "{}: socket {} log {} ({} record(s), {} unreadable) core_dumps_disabled={} memory_locked={}{}",
         crate::build_info::BUILD,
         paths.socket().display(),
         paths.log_dir().display(),
@@ -990,12 +990,12 @@ pub fn serve(paths: &Paths, retention: Retention) -> io::Result<()> {
             if err.kind() == io::ErrorKind::Interrupted {
                 continue;
             }
-            eprintln!("conbus daemon: poll failed: {err}");
+            note!("poll failed: {err}");
             continue;
         }
         if n == 0 {
             if let Err(err) = daemon.absorb_chat_exports() {
-                eprintln!("conbus daemon: chat export ingest skipped ({err})");
+                note!("chat export ingest skipped ({err})");
             }
             continue;
         }
@@ -1003,28 +1003,56 @@ pub fn serve(paths: &Paths, retention: Retention) -> io::Result<()> {
             match listener.accept() {
                 Ok((stream, _)) => {
                     if let Err(err) = handle_connection(&mut daemon, stream) {
-                        eprintln!("conbus daemon: connection failed: {err}");
+                        note!("connection failed: {err}");
                     }
-                    if let Some(bus_id) = daemon.take_pending_warm() {
-                        spawn_hop_apply(bus_id, None);
-                    }
-                    if let Some((bus_id, dest)) = daemon.take_pending_directed() {
-                        spawn_hop_apply(bus_id, Some(dest));
-                    }
-                    if let Some((dest, workspace)) = daemon.take_pending_enter()
-                        && let Err(err) = crate::landing::enter(&dest, workspace.as_deref(), None)
-                    {
-                        eprintln!("conbus daemon: resume {dest} failed ({err})");
-                    }
+                    drain_pending(&mut daemon);
                 }
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
                 Err(err) => {
-                    eprintln!("conbus daemon: accept failed: {err}");
+                    note!("accept failed: {err}");
                     break;
                 }
             }
         }
     }
+}
+
+/// Hand off everything the connection queued, without waiting for any of it.
+///
+/// The daemon serves one connection to its end before it accepts the next, so
+/// anything done here is done in front of every hook still in the backlog.
+/// Proven from the outside: `a_landing_that_blocks_does_not_hold_the_next_hook`
+/// in the e2e suite starts a daemon whose Cursor binary sleeps, and times the
+/// hook behind it.
+fn drain_pending(daemon: &mut Daemon) {
+    if let Some(bus_id) = daemon.take_pending_warm() {
+        spawn_hop_apply(bus_id, None);
+    }
+    if let Some((bus_id, dest)) = daemon.take_pending_directed() {
+        spawn_hop_apply(bus_id, Some(dest));
+    }
+    if let Some((dest, workspace)) = daemon.take_pending_enter() {
+        spawn_enter(dest, workspace);
+    }
+}
+
+/// Bring the person to the leg they asked for, off the accept loop.
+///
+/// Its two siblings were already threads and this one was not. The daemon
+/// serves one connection to its end before it accepts the next, so anything
+/// it waits for here is a wait every hook behind it pays: `cursor -n` blocks
+/// until Cursor's own process exits, and the Terminal path blocks on
+/// `osascript` — a cold app launch, or a macOS automation prompt nobody is
+/// looking at. On 2026-09-08 sixty hooks in five minutes gave up at their
+/// 500ms deadline while the daemon was busy with something.
+fn spawn_enter(dest: String, workspace: Option<String>) {
+    std::thread::spawn(
+        move || match crate::landing::enter(&dest, workspace.as_deref(), None) {
+            Ok(true) => {}
+            Ok(false) => note!("resume {dest} had nothing to open"),
+            Err(err) => note!("resume {dest} failed ({err})"),
+        },
+    );
 }
 
 /// Open the Codex warm thread after a quota hop, out of the hook's deadline.
@@ -1050,13 +1078,13 @@ fn spawn_hop_apply(bus_id: BusId, to: Option<String>) {
             Ok(out) if out.status.success() => {}
             Ok(out) => {
                 let err = String::from_utf8_lossy(&out.stderr);
-                eprintln!(
-                    "conbus daemon: automatic hop --apply for {bus_id} exited {}: {}",
+                note!(
+                    "automatic hop --apply for {bus_id} exited {}: {}",
                     out.status,
                     err.trim()
                 );
             }
-            Err(err) => eprintln!("conbus daemon: automatic hop --apply failed: {err}"),
+            Err(err) => note!("automatic hop --apply failed: {err}"),
         }
     });
 }
@@ -1856,6 +1884,20 @@ mod tests {
                 .dirs
                 .iter()
                 .any(|dir| dir.dir.to_string_lossy().contains("Downloads"))
+        );
+    }
+
+    #[test]
+    fn nothing_in_the_daemon_speaks_around_the_stamped_channel() {
+        // Every line this file writes must carry the time it happened, or
+        // the next outage is again unplaceable. The needle is assembled at
+        // runtime so this assertion's own source cannot satisfy it.
+        let source = include_str!("daemon.rs");
+        let bare = format!("{}{}", "eprint", "ln!");
+
+        assert!(
+            !source.contains(&bare),
+            "the daemon must say everything through `note!`, which stamps it"
         );
     }
 }
