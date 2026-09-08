@@ -70,8 +70,11 @@ cargo build --release -p conbus
 
 미리보기는 `--apply` 없이. 이미 있는 훅은 그대로 두고 Conbus만 붙인다.
 
-- Claude: `~/.claude/settings.json`
+- Claude: `~/.claude/settings.json` (StatusLine 래퍼도 여기)
 - Codex: `$CODEX_HOME/hooks.json` (`settings.json`이 아니다)
+- Cursor: `~/.cursor/hooks.json`
+- grok: `~/.grok/hooks/conbus.json`
+- opencode: `~/.config/opencode/plugins/conbus.js`
 - 데몬: `sh.conbus.daemon`
 
 수동으로 `conbus daemon`을 띄운 채로 에이전트를 올리면 소켓을 못 잡고 `KeepAlive`가 재시작 루프에 들어간다. 수동 프로세스를 먼저 끈다.
@@ -101,7 +104,7 @@ conbus --version
 | 줄 | 정상 |
 | --- | --- |
 | `daemon` | 지금 돌아가는 빌드와 pid |
-| `hooks` / `events` | Claude·Codex가 등록됨. Codex는 `trusted` |
+| `hooks` / `events` | 찾은 벤더마다 등록됨(Claude·Codex·Cursor·grok·opencode). Codex는 `trusted` |
 | `last` | 방금 켠 세션의 시각이 최근 |
 | `drops` | 설치 직후가 아니면 늘어나지 않음 |
 | `route` | `stay on …` 또는 `hop …` |

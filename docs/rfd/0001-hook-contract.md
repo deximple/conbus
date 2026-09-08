@@ -23,11 +23,14 @@ absolute path because a vendor `PATH` is not ours.
 Claude Code also wraps StatusLine: `{bin} hook --statusline`. The person's
 original status bar command is saved at `~/.claude/conbus-statusline-forward`.
 
-Codex: never `"async": true` (0.147.0 drops those hooks). Never write
+Codex: never `"async": true` (0.147.0 drops those hooks; 0.148 allows
+them again, and conbus registers none either way). Never write
 `trusted_hash`. Trust is a gesture inside Codex.
 
-Cursor dialect is not Claude's. Official inject is `additional_context`
-on `sessionStart`. `beforeSubmitPrompt` has `continue` and `user_message`.
+Cursor's payload is not Claude's — identification is `cursor_version`, and
+the prompt field is `prompt`, not Claude's `prompt` plus envelope. Official
+inject is `additional_context` on `sessionStart`. Field names come from
+`tests/fixtures/cursor_hooks_contract.md`, which is pinned by live traffic.
 
 ## Events we register (Claude Code)
 
@@ -37,8 +40,10 @@ on `sessionStart`. `beforeSubmitPrompt` has `continue` and `user_message`.
 `SubagentStop`, `SessionEnd`.
 
 `bus_id` is minted on the first `UserPromptSubmit`, never on
-`SessionStart`. Cursor also mints on a completed turn when that prompt
-was never seen.
+`SessionStart`. Cursor also mints on work the bus can see it doing — a
+completed turn, or a tool call — because its prompt hook lives in its own
+hooks file while its tool hooks arrive through Claude Code's, and the two do
+not always both fire. A Cursor session that only *ends* still orphans.
 
 ## Reply dialect
 
@@ -48,7 +53,9 @@ A hook must exit zero. A non-zero `UserPromptSubmit` blocks the prompt.
   Briefing uses `hookSpecificOutput.additionalContext`.
 - Codex: `{}` on every event. `continue` / `suppressOutput` fail the hook
   on 0.152.1.
-- Cursor `sessionStart`: `additional_context` (snake_case).
+- Cursor `sessionStart`: `additional_context` (snake_case). The reply also
+  carries Claude's `continue` / `suppressOutput`, which Cursor accepts and
+  ignores; only the inject key differs.
 
 Zero-byte stdout on a context-injecting Claude event has taken a session
 down (`cache_control` on an empty text block). Always print a JSON object.
