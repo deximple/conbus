@@ -44,7 +44,7 @@ Conbus는 채팅 앱이 아니다. Claude Code / Codex TUI를 그대로 쓰면�
 - macOS. 데몬은 `launchd` 에이전트 `sh.conbus.daemon`이다.
 - 이미 로그인된 `claude`, `codex`. PATH에서 보이면 된다.
 - 빌드하려면 `cargo` (이 저장소는 edition 2024).
-- 설치 위치는 `~/.local/bin/conbus`. 훅은 PATH가 아니라 **이 절대 경로**를 부른다.
+- 설치 위치는 `~/.local/bin/conbus`. `conbus`가 안 잡히면 `~/.local/bin`을 PATH에 넣는다. 훅은 PATH가 아니라 **이 절대 경로**를 부른다.
 
 데이터는 `$XDG_STATE_HOME/conbus`가 있으면 거기, 없으면 `~/.conbus/`.
 

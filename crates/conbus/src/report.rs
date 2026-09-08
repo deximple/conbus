@@ -269,6 +269,13 @@ pub fn install(apply: bool) -> io::Result<()> {
         } else {
             println!("{:<12} already the installed file", "");
         }
+        if dest.parent().is_some_and(|dir| !path_lists(dir)) {
+            println!(
+                "{:<12} put {} on PATH if `conbus` is not found",
+                "path",
+                dest.parent().unwrap_or(dest.as_path()).display()
+            );
+        }
     } else {
         println!("{:<12} would place on --apply", "");
     }
@@ -393,6 +400,11 @@ pub fn install(apply: bool) -> io::Result<()> {
          forge. Until you approve there, Codex hooks are registered and silently do not fire."
     );
     Ok(())
+}
+
+fn path_lists(dir: &std::path::Path) -> bool {
+    std::env::var_os("PATH")
+        .is_some_and(|path| std::env::split_paths(&path).any(|entry| entry == dir))
 }
 
 /// The conbus hook commands a vendor settings file actually registers.

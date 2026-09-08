@@ -114,6 +114,11 @@ where
     let Some(first) = args.first() else {
         return Command::Help;
     };
+    // `conbus go --help` must not apply a hop. A leading `-h`/`--help` after
+    // the subcommand is usage, not a catalog slug or a bus id.
+    if args.iter().skip(1).any(|a| a == "--help" || a == "-h") {
+        return Command::Help;
+    }
     match first.as_str() {
         "daemon" => Command::Daemon,
         "hook" => Command::Hook {
@@ -382,6 +387,8 @@ mod tests {
                 demo: false
             }
         );
+        assert_eq!(parse(["go", "--help"], None), Command::Help);
+        assert_eq!(parse(["hop", "-h"], None), Command::Help);
     }
 
     #[test]

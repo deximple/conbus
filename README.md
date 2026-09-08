@@ -30,7 +30,7 @@ conbus doctor
 conbus hop --demo
 ```
 
-`install --apply` places `~/.local/bin/conbus` (beside, then `mv`), merges hooks, and writes `~/Library/LaunchAgents/sh.conbus.daemon.plist`. It does not write Codex `trusted_hash`. Trust the hooks inside Codex, then `conbus run claude_code`.
+`install --apply` places `~/.local/bin/conbus` (beside, then `mv`), merges hooks, and writes `~/Library/LaunchAgents/sh.conbus.daemon.plist`. Put `~/.local/bin` on `PATH` if `conbus` is not found. It does not write Codex `trusted_hash`. Trust the hooks inside Codex, then `conbus run claude_code`.
 
 Daily: `conbus run claude_code`, or type a hop order in the vendor chat. Preview: `conbus hop cursor`. Apply: `conbus go cursor`.
 
