@@ -32,7 +32,19 @@ impl Drop for Daemon {
 
 /// Start a daemon rooted at `home` and wait for its socket to answer.
 fn start_daemon(home: &Path) -> Daemon {
-    let child = Command::new(bin())
+    start_daemon_with(home, &[])
+}
+
+/// A daemon with extra environment. Setting it on the child is safe in a way
+/// that setting it on the test process is not: `cargo test` runs tests in
+/// threads of one process, and a `set_var` there is unsound while any other
+/// thread reads the environment.
+fn start_daemon_with(home: &Path, env: &[(&str, &std::ffi::OsStr)]) -> Daemon {
+    let mut command = Command::new(bin());
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    let child = command
         .arg("daemon")
         .env("CONBUS_HOME", home)
         .stdout(Stdio::null())
@@ -44,8 +56,7 @@ fn start_daemon(home: &Path) -> Daemon {
     let socket = home.join("conbus.sock");
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
-        if std::os::unix::net::UnixStream::connect(&socket).is_ok()
-            && daemon_stamp_is_settled(home)
+        if std::os::unix::net::UnixStream::connect(&socket).is_ok() && daemon_stamp_is_settled(home)
         {
             return daemon;
         }
@@ -1484,4 +1495,112 @@ fn a_person_can_switch_the_briefing_off() {
         "off means no briefing, not no recording: {lines:#?}"
     );
     daemon.stop();
+}
+
+/// A stub vendor CLI that takes its time.
+fn slow_stub(dir: &Path, name: &str, seconds: u32) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join(name);
+    std::fs::write(&path, format!("#!/bin/sh\nsleep {seconds}\n")).expect("stub");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    path
+}
+
+#[test]
+fn a_landing_that_blocks_does_not_hold_the_next_hook() {
+    // On 2026-09-08 sixty hooks in five minutes gave up at their 500ms
+    // deadline. The daemon serves one connection to its end before it accepts
+    // the next, and `landing::enter` was the last pending action still run on
+    // that loop — it waits for `cursor -n` to exit. A chat order that is only
+    // an order ("work in cursor from here", while already in Cursor) is what
+    // queues one.
+    let home = tempfile::tempdir().expect("tempdir");
+    let cursor = slow_stub(home.path(), "cursor", 3);
+    let workspace = home.path().join("repo");
+    std::fs::create_dir(&workspace).expect("repo");
+    let daemon = start_daemon_with(
+        home.path(),
+        &[("CONBUS_CURSOR_APP_BIN", cursor.as_os_str())],
+    );
+
+    let order = format!(
+        r#"{{"cursor_version":"3.19.13","hook_event_name":"beforeSubmitPrompt",
+            "conversation_id":"conv-landing","generation_id":"g1",
+            "workspace_roots":["{}"],"prompt":"이제 커서로 작업할거야"}}"#,
+        workspace.display()
+    );
+    let (code, stderr) = run_hook(home.path(), &order, &[]);
+    assert_eq!(code, 0, "the order hook failed: {stderr}");
+
+    // The landing is now in flight. The next hook must not wait behind it.
+    let began = Instant::now();
+    let (code, stderr) = run_hook(
+        home.path(),
+        r#"{"cursor_version":"3.19.13","hook_event_name":"preToolUse",
+            "conversation_id":"conv-landing","generation_id":"g2",
+            "tool_name":"Read","tool_use_id":"t1","tool_input":{}}"#,
+        &[],
+    );
+    let waited = began.elapsed();
+    daemon.stop();
+
+    assert_eq!(code, 0, "{stderr}");
+    assert!(
+        waited < Duration::from_secs(2),
+        "the hook waited {waited:?} behind a landing; the daemon accepts one at a time"
+    );
+    assert!(
+        !stderr.contains("record dropped"),
+        "the hook behind the landing lost its record: {stderr}"
+    );
+}
+
+#[test]
+fn every_line_of_the_daemon_log_says_when_it_happened() {
+    // launchd points both of the daemon's streams at one file and appends
+    // across restarts. That file held 691 lines and no times at all, so the
+    // outage of 2026-09-08 could not be placed against anything.
+    let home = tempfile::tempdir().expect("tempdir");
+    let log = home.path().join("daemon.log");
+    let child = Command::new(bin())
+        .arg("daemon")
+        .env("CONBUS_HOME", home.path())
+        .stdout(Stdio::from(std::fs::File::create(&log).expect("create")))
+        .stderr(Stdio::from(
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&log)
+                .expect("append"),
+        ))
+        .spawn()
+        .expect("spawn daemon");
+    let daemon = Daemon(child);
+    let socket = home.path().join("conbus.sock");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && std::os::unix::net::UnixStream::connect(&socket).is_err() {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // The other line the outage would have needed: a connection that says
+    // nothing, which the daemon drops after its silence bound.
+    let quiet = std::os::unix::net::UnixStream::connect(&socket).expect("connect");
+    std::thread::sleep(Duration::from_millis(400));
+    drop(quiet);
+    std::thread::sleep(Duration::from_millis(200));
+    daemon.stop();
+
+    let text = std::fs::read_to_string(&log).expect("daemon.log");
+    let lines: Vec<&str> = text.lines().filter(|line| !line.is_empty()).collect();
+    assert!(lines.len() >= 2, "expected a banner and a drop: {text}");
+    for line in &lines {
+        let stamp = line.get(..24).unwrap_or_default();
+        assert!(
+            stamp.parse::<conbus_core::clock::Timestamp>().is_ok(),
+            "a daemon.log line with no time on it: {line:?}"
+        );
+    }
+    assert!(
+        text.contains("sent no request"),
+        "the silence drop should be in the log: {text}"
+    );
 }

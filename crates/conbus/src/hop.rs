@@ -304,11 +304,6 @@ fn apply_hop(
 ) -> io::Result<()> {
     let focus = predecessor(records, from, current)?;
     let code_freshness = Some(crate::code::probe(focus.workspace.as_deref()).line());
-    let kind = match hop {
-        Hop::Displaced => "displaced",
-        Hop::HandedOff => "handed_off",
-    };
-
     if matches!(lease_of(records, focus.bus_id), Lease::Held(_)) {
         return Err(io::Error::other(
             "this conversation is already leased for a hop; wait for it to end",
@@ -327,13 +322,14 @@ fn apply_hop(
                 paths,
                 records,
                 &focus,
-                to,
-                hop,
-                reason,
-                kind,
-                Some(&warm::holder(&thread)),
-                Some(&thread),
-                code_freshness,
+                &Landing {
+                    to,
+                    hop,
+                    reason,
+                    holder: Some(warm::holder(&thread)),
+                    thread: Some(thread.clone()),
+                    code_freshness,
+                },
             )?;
             if let Err(err) = ensure_claude_warm(paths, records, &focus, &text) {
                 println!("warm      claude skipped ({err})");
@@ -345,13 +341,14 @@ fn apply_hop(
                 paths,
                 records,
                 &focus,
-                to,
-                hop,
-                reason,
-                kind,
-                Some(&warm::claude_holder(&thread)),
-                Some(&thread),
-                code_freshness,
+                &Landing {
+                    to,
+                    hop,
+                    reason,
+                    holder: Some(warm::claude_holder(&thread)),
+                    thread: Some(thread.clone()),
+                    code_freshness,
+                },
             )?;
             if let Err(err) = take_codex_warm(paths, records, &focus, &text) {
                 println!("warm      codex skipped ({err})");
@@ -368,13 +365,14 @@ fn apply_hop(
                 paths,
                 records,
                 &focus,
-                to,
-                hop,
-                reason,
-                kind,
-                None,
-                None,
-                code_freshness,
+                &Landing {
+                    to,
+                    hop,
+                    reason,
+                    holder: None,
+                    thread: None,
+                    code_freshness,
+                },
             )?;
         }
     }
@@ -395,24 +393,51 @@ fn take_codex_warm(
     Ok(codex)
 }
 
+/// Where one hop lands: the leg, why it is going, and what that leg handed
+/// back. One value rather than seven arguments — the list had grown past what
+/// a reader can hold, and past what clippy will accept.
+struct Landing<'a> {
+    to: &'a Harness,
+    hop: Hop,
+    reason: &'a str,
+    /// The `leased.holder` naming the warm thread, when the leg has one.
+    holder: Option<String>,
+    /// The thread or session the next leg should resume.
+    thread: Option<String>,
+    code_freshness: Option<String>,
+}
+
+impl Landing<'_> {
+    /// The word the log and the operator both use for this kind of hop.
+    fn kind(&self) -> &'static str {
+        match self.hop {
+            Hop::Displaced => "displaced",
+            Hop::HandedOff => "handed_off",
+        }
+    }
+}
+
 fn finish_hop(
     paths: &Paths,
     records: &[Record],
     focus: &Focus,
-    to: &Harness,
-    hop: Hop,
-    reason: &str,
-    kind: &str,
-    holder: Option<&str>,
-    thread: Option<&str>,
-    code_freshness: Option<String>,
+    landing: &Landing<'_>,
 ) -> io::Result<()> {
-    if routed_to(records, focus.bus_id, to) {
-        return handoff(paths, focus, to.as_str(), thread);
+    let thread = landing.thread.as_deref();
+    if routed_to(records, focus.bus_id, landing.to) {
+        return handoff(paths, focus, landing.to.as_str(), thread);
     }
-    record_hop(paths, focus, to, hop, reason, holder, code_freshness)?;
-    println!("recorded  routed {kind}");
-    handoff(paths, focus, to.as_str(), thread)
+    record_hop(
+        paths,
+        focus,
+        landing.to,
+        landing.hop,
+        landing.reason,
+        landing.holder.as_deref(),
+        landing.code_freshness.clone(),
+    )?;
+    println!("recorded  routed {}", landing.kind());
+    handoff(paths, focus, landing.to.as_str(), thread)
 }
 
 fn ensure_claude_warm(

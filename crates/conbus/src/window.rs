@@ -26,13 +26,26 @@ pub fn url_for(harness: &str, session: &str) -> Option<String> {
     }
 }
 
+/// Which binary opens a URL. `CONBUS_OPEN_BIN` overrides `open`, for tests
+/// and for a machine whose `open` is not macOS's.
+fn open_binary() -> std::ffi::OsString {
+    std::env::var_os("CONBUS_OPEN_BIN")
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "open".into())
+}
+
 /// Bring the vendor app to the bus-owned session. Failure is the caller's
 /// to ignore — takeover still execs the TTY.
 pub fn reveal(harness: &str, session: &str) -> io::Result<bool> {
+    reveal_with(&open_binary(), harness, session)
+}
+
+/// As [`reveal`], with the opener named. Tests pass a stand-in this way
+/// rather than through the environment, which is not theirs alone to set.
+fn reveal_with(bin: &std::ffi::OsStr, harness: &str, session: &str) -> io::Result<bool> {
     let Some(url) = url_for(harness, session) else {
         return Ok(false);
     };
-    let bin = std::env::var_os("CONBUS_OPEN_BIN").unwrap_or_else(|| "open".into());
     let mut cmd = Command::new(bin);
     match harness {
         Harness::CODEX => {
@@ -138,8 +151,6 @@ mod tests {
     #[test]
     fn reveal_hands_the_official_url_to_open() {
         use std::os::unix::fs::PermissionsExt;
-        use std::sync::Mutex;
-        static ENV: Mutex<()> = Mutex::new(());
         let dir = tempfile::tempdir().expect("tempdir");
         let stub = dir.path().join("open");
         let mark = dir.path().join("url");
@@ -152,15 +163,12 @@ mod tests {
         )
         .expect("stub");
         std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-        let _guard = ENV.lock().unwrap_or_else(|e| e.into_inner());
-        unsafe {
-            std::env::set_var("CONBUS_OPEN_BIN", &stub);
-        }
-        let opened = reveal(Harness::CODEX, "01a06307-1111-2222-3333-444444444444");
+        let opened = reveal_with(
+            stub.as_os_str(),
+            Harness::CODEX,
+            "01a06307-1111-2222-3333-444444444444",
+        );
         let got = std::fs::read_to_string(&mark);
-        unsafe {
-            std::env::remove_var("CONBUS_OPEN_BIN");
-        }
         assert!(opened.expect("open"));
         assert_eq!(
             got.expect("url"),
