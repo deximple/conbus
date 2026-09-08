@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -460,6 +460,21 @@ impl Daemon {
         let Some(bus_id) = bus_id else {
             return;
         };
+        // One decision per transition. A leg that keeps refusing keeps
+        // sending `InterruptedQuota`, and this used to answer every one of
+        // them: on 2026-09-08 a single conversation wrote 146 `routed`
+        // records between 16:14 and 16:52, spawned a `hop --apply` behind
+        // each, and left 32 headless Claude sessions leased. The decision
+        // stands until a `continued` edge closes it, which is the same state
+        // `hop --apply` consults before writing one by hand.
+        let already_going = self
+            .chapters
+            .get(&bus_id)
+            .and_then(|chapter| chapter.pending_hop.as_ref())
+            .is_some_and(|(pending, hop)| pending == next.as_str() && *hop == Hop::Displaced);
+        if already_going {
+            return;
+        }
         self.write_extra(
             bus_id,
             source,
@@ -842,10 +857,52 @@ impl Daemon {
     }
 }
 
+/// How long the liveness probe waits for the far end to say something.
+///
+/// A daemon that is serving another connection says nothing at all, so this
+/// expiring is the *positive* answer. It only has to outlast a scheduling
+/// hiccup, not any real work.
+const LIVENESS_PROBE: Duration = Duration::from_millis(50);
+
+/// Is anything actually serving this socket?
+///
+/// Connecting is not the question, though it used to be the answer. Closing a
+/// listening AF_UNIX socket does not tear the path down at once, so a
+/// connect to a daemon that has just died can still succeed — measured here
+/// under load, with `lsof` showing no process holding the path. On a machine
+/// where launchd restarts the daemon the moment it exits, "I connected"
+/// would refuse the new daemon its own socket and turn a crash into a restart
+/// loop.
+///
+/// A peer that is really there holds the line: our request is what it waits
+/// for, so the read expires. A peer that is going away hands back end-of-file
+/// straight away.
+fn someone_is_serving(socket: &Path) -> bool {
+    let Ok(stream) = UnixStream::connect(socket) else {
+        return false;
+    };
+    if stream.set_read_timeout(Some(LIVENESS_PROBE)).is_err() {
+        return false;
+    }
+    let mut byte = [0u8; 1];
+    match (&stream).read(&mut byte) {
+        // Nobody on the other end: the socket answered out of a listener
+        // that is closing, or the daemon hung up as we arrived.
+        Ok(0) => false,
+        // It spoke first, which no version of this daemon does, but anything
+        // that talks is certainly alive.
+        Ok(_) => true,
+        Err(err) => matches!(
+            err.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+        ),
+    }
+}
+
 /// Bind the control socket, refusing to steal one a live daemon still owns.
 pub fn bind(socket: &Path) -> io::Result<UnixListener> {
     if socket.exists() {
-        if UnixStream::connect(socket).is_ok() {
+        if someone_is_serving(socket) {
             return Err(io::Error::new(
                 io::ErrorKind::AddrInUse,
                 format!(
@@ -1914,6 +1971,87 @@ mod tests {
         assert!(
             !source.contains(&bare),
             "the daemon must say everything through `note!`, which stamps it"
+        );
+    }
+
+    #[test]
+    fn a_leg_that_keeps_refusing_gets_one_decision_not_one_per_turn() {
+        // Measured on 2026-09-08: one conversation wrote 146 `routed`
+        // records in 38 minutes — one per `InterruptedQuota` from a leg that
+        // kept refusing — spawned a `hop --apply` behind each, and left 32
+        // headless Claude sessions leased. The decision stands until a
+        // `continued` edge closes it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = SegmentLog::open(dir.path(), Retention::default()).expect("open");
+        let mut daemon = Daemon::new(log, Registry::new(), HashMap::new());
+        daemon.handle(request(Event::TurnStarted {
+            author: None,
+            prompt: Body::kept("work"),
+        }));
+        let refused = || {
+            request(Event::TurnEnded {
+                state: TurnState::InterruptedQuota {
+                    reason: "rate_limit".into(),
+                },
+                assistant_message: None,
+            })
+        };
+
+        for _ in 0..4 {
+            daemon.handle(refused());
+        }
+
+        let scan = SegmentLog::scan(dir.path()).expect("scan");
+        let routed = scan
+            .records
+            .iter()
+            .filter(|record| matches!(record.event, Event::Routed { .. }))
+            .count();
+        assert_eq!(routed, 1, "one transition, one decision");
+    }
+
+    #[test]
+    fn a_daemon_that_is_busy_still_counts_as_serving() {
+        // The probe's positive answer is silence: a daemon serving another
+        // connection says nothing until it has our request, so the read
+        // expiring is what proves it is there.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("conbus.sock");
+        let _live = bind(&socket).expect("bind");
+
+        assert!(someone_is_serving(&socket));
+    }
+
+    #[test]
+    fn a_socket_nobody_holds_is_not_serving() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("conbus.sock");
+        std::fs::write(&socket, b"not a socket").expect("write");
+
+        assert!(!someone_is_serving(&socket));
+    }
+
+    #[test]
+    fn a_peer_that_hangs_up_as_we_arrive_is_not_serving() {
+        // What a dying daemon looks like from here, and what used to read as
+        // "already listening": the connection is accepted and then dropped.
+        // Under load, closing a listening AF_UNIX socket leaves the path
+        // answering for long enough to do exactly this.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("conbus.sock");
+        let listener = bind(&socket).expect("bind");
+        let hangs_up = std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                drop(stream);
+            }
+        });
+
+        let serving = someone_is_serving(&socket);
+        hangs_up.join().expect("accepted");
+
+        assert!(
+            !serving,
+            "a peer that hung up is nobody to refuse a bind for"
         );
     }
 }
