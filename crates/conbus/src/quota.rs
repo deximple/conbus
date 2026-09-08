@@ -394,11 +394,25 @@ pub fn read_cached_at(paths: &Paths, harness: &str, now: i64) -> Option<Quota> {
         })
     };
     let primary = window("primary");
-    let still_reached = value
-        .get("primary")
-        .and_then(|w| w.get("resets_at"))
-        .and_then(|at| at.as_i64())
-        .is_none_or(|resets_at| resets_at > now);
+    // An exhaustion is over when the window that caused it has reset, and
+    // the cache does not say which window that was: `reached` is set if the
+    // five-hour, the weekly *or* the spend cap is full, while `primary` is
+    // whichever of them was recorded first. Expiring on `primary` alone
+    // un-flags a weekly cap the moment the five-hour window rolls over, and
+    // then the router hops into an account that is spent for another three
+    // days — the wall `Wait` exists to prevent. So the exhaustion stands
+    // while *any* window we recorded is still open, and a reading that
+    // describes no window at all is never expired: not knowing when it ends
+    // is not evidence that it has.
+    let resets_at = |name: &str| {
+        value
+            .get(name)
+            .and_then(|w| w.get("resets_at"))
+            .and_then(|at| at.as_i64())
+    };
+    let windows = [resets_at("primary"), resets_at("secondary")];
+    let still_reached = windows.iter().flatten().any(|at| *at > now)
+        || windows.iter().all(std::option::Option::is_none);
     Some(Quota {
         plan: value
             .get("plan")
@@ -994,5 +1008,50 @@ mod tests {
             line.contains("StatusLine has not fired"),
             "a stale reading must say so: {line}"
         );
+    }
+
+    #[test]
+    fn a_weekly_cap_survives_the_five_hour_window_rolling_over() {
+        // `reached` is set when the five-hour, the weekly or the spend cap
+        // is full, and the cache does not record which. Expiring it on the
+        // five-hour window alone told the router that an account spent for
+        // another three days was available.
+        let (_dir, paths) = machine();
+        let now = 1_800_000_000;
+        cached(
+            &paths,
+            now - 600,
+            serde_json::json!({
+                "plan": "max",
+                "reached": "rate_limit",
+                "primary": {"used_percent": 62, "minutes": 300, "resets_at": now - 60},
+                "secondary": {"used_percent": 100, "minutes": 10080, "resets_at": now + 3 * 86400},
+            }),
+        );
+
+        let quota = read_cached_at(&paths, Harness::CLAUDE_CODE, now).expect("cache");
+
+        assert_eq!(
+            quota.reached.as_deref(),
+            Some("rate_limit"),
+            "the weekly window has three days left"
+        );
+    }
+
+    #[test]
+    fn an_exhaustion_describing_no_window_is_never_expired() {
+        // A spend cap sets `reached` and persists no window of its own. Not
+        // knowing when it ends is not evidence that it has.
+        let (_dir, paths) = machine();
+        let now = 1_800_000_000;
+        cached(
+            &paths,
+            now - 600,
+            serde_json::json!({"plan": "max", "reached": "rate_limit"}),
+        );
+
+        let quota = read_cached_at(&paths, Harness::CLAUDE_CODE, now).expect("cache");
+
+        assert_eq!(quota.reached.as_deref(), Some("rate_limit"));
     }
 }
