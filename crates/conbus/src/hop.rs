@@ -201,13 +201,17 @@ fn plan(paths: &Paths, records: &[Record], from: Option<&str>) -> io::Result<(Le
         .unwrap_or_else(|| Harness::new(Harness::CODEX));
     let other_turn = latest_turn(records, other_harness.as_str());
     let other = leg(paths, &other_harness, other_turn, now);
-    let decision = route::decide(&current, &other);
+    let decision = route::decide_driven(&current, &other, focus.machine_driven);
     Ok((current, other, decision))
 }
 
 struct Focus {
     harness: Harness,
     last_turn: Option<TurnState>,
+    /// Whether a program drove this conversation rather than a person. The
+    /// briefing already refuses these; routing did not, so a scheduled task
+    /// crossing 80% was moved to another harness mid-run.
+    machine_driven: bool,
     vendor_session_id: Option<String>,
     workspace: Option<String>,
     bus_id: BusId,
@@ -232,8 +236,15 @@ fn focus(records: &[Record], from: Option<&str>) -> Option<Focus> {
         }
     }
     let record = chosen?;
+    let machine_driven = conbus_core::continuation::unattended(record.source.entrypoint.as_ref())
+        || matches!(
+            &record.event,
+            Event::TurnStarted { prompt, .. }
+                if conbus_core::continuation::machine_authored(prompt)
+        );
     Some(Focus {
         harness: record.source.harness.clone(),
+        machine_driven,
         last_turn: latest_turn_on(records, record.bus_id),
         vendor_session_id: record.source.vendor_session_id.clone(),
         workspace: record.source.workspace.clone(),
@@ -311,48 +322,42 @@ fn apply_hop(
     }
 
     let text = digest(records, focus.bus_id);
-    // Destination first. Overflow to Codex was waiting on `claude -p`
-    // (MCP spawn) before `codex://` could open. The other leg still
-    // warms after the vendor window is up; a failure there is not a
-    // failed hop.
-    match to.as_str() {
+    let kind = match hop {
+        Hop::Displaced => "displaced",
+        Hop::HandedOff => "handed_off",
+    };
+
+    // The decision is durable before anything is opened at the vendor.
+    // The other order — open, then record — leaves a warm thread nothing
+    // points at whenever the record fails, and the next hop, finding no
+    // lease, opens a second one and orphans the first with no account of
+    // why. Recording first can only cost a `routed` line for a hop whose
+    // destination then failed to open, which the log can say and a person
+    // can read.
+    if !routed_to(records, focus.bus_id, to) {
+        record_hop(paths, &focus, to, hop, reason, code_freshness)?;
+        println!("recorded  routed {kind}");
+    }
+
+    // Destination first among the warms. Overflow to Codex was waiting on
+    // `claude -p` (MCP spawn) before `codex://` could open. The other leg
+    // still warms after the vendor window is up; a failure there is not a
+    // failed hop. Each warm writes its own lease, checked, where it opens —
+    // this used to write a second, unchecked copy from here as well.
+    let thread = match to.as_str() {
         Harness::CODEX => {
             let thread = take_codex_warm(paths, records, &focus, &text)?;
-            finish_hop(
-                paths,
-                records,
-                &focus,
-                &Landing {
-                    to,
-                    hop,
-                    reason,
-                    holder: Some(warm::holder(&thread)),
-                    thread: Some(thread.clone()),
-                    code_freshness,
-                },
-            )?;
             if let Err(err) = ensure_claude_warm(paths, records, &focus, &text) {
                 println!("warm      claude skipped ({err})");
             }
+            Some(thread)
         }
         Harness::CLAUDE_CODE => {
             let thread = ensure_claude_warm(paths, records, &focus, &text)?;
-            finish_hop(
-                paths,
-                records,
-                &focus,
-                &Landing {
-                    to,
-                    hop,
-                    reason,
-                    holder: Some(warm::claude_holder(&thread)),
-                    thread: Some(thread.clone()),
-                    code_freshness,
-                },
-            )?;
             if let Err(err) = take_codex_warm(paths, records, &focus, &text) {
                 println!("warm      codex skipped ({err})");
             }
+            Some(thread)
         }
         _ => {
             if let Err(err) = take_codex_warm(paths, records, &focus, &text) {
@@ -361,22 +366,11 @@ fn apply_hop(
             if let Err(err) = ensure_claude_warm(paths, records, &focus, &text) {
                 println!("warm      claude skipped ({err})");
             }
-            finish_hop(
-                paths,
-                records,
-                &focus,
-                &Landing {
-                    to,
-                    hop,
-                    reason,
-                    holder: None,
-                    thread: None,
-                    code_freshness,
-                },
-            )?;
+            None
         }
-    }
-    Ok(())
+    };
+
+    handoff(paths, &focus, to.as_str(), thread.as_deref())
 }
 
 fn take_codex_warm(
@@ -391,53 +385,6 @@ fn take_codex_warm(
         lease_only(paths, focus, &warm::holder(&codex))?;
     }
     Ok(codex)
-}
-
-/// Where one hop lands: the leg, why it is going, and what that leg handed
-/// back. One value rather than seven arguments — the list had grown past what
-/// a reader can hold, and past what clippy will accept.
-struct Landing<'a> {
-    to: &'a Harness,
-    hop: Hop,
-    reason: &'a str,
-    /// The `leased.holder` naming the warm thread, when the leg has one.
-    holder: Option<String>,
-    /// The thread or session the next leg should resume.
-    thread: Option<String>,
-    code_freshness: Option<String>,
-}
-
-impl Landing<'_> {
-    /// The word the log and the operator both use for this kind of hop.
-    fn kind(&self) -> &'static str {
-        match self.hop {
-            Hop::Displaced => "displaced",
-            Hop::HandedOff => "handed_off",
-        }
-    }
-}
-
-fn finish_hop(
-    paths: &Paths,
-    records: &[Record],
-    focus: &Focus,
-    landing: &Landing<'_>,
-) -> io::Result<()> {
-    let thread = landing.thread.as_deref();
-    if routed_to(records, focus.bus_id, landing.to) {
-        return handoff(paths, focus, landing.to.as_str(), thread);
-    }
-    record_hop(
-        paths,
-        focus,
-        landing.to,
-        landing.hop,
-        landing.reason,
-        landing.holder.as_deref(),
-        landing.code_freshness.clone(),
-    )?;
-    println!("recorded  routed {}", landing.kind());
-    handoff(paths, focus, landing.to.as_str(), thread)
 }
 
 fn ensure_claude_warm(
@@ -538,6 +485,10 @@ fn predecessor(records: &[Record], from: Option<&str>, current: &Leg) -> io::Res
             records.iter().rev().find_map(|record| {
                 (record.source.harness == current.harness).then(|| Focus {
                     harness: record.source.harness.clone(),
+                    // This fallback only names where to *record* a hop the
+                    // caller already decided on, so authorship is not
+                    // consulted again here.
+                    machine_driven: false,
                     last_turn: current.last_turn.clone(),
                     vendor_session_id: record.source.vendor_session_id.clone(),
                     workspace: record.source.workspace.clone(),
@@ -652,13 +603,19 @@ fn lease_only(paths: &Paths, focus: &Focus, holder: &str) -> io::Result<()> {
     }
 }
 
+/// Write the routing decision, and nothing else.
+///
+/// It used to write the companion `Leased` too, with `let _ = submit(...)` —
+/// a discarded Result on the one write that says which warm thread this hop
+/// belongs to. When it failed the log kept a `routed` with no lease, and the
+/// next `hop --apply` opened a second thread at the vendor. Both warms write
+/// their own lease where they open it, checked; this writes the decision.
 fn record_hop(
     paths: &Paths,
     focus: &Focus,
     to: &Harness,
     hop: Hop,
     reason: &str,
-    holder: Option<&str>,
     code_freshness: Option<String>,
 ) -> io::Result<()> {
     let event = Event::Routed {
@@ -686,21 +643,7 @@ fn record_hop(
         event,
     };
     match submit(paths, &request) {
-        Ok(Response::Recorded { .. } | Response::Briefed { .. }) => {
-            if let Some(holder) = holder {
-                let _ = submit(
-                    paths,
-                    &Request {
-                        event: Event::Leased {
-                            holder: holder.into(),
-                        },
-                        brief: false,
-                        ..request.clone()
-                    },
-                );
-            }
-            Ok(())
-        }
+        Ok(Response::Recorded { .. } | Response::Briefed { .. }) => Ok(()),
         Ok(Response::Orphaned) => Err(io::Error::other(
             "daemon has no binding for this session; resume it or restart the daemon",
         )),
@@ -1011,5 +954,88 @@ mod tests {
         assert_eq!(meter.failover_hops, 1);
         assert_eq!(meter.routing_hops, 0);
         assert_eq!(meter.failover_edges, 1);
+    }
+
+    /// A stand-in daemon that answers `Recorded` and remembers what it was
+    /// asked, for a fixed window. The window, rather than a request count,
+    /// is the point: a test that accepted exactly one connection could not
+    /// see a second write, which is the defect being pinned.
+    fn fake_daemon(socket: std::path::PathBuf) -> std::thread::JoinHandle<Vec<String>> {
+        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
+        listener.set_nonblocking(true).expect("nonblocking");
+        std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            let until = std::time::Instant::now() + std::time::Duration::from_millis(400);
+            while std::time::Instant::now() < until {
+                let Ok((stream, _)) = listener.accept() else {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    continue;
+                };
+                stream.set_nonblocking(false).expect("blocking");
+                let mut lines = BufReader::new(&stream).lines();
+                let Some(Ok(line)) = lines.next() else {
+                    continue;
+                };
+                let value: serde_json::Value = serde_json::from_str(&line).expect("request");
+                let event = value
+                    .get("event")
+                    .and_then(|e| e.as_str().map(str::to_string))
+                    .or_else(|| {
+                        value
+                            .get("event")?
+                            .get("event")?
+                            .as_str()
+                            .map(str::to_string)
+                    })
+                    .unwrap_or_else(|| line.clone());
+                seen.push(event);
+                let reply = serde_json::json!({
+                    "status": "recorded",
+                    "bus_id": "01a07243-a666-7d50-b64b-773b257d06e1",
+                    "seqs": [1],
+                });
+                let mut stream = &stream;
+                let _ = writeln!(stream, "{reply}");
+                let _ = stream.flush();
+            }
+            seen
+        })
+    }
+
+    #[test]
+    fn recording_a_hop_writes_the_decision_and_no_lease() {
+        // The companion `Leased` used to go out from here with its Result
+        // discarded, while both warms already write their own — checked —
+        // where they open the thread. A cold hop put `leased, routed, leased`
+        // on the log, and when the unchecked one failed the log kept a routed
+        // with no lease and the next hop opened a second vendor thread.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::from_env(dir.path().to_str(), None, None).expect("paths");
+        std::fs::create_dir_all(paths.root()).expect("root");
+        let daemon = fake_daemon(paths.socket());
+        let focus = Focus {
+            harness: Harness::new(Harness::CLAUDE_CODE),
+            machine_driven: false,
+            last_turn: None,
+            vendor_session_id: Some("vendor-abc".into()),
+            workspace: Some("/repo".into()),
+            bus_id: "01a07243-a666-7d50-b64b-773b257d06e1".parse().expect("id"),
+        };
+
+        record_hop(
+            &paths,
+            &focus,
+            &Harness::new(Harness::CODEX),
+            Hop::Displaced,
+            "rate_limit",
+            None,
+        )
+        .expect("record");
+
+        assert_eq!(
+            daemon.join().expect("daemon"),
+            vec!["routed".to_string()],
+            "the decision, and only the decision"
+        );
     }
 }

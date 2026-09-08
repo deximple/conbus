@@ -103,6 +103,40 @@ pub fn decide(current: &Leg, other: &Leg) -> Decision {
     Decision::Stay
 }
 
+/// As [`decide`], for a turn a program drove rather than a person.
+///
+/// The briefing already refuses these — `continuation` silences a session
+/// whose entrypoint is an SDK or whose prompt opens with a vendor's own tell
+/// that a program wrote it, on the ground that they are programs. Routing had
+/// no such notion, so a scheduled task or a CI run crossing 80% was moved to
+/// another harness mid-automation, with nobody there to notice.
+///
+/// The two halves differ. A predictive hop is a convenience nobody asked for,
+/// so a program simply stays. A failover is the leg saying it cannot serve
+/// the turn at all, and moving an unattended run to another vendor without a
+/// person watching is its own hazard — so it waits, which is the answer this
+/// module already gives when there is nowhere good to go.
+pub fn decide_driven(current: &Leg, other: &Leg, driven: bool) -> Decision {
+    let decision = decide(current, other);
+    if !driven {
+        return decision;
+    }
+    match decision {
+        Decision::Hop {
+            hop: Hop::HandedOff,
+            ..
+        } => Decision::Stay,
+        Decision::Hop {
+            hop: Hop::Displaced,
+            reason,
+            ..
+        } => Decision::Wait {
+            reason: format!("{reason}; nobody is driving this session"),
+        },
+        other => other,
+    }
+}
+
 impl Decision {
     pub fn describe(&self, current: &Harness) -> String {
         match self {
@@ -273,5 +307,68 @@ mod tests {
             }
             other => panic!("expected overflow to Codex, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_program_at_eighty_percent_stays_where_it_is() {
+        // The predictive hop is a convenience for somebody who is sitting
+        // there. A scheduled task crossing the line mid-run is not asking to
+        // change harness.
+        let current = Leg {
+            used_percent: Some(85),
+            minutes_to_reset: Some(180),
+            ..claude()
+        };
+        let other = codex();
+
+        assert!(matches!(
+            decide(&current, &other),
+            Decision::Hop {
+                hop: Hop::HandedOff,
+                ..
+            }
+        ));
+        assert_eq!(decide_driven(&current, &other, true), Decision::Stay);
+    }
+
+    #[test]
+    fn a_program_that_hit_quota_waits_rather_than_changing_vendor() {
+        // A failover is the leg saying it cannot serve the turn, so staying
+        // is not right either — but moving an unattended run to another
+        // vendor with nobody watching is its own hazard.
+        let current = Leg {
+            last_turn: Some(TurnState::InterruptedQuota {
+                reason: "rate_limit".into(),
+            }),
+            ..claude()
+        };
+        let other = codex();
+
+        assert!(matches!(
+            decide(&current, &other),
+            Decision::Hop {
+                hop: Hop::Displaced,
+                ..
+            }
+        ));
+        let Decision::Wait { reason } = decide_driven(&current, &other, true) else {
+            panic!("a program must wait, not hop");
+        };
+        assert!(reason.contains("nobody is driving"), "{reason}");
+    }
+
+    #[test]
+    fn a_person_is_routed_exactly_as_before() {
+        let current = Leg {
+            used_percent: Some(85),
+            minutes_to_reset: Some(180),
+            ..claude()
+        };
+        let other = codex();
+
+        assert_eq!(
+            decide_driven(&current, &other, false),
+            decide(&current, &other)
+        );
     }
 }

@@ -7,6 +7,7 @@
 //! (anthropics/claude-code#78455). Minting there would pile up ids that no
 //! conversation ever uses, and can leave a real session aliased to a ghost.
 
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 
 use crate::event::{Event, Harness, VendorAgentId, VendorTurnId};
@@ -75,6 +76,18 @@ pub enum Disposition {
     Orphaned,
 }
 
+/// Who a directed hop reserved a leg for, in one checkout.
+///
+/// Claimed is an identity claim, and this codebase only makes one where the
+/// identity is known. Two conversations claiming the same leg in the same
+/// checkout is exactly the case where it is not, so the seat holds nobody
+/// rather than the last writer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Seat {
+    Claimed(BusId),
+    Contested,
+}
+
 /// The vendor-session-to-conversation map. Lives in the daemon's memory.
 #[derive(Default)]
 pub struct Registry {
@@ -96,7 +109,7 @@ pub struct Registry {
     remembered: u64,
     /// A hop to a catalog leg that cannot keep a warm session. The next
     /// unbound prompt in that checkout claims this conversation.
-    pending: HashMap<(String, String), BusId>,
+    pending: HashMap<(String, String), Seat>,
 }
 
 impl Registry {
@@ -182,7 +195,8 @@ impl Registry {
     }
 
     fn clear_pending_bus(&mut self, bus_id: BusId) {
-        self.pending.retain(|_, id| *id != bus_id);
+        self.pending
+            .retain(|_, seat| !matches!(seat, Seat::Claimed(id) if *id == bus_id));
     }
 
     fn note_route(&mut self, bus_id: BusId, observed: &Observed) {
@@ -200,7 +214,24 @@ impl Registry {
         else {
             return;
         };
-        self.pending.insert((next.clone(), workspace), bus_id);
+        // Two conversations in one checkout can be directed at the same
+        // attach leg before either has said a word there — parallel sessions
+        // or worktrees in one repo make that ordinary, not exotic. A plain
+        // insert let the second silently take the first's seat, and the next
+        // prompt in that checkout then bound to the wrong conversation and
+        // the first was split a second time. A seat two conversations claim
+        // belongs to neither: minting a fresh id is a recoverable
+        // disappointment, and binding to the wrong one is not.
+        match self.pending.entry((next.clone(), workspace)) {
+            Entry::Vacant(seat) => {
+                seat.insert(Seat::Claimed(bus_id));
+            }
+            Entry::Occupied(mut seat) => {
+                if !matches!(seat.get(), Seat::Claimed(id) if *id == bus_id) {
+                    seat.insert(Seat::Contested);
+                }
+            }
+        }
     }
 
     fn note_route_record(&mut self, record: &Record) {
@@ -217,16 +248,22 @@ impl Registry {
             record.event,
             Event::TurnStarted { .. } | Event::TurnEnded { .. }
         ) {
-            self.pending.retain(|(harness, _), id| {
-                !(*id == record.bus_id && harness == record.source.harness.as_str())
+            self.pending.retain(|(harness, _), seat| {
+                !(matches!(seat, Seat::Claimed(id) if *id == record.bus_id)
+                    && harness == record.source.harness.as_str())
             });
         }
     }
 
     fn take_seat(&mut self, harness: &Harness, workspace: Option<&str>) -> Option<BusId> {
         let workspace = Self::normalize_workspace(workspace?)?;
-        self.pending
+        match self
+            .pending
             .remove(&(harness.as_str().to_string(), workspace))
+        {
+            Some(Seat::Claimed(bus_id)) => Some(bus_id),
+            Some(Seat::Contested) | None => None,
+        }
     }
 
     /// The most session starts held at once before the oldest is forgotten.
@@ -926,6 +963,82 @@ mod tests {
             claude, codex_id,
             "vendor session ids are only unique per vendor"
         );
+    }
+
+    #[test]
+    fn two_conversations_directed_at_one_leg_in_one_checkout_seat_neither() {
+        // Parallel sessions or worktrees in one repo make this ordinary. A
+        // plain insert let the second hop take the first's seat with no
+        // trace, and the next Cursor prompt then bound to the wrong
+        // conversation — splitting the first a second time, in a log that
+        // cannot be rewritten. A fresh id is a recoverable disappointment;
+        // the wrong id is not.
+        let mut registry = Registry::new();
+        let first = key();
+        let second = SessionKey::new(Harness::new(Harness::CLAUDE_CODE), "vendor-def");
+        let Disposition::Write { bus_id: a, .. } =
+            registry.observe(&first, Observed::bare(prompt("work")))
+        else {
+            panic!("mint");
+        };
+        let Disposition::Write { bus_id: b, .. } =
+            registry.observe(&second, Observed::bare(prompt("other work")))
+        else {
+            panic!("mint");
+        };
+        for who in [&first, &second] {
+            let mut routed = Observed::bare(Event::Routed {
+                next: Harness::CURSOR.into(),
+                hop: crate::event::Hop::HandedOff,
+                reason: "directed".into(),
+                code_freshness: None,
+            });
+            routed.workspace = Some("/repo".into());
+            registry.observe(who, routed);
+        }
+
+        let cursor = SessionKey::new(Harness::new(Harness::CURSOR), "composer-1");
+        let mut arriving = Observed::bare(prompt("continue"));
+        arriving.workspace = Some("/repo".into());
+        let Disposition::Write { bus_id: seated, .. } = registry.observe(&cursor, arriving) else {
+            panic!("mint");
+        };
+
+        assert_ne!(seated, a, "a contested seat must not hand out the first");
+        assert_ne!(seated, b, "nor the second");
+    }
+
+    #[test]
+    fn one_conversation_hopping_twice_keeps_its_seat() {
+        // The companion guard: the contested rule must not fire on a
+        // conversation that simply hops to the same leg again, which would
+        // silently disable directed hops for everybody.
+        let mut registry = Registry::new();
+        let claude = key();
+        let Disposition::Write { bus_id, .. } =
+            registry.observe(&claude, Observed::bare(prompt("work")))
+        else {
+            panic!("mint");
+        };
+        for _ in 0..2 {
+            let mut routed = Observed::bare(Event::Routed {
+                next: Harness::CURSOR.into(),
+                hop: crate::event::Hop::HandedOff,
+                reason: "directed".into(),
+                code_freshness: None,
+            });
+            routed.workspace = Some("/repo".into());
+            registry.observe(&claude, routed);
+        }
+
+        let cursor = SessionKey::new(Harness::new(Harness::CURSOR), "composer-2");
+        let mut arriving = Observed::bare(prompt("continue"));
+        arriving.workspace = Some("/repo".into());
+        let Disposition::Write { bus_id: seated, .. } = registry.observe(&cursor, arriving) else {
+            panic!("mint");
+        };
+
+        assert_eq!(seated, bus_id, "its own second hop is not a contest");
     }
 
     #[test]
