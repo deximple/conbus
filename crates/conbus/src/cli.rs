@@ -22,6 +22,11 @@ pub enum Command {
     Install {
         apply: bool,
     },
+    /// Take back everything `install --apply` wrote. Reports by default; the
+    /// log is never removed.
+    Uninstall {
+        apply: bool,
+    },
     /// Recover history from before the recorder was installed.
     ///
     /// `--gaps` is the other job: turns that happened while the daemon was
@@ -135,6 +140,9 @@ where
         "install" => Command::Install {
             apply: args.iter().any(|a| a == "--apply"),
         },
+        "uninstall" => Command::Uninstall {
+            apply: args.iter().any(|a| a == "--apply"),
+        },
         "backfill" => Command::Backfill {
             apply: args.iter().any(|a| a == "--apply"),
             gaps: args.iter().any(|a| a == "--gaps"),
@@ -225,7 +233,9 @@ USAGE:
     conbus log [--json] [--bus-id ID] [--since TS] [--tail N] [--grep TEXT] [--reveal]
                                   read the conversation log back; --reveal
                                   decrypts sealed tool bodies (explicit only)
-    conbus install [--apply]      register the hook with Claude Code and Codex
+    conbus install [--apply]      register the hooks with every vendor found;
+                                  reports unless told to write
+    conbus uninstall [--apply]    take them all back out; the log is kept
     conbus backfill [--apply] [--gaps] [--chat-export PATH]
                                   recover history; --gaps fills missed turns of live sessions;
                                   --chat-export reads official Claude.ai conversations.json (or zip)
@@ -488,6 +498,18 @@ mod tests {
         assert_eq!(
             parse(["install", "--apply"], None),
             Command::Install { apply: true }
+        );
+    }
+
+    #[test]
+    fn uninstall_reports_unless_told_to_apply() {
+        assert_eq!(
+            parse(["uninstall"], None),
+            Command::Uninstall { apply: false }
+        );
+        assert_eq!(
+            parse(["uninstall", "--apply"], None),
+            Command::Uninstall { apply: true }
         );
     }
 

@@ -16,7 +16,10 @@ path = "src/main.rs"
 conbus-core.workspace = true
 libc.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+# `preserve_order`: install and uninstall rewrite files that belong to the
+# person — Claude's settings.json, Codex's and Cursor's hooks.json — and a
+# rewrite that sorts their keys is not leaving their file alone.
+serde_json = { workspace = true, features = ["preserve_order"] }
 
 [dev-dependencies]
 serde_json.workspace = true

@@ -22,6 +22,7 @@ mod report;
 mod runner;
 mod summarise;
 mod takeover;
+mod uninstall;
 mod verdict;
 mod warm;
 mod window;
@@ -100,6 +101,7 @@ fn main() -> ExitCode {
         Command::Daemon => run(|paths| daemon::serve(paths, Retention::from_env())),
         Command::Log { json, filter } => run(|paths| report::log(paths, json, &filter)),
         Command::Install { apply } => run(|_| report::install(apply)),
+        Command::Uninstall { apply } => run(|_| uninstall::run(apply)),
         Command::Backfill {
             apply,
             gaps,

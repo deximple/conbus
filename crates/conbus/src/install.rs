@@ -106,6 +106,20 @@ pub fn merge(existing: &Value, events: &[&str], command: &str) -> (Value, Vec<Ch
     (Value::Object(document), changes)
 }
 
+/// Whether a registered command runs this recorder's hook, wherever the binary
+/// that registered it lives.
+///
+/// Matched on the program's file name, not on our own path: a registration
+/// left pointing at an old checkout's build is still ours to report in
+/// `doctor` and still ours to take out in `uninstall`.
+pub fn is_conbus_hook(command: &str) -> bool {
+    command
+        .split_once(" hook")
+        .map(|(program, _)| program.trim())
+        .and_then(|program| Path::new(program).file_name())
+        .is_some_and(|name| name == "conbus")
+}
+
 /// Whether a registration block already runs this command.
 fn mentions(block: &Value, command: &str) -> bool {
     block
@@ -328,10 +342,19 @@ fn merge_statusline(document: &mut Value, command: &str) -> Option<Change> {
     match existing {
         Some(cmd) if cmd.contains("hook --statusline") => Some(Change::Keep("StatusLine".into())),
         Some(_) | None => {
-            document.as_object_mut()?.insert(
-                "statusLine".into(),
-                json!({ "type": "command", "command": command }),
-            );
+            // Only the command is ours to change. Anything else the person set
+            // on their StatusLine — `padding`, say — stays, so uninstalling
+            // can put back exactly what was there.
+            let mut line = document
+                .get("statusLine")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            line.insert("type".into(), json!("command"));
+            line.insert("command".into(), json!(command));
+            document
+                .as_object_mut()?
+                .insert("statusLine".into(), Value::Object(line));
             Some(Change::Add("StatusLine".into()))
         }
     }
@@ -562,10 +585,7 @@ pub fn apply_daemon(home: &Path, binary: &Path, log: &Path, load: bool) -> io::R
     let body = daemon_plist(binary, log);
     let unchanged = fs::read_to_string(&path).is_ok_and(|existing| existing == body);
     if !unchanged {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&path, body)?;
+        write_atomically(&path, &body)?;
     }
     if load {
         load_launch_agent(&path)?;
@@ -776,6 +796,31 @@ mod tests {
             "/opt/conbus hook --statusline"
         );
         assert_eq!(existing["statusLine"]["command"], "their-status");
+    }
+
+    #[test]
+    fn wrapping_the_statusline_keeps_the_persons_other_settings_on_it() {
+        let mut document = json!({
+            "statusLine": { "type": "command", "command": "their-status", "padding": 0 }
+        });
+        merge_statusline(&mut document, "/opt/conbus hook --statusline");
+
+        assert_eq!(
+            document["statusLine"],
+            json!({ "type": "command", "command": "/opt/conbus hook --statusline", "padding": 0 })
+        );
+    }
+
+    #[test]
+    fn a_hook_command_is_ours_by_program_name_wherever_it_was_built() {
+        assert!(is_conbus_hook("/Users/x/.local/bin/conbus hook"));
+        assert!(is_conbus_hook(
+            "/Applications/conbus/target/release/conbus hook --harness codex"
+        ));
+        assert!(is_conbus_hook("/opt/conbus hook --statusline"));
+        assert!(!is_conbus_hook("their-own-stop"));
+        assert!(!is_conbus_hook("/opt/not-conbus hook"));
+        assert!(!is_conbus_hook("paseo hooks codex Stop"));
     }
 
     #[test]

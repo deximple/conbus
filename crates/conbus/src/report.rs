@@ -450,11 +450,7 @@ fn registered_hooks(settings: &serde_json::Value) -> BTreeSet<String> {
 /// Whether a registered command is one of ours, by the shape `install` writes:
 /// a path to a `conbus` binary followed by the `hook` subcommand.
 fn is_ours(command: &str) -> bool {
-    command
-        .split_once(" hook")
-        .map(|(program, _)| program.trim())
-        .and_then(|program| Path::new(program).file_name())
-        .is_some_and(|name| name == "conbus")
+    crate::install::is_conbus_hook(command)
 }
 
 /// Can the vendor actually run this command?
