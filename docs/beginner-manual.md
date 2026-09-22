@@ -52,7 +52,16 @@ Conbus는 채팅 앱이 아니다. Claude Code / Codex TUI를 그대로 쓰면�
 
 이미 이 머신에 돌아가고 있으면 이 장을 건너뛰고 `conbus doctor`만 본다.
 
-낯선 사람 경로: clone → build → `install --apply` → `doctor` → hop.
+낯선 사람 경로 (0.1.0): 릴리스 설치 스크립트 → `install --apply` → Codex 승인 → `doctor` → hop.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/deximple/conbus/main/install.sh | sh
+conbus install --apply
+```
+
+스크립트는 최신 릴리스의 유니버설 바이너리를 받아 SHA-256을 확인하고 `~/.local/bin/conbus`에 옆에 쓴 뒤 `mv`한다. 벤더 설정은 건드리지 않고 `conbus install` 보고만 보여 준다. 저장소가 비공개인 동안은 `gh auth login`으로 접근 권한이 있는 사람만 받을 수 있다.
+
+소스에서 빌드하려면:
 
 ```bash
 git clone https://github.com/deximple/conbus
@@ -258,6 +267,17 @@ B에서 다음 프롬프트를 치면 팩에 `arena` 줄이 보인다. 이 에�
 데몬 로그는 `~/.conbus/daemon.log`.
 떨어뜨린 훅은 `~/.conbus/drops.jsonl`.
 
+## 되돌리기
+
+```bash
+conbus uninstall          # 무엇을 지울지 보고만
+conbus uninstall --apply  # 지운다
+```
+
+벤더 파일마다 conbus 훅 항목만 빠지고, 다른 훅은 그대로 남는다. StatusLine은 원래 명령으로 돌아가고, opencode 플러그인·grok 훅 파일·launchd 에이전트·`~/.local/bin/conbus`는 지워진다. 고친 파일 옆에는 `.conbus-uninstall-backup`이 남는다. Codex는 훅 신뢰를 위치로 기억하므로, conbus 뒤에 있던 훅이 앞으로 당겨지면 Codex가 그 훅을 다시 승인해 달라고 한다(uninstall이 미리 알려 준다).
+
+**로그(`~/.conbus`)는 지우지 않는다.** 원하면 직접 `rm -rf ~/.conbus`.
+
 ## 명령 한 장
 
 ```text
@@ -275,6 +295,7 @@ conbus hop --demo
 conbus verdict
 conbus summary --bus-id <bus_id>
 conbus install --apply
+conbus uninstall --apply
 conbus backfill --gaps
 conbus backfill --chat-export ~/.conbus/chat-export
 conbus --version
