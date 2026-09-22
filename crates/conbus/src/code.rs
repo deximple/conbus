@@ -93,9 +93,14 @@ fn gh_note(gh_bin: &str, dir: &str) -> Result<String, String> {
 mod tests {
     use super::*;
 
+    /// A checkout that exists wherever the tests run. These used to name
+    /// `/Applications/conbus`, which exists on one machine: anywhere else the
+    /// probe took the "no checkout" path and never reached `gh` at all.
+    const CHECKOUT: &str = env!("CARGO_MANIFEST_DIR");
+
     #[test]
     fn a_missing_gh_marks_the_code_stale_not_the_route() {
-        let freshness = probe_with("/no/such/gh", Some("/Applications/conbus"));
+        let freshness = probe_with("/no/such/gh", Some(CHECKOUT));
         let line = freshness.line();
         assert!(line.starts_with("stale ·"), "{line}");
         assert!(line.contains("gh unavailable"), "{line}");
@@ -103,11 +108,9 @@ mod tests {
 
     #[test]
     fn a_failing_gh_marks_the_code_stale() {
-        let freshness = probe_with("/usr/bin/false", Some("/Applications/conbus"));
-        assert!(
-            freshness.line().starts_with("stale ·"),
-            "{}",
-            freshness.line()
-        );
+        let freshness = probe_with("/usr/bin/false", Some(CHECKOUT));
+        let line = freshness.line();
+        assert!(line.starts_with("stale ·"), "{line}");
+        assert!(!line.contains("no checkout"), "the probe never reached gh: {line}");
     }
 }
