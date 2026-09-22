@@ -87,6 +87,9 @@ fn uninstall_takes_back_everything_install_wrote_and_nothing_else() {
     write(&machine.at(".claude/settings.json"), &claude);
     write(&machine.at(".codex/hooks.json"), &codex);
     write(&machine.at(".cursor/hooks.json"), &cursor);
+    // grok and opencode are installed too, with nothing of theirs configured.
+    std::fs::create_dir_all(machine.at(".grok")).expect("grok");
+    std::fs::create_dir_all(machine.at(".config/opencode")).expect("opencode");
     std::fs::create_dir_all(machine.at(".conbus/log")).expect("log");
     std::fs::write(machine.at(".conbus/log/segment-00000000.jsonl"), "{}\n").expect("seed");
 
@@ -181,4 +184,27 @@ fn uninstall_on_a_machine_conbus_never_touched_changes_nothing() {
         before,
         "a file with nothing of ours in it must not even be rewritten"
     );
+}
+
+#[test]
+fn install_registers_only_the_vendors_this_machine_has() {
+    // Someone with only Claude Code must not get configuration directories
+    // for four tools they never installed.
+    let machine = Machine::new();
+    let built = PathBuf::from(env!("CARGO_BIN_EXE_conbus"));
+    std::fs::create_dir_all(machine.at(".claude")).expect("claude");
+
+    let out = conbus(&built, &machine.home, &["install", "--apply"]);
+
+    assert!(
+        machine.at(".claude/settings.json").exists(),
+        "Claude Code is here and must be registered:\n{out}"
+    );
+    for absent in [".codex", ".grok", ".cursor", ".config/opencode"] {
+        assert!(
+            !machine.at(absent).exists(),
+            "install created {absent} for a vendor that is not installed:\n{out}"
+        );
+    }
+    assert!(out.contains("codex        not found"), "{out}");
 }

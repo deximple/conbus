@@ -4,6 +4,17 @@ All notable changes to conbus. Versions follow [Semantic Versioning](https://sem
 until 1.0 a minor version may change the command line or the log format, and
 the entry says so when it does.
 
+## [0.1.1] — 2026-09-23
+
+### Fixed
+
+- `install` registers only the vendors this machine has. It used to create
+  `~/.codex`, `~/.grok`, `~/.cursor` and `~/.config/opencode` for someone who
+  had only Claude Code, which `uninstall` could not tell were its own to
+  remove. A vendor installed later is picked up by running `install --apply`
+  again, and `doctor` says "not installed here" instead of telling you to run
+  an install that would skip it.
+
 ## [0.1.0] — 2026-09-23
 
 The first release someone other than its author can install, check, and take
@@ -70,4 +81,5 @@ back out. macOS only.
   not quarantine; a copy downloaded in a browser needs
   `xattr -d com.apple.quarantine conbus` before macOS will run it.
 
+[0.1.1]: https://github.com/deximple/conbus/releases/tag/v0.1.1
 [0.1.0]: https://github.com/deximple/conbus/releases/tag/v0.1.0

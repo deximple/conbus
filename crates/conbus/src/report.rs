@@ -292,6 +292,10 @@ pub fn install(apply: bool) -> io::Result<()> {
     for target in crate::install::targets(&binary, &home) {
         let harness = target.harness;
         let settings = target.settings.clone();
+        if !crate::install::vendor_present(harness, &home) {
+            print_absent(harness, &home);
+            continue;
+        }
         let plan = crate::install::plan(target)?;
 
         if let Some(err) = &plan.unreadable {
@@ -328,7 +332,9 @@ pub fn install(apply: bool) -> io::Result<()> {
     }
 
     let plugin = crate::install::opencode_plugin_path(&home);
-    if crate::install::opencode_plugin_registered(&home) {
+    if !crate::install::vendor_present("opencode", &home) {
+        print_absent("opencode", &home);
+    } else if crate::install::opencode_plugin_registered(&home) {
         println!(
             "{:<12} {} — already registered",
             "opencode",
@@ -350,7 +356,9 @@ pub fn install(apply: bool) -> io::Result<()> {
     }
 
     let cursor_hooks = crate::install::cursor_hooks_path(&home);
-    if crate::install::cursor_hooks_registered(&home) {
+    if !crate::install::vendor_present("cursor", &home) {
+        print_absent("cursor", &home);
+    } else if crate::install::cursor_hooks_registered(&home) {
         println!(
             "{:<12} {} — already registered",
             "cursor",
@@ -408,6 +416,14 @@ pub fn install(apply: bool) -> io::Result<()> {
          forge. Until you approve there, Codex hooks are registered and silently do not fire."
     );
     Ok(())
+}
+
+/// A vendor this machine does not have: say so, and how to add it later.
+fn print_absent(harness: &str, home: &std::path::Path) {
+    println!(
+        "{harness:<12} not found (no {}) — skipped; run install again after installing it",
+        crate::install::vendor_home(harness, home).display()
+    );
 }
 
 fn path_lists(dir: &std::path::Path) -> bool {
@@ -754,6 +770,10 @@ fn snake_case(event: &str) -> String {
 fn report_hooks(home: &Path) {
     let mut any = false;
     for target in crate::install::targets(Path::new("conbus"), home) {
+        if !crate::install::vendor_present(target.harness, home) {
+            println!("hooks     {:<12} not installed here", target.harness);
+            continue;
+        }
         let Ok(text) = std::fs::read_to_string(&target.settings) else {
             println!(
                 "hooks     {:<12} {} — no settings file",
@@ -819,7 +839,9 @@ fn report_hooks(home: &Path) {
     if !any {
         println!("hooks     nothing registered; run `conbus install --apply`");
     }
-    if crate::install::opencode_plugin_registered(home) {
+    if !crate::install::vendor_present("opencode", home) {
+        println!("hooks     {:<12} not installed here", "opencode");
+    } else if crate::install::opencode_plugin_registered(home) {
         println!(
             "hooks     {:<12} runs — {} plugin",
             "opencode",
@@ -831,7 +853,9 @@ fn report_hooks(home: &Path) {
             "opencode"
         );
     }
-    if crate::install::cursor_hooks_registered(home) {
+    if !crate::install::vendor_present("cursor", home) {
+        println!("hooks     {:<12} not installed here", "cursor");
+    } else if crate::install::cursor_hooks_registered(home) {
         println!(
             "hooks     {:<12} runs — {} {}",
             "cursor",

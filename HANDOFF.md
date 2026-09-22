@@ -342,8 +342,9 @@ three.
   `beforeSubmitPrompt` ever arrived for them. Letting a Cursor tool call mint
   (2026-09-09) stopped the orphans and created a worse defect: worker-shaped
   sessions send their tool hooks with an **empty** conversation id, and
-  `(cursor, "")` became one conversation holding 877 tool records from two
-  sessions. 0.1.0 refuses an empty id on both sides of the socket
+  `(cursor, "")` became one conversation — 877 tool records from two
+  sessions when the 4th audit found it, 4,569 by the time it stopped growing
+  on 2026-09-13. 0.1.0 refuses an empty id on both sides of the socket
   (`hook::NO_SESSION`) and doctor names the merged conversation (`nameless`).
   Those payloads are dropped now, visibly. Which field, if any, names the
   session in a worker payload is still unread — capture one rather than
