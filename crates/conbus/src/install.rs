@@ -16,6 +16,31 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value, json};
 
+/// Where a vendor keeps its own configuration, which is how `install` knows the
+/// vendor is on this machine at all.
+///
+/// Registering a vendor that is not installed used to create its directories:
+/// someone with only Claude Code got `~/.codex`, `~/.grok`, `~/.cursor` and
+/// `~/.config/opencode` from conbus, for tools they never had, and uninstall
+/// could not tell those directories were ours to remove.
+pub fn vendor_home(harness: &str, home: &Path) -> PathBuf {
+    match harness {
+        "claude_code" => home.join(".claude"),
+        "codex" => std::env::var_os("CODEX_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".codex")),
+        "grok" => home.join(".grok"),
+        "cursor" => home.join(".cursor"),
+        "opencode" => home.join(".config").join("opencode"),
+        other => home.join(format!(".{other}")),
+    }
+}
+
+/// Whether the vendor has ever run here.
+pub fn vendor_present(harness: &str, home: &Path) -> bool {
+    vendor_home(harness, home).is_dir()
+}
+
 /// What a merge would do to one hook event.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Change {
@@ -686,6 +711,17 @@ mod tests {
 
         let text = serde_json::to_string(&merged).expect("serialise");
         assert!(!text.contains("async"), "{text}");
+    }
+
+    #[test]
+    fn a_vendor_is_present_only_when_its_own_directory_is() {
+        let home = tempfile::tempdir().expect("tempdir");
+        assert!(!vendor_present("grok", home.path()));
+        fs::create_dir_all(home.path().join(".grok")).expect("grok");
+        assert!(vendor_present("grok", home.path()));
+        fs::create_dir_all(home.path().join(".config/opencode")).expect("opencode");
+        assert!(vendor_present("opencode", home.path()));
+        assert!(!vendor_present("cursor", home.path()));
     }
 
     #[test]
