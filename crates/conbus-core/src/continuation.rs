@@ -1108,7 +1108,7 @@ mod tests {
     #[test]
     fn the_machine_tells_are_the_vendors_own_and_nothing_looser() {
         assert!(machine_authored(&Body::kept(
-            "<scheduled-task name=\"moet-daily-report\" file=\"/x\">run it</scheduled-task>"
+            "<scheduled-task name=\"nightly-report\" file=\"/x\">run it</scheduled-task>"
         )));
         assert!(machine_authored(&Body::kept(
             "## Memory Writing Agent: Phase 2 (Consolidation)\n\nYou are…"

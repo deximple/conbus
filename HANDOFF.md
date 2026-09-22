@@ -2,6 +2,10 @@
 
 Operator notes for the next agent, and the knowledge this project paid for.
 
+SaaS scope is decided: conbus is a local tool (`docs/saas-hypothesis.md`,
+2026-09-23). Before any hosted bus, account, or price, reopen that file and
+write the new choice there. Do not start that host in the same turn.
+
 Live bus ids, home paths, quota numbers and probe session ids do not belong
 here — they live in `HANDOFF.local.md` (gitignored) and in `~/.conbus/`.
 Everything below is true of the code, not of one machine, which is why it is
@@ -10,8 +14,10 @@ tracked: it took weeks to learn and a clone should not have to learn it again.
 ## Where things are
 
 - Repo: `deximple/conbus`, **private** until an operator flips visibility.
-  The README and the landing page open with `git clone`, which is why that
-  decision is theirs and is called out in both.
+  The README and the landing page install from a release with `install.sh`;
+  until the repo is public that works only for people signed in to `gh` with
+  access, which both pages say. Releasing: `docs/release.md`; what going public
+  would expose: `docs/publication-review.md`.
 - Design SSOT: `.cursor/plans/shared_workspace_context_3f7139b8.plan.md`.
   The filename is a generated id and no longer matches the content; leave it
   so the Cursor plan UI keeps its association.
@@ -291,9 +297,14 @@ injection problem — over budget it drops whole chapters, then refuses), and
 
 ## Shipped user surface
 
-Stranger path: clone → build → `install --apply` → `doctor` → `hop --demo` →
-`conbus run claude_code`. Chat orders and `conbus go <leg>` are directed hops.
-Cursor landing is `cursor -n`. Repo visibility and DNS stay operator actions.
+Stranger path (0.1.0): `install.sh` (download, checksum, place, report) →
+`install --apply` → trust the hooks in Codex → `doctor` → `hop --demo` →
+`conbus run claude_code`. `conbus uninstall --apply` takes everything back out
+and keeps the log; `tests/install_roundtrip.rs` holds that promise, key order
+included. Chat orders and `conbus go <leg>` are directed hops. Cursor landing is
+`cursor -n`. Releases come from a `vX.Y.Z` tag (`.github/workflows/release.yml`);
+CI gates every pull request. Repo visibility, notarization and DNS stay
+operator actions.
 
 ## What the counters mean
 
@@ -328,9 +339,15 @@ three.
   one.
 - **42 Cursor conversations were lost before 2026-09-09** and are not
   recoverable: their tool events were dropped as orphans because no
-  `beforeSubmitPrompt` ever arrived for them. A Cursor tool call now mints, so
-  the loss stops there, but why that prompt hook does not fire for those
-  sessions is still unread — capture one payload rather than guessing.
+  `beforeSubmitPrompt` ever arrived for them. Letting a Cursor tool call mint
+  (2026-09-09) stopped the orphans and created a worse defect: worker-shaped
+  sessions send their tool hooks with an **empty** conversation id, and
+  `(cursor, "")` became one conversation holding 877 tool records from two
+  sessions. 0.1.0 refuses an empty id on both sides of the socket
+  (`hook::NO_SESSION`) and doctor names the merged conversation (`nameless`).
+  Those payloads are dropped now, visibly. Which field, if any, names the
+  session in a worker payload is still unread — capture one rather than
+  guessing.
 - Nothing produces `interrupted_user`; `is_interrupt` on a failed tool call is
   the only signal anywhere that a person stopped the work.
 - An older `v` is still read as if it were current. `scan` rejects a record
@@ -353,7 +370,9 @@ clock closed unless the command says it is, and note that it now refuses to
 score a window with no organic hop at all. A model digest is
 `conbus summary --bus-id`; hop-path model calls stay zero.
 
-The live defect to watch after the 2026-09-09 sweep: whether Cursor's
-`beforeSubmitPrompt` still fails to arrive for worker-shaped sessions. The
-orphan drops with a `preToolUse` detail should stop; if they do not, the
-adapter is not the whole story.
+After 0.1.0, watch two things on a live machine. Drops with the
+`NO_SESSION` reason and a `preToolUse`/`postToolUse` detail are Cursor worker
+sessions; one captured payload decides whether they can be keyed at all. And
+the runaway guard's per-conversation half (`pending_hop`) has still never been
+exercised by a real quota stop — its unattended half was, on 2026-09-16, when
+200 SDK sessions hit `rate_limit` and none was routed.
