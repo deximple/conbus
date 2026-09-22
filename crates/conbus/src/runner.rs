@@ -14,7 +14,7 @@ use conbus_core::event::Harness;
 use conbus_core::paths::Paths;
 
 use crate::appserver;
-use crate::takeover::{self, Takeover};
+use crate::takeover::{self, Taken, Takeover};
 
 /// Which binary answers for a leg.
 ///
@@ -56,29 +56,72 @@ pub fn run(paths: &Paths, harness: &str) -> io::Result<()> {
 }
 
 fn run_with(paths: &Paths, harness: &str, bins: &Bins) -> io::Result<()> {
-    let mut pending = takeover::take(paths)?;
+    let requested = normalize(harness)?;
+    let mut pending = match takeover::take(paths)? {
+        Taken::Fresh { takeover, age } => {
+            // Said out loud: the person asked for one leg and is about to get
+            // another, in whatever checkout that hop was made from.
+            println!(
+                "conbus run: picking up a hop written {} ago → {}{}{}",
+                conbus_core::clock::ago(age),
+                takeover.next,
+                warm_suffix(&takeover),
+                if takeover.next == requested {
+                    String::new()
+                } else {
+                    format!(" (instead of {requested})")
+                }
+            );
+            Some(takeover)
+        }
+        Taken::Stale { next, age } => {
+            println!("conbus run: {}; starting {requested}", ignored(&next, age));
+            None
+        }
+        Taken::Nothing => None,
+    };
     let mut current = match pending.as_ref() {
         Some(next) => normalize(&next.next)?,
-        None => normalize(harness)?,
+        None => requested,
     };
     loop {
         spawn(paths, &current, pending.as_ref(), bins)?;
-        pending = takeover::take(paths)?;
-        match pending.as_ref() {
-            Some(next) => {
+        match takeover::take(paths)? {
+            Taken::Fresh { takeover, .. } => {
                 println!(
                     "conbus run: hop → {}{}",
-                    next.next,
-                    next.thread
-                        .as_deref()
-                        .map(|id| format!(" · warm {id}"))
-                        .unwrap_or_default()
+                    takeover.next,
+                    warm_suffix(&takeover)
                 );
-                current = normalize(&next.next)?;
+                current = normalize(&takeover.next)?;
+                pending = Some(takeover);
             }
-            None => return Ok(()),
+            Taken::Stale { next, age } => {
+                println!("conbus run: {}", ignored(&next, age));
+                return Ok(());
+            }
+            Taken::Nothing => return Ok(()),
         }
     }
+}
+
+fn warm_suffix(takeover: &Takeover) -> String {
+    takeover
+        .thread
+        .as_deref()
+        .map(|id| format!(" · warm {id}"))
+        .unwrap_or_default()
+}
+
+fn ignored(next: &str, age: Option<i64>) -> String {
+    let when = match age {
+        Some(age) => format!("written {} ago", conbus_core::clock::ago(age)),
+        None => "that does not say when it was written".into(),
+    };
+    format!(
+        "ignored a hop to {next} {when} — older than {}m, it was meant for a run that is gone",
+        takeover::FRESH_FOR_SECS / 60
+    )
 }
 
 fn normalize(name: &str) -> io::Result<String> {
@@ -232,6 +275,46 @@ mod tests {
         assert!(
             text.contains("exec resume thr_bus_owned"),
             "the same process must start the warm thread, got {text:?}"
+        );
+    }
+
+    #[test]
+    fn a_takeover_nobody_took_is_ignored_and_the_requested_leg_starts() {
+        // The shape left on a real machine by hops nobody ran `conbus run`
+        // for: no `written_at`, pointing at another project's Codex thread.
+        // Following it would resume a stranger's conversation in a stranger's
+        // checkout; the person asked for Claude.
+        let (root, paths) = machine();
+        let claude_marker = root.path().join("claude-started");
+        let codex_marker = root.path().join("codex-started");
+        let claude = stub(
+            root.path(),
+            "claude",
+            &format!("echo started > {}", claude_marker.display()),
+        );
+        let codex = stub(
+            root.path(),
+            "codex",
+            &format!("echo started > {}", codex_marker.display()),
+        );
+        fs::write(
+            paths.takeover(),
+            r#"{"next":"codex","thread":"thr_old","bus_id":"01a081ef-889d-76d0-9e03-2352684e8e0c","cwd":"/elsewhere"}"#,
+        )
+        .expect("legacy takeover");
+
+        run_with(
+            &paths,
+            "claude_code",
+            &bins(&[("claude_code", &claude), ("codex", &codex)]),
+        )
+        .expect("run");
+
+        assert!(claude_marker.exists(), "the requested leg must start");
+        assert!(!codex_marker.exists(), "a stale hop must not be followed");
+        assert!(
+            !paths.takeover().exists(),
+            "and it must not wait for the next run"
         );
     }
 

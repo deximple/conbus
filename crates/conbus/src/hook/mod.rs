@@ -40,6 +40,17 @@ pub enum Normalized {
     Unknown { hook_event_name: String },
 }
 
+/// Why a payload that names no session is refused, on both sides of the socket.
+///
+/// An empty id is not an identity. From 2026-09-10 Cursor's worker-shaped
+/// sessions sent their tool hooks with an empty conversation id, and once a
+/// Cursor tool call was allowed to start a conversation, `(cursor, "")` became
+/// one conversation that collected 877 tool records from two unrelated
+/// sessions — while the dashboard counted zero orphans, because nothing was
+/// orphaned any more. Dropping such a payload loses one record, visibly;
+/// keying it merges strangers, silently, for as long as the machine runs.
+pub const NO_SESSION: &str = "the hook payload names no session; an empty id would merge unrelated sessions into one conversation";
+
 /// A payload we could not read at all.
 #[derive(Debug, PartialEq, Eq)]
 pub struct HookError(pub String);

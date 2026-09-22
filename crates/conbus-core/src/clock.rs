@@ -107,9 +107,33 @@ impl<'de> serde::Deserialize<'de> for Timestamp {
     }
 }
 
+/// How long ago, the way a person says it: "42s", "7m", "3h", "14d".
+///
+/// Whole units, rounded down, because every caller is answering "is this
+/// current?" — and "0s" for anything in the future, which a clock that stepped
+/// backwards can produce.
+pub fn ago(seconds: i64) -> String {
+    let seconds = seconds.max(0);
+    match seconds {
+        0..60 => format!("{seconds}s"),
+        60..3_600 => format!("{}m", seconds / 60),
+        3_600..86_400 => format!("{}h", seconds / 3_600),
+        _ => format!("{}d", seconds / 86_400),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ages_read_the_way_a_person_says_them() {
+        assert_eq!(ago(42), "42s");
+        assert_eq!(ago(7 * 60), "7m");
+        assert_eq!(ago(3 * 3_600 + 5), "3h");
+        assert_eq!(ago(14 * 86_400), "14d");
+        assert_eq!(ago(-3), "0s");
+    }
 
     #[test]
     fn a_timestamp_compares_the_same_before_and_after_the_log() {

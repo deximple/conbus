@@ -16,6 +16,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+use conbus_core::clock::ago;
 use conbus_core::event::Harness;
 use conbus_core::paths::Paths;
 
@@ -532,30 +533,46 @@ fn describe_attach(paths: &Paths, slug: &str, quota_signal: bool) -> String {
     "hook keys scanned, no remaining-quota field".into()
 }
 
+/// Only the terminal `claude` runs a StatusLine command. The desktop app and
+/// SDK sessions never do, so a person who works there has a live Claude and no
+/// reading at all — measured on 2026-09-11, when 81% of Claude records came
+/// from those two and the last reading was two days old.
+const CLAUDE_SURFACES: &str =
+    "only the terminal `claude` sends one; desktop and SDK sessions never do";
+
 /// What doctor/quota say about the Claude StatusLine channel.
+///
+/// Two ages, because they answer different questions: how old the numbers are
+/// says whether they still count, and when the StatusLine last ran says
+/// whether the channel is alive at all. Reporting the first as the second told
+/// a person their StatusLine "had not fired" for thirteen days while it had run
+/// a week earlier with nothing to report.
 pub fn describe_claude(paths: &Paths, now: i64) -> String {
+    let ran = read_seen(paths, Harness::CLAUDE_CODE)
+        .map(|at| format!("StatusLine last ran {} ago", ago(now.saturating_sub(at))));
     if let Some(quota) = read_cached_at(paths, Harness::CLAUDE_CODE, now) {
         let age = cached_observed_at(paths, Harness::CLAUDE_CODE)
             .map(|at| now.saturating_sub(at))
             .unwrap_or_default();
         if age > CACHE_TTL_SECS {
             return format!(
-                "{} · StatusLine has not fired for {}m, so the numbers are not counted",
+                "{} · last reading {} ago, so the numbers are not counted{} · {CLAUDE_SURFACES}",
                 describe(&quota, now),
-                age / 60
+                ago(age),
+                ran.map(|ran| format!(" · {ran}")).unwrap_or_default()
             );
         }
         return describe(&quota, now);
     }
-    match read_seen(paths, Harness::CLAUDE_CODE) {
-        Some(_) => {
-            "StatusLine fired, no rate_limits yet — vendor fills them after the first API response"
-                .into()
-        }
-        None => {
-            "StatusLine never fired — restart claude so it loads the wrapped statusLine command"
-                .into()
-        }
+    match ran {
+        Some(ran) => format!(
+            "no rate_limits reading yet — {ran}; the vendor fills them after the first API \
+             response · {CLAUDE_SURFACES}"
+        ),
+        None => format!(
+            "StatusLine never ran — restart the terminal `claude` so it loads the wrapped \
+             statusLine command · {CLAUDE_SURFACES}"
+        ),
     }
 }
 
@@ -765,7 +782,7 @@ mod tests {
         observe_statusline(Some(&paths), None, r#"{"cwd":"/repo"}"#);
         assert!(read_cached(&paths, Harness::CLAUDE_CODE).is_none());
         assert!(read_seen(&paths, Harness::CLAUDE_CODE).is_some());
-        assert!(describe_claude(&paths, 0).contains("no rate_limits yet"));
+        assert!(describe_claude(&paths, 0).contains("no rate_limits reading yet"));
     }
 
     #[test]
@@ -1005,9 +1022,39 @@ mod tests {
         let line = describe_claude(&paths, now);
 
         assert!(
-            line.contains("StatusLine has not fired"),
-            "a stale reading must say so: {line}"
+            line.contains("last reading 4h ago, so the numbers are not counted"),
+            "a stale reading must say how old it is: {line}"
         );
+        assert!(
+            !line.contains("StatusLine last ran"),
+            "nothing says when the StatusLine ran, so the line must not guess: {line}"
+        );
+        assert!(line.contains("desktop and SDK sessions never do"), "{line}");
+    }
+
+    #[test]
+    fn a_statusline_that_ran_without_limits_is_not_reported_as_silent() {
+        // 2026-09-23: the reading was 13 days old, the StatusLine had last run
+        // 7 days earlier with no `rate_limits`, and doctor said it "has not
+        // fired for 19304m" — the age of the numbers, not of the channel.
+        let (_dir, paths) = machine();
+        // Real time on both sides: `write_seen` stamps the present.
+        let now = now_secs();
+        cached(
+            &paths,
+            now - 13 * 86_400,
+            serde_json::json!({
+                "plan": "claude",
+                "primary": {"used_percent": 87, "minutes": 10080, "resets_at": now - 86_400},
+            }),
+        );
+        write_seen(&paths, Harness::CLAUDE_CODE, false).expect("seen");
+
+        let line = describe_claude(&paths, now);
+
+        assert!(line.contains("StatusLine last ran 0s ago"), "{line}");
+        assert!(line.contains("last reading 13d ago"), "{line}");
+        assert!(!line.contains("has not fired"), "{line}");
     }
 
     #[test]

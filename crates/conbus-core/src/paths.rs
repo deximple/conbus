@@ -28,6 +28,26 @@ fn set(value: Option<&str>) -> Option<&str> {
     value.filter(|text| !text.is_empty())
 }
 
+/// The longest Unix socket path the kernel binds, in bytes, not counting the
+/// terminating NUL: `sockaddr_un.sun_path` is 104 bytes on macOS and the BSDs,
+/// 108 on Linux.
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd"
+))]
+pub const SOCKET_PATH_MAX: usize = 103;
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd"
+)))]
+pub const SOCKET_PATH_MAX: usize = 107;
+
 /// Neither an override nor a home directory was available.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct NoHomeError;
@@ -87,6 +107,25 @@ impl Paths {
     /// The daemon's control socket.
     pub fn socket(&self) -> PathBuf {
         self.root.join("conbus.sock")
+    }
+
+    /// Why the socket cannot live here, when it cannot.
+    ///
+    /// The kernel keeps a Unix socket's path in a fixed-size field, and the
+    /// standard library's refusal — "path must be shorter than SUN_LEN" — names
+    /// neither the path nor the fix. A `CONBUS_HOME` under a deep temp or
+    /// project directory crosses the limit easily, and the daemon then dies
+    /// before it has said anything a person could act on.
+    pub fn socket_problem(&self) -> Option<String> {
+        let socket = self.socket();
+        let bytes = socket.as_os_str().len();
+        (bytes > SOCKET_PATH_MAX).then(|| {
+            format!(
+                "the socket path {} is {bytes} bytes and this system allows {SOCKET_PATH_MAX}; \
+                 set CONBUS_HOME to a shorter directory",
+                socket.display()
+            )
+        })
     }
 
     /// Written by `hop --apply` so `conbus run` can exec the next leg
@@ -202,5 +241,26 @@ mod tests {
             Path::new("/tmp/bus/quota/cursor.keys.json")
         );
         assert_eq!(paths.chat_export(), Path::new("/tmp/bus/chat-export"));
+    }
+
+    #[test]
+    fn a_home_too_deep_for_a_socket_says_so_and_names_the_fix() {
+        let short = Paths::from_env(Some("/Users/someone/.conbus"), None, None).expect("resolve");
+        assert_eq!(short.socket_problem(), None);
+
+        // `conbus.sock` plus its slash is 12 bytes; this root leaves one too many.
+        let deep = "/".to_string() + &"d".repeat(SOCKET_PATH_MAX - 12);
+        let paths = Paths::from_env(Some(&deep), None, None).expect("resolve");
+        let problem = paths.socket_problem().expect("one byte over the limit");
+        assert!(problem.contains("CONBUS_HOME"), "{problem}");
+        assert!(
+            problem.contains(&(SOCKET_PATH_MAX + 1).to_string()),
+            "{problem}"
+        );
+
+        let exact = "/".to_string() + &"d".repeat(SOCKET_PATH_MAX - 13);
+        let fits = Paths::from_env(Some(&exact), None, None).expect("resolve");
+        assert_eq!(fits.socket().as_os_str().len(), SOCKET_PATH_MAX);
+        assert_eq!(fits.socket_problem(), None);
     }
 }
