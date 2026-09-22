@@ -326,19 +326,69 @@ pub fn append_gaps_at_start(
     held: &[Record],
     log: &mut SegmentLog,
 ) -> io::Result<u64> {
+    // Only what changed after the log's newest record can hold a turn that
+    // happened while no daemon was listening. Reading every transcript the log
+    // had ever bound took ten seconds with a warm cache and 71 after a reboot
+    // on a machine with 6,190 of them (6.3 GB) — with the socket already
+    // bound, so every hook in that window timed out. Earlier downtimes were
+    // filled by earlier starts; `conbus backfill --gaps` still reads them all.
+    let since = newest_unix(held).map(|newest| newest - GAP_MARGIN_SECS);
     let mut n = 0;
     if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
         let transcripts = home.join(".claude").join("projects");
         if transcripts.is_dir() {
-            n += append_gaps(&transcripts, held, Some(log))?.gap_records;
+            n += append_gaps(&transcripts, held, Some(log), since)?.gap_records;
         }
     }
     // Codex.app burns the same account and never hits CLI hooks. Official
     // thread/turns/list on threads we already bound fills those turns under
     // the live `bus_id` — not a second conversation.
-    n += fill_live_codex_gaps(held, log)?;
-    n += ingest_chat_exports(&paths.chat_export(), held, log)?;
+    n += fill_live_codex_gaps(held, log, since)?;
+    n += ingest_chat_exports_since(&paths.chat_export(), held, log, since)?;
     Ok(n)
+}
+
+/// How long before the log's newest record a file may have last changed and
+/// still hold a turn this daemon missed: vendors buffer their writes, and a
+/// clock can step.
+const GAP_MARGIN_SECS: i64 = 15 * 60;
+
+/// The newest record's time, as unix seconds.
+fn newest_unix(held: &[Record]) -> Option<i64> {
+    let epoch = conbus_core::clock::Timestamp::from_unix_seconds(0)?;
+    held.iter()
+        .map(|record| record.ts)
+        .max()
+        .map(|newest| newest.seconds_since(epoch))
+}
+
+/// A file's modification time, as unix seconds.
+fn modified_unix(path: &Path) -> Option<i64> {
+    let modified = fs::metadata(path).ok()?.modified().ok()?;
+    let seconds = modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    i64::try_from(seconds).ok()
+}
+
+/// Whether a file is old enough that it cannot hold anything after `since`.
+fn untouched_since(path: &Path, since: Option<i64>) -> bool {
+    match (since, modified_unix(path)) {
+        (Some(since), Some(modified)) => modified < since,
+        // No cutoff, or a file whose time cannot be read: read it.
+        _ => false,
+    }
+}
+
+/// Every record, grouped by conversation, so a lookup per file is not a pass
+/// over the whole log per file.
+fn by_bus(held: &[Record]) -> HashMap<BusId, Vec<&Record>> {
+    let mut grouped: HashMap<BusId, Vec<&Record>> = HashMap::new();
+    for record in held {
+        grouped.entry(record.bus_id).or_default().push(record);
+    }
+    grouped
 }
 
 /// Vendor Privacy → Export data names the zip `data-export-*.zip`.
@@ -396,7 +446,17 @@ pub fn chat_export_signature_filtered(dir: &Path, official_only: bool) -> Vec<(S
 /// Official Claude.ai / Desktop export drop folder. Chat-only windows have
 /// no hook; a newer `conversations.json` is the identity-preserving channel.
 pub fn ingest_chat_exports(dir: &Path, held: &[Record], log: &mut SegmentLog) -> io::Result<u64> {
-    ingest_chat_exports_filtered(dir, held, log, false)
+    ingest_chat_exports_filtered(dir, held, log, false, None)
+}
+
+/// The drop folder at start: only exports written after `since`.
+fn ingest_chat_exports_since(
+    dir: &Path,
+    held: &[Record],
+    log: &mut SegmentLog,
+    since: Option<i64>,
+) -> io::Result<u64> {
+    ingest_chat_exports_filtered(dir, held, log, false, since)
 }
 
 /// `~/Downloads` after Privacy → Export data. Only vendor-named zips / JSON.
@@ -405,7 +465,7 @@ pub fn ingest_official_privacy_exports(
     held: &[Record],
     log: &mut SegmentLog,
 ) -> io::Result<u64> {
-    ingest_chat_exports_filtered(dir, held, log, true)
+    ingest_chat_exports_filtered(dir, held, log, true, None)
 }
 
 fn ingest_chat_exports_filtered(
@@ -413,6 +473,7 @@ fn ingest_chat_exports_filtered(
     held: &[Record],
     log: &mut SegmentLog,
     official_only: bool,
+    since: Option<i64>,
 ) -> io::Result<u64> {
     if !dir.is_dir() {
         return Ok(0);
@@ -421,6 +482,7 @@ fn ingest_chat_exports_filtered(
     let mut entries: Vec<PathBuf> = fs::read_dir(dir)?
         .filter_map(|entry| entry.ok().map(|e| e.path()))
         .filter(|path| !official_only || is_official_privacy_export(path))
+        .filter(|path| !untouched_since(path, since))
         .collect();
     entries.sort();
     for path in entries {
@@ -434,7 +496,11 @@ fn ingest_chat_exports_filtered(
 }
 
 /// Official app-server only. Live Codex threads the recorder already bound.
-fn fill_live_codex_gaps(held: &[Record], log: &mut SegmentLog) -> io::Result<u64> {
+fn fill_live_codex_gaps(
+    held: &[Record],
+    log: &mut SegmentLog,
+    since: Option<i64>,
+) -> io::Result<u64> {
     let known = known_from(held.iter());
     if known.live_codex.is_empty() {
         return Ok(0);
@@ -445,8 +511,19 @@ fn fill_live_codex_gaps(held: &[Record], log: &mut SegmentLog) -> io::Result<u64
         Ok(server) => server,
         Err(_) => return Ok(0),
     };
+    // One `thread/list` pass says which threads moved since the cutoff, so a
+    // start asks for the turns of those rather than of every thread the log
+    // has ever bound. When the list cannot be read, every thread is asked.
+    let recent = since.and_then(|since| threads_updated_since(&mut server, since));
+    let grouped = by_bus(held);
     let mut filled = 0u64;
     for session in &known.live_codex {
+        if recent
+            .as_ref()
+            .is_some_and(|recent| !recent.contains(session))
+        {
+            continue;
+        }
         let Some(&bus_id) = known.live_codex_bus.get(session) else {
             continue;
         };
@@ -457,7 +534,7 @@ fn fill_live_codex_gaps(held: &[Record], log: &mut SegmentLog) -> io::Result<u64
         let thread =
             serde_json::json!({"id": session.to_string(), "sessionId": session.to_string()});
         let recovered = parse_codex_thread(&thread, &turns);
-        let mine: Vec<&Record> = held.iter().filter(|r| r.bus_id == bus_id).collect();
+        let mine = grouped.get(&bus_id).into_iter().flatten().copied();
         for entry in missing_from(mine, recovered) {
             if log.append(entry)?.is_some() {
                 filled += 1;
@@ -465,6 +542,41 @@ fn fill_live_codex_gaps(held: &[Record], log: &mut SegmentLog) -> io::Result<u64
         }
     }
     Ok(filled)
+}
+
+/// Threads `thread/list` says were updated at or after `since`, or `None`
+/// when the list cannot be read to the end.
+fn threads_updated_since(server: &mut AppServer, since: i64) -> Option<HashSet<BusId>> {
+    let mut recent = HashSet::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let mut params = serde_json::json!({"limit": 100});
+        if let Some(cursor) = &cursor {
+            params["cursor"] = serde_json::json!(cursor);
+        }
+        let page = server.call("thread/list", params).ok()?;
+        for thread in page["data"].as_array().into_iter().flatten() {
+            // Strings on `thread/list`, numbers elsewhere in the same API.
+            let updated = match &thread["updatedAt"] {
+                serde_json::Value::String(text) => text.parse::<i64>().ok(),
+                other => other.as_i64(),
+            };
+            let Some(id) = thread["id"]
+                .as_str()
+                .and_then(|id| id.parse::<BusId>().ok())
+            else {
+                continue;
+            };
+            // A thread that does not say when it moved is asked about.
+            if updated.is_none_or(|updated| updated >= since) {
+                recent.insert(id);
+            }
+        }
+        cursor = page["nextCursor"].as_str().map(str::to_string);
+        if cursor.is_none() {
+            return Some(recent);
+        }
+    }
 }
 
 /// Read live sessions' official transcripts and, when `apply`, append the
@@ -482,7 +594,7 @@ pub fn fill_gaps(paths: &Paths, transcripts: &Path, apply: bool) -> io::Result<O
     let mut log = apply
         .then(|| SegmentLog::open(paths.log_dir(), Retention::default()))
         .transpose()?;
-    append_gaps(transcripts, &held, log.as_mut())
+    append_gaps(transcripts, &held, log.as_mut(), None)
 }
 
 /// Turns the official transcript has that the live log does not.
@@ -553,8 +665,10 @@ fn append_gaps(
     transcripts: &Path,
     held: &[Record],
     mut log: Option<&mut SegmentLog>,
+    since: Option<i64>,
 ) -> io::Result<Outcome> {
     let known = known_from(held.iter());
+    let grouped = by_bus(held);
     let mut outcome = Outcome::default();
     if !known.unreadable_live.is_empty() {
         outcome.unread.insert(
@@ -573,6 +687,9 @@ fn append_gaps(
         let Some(&live_bus) = known.live_bus.get(&session) else {
             continue;
         };
+        if untouched_since(&file, since) {
+            continue;
+        }
         let Ok(text) = fs::read_to_string(&file) else {
             *outcome.unread.entry("unreadable file".into()).or_default() += 1;
             continue;
@@ -581,7 +698,10 @@ fn append_gaps(
         for (reason, count) in &recovered.skipped {
             *outcome.unread.entry(reason.clone()).or_default() += count;
         }
-        let missing = missing_from(held.iter().filter(|r| r.bus_id == live_bus), recovered);
+        let missing = missing_from(
+            grouped.get(&live_bus).into_iter().flatten().copied(),
+            recovered,
+        );
         if missing.is_empty() {
             continue;
         }
@@ -1195,6 +1315,52 @@ mod tests {
     }
 
     #[test]
+    fn a_start_skips_a_transcript_untouched_since_before_the_newest_record() {
+        // An untouched file cannot hold a turn this downtime missed, and
+        // reading all of them is what kept the socket deaf for 71 s after a
+        // reboot. Asked by hand, `backfill --gaps` still reads everything.
+        let machine = machine();
+        recorded_live(&machine, SESSION);
+        transcript_two_turns(&machine, SESSION);
+        let file = machine
+            .transcripts
+            .join("-Applications-conbus")
+            .join(format!("{SESSION}.jsonl"));
+        let hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3_600);
+        fs::File::options()
+            .write(true)
+            .open(&file)
+            .expect("open")
+            .set_modified(hour_ago)
+            .expect("backdate");
+        let held = SegmentLog::scan(machine.paths.log_dir())
+            .expect("scan")
+            .records;
+        let since = newest_unix(&held).map(|newest| newest - GAP_MARGIN_SECS);
+
+        let at_start = append_gaps(&machine.transcripts, &held, None, since).expect("start");
+        let by_hand = append_gaps(&machine.transcripts, &held, None, None).expect("by hand");
+
+        assert_eq!(at_start.gap_records, 0);
+        assert_eq!(by_hand.gap_records, 2, "the missed prompt and its reply");
+    }
+
+    #[test]
+    fn a_start_still_reads_a_transcript_that_changed_after_the_newest_record() {
+        let machine = machine();
+        recorded_live(&machine, SESSION);
+        transcript_two_turns(&machine, SESSION);
+        let held = SegmentLog::scan(machine.paths.log_dir())
+            .expect("scan")
+            .records;
+        let since = newest_unix(&held).map(|newest| newest - GAP_MARGIN_SECS);
+
+        let at_start = append_gaps(&machine.transcripts, &held, None, since).expect("start");
+
+        assert_eq!(at_start.gap_records, 2);
+    }
+
+    #[test]
     fn a_live_session_with_no_missing_turn_is_left_alone() {
         let machine = machine();
         recorded_live(&machine, SESSION);
@@ -1402,7 +1568,8 @@ mod tests {
         assert!(!is_official_privacy_export(&dir.path().join("random.zip")));
         let mut log =
             SegmentLog::open(machine.paths.log_dir(), Retention::default()).expect("open");
-        let filled = ingest_chat_exports_filtered(dir.path(), &[], &mut log, true).expect("ingest");
+        let filled =
+            ingest_chat_exports_filtered(dir.path(), &[], &mut log, true, None).expect("ingest");
         assert!(filled >= 2, "{filled}");
         let all = SegmentLog::scan(machine.paths.log_dir())
             .expect("scan")
