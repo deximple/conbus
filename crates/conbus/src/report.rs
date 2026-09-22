@@ -282,6 +282,8 @@ pub fn install(apply: bool) -> io::Result<()> {
                 dest.parent().unwrap_or(dest.as_path()).display()
             );
         }
+    } else if crate::install::is_installed(&current, &dest) {
+        println!("{:<12} already the installed file", "");
     } else {
         println!("{:<12} would place on --apply", "");
     }
@@ -1021,7 +1023,7 @@ fn report_twins(records: &[Record]) {
 }
 
 pub fn doctor(paths: &Paths) -> io::Result<()> {
-    println!("build     {}", crate::build_info::BUILD);
+    println!("build     {}", crate::build_info::describe());
     println!(
         "root      {} ({:?})",
         paths.root().display(),

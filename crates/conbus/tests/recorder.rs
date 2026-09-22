@@ -1353,9 +1353,12 @@ fn the_daemon_leaves_its_build_where_doctor_can_compare_it() {
         .output()
         .expect("run --version");
     let version = String::from_utf8_lossy(&version.stdout).trim().to_string();
+    // `conbus 0.1.0 (a1b2c3d4e)`: the version, then the commit doctor compares.
     let build = version
         .strip_prefix("conbus ")
-        .expect("`conbus <build>`")
+        .and_then(|rest| rest.split_once(" ("))
+        .and_then(|(_, build)| build.strip_suffix(')'))
+        .expect("`conbus <version> (<build>)`")
         .to_string();
     assert!(!build.is_empty() && build != "unknown", "{version}");
 

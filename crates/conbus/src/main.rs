@@ -155,7 +155,7 @@ fn main() -> ExitCode {
             )
         }),
         Command::Version => {
-            println!("conbus {}", build_info::BUILD);
+            println!("conbus {}", build_info::describe());
             ExitCode::SUCCESS
         }
         Command::Help => {
