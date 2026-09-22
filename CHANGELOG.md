@@ -51,6 +51,10 @@ back out. macOS only.
   SUN_LEN".
 - `install` keeps the key order of your settings files and the other fields
   on your StatusLine.
+- The daemon starts serving in about two seconds instead of about twelve (71
+  after a reboot, measured on a machine with 6,190 transcripts): filling
+  turns missed while it was down now reads only what changed after the log's
+  newest record, and no longer passes over the whole log once per file.
 
 ### Known limitations
 
