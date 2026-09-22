@@ -86,13 +86,17 @@ pub fn looks_like(payload: &str) -> bool {
 
 pub fn normalize(harness: &Harness, json: &str) -> Result<Normalized, HookError> {
     let payload: Payload = serde_json::from_str(json).map_err(|err| HookError(err.to_string()))?;
-    let session = payload
-        .conversation_id
-        .clone()
+    // Present-but-empty is not an id. Worker-shaped sessions have been seen
+    // sending `""` here, and `Some("")` used to win over a real `session_id`
+    // behind it. What is left empty after this is refused by the hook client.
+    let named = |id: &Option<String>| id.clone().filter(|id| !id.trim().is_empty());
+    let session = named(&payload.conversation_id)
+        .or_else(|| named(&payload.session_id))
+        .or_else(|| payload.conversation_id.clone())
         .or_else(|| payload.session_id.clone())
         .ok_or_else(|| HookError("cursor payload has no conversation_id or session_id".into()))?;
 
-    let vendor_turn_id = payload.generation_id.clone().map(VendorTurnId::new);
+    let vendor_turn_id = named(&payload.generation_id).map(VendorTurnId::new);
     let vendor_agent_id = payload.subagent_id.clone().map(VendorAgentId::new);
     let workspace = payload
         .workspace_roots
@@ -284,6 +288,55 @@ mod tests {
             Normalized::Event { observed, .. } => observed.event.clone(),
             other => panic!("{other:?}"),
         }
+    }
+
+    fn key_of(json: &str) -> (String, Option<String>) {
+        match normalize(&Harness::new(Harness::CLAUDE_CODE), json).expect("ok") {
+            Normalized::Event { key, observed, .. } => (
+                key.vendor_session_id,
+                observed
+                    .vendor_turn_id
+                    .as_ref()
+                    .map(|id| id.as_str().to_string()),
+            ),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_empty_conversation_id_gives_way_to_a_real_session_id() {
+        // `Some("")` used to win, so a worker-shaped payload with an empty
+        // conversation id was keyed on nothing even when `session_id` named it.
+        let json = r#"{
+            "hook_event_name":"preToolUse",
+            "cursor_version":"3.19.13",
+            "conversation_id":"",
+            "session_id":"conv-worker",
+            "generation_id":"",
+            "tool_name":"Shell",
+            "tool_use_id":"tu-9",
+            "tool_input":{"command":"ls"},
+            "workspace_roots":["/repo"]
+        }"#;
+        assert_eq!(key_of(json), ("conv-worker".to_string(), None));
+    }
+
+    #[test]
+    fn a_payload_that_names_no_session_keeps_an_empty_key_for_the_client_to_refuse() {
+        // The adapter reports what arrived; refusing it is one decision made in
+        // one place (`hook::NO_SESSION`), for every harness.
+        let json = r#"{
+            "hook_event_name":"postToolUse",
+            "cursor_version":"3.19.13",
+            "conversation_id":"",
+            "session_id":"",
+            "generation_id":"",
+            "tool_name":"Read",
+            "tool_use_id":"tu-10",
+            "tool_output":{"ok":true},
+            "workspace_roots":["/repo"]
+        }"#;
+        assert_eq!(key_of(json), (String::new(), None));
     }
 
     #[test]

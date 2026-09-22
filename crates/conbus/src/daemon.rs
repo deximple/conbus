@@ -216,6 +216,16 @@ impl Daemon {
             };
         }
 
+        // The hook refuses these before they are sent; this is the second
+        // line, for a client that does not. One registry key shared by every
+        // session that names none is how two strangers become one
+        // conversation (`hook::NO_SESSION`).
+        if request.vendor_session_id.trim().is_empty() {
+            return Response::Failed {
+                error: crate::hook::NO_SESSION.to_string(),
+            };
+        }
+
         let brief = request.brief;
         let declared = request.provenance;
         let key = SessionKey::new(request.harness.clone(), request.vendor_session_id);
@@ -984,6 +994,9 @@ fn repair_splits(held: &[Record], log: &mut SegmentLog) -> io::Result<u64> {
 /// Run the daemon until the process is stopped.
 pub fn serve(paths: &Paths, retention: Retention) -> io::Result<()> {
     let _ = harden::harden();
+    if let Some(problem) = paths.socket_problem() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, problem));
+    }
     let listener = bind(&paths.socket())?;
     // Named before restore. `doctor` and the recorder tests wait on the
     // socket; a stamp that lands after a long scan looks like no daemon.
@@ -1329,6 +1342,32 @@ mod tests {
             panic!("a newer hook must be refused, not half-read: {response:?}");
         };
         assert!(error.contains("Restart the daemon"), "{error}");
+        assert_eq!(SegmentLog::scan(dir.path()).expect("scan").records, vec![]);
+    }
+
+    #[test]
+    fn a_request_that_names_no_session_is_refused_rather_than_keyed_on_nothing() {
+        // The second line behind the hook's own refusal. Two nameless tool
+        // calls from different sessions must not become one conversation.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = SegmentLog::open(dir.path(), Retention::default()).expect("open");
+        let mut daemon = Daemon::new(log, Registry::new(), HashMap::new());
+
+        for blank in ["", "   "] {
+            let response = daemon.handle(Request {
+                harness: Harness::new(Harness::CURSOR),
+                vendor_session_id: blank.into(),
+                ..request(Event::TurnStarted {
+                    author: None,
+                    prompt: Body::kept("a prompt with no session"),
+                })
+            });
+
+            let Response::Failed { error } = response else {
+                panic!("an empty session id must be refused: {response:?}");
+            };
+            assert_eq!(error, crate::hook::NO_SESSION);
+        }
         assert_eq!(SegmentLog::scan(dir.path()).expect("scan").records, vec![]);
     }
 

@@ -114,6 +114,11 @@ fn appendable(paths: &Paths) -> io::Result<()> {
 fn describe_appendable(result: &io::Result<()>) -> String {
     match result {
         Ok(()) => "appendable".to_string(),
+        // A first install reads like a fault otherwise: nothing has run yet,
+        // and the daemon makes the directory the first time it starts.
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            format!("not created yet ({err}) — the daemon makes it the first time it starts")
+        }
         Err(err) => format!("NOT APPENDABLE: {err} — records will be refused"),
     }
 }
@@ -950,6 +955,41 @@ fn missing_events(settings: &serde_json::Value, events: &[&str]) -> Vec<String> 
         .collect()
 }
 
+/// Conversations keyed on an empty vendor session id, with how many records
+/// each holds and which harness wrote them.
+///
+/// An empty id is not an identity (`hook::NO_SESSION`), and this build refuses
+/// to key on one. Records an older build wrote that way stay in the log —
+/// it is append-only — so the line says what they are rather than letting a
+/// merged conversation pass as one real session.
+fn nameless(records: &[Record]) -> Vec<(BusId, String, usize)> {
+    let mut found: Vec<(BusId, String, usize)> = Vec::new();
+    for record in records {
+        let empty = record
+            .source
+            .vendor_session_id
+            .as_deref()
+            .is_some_and(|id| id.trim().is_empty());
+        if !empty {
+            continue;
+        }
+        match found.iter_mut().find(|(bus, _, _)| *bus == record.bus_id) {
+            Some((_, _, n)) => *n += 1,
+            None => found.push((record.bus_id, record.source.harness.as_str().to_string(), 1)),
+        }
+    }
+    found
+}
+
+fn report_nameless(records: &[Record]) {
+    for (bus, harness, n) in nameless(records) {
+        println!(
+            "nameless  {bus} — {n} {harness} record(s) keyed on an empty session id by an older \
+             build; they came from sessions that named none and may belong to several"
+        );
+    }
+}
+
 fn report_twins(records: &[Record]) {
     let summary = twins(records);
     if summary.total == 0 {
@@ -994,9 +1034,10 @@ pub fn doctor(paths: &Paths) -> io::Result<()> {
     println!("log       {}", paths.log_dir().display());
 
     let socket = paths.socket();
-    let daemon = match UnixStream::connect(&socket) {
-        Ok(_) => "listening".to_string(),
-        Err(err) => format!("not answering ({err})"),
+    let daemon = match (paths.socket_problem(), UnixStream::connect(&socket)) {
+        (Some(problem), _) => format!("UNUSABLE — {problem}"),
+        (None, Ok(_)) => "listening".to_string(),
+        (None, Err(err)) => format!("not answering ({err})"),
     };
     println!("socket    {} — {daemon}", socket.display());
     // Which build answers on that socket. The daemon writes it at start; a
@@ -1072,6 +1113,7 @@ pub fn doctor(paths: &Paths) -> io::Result<()> {
     // The binding is the daemon's decision, so this asks the same code the
     // daemon runs at start rather than guessing at it.
     report_twins(&scan.records);
+    report_nameless(&scan.records);
 
     // What a session opening in each checkout would have been told, replayed
     // over the whole log. The briefing is live since 2026-09-01; this replay is
@@ -1123,6 +1165,9 @@ pub fn doctor(paths: &Paths) -> io::Result<()> {
     match crate::hop::decide_from(paths, &scan.records, None) {
         Ok(line) => println!("route     {line}"),
         Err(err) => println!("route     unavailable — {err}"),
+    }
+    if let Some(line) = crate::takeover::describe(paths) {
+        println!("takeover  {line}");
     }
     let warm = crate::hop::live_warm_threads(&scan.records);
     let claude = crate::hop::live_claude_sessions(&scan.records);
@@ -1220,6 +1265,9 @@ pub fn status(paths: &Paths) -> io::Result<()> {
         for line in hops {
             println!("history   {line}");
         }
+    }
+    if let Some(line) = crate::takeover::describe(paths) {
+        println!("takeover  {line}");
     }
     Ok(())
 }
@@ -1891,6 +1939,35 @@ mod tests {
 
         assert_eq!(summary.total, 0, "no reconstruction, so not a twin");
         assert_eq!(summary.split, 1);
+    }
+
+    #[test]
+    fn doctor_names_a_conversation_an_older_build_keyed_on_an_empty_session_id() {
+        let keyed = |id: Option<&str>, bus: &str, harness: &str| {
+            let mut r = at(0, "2026-09-10T22:18:17.000Z", bus);
+            r.source.vendor_session_id = id.map(str::to_string);
+            r.source.harness = Harness::new(harness);
+            r
+        };
+        let merged = "01a08d66-742e-70f2-a5e6-eb4bda1030ed";
+        let real = "01a08d66-3ec0-7b81-af99-3c0549c4ad7c";
+        let records = [
+            keyed(Some(""), merged, Harness::CURSOR),
+            keyed(Some(""), merged, Harness::CURSOR),
+            keyed(Some("bc-cfe37b99"), real, Harness::CURSOR),
+            keyed(None, real, Harness::CURSOR),
+        ];
+
+        let found = nameless(&records);
+
+        assert_eq!(
+            found,
+            vec![(merged.parse().expect("id"), Harness::CURSOR.to_string(), 2)]
+        );
+        assert!(
+            nameless(&records[2..]).is_empty(),
+            "a missing id is not an empty one"
+        );
     }
 
     #[test]

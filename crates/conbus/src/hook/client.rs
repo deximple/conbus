@@ -11,6 +11,7 @@ use std::os::unix::net::UnixStream;
 
 use conbus_core::event::{Entrypoint, Harness};
 use conbus_core::paths::Paths;
+use conbus_core::registry::SessionKey;
 
 use crate::drops::Dropped;
 use crate::hook::{self, Normalized};
@@ -247,7 +248,11 @@ pub fn run(harness: &str, stdin: &mut impl Read) -> Result<Reply, Dropped> {
             .into());
         }
     }
+    named_session(&key, &hook_event_name)?;
     let paths = Paths::resolve().map_err(|_| "no home directory to resolve".to_string())?;
+    if let Some(problem) = paths.socket_problem() {
+        return Err(Dropped::new(problem));
+    }
     if key.harness.as_str() == Harness::CURSOR
         || key.harness.as_str() == Harness::AGY
         || key.harness.as_str() == Harness::OPENCODE
@@ -294,6 +299,17 @@ pub fn run(harness: &str, stdin: &mut impl Read) -> Result<Reply, Dropped> {
         Ok(_) if inference => Ok(hook::inference::ALLOW.to_string()),
         other => other,
     }
+}
+
+/// Refuse a payload that names no session, before any socket is opened
+/// (`hook::NO_SESSION`). Its own function so a test can hold the refusal
+/// without a daemon — and without ever reaching someone's real one.
+fn named_session(key: &SessionKey, hook_event_name: &str) -> Result<(), Dropped> {
+    if key.vendor_session_id.trim().is_empty() {
+        return Err(Dropped::new(hook::NO_SESSION)
+            .with_detail(format!("{hook_event_name} as {}", key.harness.as_str())));
+    }
+    Ok(())
 }
 
 fn connect(socket: &std::path::Path) -> Result<UnixStream, Dropped> {
@@ -403,6 +419,29 @@ mod tests {
 
         assert_eq!(described, "cwd,hook_event_name,prompt");
         assert!(!described.contains("secret"));
+    }
+
+    #[test]
+    fn a_payload_that_names_no_session_is_dropped_before_it_reaches_the_daemon() {
+        // Refused before a socket is opened, so it cannot mint the one
+        // conversation every nameless session would otherwise share.
+        let nameless = r#"{"session_id":"","hook_event_name":"UserPromptSubmit","prompt":"hi","prompt_id":"p1"}"#;
+        let named = r#"{"session_id":"s-1","hook_event_name":"UserPromptSubmit","prompt":"hi","prompt_id":"p1"}"#;
+        let key = |json: &str| match hook::normalize(&Harness::new(Harness::CLAUDE_CODE), json)
+            .expect("normalise")
+        {
+            Normalized::Event { key, .. } => key,
+            other => panic!("{other:?}"),
+        };
+
+        let dropped = named_session(&key(nameless), "UserPromptSubmit")
+            .expect_err("an empty session id must not be sent");
+        assert_eq!(dropped.reason, hook::NO_SESSION);
+        assert_eq!(
+            dropped.detail.as_deref(),
+            Some("UserPromptSubmit as claude_code")
+        );
+        assert!(named_session(&key(named), "UserPromptSubmit").is_ok());
     }
 
     #[test]
