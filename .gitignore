@@ -3,3 +3,6 @@
 /mainView.js
 /mainWindow.js
 HANDOFF.local.md
+/dist
+/.playwright-mcp/
+/.ruff_cache/

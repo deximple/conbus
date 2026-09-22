@@ -544,6 +544,11 @@ pub fn place_binary(current: &Path, dest: &Path) -> io::Result<bool> {
     Ok(true)
 }
 
+/// Whether `current` already is the installed binary, by path or by bytes.
+pub fn is_installed(current: &Path, dest: &Path) -> bool {
+    same_file(current, dest) || (dest.is_file() && fs::read(current).ok() == fs::read(dest).ok())
+}
+
 fn same_file(a: &Path, b: &Path) -> bool {
     match (fs::canonicalize(a), fs::canonicalize(b)) {
         (Ok(left), Ok(right)) => left == right,

@@ -15,8 +15,17 @@ use conbus_core::paths::Paths;
 use serde::{Deserialize, Serialize};
 
 /// The commit this binary was built from — `<sha>`, `<sha>+dirty`, or
-/// `unknown` outside a checkout. Set by `build.rs`.
+/// `unknown` outside a checkout. Set by `build.rs`. This, not the version, is
+/// what `doctor` compares with the daemon: two builds of one version differ.
 pub const BUILD: &str = env!("CONBUS_BUILD");
+
+/// The release this binary belongs to, from the workspace manifest.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// What `--version` prints: `0.1.0 (a1b2c3d4e)`.
+pub fn describe() -> String {
+    format!("{VERSION} ({BUILD})")
+}
 
 fn stamp_file(paths: &Paths) -> PathBuf {
     paths.root().join("daemon.build")
