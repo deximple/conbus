@@ -111,6 +111,9 @@ mod tests {
         let freshness = probe_with("/usr/bin/false", Some(CHECKOUT));
         let line = freshness.line();
         assert!(line.starts_with("stale ·"), "{line}");
-        assert!(!line.contains("no checkout"), "the probe never reached gh: {line}");
+        assert!(
+            !line.contains("no checkout"),
+            "the probe never reached gh: {line}"
+        );
     }
 }
