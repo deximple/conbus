@@ -634,6 +634,39 @@ fn same_file(a: &Path, b: &Path) -> bool {
 
 pub const DAEMON_LABEL: &str = "sh.conbus.daemon";
 
+/// How long launchd waits to start the agent again after a start that failed
+/// at once.
+///
+/// Its default is ten seconds, and an upgrade meets it every time: the first
+/// start of a replaced binary is refused by a Background Task Management launch
+/// constraint until macOS has looked at the new file again. Two seconds keeps
+/// that window short, and still spaces out a daemon that cannot start — most of
+/// its failures come before the log is read, so a retry costs little.
+pub const DAEMON_THROTTLE_SECS: u32 = 2;
+
+/// How `install --apply` hands the agent to launchd.
+#[derive(Debug, PartialEq, Eq)]
+enum Reload {
+    /// Restart the job launchd holds: the definition is the same.
+    Restart,
+    /// Unload it and load the file again: `kickstart` would keep running the
+    /// definition launchd read at bootstrap.
+    Replace,
+}
+
+fn reload_for(changed: bool) -> Reload {
+    if changed {
+        Reload::Replace
+    } else {
+        Reload::Restart
+    }
+}
+
+/// A bootstrap straight after a bootout can fail with an I/O error while
+/// launchd lets go of the job (seen on this machine on 2026-09-03).
+const BOOTSTRAP_TRIES: u32 = 5;
+const LAUNCHCTL_PAUSE: std::time::Duration = std::time::Duration::from_millis(200);
+
 /// launchd agent that keeps one daemon on the socket.
 pub fn daemon_plist(binary: &Path, log: &Path) -> String {
     format!(
@@ -649,6 +682,7 @@ pub fn daemon_plist(binary: &Path, log: &Path) -> String {
   </array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>{DAEMON_THROTTLE_SECS}</integer>
   <key>StandardOutPath</key><string>{}</string>
   <key>StandardErrorPath</key><string>{}</string>
 </dict>
@@ -669,25 +703,53 @@ pub fn apply_daemon(home: &Path, binary: &Path, log: &Path, load: bool) -> io::R
         write_atomically(&path, &body)?;
     }
     if load {
-        load_launch_agent(&path)?;
+        load_launch_agent(&path, !unchanged);
     }
     Ok(!unchanged)
 }
 
-fn load_launch_agent(plist: &Path) -> io::Result<()> {
+fn load_launch_agent(plist: &Path, changed: bool) {
     let uid = unsafe { libc::getuid() };
     let domain = format!("gui/{uid}");
     let target = format!("{domain}/{DAEMON_LABEL}");
-    let kick = std::process::Command::new("launchctl")
-        .args(["kickstart", "-k", &target])
-        .status();
-    if kick.is_ok_and(|s| s.success()) {
-        return Ok(());
+    let plist = plist.display().to_string();
+    match reload_for(changed) {
+        Reload::Restart => {
+            if !launchctl(&["kickstart", "-k", &target]) {
+                bootstrap(&domain, &plist);
+            }
+        }
+        Reload::Replace => {
+            // Not loaded is fine: a first install has nothing to boot out.
+            let _ = launchctl(&["bootout", &target]);
+            for _ in 0..25 {
+                if !launchctl(&["print", &target]) {
+                    break;
+                }
+                std::thread::sleep(LAUNCHCTL_PAUSE);
+            }
+            bootstrap(&domain, &plist);
+        }
     }
-    let _ = std::process::Command::new("launchctl")
-        .args(["bootstrap", &domain, &plist.display().to_string()])
-        .status();
-    Ok(())
+}
+
+fn bootstrap(domain: &str, plist: &str) {
+    for _ in 0..BOOTSTRAP_TRIES {
+        if launchctl(&["bootstrap", domain, plist]) {
+            return;
+        }
+        std::thread::sleep(LAUNCHCTL_PAUSE);
+    }
+}
+
+/// Run launchctl quietly; `print` in particular writes pages of state.
+fn launchctl(args: &[&str]) -> bool {
+    std::process::Command::new("launchctl")
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 #[cfg(test)]
@@ -1086,6 +1148,35 @@ mod tests {
         assert!(body.contains(DAEMON_LABEL));
         assert!(body.contains("KeepAlive"));
         assert!(!body.contains("async"));
+    }
+
+    #[test]
+    fn a_start_macos_refuses_once_is_retried_in_seconds_not_ten() {
+        // After an upgrade replaced the binary, the first start of the agent
+        // was refused at once by a Background Task Management launch
+        // constraint ("Launch Constraint Violation", OS_REASON_CODESIGNING),
+        // and launchd pushed the next start out by its default ten seconds:
+        // both deploys on 2026-09-23 left the hooks with no daemon for ~14 s.
+        let body = daemon_plist(Path::new("/opt/conbus"), Path::new("/tmp/daemon.log"));
+        assert!(
+            body.contains(&format!(
+                "<key>ThrottleInterval</key><integer>{DAEMON_THROTTLE_SECS}</integer>"
+            )),
+            "{body}"
+        );
+        assert!(
+            (1..10).contains(&DAEMON_THROTTLE_SECS),
+            "shorter than launchd's default, and not zero"
+        );
+    }
+
+    #[test]
+    fn a_changed_agent_definition_is_reloaded_not_only_restarted() {
+        // `kickstart -k` restarts the job launchd already holds, with the
+        // definition it read at bootstrap. A plist that changed takes effect
+        // only once the job is booted out and bootstrapped again.
+        assert_eq!(reload_for(true), Reload::Replace);
+        assert_eq!(reload_for(false), Reload::Restart);
     }
 
     #[test]
