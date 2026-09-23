@@ -6,6 +6,14 @@ the entry says so when it does.
 
 ## [Unreleased]
 
+### Added
+
+- `tests/otlp_collector.rs`, an opt-in check of `usage --otlp` against a
+  real OpenTelemetry Collector, which runs when `CONBUS_OTELCOL` names one.
+  Against otelcol 0.161.0 every point the collector kept equalled the row
+  `--shareable` printed, and a wrong path or a stopped collector exited
+  non-zero.
+
 ### Fixed
 
 - conbus's own tests no longer reach the recorder of the person running them.
