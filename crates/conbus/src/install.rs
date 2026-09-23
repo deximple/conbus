@@ -18,7 +18,10 @@ use serde_json::{Map, Value, json};
 
 mod opencode;
 
-pub use opencode::{apply_opencode_plugin, opencode_plugin_path, opencode_plugin_registered};
+pub use opencode::{
+    apply_opencode_plugin, opencode_plugin_current, opencode_plugin_path,
+    opencode_plugin_registered,
+};
 
 /// Where a vendor keeps its own configuration, which is how `install` knows the
 /// vendor is on this machine at all.

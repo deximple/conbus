@@ -39,6 +39,10 @@ pub fn normalize(json: &str) -> Result<Normalized, HookError> {
     let payload: Payload = serde_json::from_str(json).map_err(|err| HookError(err.to_string()))?;
     let event = match payload.hook_event_name.as_str() {
         "session.created" => Event::SessionCandidate { trigger: None },
+        // The plugin decides what a prompt is and sends each one once, as
+        // `message.part.updated` (install/opencode_plugin.js). `message.updated`
+        // is what the 0.2.3 plugin also sent, once per agent step; it stays
+        // readable because machines keep that plugin until `install --apply`.
         "message.updated" | "message.part.updated" => Event::TurnStarted {
             author: None,
             prompt: Body::kept(payload.prompt.unwrap_or_default()),
@@ -169,6 +173,37 @@ mod tests {
                 } => {}
                 other => panic!("{other:?}"),
             },
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_prompt_is_a_turn_under_the_id_of_its_message() {
+        // A `msg_…` id names exactly one message, which is what lets the
+        // plugin send a person's message once and the log tell a re-report.
+        let json = r#"{
+            "opencode_plugin": 1,
+            "hook_event_name": "message.part.updated",
+            "session_id": "ses_1",
+            "cwd": "/repo",
+            "message_id": "msg_1",
+            "prompt": "the checkout test is flaky"
+        }"#;
+        match normalize(&Harness::new(Harness::OPENCODE), json).expect("ok") {
+            Normalized::Event { key, observed, .. } => {
+                assert_eq!(key.vendor_session_id, "ses_1");
+                assert_eq!(
+                    observed.vendor_turn_id.as_ref().map(VendorTurnId::as_str),
+                    Some("msg_1")
+                );
+                assert_eq!(
+                    observed.event,
+                    Event::TurnStarted {
+                        author: None,
+                        prompt: Body::kept("the checkout test is flaky"),
+                    }
+                );
+            }
             other => panic!("{other:?}"),
         }
     }
