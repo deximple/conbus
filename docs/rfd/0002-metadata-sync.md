@@ -53,6 +53,7 @@ workspace.
 | `tool_ms` | count | Summed tool durations the vendor reported |
 | `briefings`, `hops` | count | Briefings handed over; `routed` records |
 | `repeated` | count | Second deliveries of a report already counted — a data-quality signal |
+| `recovered` | count | Records counted in this row that gap fill or backfill recovered rather than a hook saw — a data-quality signal |
 
 The envelope around one device-day adds `device` (a random id minted when the
 machine joins), `schema` (this RFD's version, `1`) and `day_closed` (the UTC day

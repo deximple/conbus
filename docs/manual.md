@@ -207,20 +207,20 @@ conbus log --reveal --bus-id 01a0c7f2 # decrypt sealed tool bodies (section 11)
 ```
 
 **Counting it:** `conbus usage` folds the log into what your agents did, per
-agent, over the last 7 days (`--days 30`, or `--since 2026-09-01`). Thirty days
-on the machine that built it:
+agent, over the last 7 days (`--days 30`, `--since 2026-09-01`, or one closed day
+with `--day 2026-09-22`). Thirty days on the machine that built it:
 
 ```text
-usage     from 2026-08-25 (UTC) · 119745 live record(s) · not counted: backfilled 37559 · earlier 0 · repeated 9782
-harness   claude_code — 2534 conversation(s): attended 211 · unattended 2260 · unknown 63
-          2967 turn(s) · subagents 980
+usage     from 2026-08-25 (UTC) · 131666 record(s), 4397 recovered · not counted: earlier 33138 · repeated 10610 · recorded twice 24
+harness   claude_code — 2657 conversation(s): attended 240 · unattended 2354 · unknown 63
+          3207 turn(s) · subagents 1016
           stopped: limit 211 in 3 episode(s) · account 111 · vendor 3 · request 0 · other 1 · by a person 0
-          26188 tool call(s): failed 510 · interrupted 0 · refused 46 · asks 244 · 18h in tools
-harness   codex — 130 conversation(s): attended 9 · unattended 0 · unknown 121
-          184 turn(s) · subagents 0
+          27982 tool call(s): failed 545 · interrupted 0 · refused 48 · asks 247 · 21h in tools
+harness   codex — 183 conversation(s): attended 70 · unattended 0 · unknown 113
+          1419 turn(s) · subagents 0
           stopped: limit 0 in 0 episode(s) · account 0 · vendor 0 · request 0 · other 0 · by a person 0
           1892 tool call(s): failed 0 · interrupted 0 · refused 0 · asks 1 · 0s in tools
-failing   Bash 420 · Read 61 · Glob 4
+failing   Bash 453 · Read 61 · Glob 4
 busiest   /Users/you/project 2151 · /Users/you/other 145 (turns)
 cost      not in this log: no hook payload carries tokens or prices
 ```
@@ -240,10 +240,18 @@ cost      not in this log: no hook payload carries tokens or prices
   that you stopped, that the agent refused to run, and the times you were
   asked for permission. **in tools** adds up the durations the agent reported;
   Codex reports none.
-- **repeated**: a second delivery of the same report — with some agents one
-  event reaches the log twice. It is counted once.
-- History recovered by `backfill` is not counted: it is not activity the
-  recorder saw. Neither is cost: no hook carries tokens or prices.
+- **recovered**: records the recorder did not see as they happened but
+  recovered later — turns missed while it was down (gap fill) and conversations
+  `backfill` brought in, such as Codex.app's threads, which no hook reports.
+  They count by when they happened, so history older than the window does not
+  appear.
+- **not counted**: records before or after the window; **repeated** — a second
+  delivery of the same report, since with some agents one event reaches the log
+  twice; **recorded twice** — a recovered copy of a session the hooks also
+  recorded; **probe** — a run that declared itself a test of conbus.
+- A Cursor turn that reported several stops — Cursor writes a turn's end from
+  more than one hook — counts its most serious one. Cost is not counted at all:
+  no hook carries tokens or prices.
 
 `conbus usage --json` prints one row per day, agent, folder and attendance:
 counts only, never a prompt, a reply or a tool body. `conbus usage --shareable`
@@ -621,7 +629,7 @@ line, the destination's quota, and whether the session was a program
 | `conbus run [HARNESS]` | Start an agent in this terminal; hops start the next one here |
 | `conbus backfill [--apply] [--gaps] [--chat-export PATH]` | Recover history |
 | `conbus summary --bus-id ID` | Ask the other leg's agent for a digest of a conversation |
-| `conbus usage [--days N] [--since DAY] [--json] [--shareable]` | What the agents did, counted (section 5) |
+| `conbus usage [--days N] [--since DAY] [--day DAY] [--json] [--shareable]` | What the agents did, counted (section 5) |
 | `conbus verdict` | Score a four-week trial of the hop (below) |
 | `conbus arena fact --workspace DIR --claim TEXT --anchor PATH [--type T]` | Accept a fact |
 | `conbus arena link --from DIR --to DIR` | Share one folder's facts with another |

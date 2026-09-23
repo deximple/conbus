@@ -202,20 +202,20 @@ conbus log --reveal --bus-id 01a0c7f2 # 봉인된 툴 본문 복호화 (11장)
 ```
 
 **세어 보기:** `conbus usage`는 로그를 에이전트별로 무엇을 했는지로 접어 보여
-줍니다. 기본은 최근 7일이고, `--days 30`이나 `--since 2026-09-01`로 바꿉니다.
-아래는 이 도구를 만든 Mac의 30일입니다.
+줍니다. 기본은 최근 7일이고, `--days 30`, `--since 2026-09-01`, 또는 끝난 하루
+`--day 2026-09-22`로 바꿉니다. 아래는 이 도구를 만든 Mac의 30일입니다.
 
 ```text
-usage     from 2026-08-25 (UTC) · 119745 live record(s) · not counted: backfilled 37559 · earlier 0 · repeated 9782
-harness   claude_code — 2534 conversation(s): attended 211 · unattended 2260 · unknown 63
-          2967 turn(s) · subagents 980
+usage     from 2026-08-25 (UTC) · 131666 record(s), 4397 recovered · not counted: earlier 33138 · repeated 10610 · recorded twice 24
+harness   claude_code — 2657 conversation(s): attended 240 · unattended 2354 · unknown 63
+          3207 turn(s) · subagents 1016
           stopped: limit 211 in 3 episode(s) · account 111 · vendor 3 · request 0 · other 1 · by a person 0
-          26188 tool call(s): failed 510 · interrupted 0 · refused 46 · asks 244 · 18h in tools
-harness   codex — 130 conversation(s): attended 9 · unattended 0 · unknown 121
-          184 turn(s) · subagents 0
+          27982 tool call(s): failed 545 · interrupted 0 · refused 48 · asks 247 · 21h in tools
+harness   codex — 183 conversation(s): attended 70 · unattended 0 · unknown 113
+          1419 turn(s) · subagents 0
           stopped: limit 0 in 0 episode(s) · account 0 · vendor 0 · request 0 · other 0 · by a person 0
           1892 tool call(s): failed 0 · interrupted 0 · refused 0 · asks 1 · 0s in tools
-failing   Bash 420 · Read 61 · Glob 4
+failing   Bash 453 · Read 61 · Glob 4
 busiest   /Users/you/project 2151 · /Users/you/other 145 (turns)
 cost      not in this log: no hook payload carries tokens or prices
 ```
@@ -234,10 +234,16 @@ cost      not in this log: no hook payload carries tokens or prices
 - **failed · interrupted · refused · asks**: 실행됐다가 실패한 툴 호출, 사용자가
   멈춘 호출, 에이전트가 실행을 거부한 호출, 권한을 물어본 횟수입니다.
   **in tools**는 에이전트가 알려 준 실행 시간의 합이고, Codex는 알려 주지 않습니다.
-- **repeated**: 같은 보고가 두 번 전달된 것입니다. 에이전트에 따라 이벤트 하나가
-  로그에 두 번 들어오는 경우가 있어, 한 번만 셉니다.
-- `backfill`로 복구한 기록은 세지 않습니다. 기록기가 직접 본 활동이 아니기
-  때문입니다. 비용도 없습니다. 토큰이나 가격을 싣는 훅이 없습니다.
+- **recovered**: 기록기가 그때 보지 못하고 나중에 복구한 기록입니다. 기록기가
+  꺼져 있던 동안 빠진 턴(갭 채우기)과, 훅이 없는 Codex.app 스레드처럼
+  `backfill`로 들여온 대화가 여기에 들어갑니다. 일어난 시각으로 세므로 기간보다
+  오래된 과거는 나오지 않습니다.
+- **not counted**: 기간 앞뒤의 기록, **repeated**(같은 보고가 두 번 전달된 것 —
+  에이전트에 따라 이벤트 하나가 로그에 두 번 들어옵니다), **recorded twice**(훅도
+  기록한 세션의 복구 사본), **probe**(conbus 시험이라고 스스로 밝힌 실행)입니다.
+- 한 턴에 중단을 여러 번 보고한 Cursor 턴은 가장 심각한 하나로 셉니다. Cursor는
+  턴의 끝을 여러 훅에서 씁니다. 비용은 세지 않습니다. 토큰이나 가격을 싣는 훅이
+  없습니다.
 
 `conbus usage --json`은 날짜·에이전트·폴더·사람 여부마다 한 줄씩 출력합니다.
 숫자만 있고, 프롬프트·답변·툴 본문은 절대 들어가지 않습니다. `conbus usage
@@ -603,7 +609,7 @@ conbus uninstall --apply  # 지우기
 | `conbus run [HARNESS]` | 이 터미널에서 에이전트 시작. hop이 다음 에이전트를 여기서 띄움 |
 | `conbus backfill [--apply] [--gaps] [--chat-export PATH]` | 지난 기록 되살리기 |
 | `conbus summary --bus-id ID` | 다른 레그의 에이전트에게 대화 요약 요청 |
-| `conbus usage [--days N] [--since DAY] [--json] [--shareable]` | 에이전트가 한 일을 셈(5장) |
+| `conbus usage [--days N] [--since DAY] [--day DAY] [--json] [--shareable]` | 에이전트가 한 일을 셈(5장) |
 | `conbus verdict` | hop의 4주 시험 채점(아래) |
 | `conbus arena fact --workspace DIR --claim TEXT --anchor PATH [--type T]` | 사실 받아들이기 |
 | `conbus arena link --from DIR --to DIR` | 한 폴더의 사실을 다른 폴더와 공유 |

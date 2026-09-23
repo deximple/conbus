@@ -6,7 +6,27 @@ the entry says so when it does.
 
 ## [Unreleased]
 
+### Added
+
+- `conbus usage --day DAY`: one closed UTC day, and nothing after it — the unit
+  RFD 0002 sends once a day.
+
+### Changed
+
+- `conbus usage` counts recovered records by when they happened and marks them
+  `recovered`: turns gap fill wrote while the recorder was down, and
+  conversations `backfill` brought in — Codex.app's threads have no hook, and
+  2,442 of their records from the last 30 days were in the log and in no report.
+  A recovered copy of a session the hooks also recorded is left out
+  (`recorded twice`), and so is a run that declared itself a probe. The header
+  names what it set aside, and only what it set aside.
+
 ### Fixed
+
+- A Cursor turn that reported several stops counts its most serious one.
+  Cursor writes a turn's end from `afterAgentResponse`, `stop` and sometimes
+  `sessionEnd`, and its `generation_id` names one turn, so one exhausted turn
+  could count as a limit and an `error`.
 
 - A Cursor reply that mentions a limit code is a reply, not a quota stop.
   `afterAgentResponse` carries the agent's own words, and any reply containing
