@@ -73,6 +73,10 @@ pub enum Command {
         json: bool,
         /// Print what a sync would send (RFD 0002): the rows, with no folder.
         shareable: bool,
+        /// Send those rows as OTLP metrics to a collector on this machine.
+        /// Present with no URL after it is `Some("")`, refused rather than
+        /// read as "do not send".
+        otlp: Option<String>,
     },
     /// Same TTY: start a vendor, and exec the next one when a hop lands.
     Run {
@@ -204,6 +208,10 @@ where
             day: flag_value(&args, "--day"),
             json: args.iter().any(|a| a == "--json"),
             shareable: args.iter().any(|a| a == "--shareable"),
+            otlp: args
+                .iter()
+                .any(|a| a == "--otlp")
+                .then(|| flag_value(&args, "--otlp").unwrap_or_default()),
         },
         "run" => Command::Run {
             harness: args.get(1).cloned().unwrap_or_else(|| "claude_code".into()),
@@ -284,14 +292,17 @@ USAGE:
     conbus go [HARNESS]           hop --apply for the current conversation
     conbus summary --bus-id ID    opposite-leg digest; never the protected leg
     conbus verdict                4-week dogfood score; open window is not a kill
-    conbus usage [--days N] [--since DAY] [--day DAY] [--json] [--shareable]
+    conbus usage [--days N] [--since DAY] [--day DAY] [--json] [--shareable] [--otlp URL]
                                   what the agents did, per harness: turns, stops,
                                   tool failures, permission asks (default 7 days;
                                   --day is one closed UTC day);
                                   --json prints one row per day, harness,
                                   workspace and attendance — counts, never bodies;
                                   --shareable prints what a sync would send:
-                                  the same rows with no folder (docs/rfd/0002)
+                                  the same rows with no folder (docs/rfd/0002);
+                                  --otlp sends those rows as OTLP metrics to a
+                                  collector on this machine over plain HTTP
+                                  (http://127.0.0.1:4318); send a --day once
     conbus run [claude_code|codex|cursor|agy|opencode|grok]
                                   same TTY: start a vendor; hop execs the next
     conbus arena fact --workspace DIR --claim TEXT --anchor PATH
@@ -451,7 +462,8 @@ mod tests {
                 since: None,
                 day: None,
                 json: false,
-                shareable: false
+                shareable: false,
+                otlp: None
             }
         );
         assert_eq!(
@@ -461,7 +473,8 @@ mod tests {
                 since: None,
                 day: None,
                 json: true,
-                shareable: false
+                shareable: false,
+                otlp: None
             }
         );
         assert_eq!(
@@ -471,7 +484,8 @@ mod tests {
                 since: Some("2026-09-01".into()),
                 day: None,
                 json: false,
-                shareable: false
+                shareable: false,
+                otlp: None
             }
         );
         assert_eq!(
@@ -481,7 +495,8 @@ mod tests {
                 since: None,
                 day: None,
                 json: false,
-                shareable: false
+                shareable: false,
+                otlp: None
             },
             "a count that is not a number is ignored, the way --tail is"
         );
@@ -492,7 +507,8 @@ mod tests {
                 since: None,
                 day: None,
                 json: false,
-                shareable: true
+                shareable: true,
+                otlp: None
             }
         );
         assert_eq!(
@@ -502,9 +518,49 @@ mod tests {
                 since: None,
                 day: Some("2026-09-22".into()),
                 json: false,
-                shareable: true
+                shareable: true,
+                otlp: None
             }
         );
+    }
+
+    #[test]
+    fn usage_sends_to_a_collector_only_when_given_one() {
+        assert_eq!(
+            parse(
+                [
+                    "usage",
+                    "--day",
+                    "2026-09-22",
+                    "--otlp",
+                    "http://127.0.0.1:4318"
+                ],
+                None
+            ),
+            Command::Usage {
+                days: 7,
+                since: None,
+                day: Some("2026-09-22".into()),
+                json: false,
+                shareable: false,
+                otlp: Some("http://127.0.0.1:4318".into())
+            }
+        );
+        // A flag with nothing after it is a URL that will be refused, not a
+        // quiet "do not send".
+        assert_eq!(
+            parse(["usage", "--shareable", "--otlp"], None),
+            Command::Usage {
+                days: 7,
+                since: None,
+                day: None,
+                json: false,
+                shareable: true,
+                otlp: Some(String::new())
+            }
+        );
+        assert!(USAGE.contains("[--shareable] [--otlp URL]"), "{USAGE}");
+        assert!(USAGE.contains("--otlp sends those rows"), "{USAGE}");
     }
 
     #[test]

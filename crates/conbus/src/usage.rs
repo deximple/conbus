@@ -11,6 +11,8 @@ use conbus_core::paths::Paths;
 use conbus_core::segment::SegmentLog;
 use conbus_core::usage::{HarnessTotal, Ledger, first_day, next_day};
 
+use crate::otlp;
+
 /// How many names a top-N line prints.
 const TOP: usize = 5;
 
@@ -78,7 +80,18 @@ pub fn window(
     })
 }
 
-pub fn run(paths: &Paths, window: Window, output: Output) -> io::Result<()> {
+/// Print the report; with a collector, send it the shareable rows after.
+///
+/// What is sent is printed first, whichever form was asked for, so the rows a
+/// collector receives are rows their owner could read — `--shareable` prints
+/// exactly them. What the send did goes to stderr, which keeps `--json` and
+/// `--shareable` one row per line and nothing else.
+pub fn run(
+    paths: &Paths,
+    window: Window,
+    output: Output,
+    collector: Option<&otlp::Endpoint>,
+) -> io::Result<()> {
     let scan = SegmentLog::scan(paths.log_dir())?;
     let ledger = Ledger::fold_between(&scan.records, &window.since, window.until.as_deref());
     let lines = match output {
@@ -94,6 +107,11 @@ pub fn run(paths: &Paths, window: Window, output: Output) -> io::Result<()> {
             "unreadable: {} line(s) not counted (conbus log names them)",
             scan.defects.len()
         );
+    }
+    if let Some(collector) = collector {
+        for line in otlp::export(collector, &ledger.shareable(), Timestamp::now())? {
+            eprintln!("{line}");
+        }
     }
     Ok(())
 }
