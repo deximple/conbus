@@ -127,7 +127,7 @@ and `rm -rf ~/.conbus` removes it if you want it gone.
 | `conbus status` | Routing rules, quota, hop history, cost |
 | `conbus quota` | What each leg has left |
 | `conbus log [FILTERS]` | Read the conversation log back |
-| `conbus usage [--days N] [--since DAY] [--json]` | What the agents did, counted: stops, tool failures, permission asks |
+| `conbus usage [--days N] [--since DAY] [--json] [--shareable]` | What the agents did, counted: stops, tool failures, permission asks |
 | `conbus hop [HARNESS]` | Preview the next leg (`--apply` records it) |
 | `conbus go [HARNESS]` | Hop the current conversation |
 | `conbus run [HARNESS]` | Start a leg in this terminal; hops exec the next one |

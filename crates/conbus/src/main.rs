@@ -139,7 +139,12 @@ fn main() -> ExitCode {
         }
         Command::Summary { bus_id } => run(|paths| summarise::run(paths, bus_id)),
         Command::Verdict => run(verdict::run),
-        Command::Usage { days, since, json } => run(|paths| usage::run(paths, days, since, json)),
+        Command::Usage {
+            days,
+            since,
+            json,
+            shareable,
+        } => run(|paths| usage::run(paths, days, since, usage::Output::of(json, shareable))),
         Command::Run { harness } => run(|paths| runner::run(paths, &harness)),
         Command::Arena {
             action,
