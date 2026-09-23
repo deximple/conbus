@@ -62,11 +62,16 @@ every build. So the first start of a replaced binary exits at once with
 `OS_REASON_CODESIGNING | Launch Constraint Violation`, and launchd waits its
 `ThrottleInterval` before the next — ten seconds by default, which was the whole
 ~14 s hook gap of both deploys on 2026-09-23 (`log show` with
-`eventMessage CONTAINS "sh.conbus.daemon"` shows it). The plist now asks for
-two seconds. A Developer ID signature would carry a stable team identity and
-should avoid the refusal altogether; that needs the operator's Apple account.
-The constraint is not applied to a job bootstrapped from any other directory,
-so a probe outside `LaunchAgents` does not reproduce it.
+`eventMessage CONTAINS "sh.conbus.daemon"` shows it). A `bootout` then
+`bootstrap` avoids it: the bootstrap makes Background Task Management look at
+the item again ("registerLaunchItem: checking for an updated legacy agent …
+updated item"), and the new daemon started 0.3 s after `install --apply`. So
+`install --apply` always reloads and never kickstarts; the plist's
+`ThrottleInterval` of two seconds is the backstop for any other restart. A
+Developer ID signature would carry a stable team identity instead; that needs
+the operator's Apple account. The constraint is not applied to a job
+bootstrapped from any other directory, so a probe outside `LaunchAgents` does
+not reproduce it.
 
 ## Decisions that are closed — and the two that stage 1 reopened
 

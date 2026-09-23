@@ -644,24 +644,6 @@ pub const DAEMON_LABEL: &str = "sh.conbus.daemon";
 /// its failures come before the log is read, so a retry costs little.
 pub const DAEMON_THROTTLE_SECS: u32 = 2;
 
-/// How `install --apply` hands the agent to launchd.
-#[derive(Debug, PartialEq, Eq)]
-enum Reload {
-    /// Restart the job launchd holds: the definition is the same.
-    Restart,
-    /// Unload it and load the file again: `kickstart` would keep running the
-    /// definition launchd read at bootstrap.
-    Replace,
-}
-
-fn reload_for(changed: bool) -> Reload {
-    if changed {
-        Reload::Replace
-    } else {
-        Reload::Restart
-    }
-}
-
 /// A bootstrap straight after a bootout can fail with an I/O error while
 /// launchd lets go of the job (seen on this machine on 2026-09-03).
 const BOOTSTRAP_TRIES: u32 = 5;
@@ -703,43 +685,54 @@ pub fn apply_daemon(home: &Path, binary: &Path, log: &Path, load: bool) -> io::R
         write_atomically(&path, &body)?;
     }
     if load {
-        load_launch_agent(&path, !unchanged);
+        load_launch_agent(&path)?;
     }
     Ok(!unchanged)
 }
 
-fn load_launch_agent(plist: &Path, changed: bool) {
+fn load_launch_agent(plist: &Path) -> io::Result<()> {
     let uid = unsafe { libc::getuid() };
     let domain = format!("gui/{uid}");
     let target = format!("{domain}/{DAEMON_LABEL}");
     let plist = plist.display().to_string();
-    match reload_for(changed) {
-        Reload::Restart => {
-            if !launchctl(&["kickstart", "-k", &target]) {
-                bootstrap(&domain, &plist);
-            }
-        }
-        Reload::Replace => {
-            // Not loaded is fine: a first install has nothing to boot out.
-            let _ = launchctl(&["bootout", &target]);
-            for _ in 0..25 {
-                if !launchctl(&["print", &target]) {
-                    break;
-                }
-                std::thread::sleep(LAUNCHCTL_PAUSE);
-            }
-            bootstrap(&domain, &plist);
-        }
+    if reload_agent(&domain, &target, &plist, &mut launchctl) {
+        return Ok(());
     }
+    Err(io::Error::other(format!(
+        "launchd did not load {plist}; the recorder is not running. \
+         Try: launchctl bootstrap {domain} {plist}"
+    )))
 }
 
-fn bootstrap(domain: &str, plist: &str) {
-    for _ in 0..BOOTSTRAP_TRIES {
-        if launchctl(&["bootstrap", domain, plist]) {
-            return;
+/// Unload the agent and load its file again — never `kickstart -k`.
+///
+/// A kickstart restarts the job under the launch constraint macOS recorded for
+/// the binary it last loaded, so the first start after an upgrade is refused
+/// and launchd waits `ThrottleInterval` before the next. A bootstrap makes
+/// Background Task Management look at the item again, and the new binary
+/// starts at once. `launchctl` is a parameter so the order can be tested
+/// without talking to launchd.
+fn reload_agent(
+    domain: &str,
+    target: &str,
+    plist: &str,
+    launchctl: &mut impl FnMut(&[&str]) -> bool,
+) -> bool {
+    // Not loaded is fine: a first install has nothing to boot out.
+    let _ = launchctl(&["bootout", target]);
+    for _ in 0..25 {
+        if !launchctl(&["print", target]) {
+            break;
         }
         std::thread::sleep(LAUNCHCTL_PAUSE);
     }
+    for _ in 0..BOOTSTRAP_TRIES {
+        if launchctl(&["bootstrap", domain, plist]) {
+            return true;
+        }
+        std::thread::sleep(LAUNCHCTL_PAUSE);
+    }
+    false
 }
 
 /// Run launchctl quietly; `print` in particular writes pages of state.
@@ -1170,13 +1163,71 @@ mod tests {
         );
     }
 
+    /// launchctl as a script: `print` answers "still loaded" `loaded_for`
+    /// times, and `bootstrap` fails `refusals` times before it succeeds.
+    fn scripted(loaded_for: usize, refusals: usize) -> impl FnMut(&[&str]) -> bool {
+        let mut prints = 0;
+        let mut bootstraps = 0;
+        move |args: &[&str]| match args.first().copied() {
+            Some("print") => {
+                prints += 1;
+                prints <= loaded_for
+            }
+            Some("bootstrap") => {
+                bootstraps += 1;
+                bootstraps > refusals
+            }
+            _ => true,
+        }
+    }
+
     #[test]
-    fn a_changed_agent_definition_is_reloaded_not_only_restarted() {
-        // `kickstart -k` restarts the job launchd already holds, with the
-        // definition it read at bootstrap. A plist that changed takes effect
-        // only once the job is booted out and bootstrapped again.
-        assert_eq!(reload_for(true), Reload::Replace);
-        assert_eq!(reload_for(false), Reload::Restart);
+    fn install_reloads_the_agent_and_never_just_restarts_it() {
+        // A `kickstart -k` restarts the job under the launch constraint macOS
+        // recorded for the binary it loaded last, so an upgrade's first start
+        // is refused ("Launch Constraint Violation") and launchd waits before
+        // the next. A bootstrap makes Background Task Management look at the
+        // item again ("registerLaunchItem: updated item"): on 2026-09-23 the
+        // reload had the new daemon running 0.3 s after install, where a
+        // kickstart had taken ten.
+        let mut script = scripted(2, 1);
+        let mut seen: Vec<String> = Vec::new();
+        let mut launchctl = |args: &[&str]| {
+            seen.push(args.join(" "));
+            script(args)
+        };
+
+        assert!(reload_agent(
+            "gui/501",
+            "gui/501/sh.conbus.daemon",
+            "/p.plist",
+            &mut launchctl
+        ));
+
+        assert_eq!(
+            seen,
+            vec![
+                "bootout gui/501/sh.conbus.daemon",
+                "print gui/501/sh.conbus.daemon",
+                "print gui/501/sh.conbus.daemon",
+                "print gui/501/sh.conbus.daemon",
+                "bootstrap gui/501 /p.plist",
+                "bootstrap gui/501 /p.plist",
+            ],
+            "wait for launchd to let go, then load the file, retrying the I/O-error race"
+        );
+        assert!(!seen.iter().any(|call| call.starts_with("kickstart")));
+    }
+
+    #[test]
+    fn a_reload_launchd_never_takes_is_reported_not_swallowed() {
+        let mut script = scripted(0, usize::MAX);
+        assert!(!reload_agent(
+            "gui/501",
+            "gui/501/sh.conbus.daemon",
+            "/p.plist",
+            &mut script
+        ));
     }
 
     #[test]

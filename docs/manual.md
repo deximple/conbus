@@ -1,6 +1,6 @@
 # conbus manual
 
-This manual describes **conbus 0.2.2** on macOS. For the short version, read
+This manual describes **conbus 0.2.3** on macOS. For the short version, read
 the [README](../README.md); for what changed between releases, the
 [CHANGELOG](../CHANGELOG.md). 한국어: [manual.ko.md](manual.ko.md)
 
@@ -92,7 +92,7 @@ Nothing in your agents' settings has changed at this point. Options:
 
 | Variable | Effect |
 | --- | --- |
-| `CONBUS_VERSION=v0.2.2` | Install that release instead of the latest |
+| `CONBUS_VERSION=v0.2.3` | Install that release instead of the latest |
 | `CONBUS_REPO=owner/name` | Install from a fork |
 | `CONBUS_BASE_URL=…` | Download from a mirror, or `file:///path/to/dist` for a local build |
 
@@ -153,7 +153,7 @@ approval for you — it is your consent, not conbus's.
 
 | Line | Healthy |
 | --- | --- |
-| `build` | `0.2.2 (<commit>)` |
+| `build` | `0.2.3 (<commit>)` |
 | `socket` | `listening` |
 | `daemon` | the same commit as `build`. `DIFFERS` means the binary was replaced and the daemon was not restarted |
 | `writable` | `appendable` |
@@ -319,7 +319,7 @@ and brings you there.
 | The destination is exhausted too | **wait** instead |
 | The session is unattended (a program) | **no hop** |
 
-The automatic hop is experimental in 0.2.2: it has worked in probes and on
+The automatic hop is experimental in 0.2.3: it has worked in probes and on
 request, but has not yet been seen firing on a real quota stop.
 
 ### Hopping on purpose
@@ -532,10 +532,10 @@ restarts the recorder on the new binary, which takes a few seconds. If `doctor`
 shows `daemon … DIFFERS`, this step was skipped. A hook newer than the running
 recorder is refused with "Restart the daemon" rather than half-understood.
 
-When the recorder's launchd file itself changed, as it did in 0.2.2, the same
-command unloads and reloads it (`bootout`, then `bootstrap`), because a restart
-alone keeps the old definition. macOS refuses the first start of a replaced
-binary once, so the hooks go unrecorded for a few seconds while it tries again.
+The command unloads the recorder and loads it again (`bootout`, then
+`bootstrap`) rather than restarting it: macOS checks a replaced binary when the
+agent is loaded, and refuses a plain restart of one once. The hooks go
+unrecorded for the few seconds the recorder takes to start.
 
 ---
 
