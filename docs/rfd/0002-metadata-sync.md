@@ -211,9 +211,23 @@ never-sent list applies, and every field is in the table below.
 | `repeated` | `conbus.repeated` | Sum | `{record}` | |
 | `recovered` | `conbus.recovered` | Sum | `{record}` | |
 
-Not settled by the spike. It has been driven only against a loopback listener
-that checks the request and parses the body, never a real collector. And
-backends keep their own rules for late points: Datadog does not ingest a point
+Checked against a real collector on 2026-09-24: the OpenTelemetry Collector
+0.161.0 (core distribution, darwin arm64), with its OTLP/HTTP receiver on
+loopback and the file exporter.
+- It answered `200` to a real closed day from the operator's Mac: 5 rows, 100
+  points. Every point it kept equalled the `--shareable` row, with the metric,
+  unit, type, `DELTA` temporality, monotonic sums, day-boundary timestamps,
+  and attributes tabled above.
+- The resource held `service.name` and `service.version` and nothing else. A
+  body with no `scope` was accepted.
+- A path it does not serve came back `404` and exited non-zero, and so did a
+  collector that was not running.
+
+`tests/otlp_collector.rs` repeats the check when `CONBUS_OTELCOL` names a
+collector binary; it is ignored otherwise.
+
+Not settled by the spike: Grafana Alloy and the Datadog Agent were not tried.
+And backends keep their own rules for late points: Datadog does not ingest a point
 more than an hour old unless Historical Metrics Ingestion is on, and a
 Prometheus-style store takes an old sample only inside its out-of-order window,
 and wants cumulative sums (the collector's `deltatocumulative` processor, or

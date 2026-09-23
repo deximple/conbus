@@ -471,9 +471,13 @@ own PR with a failing test first:
      writes per-user copies that sit unused under the locks.
    - `install --managed` could warn when someone other than root can replace
      the binary it names.
-   - `usage --otlp` has not been sent to a real collector (the OpenTelemetry
-     Collector, Grafana Alloy, the Datadog Agent) — do that before a pilot
-     relies on it — and counts any 2xx as sent where OTLP says 200.
+   - `usage --otlp` was checked against the OpenTelemetry Collector 0.161.0
+     on 2026-09-24: every point it kept equalled the `--shareable` row.
+     `tests/otlp_collector.rs` repeats that with `CONBUS_OTELCOL` set;
+     rerun it before a pilot relies on the pipe. Still unchecked: Grafana
+     Alloy, and the Datadog Agent, which drops points more than an hour old
+     unless Historical Metrics Ingestion is on. The pipe also counts any
+     2xx as sent where OTLP says 200.
    - `--inference-listen` authenticates nothing and binds whatever address it
      is given.
 3. After V1 (2026-11-04): the screen or the pipe, whichever the interviews'
