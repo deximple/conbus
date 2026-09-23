@@ -141,6 +141,16 @@ hooks that are new or changed and asks whether to trust them. Until you do,
 Codex hooks are registered and silently do nothing. conbus never writes that
 approval for you — it is your consent, not conbus's.
 
+### On a managed Mac
+
+If your organisation manages Claude Code and its policy sets
+`allowManagedHooksOnly`, the hooks `install --apply` registers do not run.
+`conbus install --managed` prints the hooks block your administrator adds to
+Claude Code's managed settings instead, and says where it goes; it writes
+nothing. [Managed Macs](fleet.md) covers the rest: the binary, the recorder
+each person still starts with `install --apply`, approving it as a login item,
+and taking it all back out.
+
 ---
 
 ## 4. Check that it works
@@ -624,6 +634,7 @@ line, the destination's quota, and whether the session was a program
 | Command | |
 | --- | --- |
 | `conbus install [--apply]` | Register the hooks with every installed agent; reports unless `--apply` |
+| `conbus install --managed` | Print the hooks block for Claude Code's managed settings (JSON on stdout) and where it goes; writes nothing ([Managed Macs](fleet.md)) |
 | `conbus uninstall [--apply]` | Take them all back out; the log is kept |
 | `conbus doctor` | What is wired up and what is not |
 | `conbus status` | Routing rules, quota, hop history, cost |

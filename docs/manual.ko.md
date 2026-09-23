@@ -137,6 +137,15 @@ Codex는 새 훅을 승인받은 뒤에만 실행합니다. Codex를 한 번 켜
 아무 일도 하지 않습니다. conbus는 그 승인을 대신 쓰지 않습니다. 동의는 conbus가
 아니라 여러분이 하는 것입니다.
 
+### 관리되는 Mac에서
+
+조직이 Claude Code를 관리하고 그 정책이 `allowManagedHooksOnly`를 켜 두었다면,
+`install --apply`가 등록한 훅은 실행되지 않습니다. 이때 `conbus install --managed`는
+관리자가 Claude Code 관리 설정(managed settings)에 대신 넣을 훅 블록을 출력하고,
+어디에 넣는지 알려 줍니다. 아무것도 쓰지 않습니다. 나머지 — 바이너리 배포, 각자
+`install --apply`로 띄우는 레코더, 로그인 항목 승인, 모두 다시 빼기 — 는
+[Managed Macs](fleet.md)(영문)를 보세요.
+
 ---
 
 ## 4. 작동 확인
@@ -604,6 +613,7 @@ conbus uninstall --apply  # 지우기
 | 명령 | |
 | --- | --- |
 | `conbus install [--apply]` | 설치된 모든 에이전트에 훅을 등록. `--apply`가 없으면 보고만 |
+| `conbus install --managed` | Claude Code 관리 설정에 넣을 훅 블록(stdout의 JSON)과 넣을 곳을 출력. 아무것도 쓰지 않음([Managed Macs](fleet.md)) |
 | `conbus uninstall [--apply]` | 모두 다시 빼기. 로그는 남김 |
 | `conbus doctor` | 무엇이 연결됐고 무엇이 안 됐는지 |
 | `conbus status` | 라우팅 규칙, 쿼터, hop 기록, 비용 |

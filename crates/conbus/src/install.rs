@@ -16,12 +16,28 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value, json};
 
+pub mod managed;
 mod opencode;
 
 pub use opencode::{
     apply_opencode_plugin, opencode_plugin_current, opencode_plugin_path,
     opencode_plugin_registered,
 };
+
+/// The command `install` registers for a harness: the binary by absolute path,
+/// because a vendor's `PATH` is not ours, then `hook`, then `--harness` for
+/// every harness but the one the hook assumes when nothing says otherwise.
+///
+/// One function for every registration, including the block
+/// `install --managed` prints, so a managed copy and a per-user copy can only
+/// differ in the binary they name.
+pub fn hook_command(binary: &Path, harness: &str) -> String {
+    if harness == crate::cli::DEFAULT_HARNESS {
+        format!("{} hook", binary.display())
+    } else {
+        format!("{} hook --harness {harness}", binary.display())
+    }
+}
 
 /// Where a vendor keeps its own configuration, which is how `install` knows the
 /// vendor is on this machine at all.
@@ -247,7 +263,7 @@ pub fn cursor_hooks_registered(home: &Path) -> bool {
 /// `true` when the file changed.
 pub fn apply_cursor_hooks(binary: &Path, home: &Path) -> io::Result<bool> {
     let path = cursor_hooks_path(home);
-    let command = format!("{} hook --harness cursor", binary.display());
+    let command = hook_command(binary, "cursor");
     let existing = match fs::read_to_string(&path) {
         Ok(text) => serde_json::from_str(&text).map_err(io::Error::other)?,
         Err(err) if err.kind() == io::ErrorKind::NotFound => empty_document(),
@@ -288,7 +304,6 @@ pub struct Target {
 /// one-shot import of Claude sessions, so registering there would register
 /// nothing.
 pub fn targets(binary: &Path, home: &Path) -> Vec<Target> {
-    let binary = binary.display();
     let codex_home = std::env::var_os("CODEX_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".codex"));
@@ -297,19 +312,19 @@ pub fn targets(binary: &Path, home: &Path) -> Vec<Target> {
             harness: "claude_code",
             settings: home.join(".claude").join("settings.json"),
             events: &CLAUDE_EVENTS,
-            command: format!("{binary} hook"),
+            command: hook_command(binary, "claude_code"),
         },
         Target {
             harness: "codex",
             settings: codex_home.join("hooks.json"),
             events: &CODEX_EVENTS,
-            command: format!("{binary} hook --harness codex"),
+            command: hook_command(binary, "codex"),
         },
         Target {
             harness: "grok",
             settings: grok_hooks_path(home),
             events: &GROK_EVENTS,
-            command: format!("{binary} hook --harness grok"),
+            command: hook_command(binary, "grok"),
         },
     ]
 }
