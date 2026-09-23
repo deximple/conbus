@@ -4,7 +4,7 @@ All notable changes to conbus. Versions follow [Semantic Versioning](https://sem
 until 1.0 a minor version may change the command line or the log format, and
 the entry says so when it does.
 
-## [Unreleased]
+## [0.2.2] — 2026-09-23
 
 ### Fixed
 
