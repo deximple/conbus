@@ -168,7 +168,10 @@ fn wrapped(items: &[&str], width: usize) -> Vec<String> {
             .last()
             .is_some_and(|line| line.len() + ", ".len() + item.len() < width);
         match lines.last_mut() {
-            Some(line) if fits => *line = format!("{line}, {item}"),
+            Some(line) if fits => {
+                line.push_str(", ");
+                line.push_str(item);
+            }
             Some(line) => {
                 line.push(',');
                 lines.push((*item).to_string());
@@ -187,7 +190,7 @@ fn shell_safe(path: &str) -> bool {
 }
 
 fn warnings(binary: &Path, home: Option<&Path>, apply: bool) -> String {
-    let shown = binary.display();
+    let shown = binary.to_string_lossy();
     let in_home = home.is_some_and(|home| home.parent().is_some() && binary.starts_with(home));
     let home_warning = [
         format!("{shown} is inside this account's home, and one"),
@@ -204,7 +207,7 @@ fn warnings(binary: &Path, home: Option<&Path>, apply: bool) -> String {
     ];
     [
         in_home.then(|| section("warning", &home_warning)),
-        (!shell_safe(&shown.to_string())).then(|| section("warning", &shell_warning)),
+        (!shell_safe(&shown)).then(|| section("warning", &shell_warning)),
         apply.then(|| section("note", &apply_note)),
     ]
     .into_iter()

@@ -882,6 +882,22 @@ mod tests {
     }
 
     #[test]
+    fn every_registration_names_the_binary_then_hook_then_its_harness() {
+        // The strings `install` has always written, which `uninstall`,
+        // `doctor` and the Grok echo check read back — and which a managed
+        // block must repeat with only the binary changed.
+        let binary = Path::new("/opt/conbus");
+        assert_eq!(hook_command(binary, "claude_code"), "/opt/conbus hook");
+        for harness in ["codex", "cursor", "grok"] {
+            assert_eq!(
+                hook_command(binary, harness),
+                format!("/opt/conbus hook --harness {harness}")
+            );
+        }
+        assert!(is_conbus_hook(&hook_command(binary, "codex")));
+    }
+
+    #[test]
     fn the_registered_command_is_absolute() {
         // A vendor's PATH is not ours: Codex's app-server in particular runs
         // with a different one, which is why relative registration fails there.
