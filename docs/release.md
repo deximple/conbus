@@ -48,6 +48,58 @@ The last line installs into a throwaway `HOME` from the local package, exactly
 as `curl … | sh` would from a release. A package whose checksum does not match
 is refused and nothing is installed.
 
+## Signing with a Developer ID
+
+The workflow ships an ad-hoc signed binary. `scripts/sign-release.sh`
+replaces the published package with one signed with a Developer ID and
+notarized by Apple. The package keeps its name and its files, so `install.sh`
+does not change. It runs on the operator's Mac, after the workflow has
+published the tag. No secret goes into the repository or into CI: `codesign`
+uses the key in the login keychain, and `notarytool` uses a stored profile.
+
+Once, by the operator, because each step needs their sign-in:
+
+1. Add the Developer Program account in Xcode → Settings → Accounts. For
+   its team, open Manage Certificates → + → Developer ID Application. This
+   needs the paid program and the Account Holder role. A free Personal Team
+   cannot issue one.
+2. Make an app-specific password at appleid.apple.com, and store it under a
+   profile name:
+
+   ```bash
+   xcrun notarytool store-credentials conbus-notary --apple-id APPLE_ID --team-id TEAMID
+   ```
+
+3. `security find-identity -v -p codesigning` now lists
+   `Developer ID Application: NAME (TEAMID)`.
+
+For each release, after the workflow has published `vX.Y.Z`:
+
+```bash
+CONBUS_SIGN_IDENTITY="Developer ID Application: NAME (TEAMID)" sh scripts/sign-release.sh vX.Y.Z
+```
+
+This writes `target/signed/` and uploads nothing. Run it again with
+`--upload` to replace the release's package and checksum. The script:
+
+- checks the published package against its checksum;
+- signs both slices with the hardened runtime, a secure timestamp, the
+  `sh.conbus` identifier and `scripts/conbus.entitlements`;
+- refuses a signature that names no team;
+- submits a zip to Apple and waits for `Accepted`, printing Apple's log when
+  it is not;
+- asks Gatekeeper to assess the result, then repackages.
+
+A bare binary cannot carry a stapled ticket, so Gatekeeper looks the
+notarization up online the first time it checks it.
+
+`CONBUS_SIGN_IDENTITY=-` is a rehearsal. It signs ad hoc with the same
+runtime and entitlements, and never contacts Apple or uploads. conbus has
+been run under the hardened runtime this way — recorder, hook, `doctor`,
+`usage` — with core dumps off and memory locked as before. The one
+entitlement lets a landed hop open Terminal through `osascript`. That path
+has not been exercised under the hardened runtime.
+
 ## Operator decisions
 
 These are not engineering steps and no agent takes them on its own.
@@ -58,10 +110,12 @@ These are not engineering steps and no agent takes them on its own.
   public is `gh repo edit deximple/conbus --visibility public
   --accept-visibility-change-consequences`, and it publishes the whole history.
   Read `docs/publication-review.md` first.
-- **Notarization.** The binary is ad-hoc signed, not notarized. `curl` does not
-  quarantine what it downloads, so `install.sh` works; a copy downloaded in a
-  browser needs `xattr -d com.apple.quarantine conbus`. Notarizing needs an
-  Apple Developer account and its credentials in the repository secrets.
+- **Notarization.** The workflow's binary is ad-hoc signed, not notarized.
+  `curl` does not quarantine what it downloads, so `install.sh` works; a copy
+  downloaded in a browser needs `xattr -d com.apple.quarantine conbus`.
+  Signing and notarizing a release is "Signing with a Developer ID" above. It
+  waits on the operator's certificate and stored notary profile, and neither
+  goes into the repository.
 - **The name.** `conbus.sh` is the public name (`docs/www/README.md`). DNS and
   hosting for the landing page are not set up.
 - **Scope.** conbus is a local tool; there is no hosted service

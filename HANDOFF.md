@@ -486,9 +486,11 @@ own PR with a failing test first:
    "where should this show up?" answers. Nothing is hosted before the gates,
    and no sync code is written before RFD 0002 and RFD 0003 are accepted.
 
-Waiting on the operator: the V0 desk count, the weekly hour budget, an Apple
-Developer ID (see "The first start after an upgrade is refused once"), and
-repository visibility. A model digest is `conbus summary --bus-id`; hop-path
+Waiting on the operator: the V0 desk count, the weekly hour budget, a Developer ID
+certificate and a stored notary profile (`docs/release.md`, "Signing with a
+Developer ID": `scripts/sign-release.sh` is written and rehearsed ad hoc,
+and the Apple ID to use is in `HANDOFF.local.md`; see also "The first start
+after an upgrade is refused once"), and repository visibility. A model digest is `conbus summary --bus-id`; hop-path
 model calls stay zero.
 
 After 0.1.0, watch two things on a live machine. Drops with the

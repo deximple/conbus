@@ -13,6 +13,13 @@ the entry says so when it does.
   Against otelcol 0.161.0 every point the collector kept equalled the row
   `--shareable` printed, and a wrong path or a stopped collector exited
   non-zero. Grafana Alloy 1.19.2 forwarded every point unchanged too.
+- `scripts/sign-release.sh` replaces a published release's package with one
+  signed with a Developer ID and notarized by Apple: hardened runtime, a
+  secure timestamp, and the one entitlement `scripts/conbus.entitlements`
+  explains. No secret goes into the repository or CI; the operator's keychain
+  holds the certificate and the notary profile. `CONBUS_SIGN_IDENTITY=-`
+  rehearses it ad hoc. conbus has been run under the hardened runtime:
+  recorder, hook, `doctor` and `usage`, with core dumps off and memory locked.
 
 ### Fixed
 
