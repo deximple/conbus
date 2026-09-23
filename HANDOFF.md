@@ -453,16 +453,32 @@ in 0.2.4 except its dated item: Cursor reads a limit only from its one-line
 error and counts one stop per turn (#37, #38); OpenCode's plugin sends a prompt
 once and never the agent's reply, and `install --apply` replaces an older
 plugin (#39); `usage` counts recovered turns, leaves out probes and copies
-recorded twice, and takes `--day` (#38). Next, each its own PR with a failing
-test first:
+recorded twice, and takes `--day` (#38). Week 2 shipped early, in 0.2.5: the
+log is readable by its owner only and both halves of the release binary are
+signed (#41 — both found while fact-checking the packet); a one-page
+`docs/security-packet.md` and RFD 0003 as a draft (#41); `install --managed`
+and `docs/fleet.md` for fleets that set `allowManagedHooksOnly` (#42); and
+`usage --otlp`, the pipe, to a collector on the same Mac (#43). Next, each its
+own PR with a failing test first:
 
 1. Score the dogfood window with `conbus verdict` when it closes (2026-09-28)
    and record the result against Option 2 in `docs/saas-hypothesis.md` — do
    not declare the 4-week clock closed unless the command says it is; it
    refuses to score a window with no organic hop at all.
-2. Week 2, for pilots: a managed-settings / MDM path for fleets that set
-   `allowManagedHooksOnly`, a one-page `docs/security-packet.md`, RFD 0003
-   (security, before any sync code), and a local OTLP export spike (the "pipe").
+2. Loose ends from week 2, none needed until a pilot asks:
+   - `doctor` reads only per-user registrations, so on a managed Mac its
+     `hooks` line describes a file the lock ignores; and `install --apply`
+     writes per-user copies that sit unused under the locks.
+   - `install --managed` could warn when someone other than root can replace
+     the binary it names.
+   - `usage --otlp` has not been sent to a real collector (the OpenTelemetry
+     Collector, Grafana Alloy, the Datadog Agent) — do that before a pilot
+     relies on it — and counts any 2xx as sent where OTLP says 200.
+   - `--inference-listen` authenticates nothing and binds whatever address it
+     is given.
+3. After V1 (2026-11-04): the screen or the pipe, whichever the interviews'
+   "where should this show up?" answers. Nothing is hosted before the gates,
+   and no sync code is written before RFD 0002 and RFD 0003 are accepted.
 
 Waiting on the operator: the V0 desk count, the weekly hour budget, an Apple
 Developer ID (see "The first start after an upgrade is refused once"), and
