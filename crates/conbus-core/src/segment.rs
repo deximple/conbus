@@ -177,7 +177,12 @@ impl SegmentLog {
             .recursive(true)
             .mode(0o700)
             .create(&dir)?;
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).map_err(|err| {
+            io::Error::new(
+                err.kind(),
+                format!("could not make {} private: {err}", dir.display()),
+            )
+        })?;
         let existing = segment_paths(&dir)?;
         let next_seq = last_sequence(&existing)?.map_or(0, |seq| seq + 1);
         Ok(SegmentLog {

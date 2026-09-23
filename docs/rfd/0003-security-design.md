@@ -74,6 +74,11 @@ scope; its prerequisites are listed at the end.
   With its next batch, the device sends a new public key signed by the old one.
   The service accepts the new key and honours the old one for 7 more days, so
   a lost acknowledgement cannot lock the device out.
+- **Rotation is not a cure for theft.** Whoever holds a stolen key can rotate
+  it too, and keep sending as the device. What bounds that:
+  - the rightful device is refused once the overlap ends, and says so;
+  - the admin's device list shows every rotation;
+  - the answer to theft is revocation (D3), after which neither key works.
 - **Invite codes** are single use, expire after 7 days, and an admin can
   withdraw one before it is used.
 - **Service certificates** come from a public CA and renew automatically.
@@ -121,11 +126,18 @@ scope; its prerequisites are listed at the end.
   MDM works. The service sends HSTS.
 - **Nothing secret in a request.** An organisation's TLS-inspecting proxy can
   read the counts, which are its own data, but it cannot send as the device.
-- **Proposed implementation.** Send with `/usr/bin/curl`: the body on stdin,
-  and only the URL and the signature on the command line. conbus then gains
+- **Proposed implementation.** Send with `/usr/bin/curl`. conbus then gains
   no TLS stack, and uses the system's trust store the way it already uses
-  `security` and `unzip`. A Rust TLS client that reads the system trust store
-  would meet the same policy. The implementation PR chooses between them.
+  `security` and `unzip`.
+  - The URL, headers and body go in through a config on stdin
+    (`curl --config -`), so other accounts see nothing of a send in the
+    process list.
+  - The signature is not a secret: it is good for its own body only, which
+    the service already has. Keeping it off the command line still follows
+    the rule D1 sets for secrets.
+
+  A Rust TLS client that reads the system trust store would meet the same
+  policy. The implementation PR chooses between them.
 
 ### D6 — One-way
 

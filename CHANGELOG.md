@@ -11,9 +11,13 @@ the entry says so when it does.
 - The log is readable by its owner only. The data root was made with the
   default umask, and a macOS home directory is 0755, so every other account on
   the Mac could read `~/.conbus/log` — prompts and replies included. The root
-  and the log directory are now 0700 and new segments 0600, and the daemon
-  closes a root an older build left open when it starts, so upgrading and
-  running `conbus install --apply` is enough.
+  and the log directory are now 0700 and new segments 0600, whichever part of
+  conbus makes them first, and the daemon closes a root an older build left
+  open when it starts, so upgrading and running `conbus install --apply` is
+  enough. A root it cannot close is used anyway and named in `daemon.log`.
+- The Intel half of the release binary is signed. `lipo` kept the arm64
+  slice's linker signature and left the x86_64 one unsigned; packaging now
+  signs the universal binary ad hoc and refuses one that is not signed.
 
 ## [0.2.4] — 2026-09-23
 

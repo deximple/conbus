@@ -39,8 +39,14 @@ else `~/.conbus`.
   what protect them. Nothing is pruned: the log grows until the person
   deletes it.
 - **Before 0.2.5** the root and log were created `0755`/`0644`, so other
-  accounts on a shared Mac could read them. From 0.2.5 the recorder closes an
-  existing root when it starts.
+  accounts on a shared Mac could read them. From 0.2.5, whatever creates the
+  root creates it closed: the recorder, a hook, the status line, `install` or
+  a hop. The recorder also closes an open root when it starts.
+- **A root that cannot be closed** is still used, and the recorder says so in
+  `daemon.log`. That happens when the root belongs to someone else or sits on
+  a volume without modes. The log directory is closed either way.
+- **Name a directory of its own for `CONBUS_HOME`.** conbus makes it `0700`,
+  whatever else is in it.
 - The recorder turns off core dumps, and locks its memory where macOS allows.
 
 ## What leaves the Mac
@@ -60,8 +66,10 @@ runs:
   `conbus hook --inference-listen`, is off unless started. It takes Anthropic
   Inference-hook frames over plain HTTP on `127.0.0.1:8787`, always answers
   allow, and discards the actor's email. **It does not authenticate
-  requests**: anything that can reach the port can add records. Keep it on
-  loopback, and authenticate at the organisation's HTTPS terminator.
+  requests**: anything that can reach the port can add records. Loopback is
+  the default but not enforced: `--inference-listen ADDR` binds whatever
+  address it is given. Keep it on loopback, and authenticate at the
+  organisation's HTTPS terminator.
 
 ## What it runs
 
@@ -130,7 +138,9 @@ reads the file before sending it. No sync code exists, and none will before
   `macos-latest` from a tag, and publishes it with a SHA-256 that
   `install.sh` checks. The checksum comes from the same release, so it catches
   a damaged download but not a replaced release.
-- **Signing.** The binary is ad-hoc signed and **not notarized**.
+- **Signing.** From 0.2.5 both halves of the universal binary are ad-hoc
+  signed, and packaging refuses a binary that is not. 0.2.4 and earlier
+  shipped the Intel half unsigned. The binary is **not notarized**.
 - **Licence.** Apache-2.0.
 
 ## Removing it
