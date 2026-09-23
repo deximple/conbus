@@ -32,6 +32,16 @@ the prompt field is `prompt`, not Claude's `prompt` plus envelope. Official
 inject is `additional_context` on `sessionStart`. Field names come from
 `tests/fixtures/cursor_hooks_contract.md`, which is pinned by live traffic.
 
+Grok's hook docs say it reads Claude Code's `.claude/settings.json` and
+Cursor's `.cursor/hooks.json` beside its own hooks directory, and it runs
+every registration it finds. With both of ours in place, every Grok event
+reaches `conbus hook` twice — once as `--harness grok`, once under Claude
+Code's name — and the payload names Grok both times. The hook records the
+`--harness grok` copy and answers the other without recording it, but only
+while `~/.grok/hooks/conbus.json` registers the recorder for that event
+through a binary that exists. Without that file, Claude Code's registration is
+the only copy and it is recorded.
+
 ## Events we register (Claude Code)
 
 `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`,

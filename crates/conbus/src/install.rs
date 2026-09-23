@@ -300,11 +300,62 @@ pub fn targets(binary: &Path, home: &Path) -> Vec<Target> {
         },
         Target {
             harness: "grok",
-            settings: home.join(".grok").join("hooks").join("conbus.json"),
+            settings: grok_hooks_path(home),
             events: &GROK_EVENTS,
             command: format!("{binary} hook --harness grok"),
         },
     ]
+}
+
+/// Grok's own hooks file for the recorder. Grok trusts everything in
+/// `~/.grok/hooks/` without asking.
+pub fn grok_hooks_path(home: &Path) -> PathBuf {
+    home.join(".grok").join("hooks").join("conbus.json")
+}
+
+/// Whether Grok's own hooks file runs this recorder as `--harness grok` on
+/// `event`, through a binary that is still there.
+///
+/// Grok runs Claude Code's registration of the hook as well as its own, so
+/// this is the question of whether a second copy of the event is on its way
+/// (`hook::client::grok_echo`). Every doubt answers no, because no means the
+/// copy in hand is recorded: a file that is missing or unreadable, silent
+/// about this event, or pointing at a binary that has gone.
+pub fn grok_registers(home: &Path, event: &str) -> bool {
+    let Ok(text) = fs::read_to_string(grok_hooks_path(home)) else {
+        return false;
+    };
+    let Ok(document) = serde_json::from_str::<Value>(&text) else {
+        return false;
+    };
+    document
+        .get("hooks")
+        .and_then(|hooks| hooks.get(event))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .flat_map(|block| {
+            block
+                .get("hooks")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .filter_map(|hook| hook.get("command")?.as_str())
+        .any(|command| runs_as(command, "grok"))
+}
+
+/// Whether a registered command runs a recorder binary that exists, with
+/// `--harness <harness>`.
+fn runs_as(command: &str, harness: &str) -> bool {
+    let Some((program, arguments)) = command.split_once(" hook") else {
+        return false;
+    };
+    let mut words = arguments.split_whitespace();
+    is_conbus_hook(command)
+        && Path::new(program.trim()).is_file()
+        && words.any(|word| word == "--harness")
+        && words.next() == Some(harness)
 }
 
 /// What one target's registration would become.
@@ -737,6 +788,56 @@ mod tests {
         );
         assert!(found.command.contains("--harness grok"));
         assert!(found.events.contains(&"StopFailure"));
+    }
+
+    #[test]
+    fn the_grok_registration_install_writes_is_the_one_the_echo_check_reads() {
+        // `hook::client::grok_echo` stands a copy down only on this answer, so
+        // the two have to agree on the shape `install` writes.
+        let home = tempfile::tempdir().expect("tempdir");
+        let binary = home.path().join("bin").join("conbus");
+        fs::create_dir_all(binary.parent().expect("bin")).expect("bin");
+        fs::write(&binary, "").expect("binary");
+        let target = targets(&binary, home.path())
+            .into_iter()
+            .find(|t| t.harness == "grok")
+            .expect("grok target");
+        apply(&plan(target).expect("plan")).expect("write");
+
+        for event in GROK_EVENTS {
+            assert!(grok_registers(home.path(), event), "{event}");
+        }
+        assert!(
+            !grok_registers(home.path(), "Notification"),
+            "Claude Code's settings carry Notification; Grok's own file does not"
+        );
+
+        fs::remove_file(&binary).expect("the binary moves");
+        assert!(
+            !grok_registers(home.path(), "PreToolUse"),
+            "a registration that cannot run delivers nothing"
+        );
+    }
+
+    #[test]
+    fn only_the_grok_flag_makes_a_command_groks_own_copy() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let binary = home.path().join("conbus");
+        fs::write(&binary, "").expect("binary");
+        let bin = binary.display();
+
+        assert!(runs_as(&format!("{bin} hook --harness grok"), "grok"));
+        assert!(
+            !runs_as(&format!("{bin} hook"), "grok"),
+            "Claude Code's registration"
+        );
+        assert!(!runs_as(&format!("{bin} hook --harness cursor"), "grok"));
+        assert!(!runs_as(&format!("{bin} hook --harness grokker"), "grok"));
+        assert!(!runs_as(&format!("{bin} hook --statusline"), "grok"));
+        assert!(!runs_as(
+            "/elsewhere/other-tool hook --harness grok",
+            "grok"
+        ));
     }
 
     #[test]

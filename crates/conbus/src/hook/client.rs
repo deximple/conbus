@@ -248,6 +248,10 @@ pub fn run(harness: &str, stdin: &mut impl Read) -> Result<Reply, Dropped> {
             .into());
         }
     }
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    if grok_echo(harness, &key, &hook_event_name, home.as_deref()) {
+        return Ok(silent_reply(harness).to_string());
+    }
     named_session(&key, &hook_event_name)?;
     let paths = Paths::resolve().map_err(|_| "no home directory to resolve".to_string())?;
     if let Some(problem) = paths.socket_problem() {
@@ -299,6 +303,34 @@ pub fn run(harness: &str, stdin: &mut impl Read) -> Result<Reply, Dropped> {
         Ok(_) if inference => Ok(hook::inference::ALLOW.to_string()),
         other => other,
     }
+}
+
+/// Whether this call is Grok running somebody else's registration of the hook,
+/// for an event Grok's own registration delivers too.
+///
+/// Grok's hook docs say it reads Claude Code's `.claude/settings.json` and
+/// Cursor's `.cursor/hooks.json` beside its own `~/.grok/hooks/*.json`, and it
+/// runs every hook it finds. The harness is named from the payload
+/// (`hook::normalize`), so the copy that came in through Claude Code's
+/// registration was stamped `grok` as well: from 2026-09-06, the day `install`
+/// began writing Grok's own file, every Grok event reached the log twice — one
+/// conversation, the same ids and body, 30–330 ms apart.
+///
+/// The copy kept is the one Grok runs from its own directory, which it trusts
+/// without asking; its Claude-compatible hooks have shipped loaded and never
+/// dispatched (1.0.3, `xai-org/plugin-marketplace#236`). The echo stands down
+/// only while that file registers the recorder for this event through a binary
+/// that is there. Without it the echo is the only copy, and answering it
+/// silently would lose the event.
+fn grok_echo(
+    invoked_as: &str,
+    key: &SessionKey,
+    hook_event_name: &str,
+    home: Option<&std::path::Path>,
+) -> bool {
+    key.harness.as_str() == Harness::GROK
+        && invoked_as != Harness::GROK
+        && home.is_some_and(|home| crate::install::grok_registers(home, hook_event_name))
 }
 
 /// Refuse a payload that names no session, before any socket is opened
@@ -442,6 +474,107 @@ mod tests {
             Some("UserPromptSubmit as claude_code")
         );
         assert!(named_session(&key(named), "UserPromptSubmit").is_ok());
+    }
+
+    /// A home where `install` wrote Grok's own registration, naming a binary
+    /// that is there.
+    fn home_with_groks_own_registration() -> tempfile::TempDir {
+        let home = tempfile::tempdir().expect("tempdir");
+        let binary = home.path().join("bin").join("conbus");
+        std::fs::create_dir_all(binary.parent().expect("bin")).expect("bin");
+        std::fs::write(&binary, "").expect("binary");
+        let target = crate::install::targets(&binary, home.path())
+            .into_iter()
+            .find(|t| t.harness == Harness::GROK)
+            .expect("grok target");
+        crate::install::apply(&crate::install::plan(target).expect("plan")).expect("write");
+        home
+    }
+
+    fn key_of(payload: &str) -> SessionKey {
+        match hook::normalize(&Harness::new(Harness::CLAUDE_CODE), payload).expect("normalise") {
+            Normalized::Event { key, .. } => key,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    const GROK_PROMPT: &str = r#"{"hookEventName":"user_prompt_submit",
+        "hook_event_name":"UserPromptSubmit","sessionId":"grok-1","prompt":"hi"}"#;
+
+    #[test]
+    fn grok_running_another_vendors_registration_is_an_echo_of_its_own() {
+        let home = home_with_groks_own_registration();
+        let grok = key_of(GROK_PROMPT);
+
+        assert!(grok_echo(
+            Harness::CLAUDE_CODE,
+            &grok,
+            "UserPromptSubmit",
+            Some(home.path())
+        ));
+        assert!(
+            grok_echo(
+                Harness::CURSOR,
+                &grok,
+                "UserPromptSubmit",
+                Some(home.path())
+            ),
+            "Grok reads Cursor's hooks file too"
+        );
+        assert!(
+            !grok_echo(Harness::GROK, &grok, "UserPromptSubmit", Some(home.path())),
+            "the copy from Grok's own file is the one kept"
+        );
+    }
+
+    #[test]
+    fn an_echo_with_no_copy_of_its_own_to_defer_to_is_recorded() {
+        let grok = key_of(GROK_PROMPT);
+        let bare = tempfile::tempdir().expect("tempdir");
+        let home = home_with_groks_own_registration();
+
+        assert!(
+            !grok_echo(
+                Harness::CLAUDE_CODE,
+                &grok,
+                "UserPromptSubmit",
+                Some(bare.path())
+            ),
+            "Grok installed after conbus: Claude Code's registration is all it runs"
+        );
+        assert!(!grok_echo(
+            Harness::CLAUDE_CODE,
+            &grok,
+            "UserPromptSubmit",
+            None
+        ));
+        assert!(
+            !grok_echo(
+                Harness::CLAUDE_CODE,
+                &grok,
+                "Notification",
+                Some(home.path())
+            ),
+            "an event only Claude Code's registration carries"
+        );
+    }
+
+    #[test]
+    fn only_a_grok_payload_is_ever_an_echo() {
+        let home = home_with_groks_own_registration();
+        let claude =
+            key_of(r#"{"session_id":"s","hook_event_name":"UserPromptSubmit","prompt":"hi"}"#);
+        let cursor = key_of(
+            r#"{"hook_event_name":"beforeSubmitPrompt","cursor_version":"3.19.13",
+                "conversation_id":"c","prompt":"hi"}"#,
+        );
+
+        for (key, event) in [(claude, "UserPromptSubmit"), (cursor, "beforeSubmitPrompt")] {
+            assert!(
+                !grok_echo(Harness::CLAUDE_CODE, &key, event, Some(home.path())),
+                "{key:?}"
+            );
+        }
     }
 
     #[test]

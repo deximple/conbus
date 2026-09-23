@@ -183,6 +183,24 @@ Argued through four review rounds; the reasoning is in the plan.
   The bus is a passenger on any surface it did not spawn — the design said so;
   this is the measurement.
 
+**Grok**
+
+- **Grok runs Claude Code's hooks as well as its own.** Its hook docs name
+  `.claude/settings.json` and `.cursor/hooks.json` beside `~/.grok/hooks/*.json`,
+  and every registration it finds runs. From 2026-09-06, the day `install`
+  first wrote Grok's own file, every Grok event reached the log twice: one
+  conversation, identical ids and bodies, 30–330 ms apart, consecutive seqs,
+  both stamped `grok` because the harness is read from the payload. The hook
+  now answers the copy that did not come through `--harness grok` without
+  recording it, and only while Grok's own file registers that event through a
+  binary that exists (`hook::client::grok_echo`) — without the file, Claude
+  Code's registration is the only copy. The twins already written stay, since
+  the log is append-only; `conbus usage` counts them once.
+- `~/.grok/hooks/*.json` is trusted without asking. Its Claude-compatible
+  hooks shipped loaded and never dispatched in 1.0.3
+  (`xai-org/plugin-marketplace#236`), which is why Grok's own file is the copy
+  kept.
+
 **Both**
 
 - Global hooks mirror our own background sessions unless marked. The
@@ -354,6 +372,24 @@ three.
   Those payloads are dropped now, visibly. Which field, if any, names the
   session in a worker payload is still unread — capture one rather than
   guessing.
+- **Duplicates the Grok echo fix does not cover.** Cursor: some
+  `turn_started`/`turn_ended` pairs land milliseconds apart (18 + 18 in the
+  week to 2026-09-23), most likely the same double registration, since Cursor
+  runs Claude Code's `UserPromptSubmit`/`Stop` hooks beside its own
+  `hooks.json`. Do not copy Grok's guard onto it: Cursor's two files "do not
+  always both fire", and the copy stood down could be the only prompt that
+  mints. Find out which copy ever arrives alone first. `afterAgentResponse`
+  and `stop` both write `turn_ended` on purpose, so if `stop` says `error`
+  after a limit, one quota stop is also counted as a policy stop by `usage`.
+  About 200 `tool_use` records a week share a `tool_use_id` without
+  matching; only `postToolUse` writes `tool_use`, and it comes only through
+  Claude Code's registration, so they are not echoes. OpenCode: the plugin
+  reports a user message as `turn_started` on every `message.updated`, with
+  `summary.title` as the prompt — and OpenCode's summariser rewrites the user
+  message's `summary.diffs` on every agent step, so that event fires once per
+  step (`anomalyco/opencode#43551`). The plugin also forwards
+  `message.part.updated` text without checking the role. A `msg_…` id names
+  one message, so a second `turn_started` for it is always a re-report.
 - Nothing produces `interrupted_user`; `is_interrupt` on a failed tool call is
   the only signal anywhere that a person stopped the work.
 - An older `v` is still read as if it were current. `scan` rejects a record
@@ -371,6 +407,10 @@ three.
 ## Next task
 
 Run `docs/self-improve.md` from current evidence, not from this file's memory.
+First confirm the Grok echo fix live: after `install --apply` and a daemon
+restart, records written since then should hold no Grok pair (same `bus_id`,
+event and `tool_use_id` within two seconds). Then the Cursor and OpenCode
+duplicates under Still open.
 Score the dogfood window with `conbus verdict` — do not declare the 4-week
 clock closed unless the command says it is, and note that it now refuses to
 score a window with no organic hop at all. A model digest is

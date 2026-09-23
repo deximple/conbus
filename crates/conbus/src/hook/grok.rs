@@ -5,6 +5,10 @@
 //! `hookEventName`, `errorDetails`). `StopFailure.error` is `rate_limit` —
 //! the same classified quota signal Claude uses. There is no remaining-quota
 //! JSON; this is the overflow trigger.
+//!
+//! Grok also runs Claude Code's registration of this hook, so every Grok event
+//! arrives twice. The copy that did not come through `--harness grok` is
+//! answered and not recorded (`client::grok_echo`).
 
 use serde_json::{Map, Value};
 
