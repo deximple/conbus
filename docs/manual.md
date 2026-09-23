@@ -482,6 +482,10 @@ folder's facts visible in another.
 | `facts.jsonl`, `links.jsonl` | section 10 |
 | `chat-export/` | Claude.ai exports you dropped in |
 
+Only your account can read any of it: the folder is `0700` and the log's
+segments `0600`. Builds before 0.2.5 made them `0755` and `0644`, which other
+accounts on the Mac could read; the recorder closes the folder when it starts.
+
 The socket path must stay under 104 bytes; `doctor` tells you if a
 `CONBUS_HOME` is too deep.
 

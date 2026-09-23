@@ -8,8 +8,8 @@ contract `docs/rfd/0002-metadata-sync.md`). No host exists and the product is
 still the local tool. The host waits for the gates in the plan — reach,
 problem, value, and money that has moved — and for an operator decision; do not
 start it in the turn that writes or changes the choice. No sync code before RFD
-0002 is accepted and RFD 0003 (security) is written, and no field 0002 does not
-name.
+0002 and RFD 0003 (security, drafted 2026-09-24) are both accepted, and no field
+they do not name.
 
 Live bus ids, home paths, quota numbers and probe session ids do not belong
 here — they live in `HANDOFF.local.md` (gitignored) and in `~/.conbus/`.

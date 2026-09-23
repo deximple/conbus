@@ -25,14 +25,19 @@ that other programs call on every agent turn.
 - **Your files.** `install` and `uninstall` merge into vendor settings files,
   keep a backup before each change, write by replacing atomically, and refuse
   to touch a file they cannot parse.
-- **The log at rest.** Plain JSONL under `~/.conbus`, readable by your user.
-  Tool bodies are not written by default; `CONBUS_RETENTION=encrypted_tools`
+- **The log at rest.** Plain JSONL under `~/.conbus`, readable by your user
+  only: the directory is `0700` and each segment `0600`. Builds before 0.2.5
+  left them `0755` and `0644`; the recorder closes such a directory when it
+  starts. Tool bodies are not written by default; `CONBUS_RETENTION=encrypted_tools`
   seals them with AES-256-GCM under a key kept in your login Keychain, and
   `ephemeral` writes nothing. The daemon disables core dumps and locks its
   memory where the OS allows.
 - **What leaves the machine.** See "What is recorded, and where it goes" in the
   [README](README.md): briefings, hops and `conbus summary` put excerpts of the
   log into a vendor session; nothing is sent anywhere else.
+
+For a reviewer, [`docs/security-packet.md`](docs/security-packet.md) lists on
+one page what conbus keeps, runs, changes and sends, and its known gaps.
 
 ## Supported versions
 
