@@ -137,9 +137,16 @@ fn describe(total: &HarnessTotal) -> Vec<String> {
             "harness   {} — {} conversation(s): attended {} · unattended {} · unknown {}",
             total.harness, total.conversations, total.attended, total.unattended, total.unknown
         ),
+        format!("          {} turn(s) · subagents {}", c.turns, c.subagents),
         format!(
-            "          {} turn(s): quota {} · policy {} · interrupted {} · subagents {}",
-            c.turns, c.quota_stops, c.policy_stops, c.user_stops, c.subagents
+            "          stopped: limit {} in {} episode(s) · account {} · vendor {} · request {} · other {} · by a person {}",
+            c.limit_stops,
+            c.limit_episodes,
+            c.account_stops,
+            c.vendor_errors,
+            c.request_faults,
+            c.other_stops,
+            c.user_stops
         ),
         format!(
             "          {} tool call(s): failed {} · interrupted {} · refused {} · asks {} · {} in tools",
@@ -269,8 +276,11 @@ mod tests {
             text.contains("claude_code — 1 conversation(s): attended 0 · unattended 1 · unknown 0"),
             "{text}"
         );
+        assert!(text.contains("1 turn(s) · subagents 0"), "{text}");
         assert!(
-            text.contains("1 turn(s): quota 1 · policy 0 · interrupted 0 · subagents 0"),
+            text.contains(
+                "stopped: limit 1 in 1 episode(s) · account 0 · vendor 0 · request 0 · other 0 · by a person 0"
+            ),
             "{text}"
         );
         assert!(

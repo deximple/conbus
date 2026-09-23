@@ -207,27 +207,35 @@ conbus log --reveal --bus-id 01a0c7f2 # decrypt sealed tool bodies (section 11)
 ```
 
 **Counting it:** `conbus usage` folds the log into what your agents did, per
-agent, over the last 7 days (`--days 30`, or `--since 2026-09-01`):
+agent, over the last 7 days (`--days 30`, or `--since 2026-09-01`). Thirty days
+on the machine that built it:
 
 ```text
-usage     from 2026-09-17 (UTC) · 38284 live record(s) · not counted: backfilled 37559 · earlier 79767 · repeated 6081
-harness   claude_code — 249 conversation(s): attended 52 · unattended 197 · unknown 0
-          303 turn(s): quota 0 · policy 0 · interrupted 0 · subagents 268
-          7673 tool call(s): failed 134 · interrupted 0 · refused 1 · asks 139 · 6h in tools
-harness   codex — 35 conversation(s): attended 0 · unattended 0 · unknown 35
-          64 turn(s): quota 0 · policy 0 · interrupted 0 · subagents 0
-          610 tool call(s): failed 0 · interrupted 0 · refused 0 · asks 1 · 0s in tools
-failing   Bash 112 · Read 20 · WebFetch 2
-busiest   /Users/you/project 192 · /Users/you/other 53 (turns)
+usage     from 2026-08-25 (UTC) · 119745 live record(s) · not counted: backfilled 37559 · earlier 0 · repeated 9782
+harness   claude_code — 2534 conversation(s): attended 211 · unattended 2260 · unknown 63
+          2967 turn(s) · subagents 980
+          stopped: limit 211 in 3 episode(s) · account 111 · vendor 3 · request 0 · other 1 · by a person 0
+          26188 tool call(s): failed 510 · interrupted 0 · refused 46 · asks 244 · 18h in tools
+harness   codex — 130 conversation(s): attended 9 · unattended 0 · unknown 121
+          184 turn(s) · subagents 0
+          stopped: limit 0 in 0 episode(s) · account 0 · vendor 0 · request 0 · other 0 · by a person 0
+          1892 tool call(s): failed 0 · interrupted 0 · refused 0 · asks 1 · 0s in tools
+failing   Bash 420 · Read 61 · Glob 4
+busiest   /Users/you/project 2151 · /Users/you/other 145 (turns)
 cost      not in this log: no hook payload carries tokens or prices
 ```
 
 - **attended · unattended · unknown**: whether a person was at the session,
-  from the front end it ran under. Only Claude Code says, so other agents are
-  almost always `unknown`.
-- **quota · policy · interrupted**: turns that stopped because the vendor
-  refused on quota, refused on policy or billing, or because you stopped them.
-  **subagents** are subagent runs that finished; they are not turns.
+  from the front end it ran under. Only Claude Code says; another agent started
+  from inside a Claude Code session inherits what it said, and the rest are
+  `unknown`.
+- **stopped**: why turns ended early, sorted by what you would do about it.
+  **limit** — a usage limit (stops on one agent less than an hour apart are one
+  **episode**); **account** — authentication, billing, a hold; **vendor** — the
+  vendor was overloaded or failed; **request** — invalid, too long, no such
+  model; **other** — a reason this version does not recognise; **by a person**.
+- **subagents** are subagent runs that finished. They are not turns, and how a
+  subagent ended is not counted as a stop.
 - **failed · interrupted · refused · asks**: tool calls that ran and failed,
   that you stopped, that the agent refused to run, and the times you were
   asked for permission. **in tools** adds up the durations the agent reported;

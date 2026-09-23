@@ -10,15 +10,21 @@ the entry says so when it does.
 
 - `conbus usage`: what the agents did, counted, per harness over the last 7 days
   (`--days N`, `--since DAY`). Conversations split by whether a person was
-  there; turns stopped on quota, on policy, or by you; subagent runs; tool calls
-  that failed, that you stopped, that were refused; permission asks; the tools
-  that fail most and the folders with the most turns. `--json` prints one row
-  per day, harness, folder and attendance — counts only, never a body. A report
-  that reached the log twice — on the machine that built this, every Grok event
-  did, and some Cursor ones — is counted once and named in the header as
-  `repeated`. Cost is named as absent: no hook carries tokens or prices. A
-  `--since` that is not a day like `2026-09-01` is refused rather than read as
-  an empty window.
+  there; turns and why they stopped; subagent runs; tool calls that failed, that
+  you stopped, that were refused; permission asks; the tools that fail most and
+  the folders with the most turns. `--json` prints one row per day, harness,
+  folder and attendance — counts only, never a body. A report that reached the
+  log twice — on the machine that built this, every Grok event did, and some
+  Cursor ones — is counted once and named in the header as `repeated`. Cost is
+  named as absent: no hook carries tokens or prices. A `--since` that is not a
+  day like `2026-09-01` is refused rather than read as an empty window.
+- `conbus usage` files a stop under what you would do about it: a usage limit,
+  the account (authentication, billing, a hold), the vendor (overloaded, a
+  server error), the request, or a reason this version does not recognise — not
+  the router's split into quota and everything else, which put an overloaded
+  vendor under quota and 111 authentication failures under "policy". Limit stops
+  less than an hour apart on one harness are one episode: on the machine that
+  built it, 211 limit stops in 30 days were 3 episodes.
 - `conbus usage --shareable`: the rows a sync would send under RFD 0002 — the
   same counts with no folder field at all, rows that differed only by folder
   merged. Nothing is sent; it prints, so the payload can be read before any sync

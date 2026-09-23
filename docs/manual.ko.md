@@ -203,26 +203,34 @@ conbus log --reveal --bus-id 01a0c7f2 # 봉인된 툴 본문 복호화 (11장)
 
 **세어 보기:** `conbus usage`는 로그를 에이전트별로 무엇을 했는지로 접어 보여
 줍니다. 기본은 최근 7일이고, `--days 30`이나 `--since 2026-09-01`로 바꿉니다.
+아래는 이 도구를 만든 Mac의 30일입니다.
 
 ```text
-usage     from 2026-09-17 (UTC) · 38284 live record(s) · not counted: backfilled 37559 · earlier 79767 · repeated 6081
-harness   claude_code — 249 conversation(s): attended 52 · unattended 197 · unknown 0
-          303 turn(s): quota 0 · policy 0 · interrupted 0 · subagents 268
-          7673 tool call(s): failed 134 · interrupted 0 · refused 1 · asks 139 · 6h in tools
-harness   codex — 35 conversation(s): attended 0 · unattended 0 · unknown 35
-          64 turn(s): quota 0 · policy 0 · interrupted 0 · subagents 0
-          610 tool call(s): failed 0 · interrupted 0 · refused 0 · asks 1 · 0s in tools
-failing   Bash 112 · Read 20 · WebFetch 2
-busiest   /Users/you/project 192 · /Users/you/other 53 (turns)
+usage     from 2026-08-25 (UTC) · 119745 live record(s) · not counted: backfilled 37559 · earlier 0 · repeated 9782
+harness   claude_code — 2534 conversation(s): attended 211 · unattended 2260 · unknown 63
+          2967 turn(s) · subagents 980
+          stopped: limit 211 in 3 episode(s) · account 111 · vendor 3 · request 0 · other 1 · by a person 0
+          26188 tool call(s): failed 510 · interrupted 0 · refused 46 · asks 244 · 18h in tools
+harness   codex — 130 conversation(s): attended 9 · unattended 0 · unknown 121
+          184 turn(s) · subagents 0
+          stopped: limit 0 in 0 episode(s) · account 0 · vendor 0 · request 0 · other 0 · by a person 0
+          1892 tool call(s): failed 0 · interrupted 0 · refused 0 · asks 1 · 0s in tools
+failing   Bash 420 · Read 61 · Glob 4
+busiest   /Users/you/project 2151 · /Users/you/other 145 (turns)
 cost      not in this log: no hook payload carries tokens or prices
 ```
 
 - **attended · unattended · unknown**: 그 세션에 사람이 있었는지입니다. 세션이
-  어떤 프런트엔드에서 돌았는지로 판단하는데, 이를 알려 주는 건 Claude Code뿐이라
-  다른 에이전트는 거의 항상 `unknown`입니다.
-- **quota · policy · interrupted**: 벤더가 쿼터로 거절했거나, 정책·결제로
-  거절했거나, 사용자가 멈춰서 끝난 턴입니다. **subagents**는 끝난 서브에이전트
-  실행 수이며 턴이 아닙니다.
+  어떤 프런트엔드에서 돌았는지로 판단하는데, 이를 알려 주는 건 Claude Code뿐입니다.
+  Claude Code 세션 안에서 띄운 다른 에이전트는 그 값을 물려받고, 나머지는
+  `unknown`입니다.
+- **stopped**: 턴이 일찍 끝난 이유를, 사용자가 무엇을 해야 하는지로 나눕니다.
+  **limit** — 사용 한도(한 에이전트에서 1시간 안쪽으로 이어진 중단은 **에피소드**
+  하나), **account** — 인증·결제·계정 정지, **vendor** — 벤더 과부하·장애,
+  **request** — 잘못된 요청·너무 긴 출력·없는 모델, **other** — 이 버전이 모르는
+  사유, **by a person** — 사용자가 멈춤.
+- **subagents**는 끝난 서브에이전트 실행 수입니다. 턴이 아니며, 서브에이전트가
+  어떻게 끝났는지는 중단으로 세지 않습니다.
 - **failed · interrupted · refused · asks**: 실행됐다가 실패한 툴 호출, 사용자가
   멈춘 호출, 에이전트가 실행을 거부한 호출, 권한을 물어본 횟수입니다.
   **in tools**는 에이전트가 알려 준 실행 시간의 합이고, Codex는 알려 주지 않습니다.
