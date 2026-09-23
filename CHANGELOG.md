@@ -19,6 +19,10 @@ the entry says so when it does.
   `repeated`. Cost is named as absent: no hook carries tokens or prices. A
   `--since` that is not a day like `2026-09-01` is refused rather than read as
   an empty window.
+- `conbus usage --shareable`: the rows a sync would send under RFD 0002 — the
+  same counts with no folder field at all, rows that differed only by folder
+  merged. Nothing is sent; it prints, so the payload can be read before any sync
+  exists.
 
 ## [0.1.1] — 2026-09-23
 

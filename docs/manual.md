@@ -238,7 +238,10 @@ cost      not in this log: no hook payload carries tokens or prices
   recorder saw. Neither is cost: no hook carries tokens or prices.
 
 `conbus usage --json` prints one row per day, agent, folder and attendance:
-counts only, never a prompt, a reply or a tool body.
+counts only, never a prompt, a reply or a tool body. `conbus usage --shareable`
+prints the same rows with the folder removed — what a sync would send, if one
+existed ([RFD 0002](rfd/0002-metadata-sync.md)). Nothing is sent anywhere; the
+point is that you can read it first.
 
 A record looks like this (fields vary by event):
 
@@ -605,7 +608,7 @@ line, the destination's quota, and whether the session was a program
 | `conbus run [HARNESS]` | Start an agent in this terminal; hops start the next one here |
 | `conbus backfill [--apply] [--gaps] [--chat-export PATH]` | Recover history |
 | `conbus summary --bus-id ID` | Ask the other leg's agent for a digest of a conversation |
-| `conbus usage [--days N] [--since DAY] [--json]` | What the agents did, counted (section 5) |
+| `conbus usage [--days N] [--since DAY] [--json] [--shareable]` | What the agents did, counted (section 5) |
 | `conbus verdict` | Score a four-week trial of the hop (below) |
 | `conbus arena fact --workspace DIR --claim TEXT --anchor PATH [--type T]` | Accept a fact |
 | `conbus arena link --from DIR --to DIR` | Share one folder's facts with another |

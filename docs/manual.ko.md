@@ -232,7 +232,10 @@ cost      not in this log: no hook payload carries tokens or prices
   때문입니다. 비용도 없습니다. 토큰이나 가격을 싣는 훅이 없습니다.
 
 `conbus usage --json`은 날짜·에이전트·폴더·사람 여부마다 한 줄씩 출력합니다.
-숫자만 있고, 프롬프트·답변·툴 본문은 절대 들어가지 않습니다.
+숫자만 있고, 프롬프트·답변·툴 본문은 절대 들어가지 않습니다. `conbus usage
+--shareable`은 같은 줄에서 폴더를 뺀 것 — 동기화가 생긴다면 보낼 내용
+([RFD 0002](rfd/0002-metadata-sync.md))입니다. 어디로도 보내지 않습니다. 보내기
+전에 먼저 읽어 볼 수 있게 하려는 것입니다.
 
 레코드 하나는 이렇게 생겼습니다(필드는 이벤트마다 다릅니다).
 
@@ -587,7 +590,7 @@ conbus uninstall --apply  # 지우기
 | `conbus run [HARNESS]` | 이 터미널에서 에이전트 시작. hop이 다음 에이전트를 여기서 띄움 |
 | `conbus backfill [--apply] [--gaps] [--chat-export PATH]` | 지난 기록 되살리기 |
 | `conbus summary --bus-id ID` | 다른 레그의 에이전트에게 대화 요약 요청 |
-| `conbus usage [--days N] [--since DAY] [--json]` | 에이전트가 한 일을 셈(5장) |
+| `conbus usage [--days N] [--since DAY] [--json] [--shareable]` | 에이전트가 한 일을 셈(5장) |
 | `conbus verdict` | hop의 4주 시험 채점(아래) |
 | `conbus arena fact --workspace DIR --claim TEXT --anchor PATH [--type T]` | 사실 받아들이기 |
 | `conbus arena link --from DIR --to DIR` | 한 폴더의 사실을 다른 폴더와 공유 |

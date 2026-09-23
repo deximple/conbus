@@ -101,6 +101,38 @@ pub struct Counts {
 }
 
 impl Counts {
+    /// Every field by name, so that a new count cannot be left out of a sum.
+    fn add(&mut self, other: &Counts) {
+        let Counts {
+            turns,
+            quota_stops,
+            policy_stops,
+            user_stops,
+            subagents,
+            tool_calls,
+            tool_failures,
+            tool_interrupts,
+            tool_denials,
+            permission_asks,
+            tool_ms,
+            briefings,
+            hops,
+        } = other;
+        self.turns += turns;
+        self.quota_stops += quota_stops;
+        self.policy_stops += policy_stops;
+        self.user_stops += user_stops;
+        self.subagents += subagents;
+        self.tool_calls += tool_calls;
+        self.tool_failures += tool_failures;
+        self.tool_interrupts += tool_interrupts;
+        self.tool_denials += tool_denials;
+        self.permission_asks += permission_asks;
+        self.tool_ms += tool_ms;
+        self.briefings += briefings;
+        self.hops += hops;
+    }
+
     /// Exhaustive on purpose: a new event has to be a decision here, not a
     /// silent zero.
     fn count(&mut self, record: &Record) {
@@ -165,6 +197,18 @@ pub struct Row {
     pub counts: Counts,
 }
 
+/// A row as a sync would send it: `docs/rfd/0002-metadata-sync.md` with
+/// workspaces off. There is no workspace field at all — absent, not empty.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize)]
+pub struct SharedRow {
+    pub day: String,
+    pub harness: String,
+    pub attendance: Attendance,
+    pub conversations: u64,
+    #[serde(flatten)]
+    pub counts: Counts,
+}
+
 /// One harness across the whole window.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct HarnessTotal {
@@ -207,6 +251,29 @@ impl Ledger {
             tally.add(record, since, &places);
         }
         tally.finish()
+    }
+
+    /// The rows RFD 0002 lets a sync send, with workspaces off.
+    ///
+    /// Rows that differed only by folder merge, and their conversation counts
+    /// add up rather than overlap: a conversation is attributed to one folder,
+    /// the first it reported, so it is in exactly one of the rows merged.
+    pub fn shareable(&self) -> Vec<SharedRow> {
+        let mut merged: BTreeMap<(&str, &str, Attendance), SharedRow> = BTreeMap::new();
+        for row in &self.rows {
+            let shared = merged
+                .entry((&row.day, &row.harness, row.attendance))
+                .or_insert_with(|| SharedRow {
+                    day: row.day.clone(),
+                    harness: row.harness.clone(),
+                    attendance: row.attendance,
+                    conversations: 0,
+                    counts: Counts::default(),
+                });
+            shared.conversations += row.conversations;
+            shared.counts.add(&row.counts);
+        }
+        merged.into_values().collect()
     }
 }
 
@@ -1072,6 +1139,110 @@ mod tests {
 
         assert_eq!(ledger.rows[0].counts.tool_calls, 2);
         assert_eq!(ledger.repeated, 0);
+    }
+
+    #[test]
+    fn a_shareable_row_has_no_folder_and_folders_merge() {
+        // RFD 0002 with workspaces off: the field is absent, not empty, and two
+        // conversations that differed only by folder are one row. Each
+        // conversation belongs to one folder, so their counts still add up.
+        let ledger = Ledger::fold(
+            &[
+                at(
+                    &on_day("09:00:00"),
+                    ONE,
+                    claude_in(Some("/Users/someone/secret-project"), Some("cli")),
+                    prompt("a"),
+                ),
+                at(
+                    &on_day("09:00:01"),
+                    TWO,
+                    claude_in(Some("/w"), Some("cli")),
+                    prompt("b"),
+                ),
+                at(
+                    &on_day("09:00:02"),
+                    TWO,
+                    claude_in(Some("/w"), Some("sdk-cli")),
+                    prompt("c"),
+                ),
+            ],
+            DAY,
+        );
+
+        let shared = ledger.shareable();
+        assert_eq!(ledger.rows.len(), 2, "two folders locally");
+        assert_eq!(shared.len(), 1, "{shared:?}");
+        assert_eq!(shared[0].conversations, 2);
+        assert_eq!(shared[0].counts.turns, 3);
+        assert_eq!(shared[0].attendance, Attendance::Attended);
+        let text = serde_json::to_string(&shared[0]).expect("json");
+        assert!(!text.contains("workspace"), "{text}");
+        assert!(!text.contains("secret-project"), "{text}");
+    }
+
+    #[test]
+    fn a_shareable_row_names_exactly_what_the_contract_names() {
+        // docs/rfd/0002-metadata-sync.md, "The unit: a row", with workspaces
+        // off. A new key here is an amendment to that RFD first.
+        let s = || claude_in(Some("/w"), Some("cli"));
+        let ledger = Ledger::fold(
+            &[
+                at(&on_day("09:00:00"), ONE, s(), prompt("the secret plan")),
+                at(
+                    &on_day("09:00:01"),
+                    ONE,
+                    s(),
+                    tool(
+                        "Bash",
+                        ToolOutcome::Failed {
+                            error: Body::kept("password=hunter2"),
+                            interrupted: false,
+                        },
+                        None,
+                    ),
+                ),
+            ],
+            DAY,
+        );
+
+        let json = serde_json::to_value(&ledger.shareable()[0]).expect("json");
+        let text = json.to_string();
+        for leaked in ["secret plan", "hunter2", "cargo test", "Bash", "/w"] {
+            assert!(
+                !text.contains(leaked),
+                "{leaked} reached a shared row: {text}"
+            );
+        }
+        let mut keys: Vec<&str> = json
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "attendance",
+                "briefings",
+                "conversations",
+                "day",
+                "harness",
+                "hops",
+                "permission_asks",
+                "policy_stops",
+                "quota_stops",
+                "subagents",
+                "tool_calls",
+                "tool_denials",
+                "tool_failures",
+                "tool_interrupts",
+                "tool_ms",
+                "turns",
+                "user_stops",
+            ]
+        );
     }
 
     #[test]

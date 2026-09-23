@@ -16,17 +16,38 @@ const TOP: usize = 5;
 
 const COST: &str = "cost      not in this log: no hook payload carries tokens or prices";
 
-pub fn run(paths: &Paths, days: u32, since: Option<String>, json: bool) -> io::Result<()> {
+/// What `conbus usage` prints.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Output {
+    Text,
+    /// One local row per line, folder included.
+    Json,
+    /// What a sync would send: RFD 0002, workspaces off.
+    Shareable,
+}
+
+impl Output {
+    /// `--shareable` wins: it is JSON too, with less in it.
+    pub fn of(json: bool, shareable: bool) -> Self {
+        match (json, shareable) {
+            (_, true) => Output::Shareable,
+            (true, false) => Output::Json,
+            (false, false) => Output::Text,
+        }
+    }
+}
+
+pub fn run(paths: &Paths, days: u32, since: Option<String>, output: Output) -> io::Result<()> {
     if let Some(since) = &since {
         check_since(since)?;
     }
     let scan = SegmentLog::scan(paths.log_dir())?;
     let from = since.unwrap_or_else(|| first_day(Timestamp::now(), days));
     let ledger = Ledger::fold(&scan.records, &from);
-    let lines = if json {
-        render_json(&ledger)?
-    } else {
-        render(&ledger, &from)
+    let lines = match output {
+        Output::Text => render(&ledger, &from),
+        Output::Json => render_json(&ledger)?,
+        Output::Shareable => render_shareable(&ledger)?,
     };
     for line in lines {
         println!("{line}");
@@ -94,6 +115,16 @@ fn render(ledger: &Ledger, from: &str) -> Vec<String> {
 fn render_json(ledger: &Ledger) -> io::Result<Vec<String>> {
     ledger
         .rows
+        .iter()
+        .map(|row| serde_json::to_string(row).map_err(io::Error::other))
+        .collect()
+}
+
+/// The rows as RFD 0002 lets a sync send them. Printed here first so that
+/// what leaves a machine is something its owner has already read.
+fn render_shareable(ledger: &Ledger) -> io::Result<Vec<String>> {
+    ledger
+        .shareable()
         .iter()
         .map(|row| serde_json::to_string(row).map_err(io::Error::other))
         .collect()
@@ -308,6 +339,27 @@ mod tests {
             let err = check_since(bad).expect_err(bad);
             assert!(err.to_string().contains("2026-09-01"), "{err}");
         }
+    }
+
+    #[test]
+    fn shareable_prints_the_rows_a_sync_would_send_and_no_folder() {
+        let lines = render_shareable(&week()).expect("json");
+
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        for line in &lines {
+            let row: serde_json::Value = serde_json::from_str(line).expect("a row");
+            assert_eq!(row["day"], "2026-09-22");
+            assert!(row.get("workspace").is_none(), "{line}");
+            assert!(!line.contains("/w"), "{line}");
+        }
+    }
+
+    #[test]
+    fn shareable_wins_over_json() {
+        assert_eq!(Output::of(false, false), Output::Text);
+        assert_eq!(Output::of(true, false), Output::Json);
+        assert_eq!(Output::of(true, true), Output::Shareable);
+        assert_eq!(Output::of(false, true), Output::Shareable);
     }
 
     #[test]

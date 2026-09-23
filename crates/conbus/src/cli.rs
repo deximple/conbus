@@ -65,6 +65,8 @@ pub enum Command {
         days: u32,
         since: Option<String>,
         json: bool,
+        /// Print what a sync would send (RFD 0002): the rows, with no folder.
+        shareable: bool,
     },
     /// Same TTY: start a vendor, and exec the next one when a hop lands.
     Run {
@@ -193,6 +195,7 @@ where
                 .unwrap_or(DEFAULT_USAGE_DAYS),
             since: flag_value(&args, "--since"),
             json: args.iter().any(|a| a == "--json"),
+            shareable: args.iter().any(|a| a == "--shareable"),
         },
         "run" => Command::Run {
             harness: args.get(1).cloned().unwrap_or_else(|| "claude_code".into()),
@@ -268,11 +271,13 @@ USAGE:
     conbus go [HARNESS]           hop --apply for the current conversation
     conbus summary --bus-id ID    opposite-leg digest; never the protected leg
     conbus verdict                4-week dogfood score; open window is not a kill
-    conbus usage [--days N] [--since DAY] [--json]
+    conbus usage [--days N] [--since DAY] [--json] [--shareable]
                                   what the agents did, per harness: turns, stops,
                                   tool failures, permission asks (default 7 days);
                                   --json prints one row per day, harness,
-                                  workspace and attendance — counts, never bodies
+                                  workspace and attendance — counts, never bodies;
+                                  --shareable prints what a sync would send:
+                                  the same rows with no folder (docs/rfd/0002)
     conbus run [claude_code|codex|cursor|agy|opencode|grok]
                                   same TTY: start a vendor; hop execs the next
     conbus arena fact --workspace DIR --claim TEXT --anchor PATH
@@ -430,7 +435,8 @@ mod tests {
             Command::Usage {
                 days: 7,
                 since: None,
-                json: false
+                json: false,
+                shareable: false
             }
         );
         assert_eq!(
@@ -438,7 +444,8 @@ mod tests {
             Command::Usage {
                 days: 30,
                 since: None,
-                json: true
+                json: true,
+                shareable: false
             }
         );
         assert_eq!(
@@ -446,7 +453,8 @@ mod tests {
             Command::Usage {
                 days: 7,
                 since: Some("2026-09-01".into()),
-                json: false
+                json: false,
+                shareable: false
             }
         );
         assert_eq!(
@@ -454,9 +462,19 @@ mod tests {
             Command::Usage {
                 days: 7,
                 since: None,
-                json: false
+                json: false,
+                shareable: false
             },
             "a count that is not a number is ignored, the way --tail is"
+        );
+        assert_eq!(
+            parse(["usage", "--shareable"], None),
+            Command::Usage {
+                days: 7,
+                since: None,
+                json: false,
+                shareable: true
+            }
         );
     }
 
