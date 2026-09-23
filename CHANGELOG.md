@@ -4,7 +4,11 @@ All notable changes to conbus. Versions follow [Semantic Versioning](https://sem
 until 1.0 a minor version may change the command line or the log format, and
 the entry says so when it does.
 
-## [Unreleased]
+## [0.2.4] — 2026-09-23
+
+Counts an operator can trust: recovered turns, one stop per Cursor turn, one
+turn per OpenCode prompt, and a closed day. After upgrading, run
+`conbus install --apply` and restart OpenCode, which loads plugins at startup.
 
 ### Added
 
@@ -27,7 +31,6 @@ the entry says so when it does.
   Cursor writes a turn's end from `afterAgentResponse`, `stop` and sometimes
   `sessionEnd`, and its `generation_id` names one turn, so one exhausted turn
   could count as a limit and an `error`.
-
 - A Cursor reply that mentions a limit code is a reply, not a quota stop.
   `afterAgentResponse` carries the agent's own words, and any reply containing
   `RESOURCE_EXHAUSTED` — explaining a gRPC error, say — was filed as Cursor
@@ -35,6 +38,14 @@ the entry says so when it does.
   ending in the code, the way Cursor's error bubble reads
   (`request failed: PRO_USER_USAGE_LIMIT`). Status and error fields are read as
   before.
+- OpenCode: one prompt is one turn, carrying what the person typed, and the
+  agent's reply never becomes a prompt. The plugin sent a `turn_started` each
+  time OpenCode published the person's message again — after every agent step —
+  and forwarded every text part without asking whose it was: 61 turns for about
+  8 prompts in a week. `install --apply` now replaces a conbus plugin this
+  build did not write, instead of calling any conbus plugin registered, which
+  had kept the fix from ever reaching a machine; and the plugin no longer takes
+  OpenCode down when the hook closes its input unread.
 
 ## [0.2.3] — 2026-09-23
 

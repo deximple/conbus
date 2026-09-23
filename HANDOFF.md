@@ -397,12 +397,14 @@ three.
   `hooks.json`. Do not copy Grok's guard onto it: Cursor's two files "do not
   always both fire", and the copy stood down could be the only prompt that
   mints. Find out which copy ever arrives alone first. `afterAgentResponse`
-  and `stop` both write `turn_ended` on purpose, so if `stop` says `error`
-  after a limit, one quota stop is also counted as a policy stop by `usage`.
+  and `stop` both write `turn_ended` on purpose; since 0.2.4 `usage` counts a
+  Cursor turn's several stops once, its most serious, and reads a limit from
+  the response text only when that text is Cursor's one-line error.
   About 200 `tool_use` records a week share a `tool_use_id` without
   matching; only `postToolUse` writes `tool_use`, and it comes only through
   Claude Code's registration, so they are not echoes. OpenCode: **fixed in
-  the plugin, not yet on the log.** The 0.2.3 plugin sent a `turn_started` on
+  the plugin (0.2.4); a machine gets it from `install --apply` and an OpenCode
+  restart.** The 0.2.3 plugin sent a `turn_started` on
   every `message.updated` of a person's message, with `summary.title` as the
   prompt — OpenCode's summariser publishes that message again after every
   agent step (`anomalyco/opencode#43551`) — and forwarded every text part
@@ -446,24 +448,19 @@ Run `docs/self-improve.md` from current evidence, not from this file's memory.
 The Grok echo fix is confirmed live (0.2.1: in the hour before the deploy 439
 of 887 Grok records were twins; after it, 0 of 37).
 
-The SaaS plan's agent side for 2026-09-24 → 10-07 (`docs/saas-strategy.md`,
-90 days), in this order, each its own PR with a failing test first:
+The SaaS plan's agent side (`docs/saas-strategy.md`, 90 days). Week 1 shipped
+in 0.2.4 except its dated item: Cursor reads a limit only from its one-line
+error and counts one stop per turn (#37, #38); OpenCode's plugin sends a prompt
+once and never the agent's reply, and `install --apply` replaces an older
+plugin (#39); `usage` counts recovered turns, leaves out probes and copies
+recorded twice, and takes `--day` (#38). Next, each its own PR with a failing
+test first:
 
 1. Score the dogfood window with `conbus verdict` when it closes (2026-09-28)
    and record the result against Option 2 in `docs/saas-hypothesis.md` — do
    not declare the 4-week clock closed unless the command says it is; it
    refuses to score a window with no organic hop at all.
-2. Cursor: one end per vendor turn, and quota only from structured fields
-   (`afterAgentResponse` matches quota words in the assistant's own reply) —
-   see Still open before touching the duplicate pairs.
-3. OpenCode: stop re-reporting one `msg_…` as a new `turn_started`, and check
-   the role of forwarded parts (Still open).
-4. `usage`: count gap-filled turns separately (`recovered` — Codex.app's only
-   record) and keep hop-probe conversations out of the stop counts; amend RFD
-   0002's row table in the same PR.
-5. `usage --day DAY`: one closed day, for pilots and for RFD 0002's
-   once-a-day send.
-6. For pilots: a managed-settings / MDM path for fleets that set
+2. Week 2, for pilots: a managed-settings / MDM path for fleets that set
    `allowManagedHooksOnly`, a one-page `docs/security-packet.md`, RFD 0003
    (security, before any sync code), and a local OTLP export spike (the "pipe").
 
