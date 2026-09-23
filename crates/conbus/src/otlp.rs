@@ -59,12 +59,13 @@ impl Endpoint {
     /// network.
     pub fn parse(url: &str) -> io::Result<Self> {
         if url.contains('@') {
-            // Checked first and not repeated back, whatever else is wrong with
-            // the URL: the part before the `@` may be a password.
+            // Checked first, anywhere in the URL, and never repeated back: the
+            // part before an `@` may be a password, and one with a `/` in it
+            // would otherwise read as a path.
             return Err(refused(format!(
-                "--otlp takes no user name or password in the URL: it sends to a collector \
-                 on this machine, such as {EXAMPLE}, and that collector holds whatever \
-                 credential the backend needs"
+                "--otlp takes no user name or password in the URL, and no `@` anywhere \
+                 in it: it sends to a collector on this machine, such as {EXAMPLE}, and \
+                 that collector holds whatever credential the backend needs"
             )));
         }
         let (scheme, rest) = url.split_once("://").ok_or_else(|| malformed(url))?;
@@ -352,6 +353,11 @@ mod tests {
         let text = err.to_string();
         assert!(text.contains("no user name or password"), "{text}");
         assert!(!text.contains("hunter2"), "{text}");
+        // Refused wherever it is, since a password with a `/` in it would
+        // otherwise be read as a path and repeated back; the message says so.
+        let path = Endpoint::parse("http://127.0.0.1:4318/team@a").expect_err("an @ in a path");
+        assert!(path.to_string().contains("no `@` anywhere"), "{path}");
+        assert!(!path.to_string().contains("team"), "{path}");
     }
 
     #[test]

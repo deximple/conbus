@@ -225,6 +225,10 @@ pub struct Payload {
 }
 
 /// The rows as one `ExportMetricsServiceRequest`, in OTLP's JSON encoding.
+///
+/// The rows are `Ledger::shareable`'s: one per day, harness and attendance.
+/// Two rows with the same three would be two points of one series over one
+/// interval, which a collector sums; nothing here merges them.
 pub fn encode(rows: &[SharedRow], version: &str, now: Timestamp) -> io::Result<Payload> {
     let now = unix_seconds(now)?;
     let mut metrics: Vec<Metric> = Vec::new();
@@ -296,7 +300,9 @@ struct Span {
 
 impl Span {
     /// 00:00 UTC of `day` to the next 00:00 — or to now, when that has not
-    /// come yet.
+    /// come yet. A day that has not begun (a record from a clock that ran
+    /// ahead) gets an empty interval at its start rather than one that ends
+    /// before it begins.
     fn of(day: &str, now: i64) -> io::Result<Self> {
         let start = day_start(day)?;
         let end = start + DAY_SECONDS;

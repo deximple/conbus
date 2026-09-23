@@ -176,10 +176,12 @@ fn judge(url: &str, raw: &[u8]) -> io::Result<Answer> {
             .header("retry-after")
             .filter(|_| matches!(head.status, 429 | 503))
             .map(|after| {
+                // Seconds, or an HTTP date (RFC 9110, 10.2.3) — or whatever
+                // the peer wrote, which is why the date goes through `one_line`.
                 let after = if after.bytes().all(|b| b.is_ascii_digit()) {
                     format!("{after}s")
                 } else {
-                    after.to_string()
+                    one_line(after).unwrap_or_default()
                 };
                 format!("; it asks to be tried again after {after}")
             })
@@ -225,15 +227,37 @@ fn detail(body: &[u8]) -> Option<String> {
     }
 }
 
-/// Text from the collector, made safe to print: one line, no control
-/// characters — nothing that could move a terminal's cursor — and bounded.
+/// Text from the collector, made safe to print: one line, no control or
+/// format characters — nothing that could move a terminal's cursor or turn a
+/// line around — and bounded. Everything a collector says goes through here
+/// before it is printed, because nothing authenticates the collector.
 fn one_line(text: &str) -> Option<String> {
     let line = text
-        .split(|c: char| c.is_whitespace() || c.is_control())
+        .split(|c: char| c.is_whitespace() || c.is_control() || invisible(c))
         .filter(|word| !word.is_empty())
         .collect::<Vec<_>>()
         .join(" ");
     (!line.is_empty()).then(|| line.chars().take(DETAIL_CHARS).collect())
+}
+
+/// Characters that print as nothing and change what is around them: the bidi
+/// embeddings, overrides and isolates, zero-width marks, the byte-order mark
+/// and the tag block — the format characters (Unicode `Cf`) that can make a
+/// line read other than it is.
+fn invisible(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{061C}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206F}'
+            | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{E0000}'..='\u{E007F}'
+    )
 }
 
 /// An answer's status line and headers.
@@ -269,7 +293,8 @@ impl Head {
             return None;
         }
         let status = status_line.next()?.parse().ok()?;
-        let reason = status_line.next().unwrap_or_default().to_string();
+        // Printed in every outcome, a 200 included, so made plain here.
+        let reason = one_line(status_line.next().unwrap_or_default()).unwrap_or_default();
         let headers = lines
             .filter_map(|line| line.split_once(':'))
             .map(|(name, value)| (name.trim().to_string(), value.trim().to_string()))
@@ -293,9 +318,12 @@ impl Head {
         self.header("content-length")?.parse().ok()
     }
 
+    /// Chunked frames the body only as the last transfer coding (RFC 9112,
+    /// 6.1), and a coding is a token, not a substring.
     fn chunked(&self) -> bool {
         self.header("transfer-encoding")
-            .is_some_and(|coding| coding.to_ascii_lowercase().contains("chunked"))
+            .and_then(|codings| codings.rsplit(',').next())
+            .is_some_and(|last| last.trim().eq_ignore_ascii_case("chunked"))
     }
 
     /// The body as sent, decoded when it was chunked.
@@ -551,15 +579,6 @@ mod tests {
                 "{rejected}"
             );
         }
-        // What the collector says is printed, so it reaches the terminal as
-        // one line of text and nothing that could drive it.
-        let collector = Collector::answering(&answer(
-            "200 OK",
-            r#"{"partialSuccess":{"rejectedDataPoints":"1","errorMessage":"too\u001b[2J\nold"}}"#,
-        ));
-        let taken = post(&collector.endpoint, BODY, &BOUNDS).expect("taken");
-        collector.request();
-        assert_eq!(taken.rejected, Some((1, "too [2J old".to_string())));
         // Zero rejected is a full success, whatever else it says.
         let collector = Collector::answering(&answer(
             "200 OK",
@@ -596,6 +615,68 @@ mod tests {
         let answer = post(&collector.endpoint, BODY, &BOUNDS).expect("taken");
         collector.request();
         assert_eq!(answer.rejected, Some((1, String::new())));
+
+        // Chunked frames the body only as the last coding (RFC 9112, 6.1),
+        // and it is a token, not a substring.
+        let head = |codings: &str| {
+            Head::parse(
+                format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: {codings}\r\n\r\n").as_bytes(),
+            )
+            .expect("a head")
+        };
+        assert!(head("chunked").chunked());
+        assert!(head("gzip, Chunked").chunked());
+        assert!(!head("not-chunked").chunked());
+        assert!(!head("chunked, gzip").chunked());
+    }
+
+    /// Nothing in `text` that a terminal would act on rather than print.
+    fn plain(text: &str) -> bool {
+        !text.chars().any(|c| c.is_control() || invisible(c))
+    }
+
+    #[test]
+    fn text_from_the_collector_reaches_the_terminal_as_one_plain_line() {
+        // Nothing authenticates whatever holds the port, and four things it
+        // says are printed: the reason phrase, a `Status` message, a
+        // `Retry-After`, a partial success's `errorMessage`. None may carry
+        // an escape sequence, a line break, a bidi override or a zero-width
+        // character through.
+        const NASTY: &str = "\u{1b}[2J\u{202e}sdrawkcab\u{200b}";
+        const STATUS: &str = r#"{"code":14,"message":"slow\u001b[2J\u202edown\u200b\nnow"}"#;
+
+        let ok = Collector::answering(&format!(
+            "HTTP/1.1 200 OK{NASTY}\r\nContent-Length: 2\r\n\r\n{{}}"
+        ));
+        let taken = post(&ok.endpoint, BODY, &BOUNDS).expect("taken");
+        ok.request();
+        assert_eq!(taken.reason, "OK [2J sdrawkcab");
+
+        let busy = Collector::answering(&format!(
+            "HTTP/1.1 503 Busy{NASTY}\r\nRetry-After: later{NASTY}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{STATUS}",
+            STATUS.len()
+        ));
+        let err = post(&busy.endpoint, BODY, &BOUNDS)
+            .expect_err("busy")
+            .to_string();
+        busy.request();
+        assert!(plain(&err), "{err:?}");
+        assert!(
+            err.contains("answered 503 Busy [2J sdrawkcab: slow [2J down now"),
+            "{err}"
+        );
+        assert!(
+            err.contains("tried again after later [2J sdrawkcab"),
+            "{err}"
+        );
+
+        let partial = Collector::answering(&answer(
+            "200 OK",
+            r#"{"partialSuccess":{"rejectedDataPoints":"1","errorMessage":"too\u001b[2J\u202e\nold"}}"#,
+        ));
+        let taken = post(&partial.endpoint, BODY, &BOUNDS).expect("taken");
+        partial.request();
+        assert_eq!(taken.rejected, Some((1, "too [2J old".to_string())));
     }
 
     #[test]
