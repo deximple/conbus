@@ -1,4 +1,4 @@
-//! `conbus usage`: what the agents did, counted, from the live log.
+//! `conbus usage`: what the agents did, counted, from the log.
 //!
 //! Counts only. The fold is `conbus_core::usage`, which never holds a body;
 //! this module prints it. Cost is named as absent rather than left out, because
@@ -9,7 +9,7 @@ use std::io;
 use conbus_core::clock::{Timestamp, ago};
 use conbus_core::paths::Paths;
 use conbus_core::segment::SegmentLog;
-use conbus_core::usage::{HarnessTotal, Ledger, first_day};
+use conbus_core::usage::{HarnessTotal, Ledger, first_day, next_day};
 
 /// How many names a top-N line prints.
 const TOP: usize = 5;
@@ -37,15 +37,52 @@ impl Output {
     }
 }
 
-pub fn run(paths: &Paths, days: u32, since: Option<String>, output: Output) -> io::Result<()> {
-    if let Some(since) = &since {
+/// Which records a report covers, and how its header names that.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Window {
+    pub since: String,
+    /// Exclusive; none means up to now.
+    pub until: Option<String>,
+    pub label: String,
+}
+
+/// `--day` wins, then `--since`, then the last `days` days.
+pub fn window(
+    days: u32,
+    since: Option<&str>,
+    day: Option<&str>,
+    now: Timestamp,
+) -> io::Result<Window> {
+    if let Some(day) = day {
+        check_since(day)?;
+        let until = next_day(day).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("--day wants one UTC day like 2026-09-01, got {day:?}"),
+            )
+        })?;
+        return Ok(Window {
+            since: day.to_string(),
+            until: Some(until),
+            label: format!("on {day}"),
+        });
+    }
+    if let Some(since) = since {
         check_since(since)?;
     }
+    let since = since.map_or_else(|| first_day(now, days), str::to_string);
+    Ok(Window {
+        label: format!("from {since}"),
+        since,
+        until: None,
+    })
+}
+
+pub fn run(paths: &Paths, window: Window, output: Output) -> io::Result<()> {
     let scan = SegmentLog::scan(paths.log_dir())?;
-    let from = since.unwrap_or_else(|| first_day(Timestamp::now(), days));
-    let ledger = Ledger::fold(&scan.records, &from);
+    let ledger = Ledger::fold_between(&scan.records, &window.since, window.until.as_deref());
     let lines = match output {
-        Output::Text => render(&ledger, &from),
+        Output::Text => render(&ledger, &window.label),
         Output::Json => render_json(&ledger)?,
         Output::Shareable => render_shareable(&ledger)?,
     };
@@ -90,9 +127,14 @@ fn check_since(since: &str) -> io::Result<()> {
     ))
 }
 
-fn render(ledger: &Ledger, from: &str) -> Vec<String> {
+fn render(ledger: &Ledger, label: &str) -> Vec<String> {
+    let recovered = if ledger.recovered == 0 {
+        String::new()
+    } else {
+        format!(", {} recovered", ledger.recovered)
+    };
     let mut lines = vec![format!(
-        "usage     from {from} (UTC) · {} live record(s){}",
+        "usage     {label} (UTC) · {} record(s){recovered}{}",
         ledger.records,
         skipped(ledger)
     )];
@@ -163,13 +205,21 @@ fn describe(total: &HarnessTotal) -> Vec<String> {
 /// What the window left out, so a small number is not mistaken for a quiet
 /// week.
 fn skipped(ledger: &Ledger) -> String {
-    if ledger.backfilled == 0 && ledger.before_window == 0 && ledger.repeated == 0 {
+    let parts: Vec<String> = [
+        ("earlier", ledger.before_window),
+        ("later", ledger.after_window),
+        ("repeated", ledger.repeated),
+        ("recorded twice", ledger.recorded_twice),
+        ("probe", ledger.probe),
+    ]
+    .into_iter()
+    .filter(|(_, n)| *n > 0)
+    .map(|(what, n)| format!("{what} {n}"))
+    .collect();
+    if parts.is_empty() {
         return String::new();
     }
-    format!(
-        " · not counted: backfilled {} · earlier {} · repeated {}",
-        ledger.backfilled, ledger.before_window, ledger.repeated
-    )
+    format!(" · not counted: {}", parts.join(" · "))
 }
 
 fn top(counts: &[(String, u64)]) -> String {
@@ -266,10 +316,10 @@ mod tests {
 
     #[test]
     fn the_report_names_each_harness_with_who_was_there_and_why_it_stopped() {
-        let text = render(&week(), "2026-09-17").join("\n");
+        let text = render(&week(), "from 2026-09-17").join("\n");
 
         assert!(
-            text.contains("from 2026-09-17 (UTC) · 4 live record(s)"),
+            text.contains("from 2026-09-17 (UTC) · 4 record(s)"),
             "{text}"
         );
         assert!(
@@ -306,29 +356,37 @@ mod tests {
     #[test]
     fn cost_is_named_as_absent_rather_than_left_out() {
         // A usage report silent about cost reads as one that has it.
-        let text = render(&week(), "2026-09-17").join("\n");
+        let text = render(&week(), "from 2026-09-17").join("\n");
         assert!(text.contains("cost      not in this log"), "{text}");
     }
 
     #[test]
     fn an_empty_window_says_so() {
-        let text = render(&Ledger::default(), "2026-09-17").join("\n");
+        let text = render(&Ledger::default(), "from 2026-09-17").join("\n");
         assert!(text.contains("nothing recorded"), "{text}");
     }
 
     #[test]
     fn skipped_records_are_counted_in_the_header() {
         let ledger = Ledger {
-            backfilled: 12,
+            records: 9,
+            recovered: 5,
             before_window: 3,
             repeated: 4,
+            recorded_twice: 2,
+            probe: 1,
             ..Ledger::default()
         };
-        let text = render(&ledger, "2026-09-17").join("\n");
+        let text = render(&ledger, "from 2026-09-17").join("\n");
         assert!(
-            text.contains("not counted: backfilled 12 · earlier 3 · repeated 4"),
+            text.contains("from 2026-09-17 (UTC) · 9 record(s), 5 recovered"),
             "{text}"
         );
+        assert!(
+            text.contains("not counted: earlier 3 · repeated 4 · recorded twice 2 · probe 1"),
+            "{text}"
+        );
+        assert!(!text.contains("later"), "only what was set aside: {text}");
     }
 
     #[test]
@@ -370,6 +428,23 @@ mod tests {
         assert_eq!(Output::of(true, false), Output::Json);
         assert_eq!(Output::of(true, true), Output::Shareable);
         assert_eq!(Output::of(false, true), Output::Shareable);
+    }
+
+    #[test]
+    fn a_day_is_that_day_and_says_so() {
+        let now: Timestamp = "2026-09-23T10:00:00.000Z".parse().expect("ts");
+        let day = window(7, None, Some("2026-09-22"), now).expect("a day");
+        assert_eq!(day.since, "2026-09-22");
+        assert_eq!(day.until.as_deref(), Some("2026-09-23"));
+        assert_eq!(day.label, "on 2026-09-22");
+        let week = window(7, None, None, now).expect("a week");
+        assert_eq!(
+            (week.since.as_str(), week.until, week.label.as_str()),
+            ("2026-09-17", None, "from 2026-09-17")
+        );
+        for bad in ["2026-9-22", "2026-09-22T12:00", "yesterday"] {
+            assert!(window(7, None, Some(bad), now).is_err(), "{bad}");
+        }
     }
 
     #[test]

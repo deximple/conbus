@@ -64,6 +64,8 @@ pub enum Command {
     Usage {
         days: u32,
         since: Option<String>,
+        /// One closed UTC day; wins over `days` and `since`.
+        day: Option<String>,
         json: bool,
         /// Print what a sync would send (RFD 0002): the rows, with no folder.
         shareable: bool,
@@ -194,6 +196,7 @@ where
                 .and_then(|n| n.parse().ok())
                 .unwrap_or(DEFAULT_USAGE_DAYS),
             since: flag_value(&args, "--since"),
+            day: flag_value(&args, "--day"),
             json: args.iter().any(|a| a == "--json"),
             shareable: args.iter().any(|a| a == "--shareable"),
         },
@@ -271,9 +274,10 @@ USAGE:
     conbus go [HARNESS]           hop --apply for the current conversation
     conbus summary --bus-id ID    opposite-leg digest; never the protected leg
     conbus verdict                4-week dogfood score; open window is not a kill
-    conbus usage [--days N] [--since DAY] [--json] [--shareable]
+    conbus usage [--days N] [--since DAY] [--day DAY] [--json] [--shareable]
                                   what the agents did, per harness: turns, stops,
-                                  tool failures, permission asks (default 7 days);
+                                  tool failures, permission asks (default 7 days;
+                                  --day is one closed UTC day);
                                   --json prints one row per day, harness,
                                   workspace and attendance — counts, never bodies;
                                   --shareable prints what a sync would send:
@@ -435,6 +439,7 @@ mod tests {
             Command::Usage {
                 days: 7,
                 since: None,
+                day: None,
                 json: false,
                 shareable: false
             }
@@ -444,6 +449,7 @@ mod tests {
             Command::Usage {
                 days: 30,
                 since: None,
+                day: None,
                 json: true,
                 shareable: false
             }
@@ -453,6 +459,7 @@ mod tests {
             Command::Usage {
                 days: 7,
                 since: Some("2026-09-01".into()),
+                day: None,
                 json: false,
                 shareable: false
             }
@@ -462,6 +469,7 @@ mod tests {
             Command::Usage {
                 days: 7,
                 since: None,
+                day: None,
                 json: false,
                 shareable: false
             },
@@ -472,6 +480,17 @@ mod tests {
             Command::Usage {
                 days: 7,
                 since: None,
+                day: None,
+                json: false,
+                shareable: true
+            }
+        );
+        assert_eq!(
+            parse(["usage", "--day", "2026-09-22", "--shareable"], None),
+            Command::Usage {
+                days: 7,
+                since: None,
+                day: Some("2026-09-22".into()),
                 json: false,
                 shareable: true
             }

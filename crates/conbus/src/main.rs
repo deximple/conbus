@@ -32,6 +32,7 @@ mod wire;
 use std::io::Read;
 use std::process::ExitCode;
 
+use conbus_core::clock::Timestamp;
 use conbus_core::paths::Paths;
 use conbus_core::retention::Retention;
 
@@ -142,9 +143,16 @@ fn main() -> ExitCode {
         Command::Usage {
             days,
             since,
+            day,
             json,
             shareable,
-        } => run(|paths| usage::run(paths, days, since, usage::Output::of(json, shareable))),
+        } => run(|paths| {
+            usage::run(
+                paths,
+                usage::window(days, since.as_deref(), day.as_deref(), Timestamp::now())?,
+                usage::Output::of(json, shareable),
+            )
+        }),
         Command::Run { harness } => run(|paths| runner::run(paths, &harness)),
         Command::Arena {
             action,

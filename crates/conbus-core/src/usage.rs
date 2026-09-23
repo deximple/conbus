@@ -21,7 +21,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use serde::Serialize;
 
 use crate::clock::Timestamp;
-use crate::event::{Entrypoint, Event, Harness, ToolOutcome, TurnState};
+use crate::event::{Entrypoint, Event, Harness, HopProvenance, ToolOutcome, TurnState};
 use crate::ids::BusId;
 use crate::record::Record;
 
@@ -127,6 +127,9 @@ pub struct Counts {
     /// Second deliveries of a report already counted here — which harness
     /// double-delivers, and when.
     pub repeated: u64,
+    /// Records counted here that were recovered — gap fill or backfill —
+    /// rather than seen by a hook as they happened.
+    pub recovered: u64,
 }
 
 impl Counts {
@@ -151,6 +154,7 @@ impl Counts {
             briefings,
             hops,
             repeated,
+            recovered,
         } = other;
         self.turns += turns;
         self.limit_stops += limit_stops;
@@ -170,6 +174,7 @@ impl Counts {
         self.briefings += briefings;
         self.hops += hops;
         self.repeated += repeated;
+        self.recovered += recovered;
     }
 
     /// Exhaustive on purpose: a new event has to be a decision here, not a
@@ -239,6 +244,19 @@ enum Stop {
 }
 
 impl Stop {
+    /// Which of two stops one turn reported is the one it ended on: a limit
+    /// explains an `error`, not the other way round.
+    fn severity(self) -> u8 {
+        match self {
+            Stop::Limit => 5,
+            Stop::Account => 4,
+            Stop::Vendor => 3,
+            Stop::Request => 2,
+            Stop::Other => 1,
+            Stop::Person => 0,
+        }
+    }
+
     fn of(state: &TurnState) -> Option<Self> {
         let first = |reason: &str| {
             reason
@@ -316,11 +334,16 @@ pub struct HarnessTotal {
 /// The window, folded.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct Ledger {
-    /// Live records inside the window.
+    /// Records inside the window, live or recovered, that were not set aside.
     pub records: u64,
-    /// Recovered history, which is not activity this recorder saw.
-    pub backfilled: u64,
+    /// Of those, the ones counted from recovery rather than a hook.
+    pub recovered: u64,
     pub before_window: u64,
+    pub after_window: u64,
+    /// Recovered copies of a session the hooks also recorded, under another id.
+    pub recorded_twice: u64,
+    /// Records of conversations a run declared as a probe.
+    pub probe: u64,
     /// Second deliveries of a report already counted: the same event, naming
     /// the same vendor call or turn, inside the twin window.
     pub repeated: u64,
@@ -337,10 +360,15 @@ impl Ledger {
     /// Everything at or after `since`, compared as text — a day like
     /// `2026-09-17` works, because the timestamp format is fixed-width.
     pub fn fold(records: &[Record], since: &str) -> Self {
-        let places = attribute(records);
+        Self::fold_between(records, since, None)
+    }
+
+    /// Everything at or after `since` and, when given, before `until`.
+    pub fn fold_between(records: &[Record], since: &str, until: Option<&str>) -> Self {
+        let plan = Plan::of(records);
         let mut tally = Tally::default();
-        for record in records {
-            tally.add(record, since, &places);
+        for (index, record) in records.iter().enumerate() {
+            tally.add(index, record, (since, until), &plan);
         }
         tally.finish()
     }
@@ -373,8 +401,11 @@ impl Ledger {
 #[derive(Default)]
 struct Tally {
     records: u64,
-    backfilled: u64,
+    recovered: u64,
     before_window: u64,
+    after_window: u64,
+    recorded_twice: u64,
+    probe: u64,
     repeated: u64,
     /// When each report that names a vendor thing was last counted.
     delivered: HashMap<(BusId, u64), Timestamp>,
@@ -387,18 +418,26 @@ struct Tally {
 }
 
 impl Tally {
-    fn add(&mut self, record: &Record, since: &str, places: &HashMap<BusId, Place>) {
-        if record.source.backfilled_from.is_some() {
-            self.backfilled += 1;
-            return;
-        }
+    fn add(&mut self, index: usize, record: &Record, window: (&str, Option<&str>), plan: &Plan) {
         let ts = record.ts.to_string();
-        if ts.as_str() < since {
+        if ts.as_str() < window.0 {
             self.before_window += 1;
             return;
         }
+        if window.1.is_some_and(|until| ts.as_str() >= until) {
+            self.after_window += 1;
+            return;
+        }
+        if plan.probes.contains(&record.bus_id) {
+            self.probe += 1;
+            return;
+        }
+        if plan.recorded_live_elsewhere(record) {
+            self.recorded_twice += 1;
+            return;
+        }
         self.records += 1;
-        let place = places.get(&record.bus_id);
+        let place = plan.places.get(&record.bus_id);
         let attendance = Attendance::of(place.and_then(|p| p.entrypoint.as_ref()));
         let workspace = place.and_then(|p| p.workspace.clone());
         let harness = record.source.harness.as_str().to_string();
@@ -414,15 +453,22 @@ impl Tally {
             self.harnesses.entry(harness).or_default().1.repeated += 1;
             return;
         }
+        if plan.superseded.contains(&index) {
+            return;
+        }
         let episode = u64::from(self.starts_episode(record, &harness));
+        let recovered = u64::from(record.source.backfilled_from.is_some());
+        self.recovered += recovered;
         let (seen, counts) = self.rows.entry(key).or_default();
         seen.insert(record.bus_id);
         counts.count(record);
         counts.limit_episodes += episode;
+        counts.recovered += recovered;
         let (seen, counts) = self.harnesses.entry(harness).or_default();
         seen.insert(record.bus_id, attendance);
         counts.count(record);
         counts.limit_episodes += episode;
+        counts.recovered += recovered;
         self.note_hotspots(record, workspace);
     }
 
@@ -505,8 +551,11 @@ impl Tally {
         harnesses.sort_by(|a, b| b.conversations.cmp(&a.conversations));
         Ledger {
             records: self.records,
-            backfilled: self.backfilled,
+            recovered: self.recovered,
             before_window: self.before_window,
+            after_window: self.after_window,
+            recorded_twice: self.recorded_twice,
+            probe: self.probe,
             repeated: self.repeated,
             rows,
             harnesses,
@@ -564,23 +613,117 @@ struct Place {
     entrypoint: Option<Entrypoint>,
 }
 
-/// Every live record, not only the window's: a conversation that began before
-/// the window keeps the place and the person it began with.
-fn attribute(records: &[Record]) -> HashMap<BusId, Place> {
-    let mut places: HashMap<BusId, Place> = HashMap::new();
-    for record in records {
-        if record.source.backfilled_from.is_some() {
+/// Harnesses whose turn id names exactly one turn, so a turn's several ends
+/// can be reduced to one. Cursor's `generation_id` changes with every user
+/// message, and Cursor writes a turn's end from `afterAgentResponse`, from
+/// `stop` and sometimes from `sessionEnd`: one exhausted turn arrived as a limit
+/// and an `error`. Claude Code's `prompt_id` is a process-global slot and is not
+/// on this list.
+const ONE_END_PER_TURN: &[&str] = &[Harness::CURSOR];
+
+/// What the fold needs to know about every record before it counts one.
+struct Plan {
+    /// Where each conversation is, and who is there, as it first said — over
+    /// the whole log, so a conversation that began before the window keeps
+    /// the place and the person it began with.
+    places: HashMap<BusId, Place>,
+    /// Conversations the hooks recorded, and the vendor sessions they carry.
+    live: HashSet<BusId>,
+    live_sessions: HashSet<(String, String)>,
+    /// Conversations a run declared as a probe: conbus's own traffic.
+    probes: HashSet<BusId>,
+    /// Stops that a more serious stop of the same turn replaces.
+    superseded: HashSet<usize>,
+}
+
+impl Plan {
+    fn of(records: &[Record]) -> Self {
+        let mut plan = Plan {
+            places: HashMap::new(),
+            live: HashSet::new(),
+            live_sessions: HashSet::new(),
+            probes: HashSet::new(),
+            superseded: superseded_stops(records),
+        };
+        for record in records {
+            let place = plan.places.entry(record.bus_id).or_default();
+            if place.workspace.is_none() {
+                place.workspace.clone_from(&record.source.workspace);
+            }
+            if place.entrypoint.is_none() {
+                place.entrypoint.clone_from(&record.source.entrypoint);
+            }
+            if record.source.backfilled_from.is_none() {
+                plan.live.insert(record.bus_id);
+                if let Some(session) = &record.source.vendor_session_id {
+                    plan.live_sessions.insert(session_key(record, session));
+                }
+            }
+            if let Event::Routed {
+                provenance: Some(HopProvenance::DeclaredSynthetic),
+                ..
+            } = &record.event
+            {
+                plan.probes.insert(record.bus_id);
+            }
+        }
+        plan
+    }
+
+    /// A recovered record of a session the hooks recorded under another id.
+    /// Gap fill writes under the live id and is not this; the live records
+    /// are the stronger fact.
+    fn recorded_live_elsewhere(&self, record: &Record) -> bool {
+        record.source.backfilled_from.is_some()
+            && !self.live.contains(&record.bus_id)
+            && record
+                .source
+                .vendor_session_id
+                .as_ref()
+                .is_some_and(|session| self.live_sessions.contains(&session_key(record, session)))
+    }
+}
+
+fn session_key(record: &Record, session: &str) -> (String, String) {
+    (
+        record.source.harness.as_str().to_string(),
+        session.to_string(),
+    )
+}
+
+/// For each turn of a harness on `ONE_END_PER_TURN`, the stops other than
+/// its most serious one; ties keep the first.
+fn superseded_stops(records: &[Record]) -> HashSet<usize> {
+    let mut kept: HashMap<(BusId, &str), (usize, Stop)> = HashMap::new();
+    let mut superseded = HashSet::new();
+    for (index, record) in records.iter().enumerate() {
+        if !ONE_END_PER_TURN.contains(&record.source.harness.as_str())
+            || record.vendor_agent_id.is_some()
+        {
             continue;
         }
-        let place = places.entry(record.bus_id).or_default();
-        if place.workspace.is_none() {
-            place.workspace.clone_from(&record.source.workspace);
-        }
-        if place.entrypoint.is_none() {
-            place.entrypoint.clone_from(&record.source.entrypoint);
+        let (Event::TurnEnded { state, .. }, Some(turn)) = (&record.event, &record.vendor_turn_id)
+        else {
+            continue;
+        };
+        let Some(stop) = Stop::of(state) else {
+            continue;
+        };
+        let key = (record.bus_id, turn.as_str());
+        match kept.get(&key) {
+            Some(&(earlier, worst)) if stop.severity() > worst.severity() => {
+                superseded.insert(earlier);
+                kept.insert(key, (index, stop));
+            }
+            Some(_) => {
+                superseded.insert(index);
+            }
+            None => {
+                kept.insert(key, (index, stop));
+            }
         }
     }
-    places
+    superseded
 }
 
 /// A harness name as a shared row may carry it.
@@ -610,6 +753,13 @@ pub fn first_day(now: Timestamp, days: u32) -> String {
 fn day_of(ts: Timestamp) -> String {
     let text = ts.to_string();
     text.get(..10).unwrap_or(&text).to_string()
+}
+
+/// The UTC day after `day` (`YYYY-MM-DD`), or none when `day` is not one.
+pub fn next_day(day: &str) -> Option<String> {
+    let start: Timestamp = format!("{day}T00:00:00.000Z").parse().ok()?;
+    let epoch = Timestamp::from_unix_seconds(0)?;
+    Timestamp::from_unix_seconds(start.seconds_since(epoch) + DAY_SECS).map(day_of)
 }
 
 #[cfg(test)]
@@ -1020,36 +1170,269 @@ mod tests {
         );
     }
 
+    fn recovered(from: &str, session: &str, harness: &str) -> Source {
+        Source {
+            backfilled_from: Some(from.into()),
+            vendor_session_id: Some(session.into()),
+            ..source(harness)
+        }
+    }
+
+    fn live(session: &str, harness: &str) -> Source {
+        Source {
+            vendor_session_id: Some(session.into()),
+            ..source(harness)
+        }
+    }
+
     #[test]
-    fn backfilled_history_and_records_before_the_window_are_counted_not_folded() {
-        let recovered = Source {
-            backfilled_from: Some("claude_transcript".into()),
-            ..claude_in(Some("/w"), Some("cli"))
-        };
+    fn a_recovered_turn_inside_the_window_is_counted_and_marked() {
+        // Gap fill writes the turns a live conversation missed while the
+        // daemon was down under its own id; backfill recovers conversations the
+        // hooks never saw — Codex.app has no hooks, and 2,442 of its records
+        // from the last 30 days were in the log and in no report. Both are
+        // what the agents did. Records from before the window are not.
+        const THREE: &str = "01996b1e-2c4a-7c31-9d0e-4f2a6b8c1d40";
         let ledger = Ledger::fold(
             &[
-                at(&on_day("09:00:00"), ONE, recovered, prompt("old")),
                 at(
-                    "2026-09-21T23:59:59.999Z",
-                    TWO,
-                    claude_in(Some("/w"), Some("cli")),
-                    prompt("yesterday"),
+                    &on_day("09:00:00"),
+                    ONE,
+                    live("s1", "claude_code"),
+                    prompt("a"),
                 ),
                 at(
-                    &on_day("00:00:00"),
+                    &on_day("09:05:00"),
+                    ONE,
+                    recovered("claude_transcript", "s1", "claude_code"),
+                    prompt("missed while down"),
+                ),
+                at(
+                    &on_day("10:00:00"),
                     TWO,
-                    claude_in(Some("/w"), Some("cli")),
-                    prompt("today"),
+                    recovered("codex_thread", "t9", "codex"),
+                    prompt("in Codex.app"),
+                ),
+                at(
+                    "2026-09-01T10:00:00.000Z",
+                    THREE,
+                    recovered("claude_transcript", "s3", "claude_code"),
+                    prompt("history"),
+                ),
+                at(
+                    "2026-09-21T23:59:59.999Z",
+                    ONE,
+                    live("s1", "claude_code"),
+                    prompt("yesterday"),
                 ),
             ],
             DAY,
         );
 
-        assert_eq!(ledger.backfilled, 1);
+        let claude = ledger
+            .harnesses
+            .iter()
+            .find(|h| h.harness == "claude_code")
+            .expect("claude");
+        assert_eq!(claude.counts.turns, 2);
+        assert_eq!(claude.counts.recovered, 1);
+        let codex = ledger
+            .harnesses
+            .iter()
+            .find(|h| h.harness == "codex")
+            .expect("codex");
+        assert_eq!(codex.counts.turns, 1);
+        assert_eq!(codex.counts.recovered, 1);
+        assert_eq!(ledger.recovered, 2);
+        assert_eq!(ledger.records, 3);
+        assert_eq!(ledger.before_window, 2);
+    }
+
+    #[test]
+    fn a_session_recorded_live_and_recovered_again_is_counted_once() {
+        // Backfill leaves live sessions alone, but a session it recovered
+        // before the recorder bound it lives on under a second id. The live
+        // records are the stronger fact.
+        let ledger = Ledger::fold(
+            &[
+                at(
+                    &on_day("09:00:00"),
+                    ONE,
+                    live("s1", "claude_code"),
+                    prompt("a"),
+                ),
+                at(
+                    &on_day("09:00:00"),
+                    TWO,
+                    recovered("claude_transcript", "s1", "claude_code"),
+                    prompt("a"),
+                ),
+            ],
+            DAY,
+        );
+
+        assert_eq!(ledger.harnesses[0].counts.turns, 1);
+        assert_eq!(ledger.recorded_twice, 1);
+        assert_eq!(ledger.recovered, 0);
+    }
+
+    #[test]
+    fn a_run_that_declared_itself_a_probe_is_not_the_agents_work() {
+        let probe = || live("probe", "claude_code");
+        let ledger = Ledger::fold(
+            &[
+                at(
+                    &on_day("09:00:00"),
+                    ONE,
+                    probe(),
+                    Event::Routed {
+                        next: "codex".into(),
+                        hop: crate::event::Hop::Displaced,
+                        reason: "rate_limit".into(),
+                        code_freshness: None,
+                        provenance: Some(crate::event::HopProvenance::DeclaredSynthetic),
+                    },
+                ),
+                at(
+                    &on_day("09:00:01"),
+                    ONE,
+                    probe(),
+                    ended(TurnState::InterruptedQuota {
+                        reason: "rate_limit".into(),
+                    }),
+                ),
+                at(
+                    &on_day("09:30:00"),
+                    TWO,
+                    live("real", "claude_code"),
+                    prompt("work"),
+                ),
+            ],
+            DAY,
+        );
+
+        let counts = &ledger.harnesses[0].counts;
+        assert_eq!(counts.limit_stops, 0, "the probe's stop is the probe's");
+        assert_eq!(counts.hops, 0);
+        assert_eq!(counts.turns, 1);
+        assert_eq!(ledger.probe, 2);
+    }
+
+    #[test]
+    fn one_cursor_turn_is_one_stop_the_worst_it_reported() {
+        // Cursor writes a turn's end from `afterAgentResponse` and from
+        // `stop`, so one exhausted turn arrived as a limit and an `error`.
+        // Its `generation_id` names one turn; Claude Code's `prompt_id` does
+        // not, so its ends are not merged.
+        let cursor = || source("cursor");
+        let ledger = Ledger::fold(
+            &[
+                in_turn(
+                    at(
+                        &on_day("09:00:00"),
+                        ONE,
+                        cursor(),
+                        ended(TurnState::InterruptedPolicy {
+                            reason: "error".into(),
+                        }),
+                    ),
+                    "gen-1",
+                ),
+                in_turn(
+                    at(
+                        &on_day("09:00:01"),
+                        ONE,
+                        cursor(),
+                        ended(TurnState::InterruptedQuota {
+                            reason: "request failed: PRO_USER_USAGE_LIMIT".into(),
+                        }),
+                    ),
+                    "gen-1",
+                ),
+                in_turn(
+                    at(
+                        &on_day("09:10:00"),
+                        ONE,
+                        cursor(),
+                        ended(TurnState::InterruptedPolicy {
+                            reason: "error".into(),
+                        }),
+                    ),
+                    "gen-2",
+                ),
+                in_turn(
+                    at(
+                        &on_day("09:20:00"),
+                        TWO,
+                        source("claude_code"),
+                        ended(TurnState::InterruptedPolicy {
+                            reason: "authentication_failed".into(),
+                        }),
+                    ),
+                    "slot",
+                ),
+                in_turn(
+                    at(
+                        &on_day("09:40:00"),
+                        TWO,
+                        source("claude_code"),
+                        ended(TurnState::InterruptedPolicy {
+                            reason: "authentication_failed".into(),
+                        }),
+                    ),
+                    "slot",
+                ),
+            ],
+            DAY,
+        );
+
+        let cursor = ledger
+            .harnesses
+            .iter()
+            .find(|h| h.harness == "cursor")
+            .expect("cursor");
+        assert_eq!(cursor.counts.limit_stops, 1);
+        assert_eq!(
+            cursor.counts.other_stops, 1,
+            "gen-2's error is its own turn"
+        );
+        let claude = ledger
+            .harnesses
+            .iter()
+            .find(|h| h.harness == "claude_code")
+            .expect("claude");
+        assert_eq!(claude.counts.account_stops, 2);
+    }
+
+    #[test]
+    fn a_day_is_that_day_and_nothing_after_it() {
+        let ledger = Ledger::fold_between(
+            &[
+                at(
+                    "2026-09-21T23:59:59.999Z",
+                    ONE,
+                    source("codex"),
+                    prompt("before"),
+                ),
+                at(&on_day("00:00:00"), ONE, source("codex"), prompt("first")),
+                at(&on_day("23:59:59"), ONE, source("codex"), prompt("last")),
+                at(
+                    "2026-09-23T00:00:00.000Z",
+                    ONE,
+                    source("codex"),
+                    prompt("after"),
+                ),
+            ],
+            DAY,
+            Some("2026-09-23"),
+        );
+
+        assert_eq!(ledger.harnesses[0].counts.turns, 2);
         assert_eq!(ledger.before_window, 1);
-        assert_eq!(ledger.records, 1);
-        assert_eq!(ledger.rows.len(), 1);
-        assert_eq!(ledger.rows[0].counts.turns, 1);
+        assert_eq!(ledger.after_window, 1);
+        assert_eq!(next_day("2026-09-22"), Some("2026-09-23".to_string()));
+        assert_eq!(next_day("2026-12-31"), Some("2027-01-01".to_string()));
+        assert_eq!(next_day("not a day"), None);
     }
 
     #[test]
@@ -1174,6 +1557,7 @@ mod tests {
                 "limit_stops",
                 "other_stops",
                 "permission_asks",
+                "recovered",
                 "repeated",
                 "request_faults",
                 "subagents",
@@ -1503,6 +1887,7 @@ mod tests {
                 "limit_stops",
                 "other_stops",
                 "permission_asks",
+                "recovered",
                 "repeated",
                 "request_faults",
                 "subagents",
