@@ -379,11 +379,12 @@ three.
   About 200 `tool_use` records a week share a `tool_use_id` without
   matching; only `postToolUse` writes `tool_use`, and it comes only through
   Claude Code's registration, so they are not echoes. OpenCode: the plugin
-  reports a user message as `turn_started` on every `message.updated`, which
-  fires again whenever OpenCode rewrites that message, with `summary.title`
-  as the prompt; it also forwards `message.part.updated` text without
-  checking the role. A `msg_…` id names one message, so a second
-  `turn_started` for it is always a re-report.
+  reports a user message as `turn_started` on every `message.updated`, with
+  `summary.title` as the prompt — and OpenCode's summariser rewrites the user
+  message's `summary.diffs` on every agent step, so that event fires once per
+  step (`anomalyco/opencode#43551`). The plugin also forwards
+  `message.part.updated` text without checking the role. A `msg_…` id names
+  one message, so a second `turn_started` for it is always a re-report.
 - Nothing produces `interrupted_user`; `is_interrupt` on a failed tool call is
   the only signal anywhere that a person stopped the work.
 - An older `v` is still read as if it were current. `scan` rejects a record
