@@ -1,8 +1,9 @@
 # RFD 0002 — What a sync may send
 
 Status: **draft**, 2026-09-23, revised the same day after review. No sync code
-exists. This RFD has to be accepted — and RFD 0003, the security design, written
-— before any is, and every field a sync sends has to be named here first.
+exists. This RFD and [RFD 0003](0003-security-design.md), the security design,
+have to be accepted before any is, and every field a sync sends has to be named
+here first.
 
 Context: Choice 3 in [`docs/saas-hypothesis.md`](../saas-hypothesis.md) and the
 plan in [`docs/saas-strategy.md`](../saas-strategy.md). The log itself never
@@ -56,8 +57,9 @@ workspace.
 | `recovered` | count | Records counted in this row that gap fill or backfill recovered rather than a hook saw — a data-quality signal |
 
 The envelope around one device-day adds `device` (a random id minted when the
-machine joins), `schema` (this RFD's version, `1`) and `day_closed` (the UTC day
-the batch is for). The member is known to the service from the device's
+machine joins), `schema` (this RFD's version, `1`), `day_closed` (the UTC day
+the batch is for) and `revision` (1, then higher for a corrected day — RFD 0003,
+D4). The member is known to the service from the device's
 credential; the row does not repeat it.
 
 ## Never sent
@@ -139,7 +141,8 @@ key grows to include it.
 
 ## Security requirements (RFD 0003, before any sync code)
 
-Authentication and rotation of device credentials; server-side revocation;
+Designed in [RFD 0003](0003-security-design.md), draft since 2026-09-24:
+authentication and rotation of device credentials; server-side revocation;
 replay protection (one accepted batch per device-day); a TLS policy; data
 residency; encryption at rest; backups inside the retention window; deletion by
 API with a receipt, per member and per device.

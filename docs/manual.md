@@ -482,6 +482,11 @@ folder's facts visible in another.
 | `facts.jsonl`, `links.jsonl` | section 10 |
 | `chat-export/` | Claude.ai exports you dropped in |
 
+Only your account can read any of it: the folder is `0700` and the log's
+segments `0600`. Builds before 0.2.5 made them `0755` and `0644`, which other
+accounts on the Mac could read; the recorder closes the folder when it starts,
+and says so in `daemon.log` if it cannot — the log folder is closed either way.
+
 The socket path must stay under 104 bytes; `doctor` tells you if a
 `CONBUS_HOME` is too deep.
 
@@ -643,7 +648,7 @@ line, the destination's quota, and whether the session was a program
 
 | Variable | Effect |
 | --- | --- |
-| `CONBUS_HOME` | Where conbus keeps its data (section 11) |
+| `CONBUS_HOME` | Where conbus keeps its data (section 11). Name a folder of its own: conbus makes it `0700` |
 | `XDG_STATE_HOME` | Used when `CONBUS_HOME` is unset: `$XDG_STATE_HOME/conbus` |
 | `CONBUS_RETENTION` | `full`, `encrypted_tools`, `ephemeral` (section 11) |
 | `CONBUS_BRIEFING` | `off` stops briefings |

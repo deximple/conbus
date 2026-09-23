@@ -393,7 +393,7 @@ pub fn install(apply: bool) -> io::Result<()> {
     );
     if apply {
         if let Some(parent) = log.parent() {
-            std::fs::create_dir_all(parent)?;
+            conbus_core::paths::keep_dir_private(parent)?;
         }
         let load = std::env::var_os("CONBUS_SKIP_LAUNCHCTL").is_none();
         let changed = crate::install::apply_daemon(&home, &binary, &log, load)?;

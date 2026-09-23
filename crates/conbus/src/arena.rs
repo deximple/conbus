@@ -79,9 +79,8 @@ pub fn accept(
         seq,
         verified_at: now,
     };
-    if let Some(parent) = paths.facts().parent() {
-        fs::create_dir_all(parent)?;
-    }
+    // Facts are drawn from conversations: the root stays its owner's.
+    paths.keep_private()?;
     let mut file = fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -102,9 +101,7 @@ pub fn link(paths: &Paths, from: &str, to: &str) -> io::Result<Link> {
     if link.from == link.to {
         return Err(io::Error::other("a workspace cannot link to itself"));
     }
-    if let Some(parent) = paths.links().parent() {
-        fs::create_dir_all(parent)?;
-    }
+    paths.keep_private()?;
     let mut file = fs::OpenOptions::new()
         .create(true)
         .append(true)

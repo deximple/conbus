@@ -103,7 +103,9 @@ pub fn record(dropped: &Dropped) -> bool {
     let Ok(paths) = Paths::resolve() else {
         return true;
     };
-    let _ = fs::create_dir_all(paths.root());
+    // Best effort: the drop is written whether or not the root can be
+    // closed, and the recorder reports a root it cannot close.
+    let _ = paths.keep_private();
     record_at(&paths, dropped)
 }
 

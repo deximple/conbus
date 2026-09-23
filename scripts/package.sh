@@ -23,6 +23,11 @@ done
 rm -rf "$out"
 mkdir -p "$out/stage"
 lipo -create -output "$out/stage/conbus" "$arm" "$x86"
+# `lipo` keeps the arm64 slice's linker signature and leaves the x86_64 one
+# unsigned (0.2.4 and earlier shipped it so). Sign the whole binary ad hoc,
+# and refuse to package one whose halves are not both signed.
+codesign --force --sign - --identifier sh.conbus "$out/stage/conbus"
+codesign --verify --strict "$out/stage/conbus"
 lipo -info "$out/stage/conbus"
 version=$("$out/stage/conbus" --version | awk '{print $2}')
 echo "package.sh: conbus $version"

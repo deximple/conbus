@@ -71,6 +71,8 @@ pub fn write(paths: &Paths, takeover: &Takeover) -> io::Result<()> {
         written_at: Timestamp::now(),
     })
     .map_err(io::Error::other)?;
+    // `hop --apply` can run before the recorder ever has.
+    paths.keep_private()?;
     // `conbus run` reads this every 100 ms; a torn file there is a hop lost.
     crate::install::write_atomically(&paths.takeover(), &text)
 }
@@ -204,6 +206,24 @@ mod tests {
         assert_eq!(takeover, hop());
         assert!(age < 5, "{age}");
         assert_eq!(take(&paths).expect("empty"), Taken::Nothing);
+    }
+
+    #[test]
+    fn a_hop_that_makes_the_root_makes_it_closed() {
+        // `hop --apply` can run before the recorder ever has.
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().expect("tempdir");
+        let paths =
+            Paths::from_env(home.path().join("conbus").to_str(), None, None).expect("paths");
+
+        write(&paths, &hop()).expect("write");
+
+        let mode = fs::metadata(paths.root())
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
     }
 
     #[test]

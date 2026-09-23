@@ -439,6 +439,8 @@ fn cached_observed_at(paths: &Paths, harness: &str) -> Option<i64> {
 
 fn write_cached(paths: &Paths, harness: &str, quota: &Quota) -> io::Result<()> {
     let path = paths.quota_cache(harness);
+    // A status line can run before the recorder ever has.
+    paths.keep_private()?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -490,6 +492,9 @@ pub fn observe_hook_keys(paths: &Paths, harness: &str, stdin: &str) {
         }
     }
     let names: Vec<String> = names.into_iter().collect();
+    // Best effort, like the rest of this: a hook never fails a turn, and a
+    // root that cannot be closed is the recorder's to report.
+    let _ = paths.keep_private();
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -584,6 +589,7 @@ fn read_seen(paths: &Paths, harness: &str) -> Option<i64> {
 
 fn write_seen(paths: &Paths, harness: &str, has_rate_limits: bool) -> io::Result<()> {
     let path = paths.quota_seen(harness);
+    paths.keep_private()?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -783,6 +789,30 @@ mod tests {
         assert!(read_cached(&paths, Harness::CLAUDE_CODE).is_none());
         assert!(read_seen(&paths, Harness::CLAUDE_CODE).is_some());
         assert!(describe_claude(&paths, 0).contains("no rate_limits reading yet"));
+    }
+
+    #[test]
+    fn a_status_line_or_hook_that_makes_the_root_makes_it_closed() {
+        // Either can run before the recorder ever has: a status line on the
+        // first refresh, a hook on the first turn.
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |path: &std::path::Path| {
+            std::fs::metadata(path)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        let home = tempfile::tempdir().expect("tempdir");
+
+        let status =
+            Paths::from_env(home.path().join("status").to_str(), None, None).expect("paths");
+        observe_statusline(Some(&status), None, r#"{"cwd":"/repo"}"#);
+        assert_eq!(mode(status.root()), 0o700, "the status line");
+
+        let hook = Paths::from_env(home.path().join("hook").to_str(), None, None).expect("paths");
+        observe_hook_keys(&hook, Harness::CURSOR, r#"{"cursor_version":"2"}"#);
+        assert_eq!(mode(hook.root()), 0o700, "a hook");
     }
 
     #[test]

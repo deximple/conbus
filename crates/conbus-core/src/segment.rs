@@ -3,6 +3,7 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use crate::clock::Timestamp;
@@ -171,7 +172,17 @@ impl SegmentLog {
         max_segment_bytes: u64,
     ) -> io::Result<Self> {
         let dir = dir.as_ref().to_path_buf();
-        fs::create_dir_all(&dir)?;
+        // Owner only: the segments hold prompts and replies.
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&dir)?;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).map_err(|err| {
+            io::Error::new(
+                err.kind(),
+                format!("could not make {} private: {err}", dir.display()),
+            )
+        })?;
         let existing = segment_paths(&dir)?;
         let next_seq = last_sequence(&existing)?.map_or(0, |seq| seq + 1);
         Ok(SegmentLog {
@@ -264,7 +275,11 @@ impl SegmentLog {
 
     fn open_segment(&self, index: u64) -> io::Result<Current> {
         let path = self.dir.join(segment_name(index));
-        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(&path)?;
         let bytes = heal_torn_tail(&path, &mut file)?;
         Ok(Current { index, file, bytes })
     }
@@ -311,6 +326,24 @@ mod tests {
     use super::*;
     use crate::event::{Body, Event, Harness, Source, TurnState};
     use crate::ids::BusId;
+
+    #[test]
+    fn a_new_log_is_readable_by_its_owner_only() {
+        // The log holds prompts and replies. On macOS a home directory is
+        // 0755, so a log written with the default umask was readable by every
+        // other account on the Mac.
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().expect("tempdir");
+        let dir = home.path().join("log");
+        let mut log = SegmentLog::open(&dir, Retention::default()).expect("open");
+        log.append(entry(BusId::mint(), prompt("hi")))
+            .expect("append");
+
+        let mode = |path: &Path| fs::metadata(path).expect("metadata").permissions().mode() & 0o777;
+        assert_eq!(mode(&dir), 0o700, "the log directory");
+        let segment = SegmentLog::current_segment(&dir).expect("segment");
+        assert_eq!(mode(&segment), 0o600, "a segment");
+    }
 
     fn source() -> Source {
         Source {
