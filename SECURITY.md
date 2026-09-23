@@ -34,7 +34,9 @@ that other programs call on every agent turn.
   memory where the OS allows.
 - **What leaves the machine.** See "What is recorded, and where it goes" in the
   [README](README.md): briefings, hops and `conbus summary` put excerpts of the
-  log into a vendor session; nothing is sent anywhere else.
+  log into a vendor session, and `conbus usage --otlp URL`, only when you run
+  it, sends counts to a collector on this machine that you name; nothing is
+  sent anywhere else.
 
 For a reviewer, [`docs/security-packet.md`](docs/security-packet.md) lists on
 one page what conbus keeps, runs, changes and sends, and its known gaps.

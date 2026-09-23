@@ -257,8 +257,29 @@ cost      not in this log: no hook payload carries tokens or prices
 `conbus usage --json`은 날짜·에이전트·폴더·사람 여부마다 한 줄씩 출력합니다.
 숫자만 있고, 프롬프트·답변·툴 본문은 절대 들어가지 않습니다. `conbus usage
 --shareable`은 같은 줄에서 폴더를 뺀 것 — 동기화가 생긴다면 보낼 내용
-([RFD 0002](rfd/0002-metadata-sync.md))입니다. 어디로도 보내지 않습니다. 보내기
-전에 먼저 읽어 볼 수 있게 하려는 것입니다.
+([RFD 0002](rfd/0002-metadata-sync.md))입니다. `--shareable` 자체는 아무것도
+보내지 않습니다. 보내기 전에 먼저 읽어 볼 수 있게 하려는 것입니다.
+
+**내가 쓰는 모니터링으로:** `--otlp URL`은 같은 줄을 OpenTelemetry 메트릭으로 이
+Mac의 컬렉터에 보냅니다. OpenTelemetry Collector, Grafana Alloy, Datadog Agent는
+모두 `http://127.0.0.1:4318`에서 받고, 설정된 곳(Grafana, Datadog, CloudWatch)으로
+넘깁니다. 숫자 하나하나가 메트릭이 되고(`conbus.turns`, `kind`별 `conbus.stops`,
+`conbus.tool.failures` 등 — 전체 목록은
+[RFD 0002](rfd/0002-metadata-sync.md#the-pipe-the-same-rows-into-a-collector-the-person-runs)),
+에이전트와 사람 여부가 붙습니다. 이 플래그가 없으면 아무것도 보내지 않습니다.
+
+```bash
+conbus usage --day 2026-09-22 --shareable --otlp http://127.0.0.1:4318   # 끝난 하루의 줄을 출력하고 보냄
+```
+
+보내는 단위는 `--day`입니다. 끝난 어제를 한 번만 보내세요. 각 값은 그날 일어난
+일이라서 같은 날을 두 번 보내면 두 번 세고, 오늘은 아직 늘어나는 중입니다. 오늘을
+보내면 conbus가 그렇다고 알려 줍니다. UTC 자정 직후에 보내는 것이 좋습니다. 몇 시간
+전 시각이 찍힌 값을 버리는 백엔드가 있기 때문입니다(Datadog은 Historical Metrics
+Ingestion을 켜지 않으면 1시간보다 오래된 값을 받지 않습니다). 이 첫 버전은 이 Mac의
+컬렉터에만 평문 HTTP로 보냅니다. `https://`와 다른 호스트는 거부하고, 그 너머의 TLS는
+컬렉터가 맡습니다. 다시 시도하지도 않습니다. 거부된 URL, 연결 실패, 2xx가 아닌 응답,
+컬렉터가 거부했다고 밝힌 값은 오류이고, 명령은 0이 아닌 코드로 끝납니다.
 
 레코드 하나는 이렇게 생겼습니다(필드는 이벤트마다 다릅니다).
 
@@ -507,6 +528,10 @@ conbus에는 서버도, 계정도, 텔레메트리도 없습니다. 기능 세 �
 - `conbus summary --bus-id ID` — *다른* 레그의 에이전트에게 대화 요약을 부탁합니다.
   실행할 때만 동작합니다.
 
+`conbus usage --otlp URL`은 글이 아니라 숫자(`--shareable`의 줄)만, 지정한 이 Mac의
+컬렉터로, 실행할 때만 보냅니다(5장). 그다음 어디로 가는지는 그 컬렉터의 설정에 달려
+있습니다.
+
 쿼터를 읽으려고 conbus는 에이전트 자신의 CLI를 실행합니다(8장). hop을 결정할 때는
 `gh`에 그 폴더의 풀 리퀘스트를 묻습니다.
 
@@ -624,7 +649,7 @@ conbus uninstall --apply  # 지우기
 | `conbus run [HARNESS]` | 이 터미널에서 에이전트 시작. hop이 다음 에이전트를 여기서 띄움 |
 | `conbus backfill [--apply] [--gaps] [--chat-export PATH]` | 지난 기록 되살리기 |
 | `conbus summary --bus-id ID` | 다른 레그의 에이전트에게 대화 요약 요청 |
-| `conbus usage [--days N] [--since DAY] [--day DAY] [--json] [--shareable]` | 에이전트가 한 일을 셈(5장) |
+| `conbus usage [--days N] [--since DAY] [--day DAY] [--json] [--shareable] [--otlp URL]` | 에이전트가 한 일을 셈. `--otlp`는 `--shareable`의 줄을 이 Mac의 컬렉터로 보냄(5장) |
 | `conbus verdict` | hop의 4주 시험 채점(아래) |
 | `conbus arena fact --workspace DIR --claim TEXT --anchor PATH [--type T]` | 사실 받아들이기 |
 | `conbus arena link --from DIR --to DIR` | 한 폴더의 사실을 다른 폴더와 공유 |

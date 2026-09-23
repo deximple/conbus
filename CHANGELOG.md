@@ -18,6 +18,16 @@ the entry says so when it does.
   where Codex and Cursor take managed hooks. [docs/fleet.md](docs/fleet.md)
   covers the rest of a managed deployment: the binary, the per-user recorder,
   approving it as a managed login item, and removal.
+- `conbus usage --otlp URL`: the counts, into the monitoring a team already
+  runs. It sends exactly the rows `--shareable` prints for the window, as
+  OTLP/HTTP JSON metrics — `conbus.turns`, `conbus.stops` by `kind`,
+  `conbus.tool.failures` and the rest, tabled in RFD 0002 — to a collector on
+  this Mac, such as the OpenTelemetry Collector, Grafana Alloy or the Datadog
+  Agent on `127.0.0.1:4318`, which forwards them. A spike: one plain-HTTP
+  `POST` to a loopback address, no retry and no new dependency. `https://` and
+  other hosts are refused before a connection is made, and a send that fails
+  exits non-zero. The unit is a closed `--day`, sent once: the points are
+  deltas, so a day sent twice counts twice.
 
 ### Fixed
 

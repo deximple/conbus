@@ -13,9 +13,10 @@ Rust binary at `~/.local/bin/conbus`, plus a launchd agent
 extension. It also adds hook entries to each agent's own settings. On a
 managed Mac the organisation also places a copy the managed hooks name
 ([below](#on-a-managed-mac)); conbus itself writes no system file. There is no
-server, account or telemetry, and conbus makes no outbound connection of its
-own. In a pilot, the only thing shared is the counts file described below, and
-the participant sends it themselves.
+server, account or telemetry. conbus opens one connection of its own, and only
+when the person asks: `conbus usage --otlp URL` posts counts to a collector on
+the same Mac. In a pilot, the only thing shared is the counts file described
+below, and the participant sends it themselves.
 
 ## What it keeps, and where
 
@@ -53,9 +54,20 @@ else `~/.conbus`.
 
 ## What leaves the Mac
 
-conbus has no HTTP client. Text leaves only through programs the person already
-runs:
+Anything that leaves goes through a program the person already runs:
 
+- **Counts, to the person's own collector.** conbus's one HTTP client,
+  `conbus usage --otlp URL`, is off unless run with a URL. It sends the rows
+  `--shareable` prints — counts only, no text, path or id — as OpenTelemetry
+  metrics in one HTTP `POST`, to the address the person gives and no other.
+  That address must be this Mac (`127.0.0.1`, `[::1]` or `localhost`):
+  `https://`, any other host, and a URL with a user name or password are
+  refused before a connection is made. The transport is plain HTTP/1.1 over
+  loopback, so there is no TLS and no certificate to verify; the collector —
+  the OpenTelemetry Collector, Grafana Alloy or the Datadog Agent, say —
+  forwards the points under its own configuration and TLS. No dependency and
+  no process is added: it is Rust's standard `TcpStream`, and nothing is
+  started to send.
 - **Their agents.** A briefing, a hop and `conbus summary` put excerpts of the
   log into a session of the person's own agent. That agent's vendor receives
   them as context. `CONBUS_BRIEFING=off` stops briefings. Hops and summaries
@@ -180,6 +192,9 @@ remove the managed entries first and the system-wide binary last;
 - conbus does not encrypt prompts and replies at rest.
 - Any process running as the person can write records to the socket. Such a
   process can read the log already.
+- `conbus usage --otlp` does not authenticate the collector: whatever listens
+  on the port it is given receives the counts — on a shared Mac, possibly
+  another account's process.
 - A hook runs on every agent turn with the person's privileges. Whoever can
   replace `~/.local/bin/conbus` therefore runs code in every session, as with
   any hook. On a managed Mac the same holds for the system-wide binary the

@@ -17,6 +17,7 @@ mod hop;
 mod install;
 mod intent;
 mod landing;
+mod otlp;
 mod quota;
 mod report;
 mod runner;
@@ -162,11 +163,19 @@ fn main() -> ExitCode {
             day,
             json,
             shareable,
+            otlp: collector,
         } => run(|paths| {
+            // Read before the log is: a URL the pipe will not speak to is
+            // refused before anything is printed or sent.
+            let collector = collector
+                .as_deref()
+                .map(otlp::Endpoint::parse)
+                .transpose()?;
             usage::run(
                 paths,
                 usage::window(days, since.as_deref(), day.as_deref(), Timestamp::now())?,
                 usage::Output::of(json, shareable),
+                collector.as_ref(),
             )
         }),
         Command::Run { harness } => run(|paths| runner::run(paths, &harness)),
