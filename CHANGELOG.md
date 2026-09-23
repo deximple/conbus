@@ -4,7 +4,14 @@ All notable changes to conbus. Versions follow [Semantic Versioning](https://sem
 until 1.0 a minor version may change the command line or the log format, and
 the entry says so when it does.
 
-## [Unreleased]
+## [0.2.6] — 2026-09-24
+
+Release tooling and checks; the recorder does what 0.2.5 did. The pipe was
+checked against a real OpenTelemetry Collector and Grafana Alloy, and every
+point they kept equalled the `--shareable` row. `scripts/sign-release.sh`
+signs a published release with a Developer ID and has Apple notarize it.
+conbus's own tests no longer reach the recorder of the person running them.
+Upgrading is the usual `conbus install --apply`.
 
 ### Added
 

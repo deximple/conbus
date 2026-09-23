@@ -458,8 +458,17 @@ log is readable by its owner only and both halves of the release binary are
 signed (#41 — both found while fact-checking the packet); a one-page
 `docs/security-packet.md` and RFD 0003 as a draft (#41); `install --managed`
 and `docs/fleet.md` for fleets that set `allowManagedHooksOnly` (#42); and
-`usage --otlp`, the pipe, to a collector on the same Mac (#43). Next, each its
-own PR with a failing test first:
+`usage --otlp`, the pipe, to a collector on the same Mac (#43). 0.2.6 adds
+release tooling and checks, and the recorder does what 0.2.5 did:
+- the pipe checked against a real OpenTelemetry Collector and Grafana Alloy
+  (#46, #47);
+- `scripts/sign-release.sh` (#48);
+- tests that stay out of the person's recorder (#45).
+
+Its Developer ID signing waits on the operator's certificate (`docs/release.md`).
+Sign `v0.2.6` in place with `--upload`, then deploy it and measure the upgrade
+gap with a stable signing identity. Next, each its own PR with a failing test
+first:
 
 1. Score the dogfood window with `conbus verdict` when it closes (2026-09-28)
    and record the result against Option 2 in `docs/saas-hypothesis.md` — do
