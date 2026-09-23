@@ -420,14 +420,34 @@ three.
 ## Next task
 
 Run `docs/self-improve.md` from current evidence, not from this file's memory.
-First confirm the Grok echo fix live: after `install --apply` and a daemon
-restart, records written since then should hold no Grok pair (same `bus_id`,
-event and `tool_use_id` within two seconds). Then the Cursor and OpenCode
-duplicates under Still open.
-Score the dogfood window with `conbus verdict` — do not declare the 4-week
-clock closed unless the command says it is, and note that it now refuses to
-score a window with no organic hop at all. A model digest is
-`conbus summary --bus-id`; hop-path model calls stay zero.
+The Grok echo fix is confirmed live (0.2.1: in the hour before the deploy 439
+of 887 Grok records were twins; after it, 0 of 37).
+
+The SaaS plan's agent side for 2026-09-24 → 10-07 (`docs/saas-strategy.md`,
+90 days), in this order, each its own PR with a failing test first:
+
+1. Score the dogfood window with `conbus verdict` when it closes (2026-09-28)
+   and record the result against Option 2 in `docs/saas-hypothesis.md` — do
+   not declare the 4-week clock closed unless the command says it is; it
+   refuses to score a window with no organic hop at all.
+2. Cursor: one end per vendor turn, and quota only from structured fields
+   (`afterAgentResponse` matches quota words in the assistant's own reply) —
+   see Still open before touching the duplicate pairs.
+3. OpenCode: stop re-reporting one `msg_…` as a new `turn_started`, and check
+   the role of forwarded parts (Still open).
+4. `usage`: count gap-filled turns separately (`recovered` — Codex.app's only
+   record) and keep hop-probe conversations out of the stop counts; amend RFD
+   0002's row table in the same PR.
+5. `usage --day DAY`: one closed day, for pilots and for RFD 0002's
+   once-a-day send.
+6. For pilots: a managed-settings / MDM path for fleets that set
+   `allowManagedHooksOnly`, a one-page `docs/security-packet.md`, RFD 0003
+   (security, before any sync code), and a local OTLP export spike (the "pipe").
+
+Waiting on the operator: the V0 desk count, the weekly hour budget, an Apple
+Developer ID (see "The first start after an upgrade is refused once"), and
+repository visibility. A model digest is `conbus summary --bus-id`; hop-path
+model calls stay zero.
 
 After 0.1.0, watch two things on a live machine. Drops with the
 `NO_SESSION` reason and a `preToolUse`/`postToolUse` detail are Cursor worker
