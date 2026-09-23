@@ -1,6 +1,6 @@
 # conbus 매뉴얼
 
-이 매뉴얼은 macOS용 **conbus 0.2.0**을 설명합니다. 짧게 훑으려면
+이 매뉴얼은 macOS용 **conbus 0.2.1**을 설명합니다. 짧게 훑으려면
 [README](../README.md)를, 릴리스 사이에 무엇이 바뀌었는지는
 [CHANGELOG](../CHANGELOG.md)를 보세요. English: [manual.md](manual.md)
 
@@ -90,7 +90,7 @@ curl -fsSL https://raw.githubusercontent.com/deximple/conbus/main/install.sh | s
 
 | 변수 | 효과 |
 | --- | --- |
-| `CONBUS_VERSION=v0.2.0` | 최신 대신 그 릴리스를 설치 |
+| `CONBUS_VERSION=v0.2.1` | 최신 대신 그 릴리스를 설치 |
 | `CONBUS_REPO=owner/name` | 포크에서 설치 |
 | `CONBUS_BASE_URL=…` | 미러에서 받기. 로컬 빌드는 `file:///path/to/dist` |
 
@@ -149,7 +149,7 @@ Codex는 새 훅을 승인받은 뒤에만 실행합니다. Codex를 한 번 켜
 
 | 줄 | 정상 |
 | --- | --- |
-| `build` | `0.2.0 (<commit>)` |
+| `build` | `0.2.1 (<commit>)` |
 | `socket` | `listening` |
 | `daemon` | `build`와 같은 커밋. `DIFFERS`는 바이너리를 바꾸고 데몬을 다시 시작하지 않았다는 뜻입니다 |
 | `writable` | `appendable` |
@@ -308,7 +308,7 @@ hop은 지금 대화를 다른 레그로 옮깁니다. conbus는 그 결정을 �
 | 목적지도 소진됨 | 대신 **기다림** |
 | 무인 세션(프로그램) | **hop 안 함** |
 
-0.2.0에서 자동 hop은 실험적 기능입니다. 테스트와 요청에서는 동작했지만, 실제
+0.2.1에서 자동 hop은 실험적 기능입니다. 테스트와 요청에서는 동작했지만, 실제
 쿼터 중단에서 발동하는 것은 아직 관측되지 않았습니다.
 
 ### 직접 hop하기
