@@ -143,7 +143,7 @@ pub fn normalize(harness: &Harness, json: &str) -> Result<Normalized, HookError>
         }
         "afterAgentResponse" => {
             let text = payload.text.unwrap_or_default();
-            if classified_quota(&text) {
+            if response_is_quota_error(&text) {
                 Event::TurnEnded {
                     state: TurnState::InterruptedQuota { reason: text },
                     assistant_message: None,
@@ -193,19 +193,41 @@ fn session_end_quota(payload: &Payload) -> Option<String> {
     .map(str::to_string)
 }
 
+const QUOTA_CODES: [&str; 8] = [
+    "FREE_USER_RATE_LIMIT_EXCEEDED",
+    "PRO_USER_RATE_LIMIT_EXCEEDED",
+    "FREE_USER_USAGE_LIMIT",
+    "PRO_USER_USAGE_LIMIT",
+    "RESOURCE_EXHAUSTED",
+    "RATE_LIMITED_CHANGEABLE",
+    "GENERIC_RATE_LIMIT_EXCEEDED",
+    "RATE_LIMITED",
+];
+
+/// A status or error field that names a limit. These are Cursor's own fields,
+/// so containing a code is enough.
 fn classified_quota(text: &str) -> bool {
-    [
-        "FREE_USER_RATE_LIMIT_EXCEEDED",
-        "PRO_USER_RATE_LIMIT_EXCEEDED",
-        "FREE_USER_USAGE_LIMIT",
-        "PRO_USER_USAGE_LIMIT",
-        "RESOURCE_EXHAUSTED",
-        "RATE_LIMITED_CHANGEABLE",
-        "GENERIC_RATE_LIMIT_EXCEEDED",
-        "RATE_LIMITED",
-    ]
-    .iter()
-    .any(|code| text.contains(code))
+    QUOTA_CODES.iter().any(|code| text.contains(code))
+}
+
+/// Longest agent response still read as an error line.
+const ERROR_LINE_MAX: usize = 160;
+
+/// Whether an agent response is Cursor reporting a limit rather than the agent
+/// talking about one.
+///
+/// `afterAgentResponse` is the agent's own words, and the only place Cursor
+/// names a limit it hit: the bubble reads `request failed: PRO_USER_USAGE_LIMIT`.
+/// A reply that explains gRPC's RESOURCE_EXHAUSTED contains the code too. The
+/// error is one short line that ends in the code; prose is not.
+fn response_is_quota_error(text: &str) -> bool {
+    let line = text.trim();
+    !line.contains('\n')
+        && line.chars().count() <= ERROR_LINE_MAX
+        && line
+            .rsplit([' ', ':'])
+            .next()
+            .is_some_and(|last| QUOTA_CODES.contains(&last))
 }
 
 fn stop_or_quota(status: Option<&str>) -> TurnState {
@@ -526,6 +548,62 @@ mod tests {
                 ..
             } => assert!(reason.contains("PRO_USER_USAGE_LIMIT")),
             other => panic!("{other:?}"),
+        }
+    }
+
+    fn after_agent_response(text: &str) -> Event {
+        event_of(
+            &serde_json::json!({
+                "hook_event_name": "afterAgentResponse",
+                "cursor_version": "3.19.13",
+                "conversation_id": "conv-1",
+                "generation_id": "gen-1",
+                "text": text,
+            })
+            .to_string(),
+        )
+    }
+
+    #[test]
+    fn a_reply_that_mentions_a_quota_code_is_a_reply_not_a_stop() {
+        // `afterAgentResponse` carries the agent's own words. A reply that
+        // explains gRPC's RESOURCE_EXHAUSTED contains the code and is not
+        // Cursor refusing a turn.
+        let reply =
+            "The API returned RESOURCE_EXHAUSTED, so I retried with backoff and the tests pass.";
+        match after_agent_response(reply) {
+            Event::TurnEnded {
+                state: TurnState::Complete,
+                assistant_message: Some(Body::Kept { text }),
+            } => assert_eq!(text, reply),
+            other => panic!("{other:?}"),
+        }
+        let quoted = "Found it:\nRESOURCE_EXHAUSTED";
+        assert!(
+            matches!(
+                after_agent_response(quoted),
+                Event::TurnEnded {
+                    state: TurnState::Complete,
+                    ..
+                }
+            ),
+            "a reply that ends on a code line is still prose"
+        );
+    }
+
+    #[test]
+    fn a_bare_quota_code_as_the_whole_reply_is_the_stop() {
+        for line in [
+            "RESOURCE_EXHAUSTED",
+            "request failed: FREE_USER_RATE_LIMIT_EXCEEDED",
+        ] {
+            match after_agent_response(line) {
+                Event::TurnEnded {
+                    state: TurnState::InterruptedQuota { reason },
+                    ..
+                } => assert_eq!(reason, line),
+                other => panic!("{line}: {other:?}"),
+            }
         }
     }
 

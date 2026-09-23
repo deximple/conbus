@@ -4,6 +4,18 @@ All notable changes to conbus. Versions follow [Semantic Versioning](https://sem
 until 1.0 a minor version may change the command line or the log format, and
 the entry says so when it does.
 
+## [Unreleased]
+
+### Fixed
+
+- A Cursor reply that mentions a limit code is a reply, not a quota stop.
+  `afterAgentResponse` carries the agent's own words, and any reply containing
+  `RESOURCE_EXHAUSTED` — explaining a gRPC error, say — was filed as Cursor
+  refusing the turn. A response is now a limit only when it is one short line
+  ending in the code, the way Cursor's error bubble reads
+  (`request failed: PRO_USER_USAGE_LIMIT`). Status and error fields are read as
+  before.
+
 ## [0.2.3] — 2026-09-23
 
 ### Fixed
