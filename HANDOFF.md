@@ -367,6 +367,23 @@ three.
   Those payloads are dropped now, visibly. Which field, if any, names the
   session in a worker payload is still unread — capture one rather than
   guessing.
+- **Duplicates the Grok echo fix does not cover.** Cursor: some
+  `turn_started`/`turn_ended` pairs land milliseconds apart (18 + 18 in the
+  week to 2026-09-23), most likely the same double registration, since Cursor
+  runs Claude Code's `UserPromptSubmit`/`Stop` hooks beside its own
+  `hooks.json`. Do not copy Grok's guard onto it: Cursor's two files "do not
+  always both fire", and the copy stood down could be the only prompt that
+  mints. Find out which copy ever arrives alone first. `afterAgentResponse`
+  and `stop` both write `turn_ended` on purpose, so if `stop` says `error`
+  after a limit, one quota stop is also counted as a policy stop by `usage`.
+  About 200 `tool_use` records a week share a `tool_use_id` without
+  matching; only `postToolUse` writes `tool_use`, and it comes only through
+  Claude Code's registration, so they are not echoes. OpenCode: the plugin
+  reports a user message as `turn_started` on every `message.updated`, which
+  fires again whenever OpenCode rewrites that message, with `summary.title`
+  as the prompt; it also forwards `message.part.updated` text without
+  checking the role. A `msg_…` id names one message, so a second
+  `turn_started` for it is always a re-report.
 - Nothing produces `interrupted_user`; `is_interrupt` on a failed tool call is
   the only signal anywhere that a person stopped the work.
 - An older `v` is still read as if it were current. `scan` rejects a record
@@ -384,6 +401,10 @@ three.
 ## Next task
 
 Run `docs/self-improve.md` from current evidence, not from this file's memory.
+First confirm the Grok echo fix live: after `install --apply` and a daemon
+restart, records written since then should hold no Grok pair (same `bus_id`,
+event and `tool_use_id` within two seconds). Then the Cursor and OpenCode
+duplicates under Still open.
 Score the dogfood window with `conbus verdict` — do not declare the 4-week
 clock closed unless the command says it is, and note that it now refuses to
 score a window with no organic hop at all. A model digest is

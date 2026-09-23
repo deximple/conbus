@@ -48,3 +48,16 @@ Stop a cycle when the picked defect is verified fixed. Do not mark the product f
   failing differently each run. Next live defect: whether the orphan drops with a
   `preToolUse` detail actually stop, and the first organic hop — which cannot be
   manufactured, and which `verdict` now refuses to score a window without.
+- 2026-09-23 cycle 3 — live defect: every Grok event since 2026-09-06 reached
+  the log twice (week from 09-17: 2,882 `tool_requested` and 2,881 `tool_use`
+  twins, 145 `turn_started`, 136 `turn_ended`). Root cause: Grok runs Claude
+  Code's `settings.json` hooks beside its own `~/.grok/hooks/conbus.json`, and
+  the hook names the harness from the payload, so both copies were written as
+  grok. The twins start the day `install` first wrote Grok's file. Fix: a Grok
+  payload that did not come through `--harness grok` is answered and not sent,
+  while Grok's own file registers that event through a binary that exists
+  (`hook::client::grok_echo`). Verified in the suite only:
+  `a_grok_event_reaches_the_log_once_though_grok_runs_both_registrations`
+  failed first through the real binary and `install`'s own registrations, with
+  four event kinds doubled. Live check not yet run: no Grok pair in records
+  written after `install --apply` and a daemon restart.
