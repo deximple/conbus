@@ -210,18 +210,24 @@ fn rejected(body: &[u8]) -> Option<(u64, String)> {
     let said = partial
         .get("errorMessage")
         .and_then(Value::as_str)
+        .and_then(one_line)
         .unwrap_or_default();
-    (count > 0).then(|| (count, said.to_string()))
+    (count > 0).then_some((count, said))
 }
 
-/// What the collector said, on one line: a `Status` message when it sent one,
-/// else the start of whatever it sent, with anything that is not text dropped.
+/// What the collector said: a `Status` message when it sent one, else the
+/// start of whatever it sent.
 fn detail(body: &[u8]) -> Option<String> {
     let status = serde_json::from_slice::<Value>(body).ok();
-    let text = match status.as_ref().and_then(|v| v.get("message")?.as_str()) {
-        Some(message) => message.to_string(),
-        None => String::from_utf8_lossy(body).into_owned(),
-    };
+    match status.as_ref().and_then(|v| v.get("message")?.as_str()) {
+        Some(message) => one_line(message),
+        None => one_line(&String::from_utf8_lossy(body)),
+    }
+}
+
+/// Text from the collector, made safe to print: one line, no control
+/// characters — nothing that could move a terminal's cursor — and bounded.
+fn one_line(text: &str) -> Option<String> {
     let line = text
         .split(|c: char| c.is_whitespace() || c.is_control())
         .filter(|word| !word.is_empty())
@@ -545,6 +551,15 @@ mod tests {
                 "{rejected}"
             );
         }
+        // What the collector says is printed, so it reaches the terminal as
+        // one line of text and nothing that could drive it.
+        let collector = Collector::answering(&answer(
+            "200 OK",
+            r#"{"partialSuccess":{"rejectedDataPoints":"1","errorMessage":"too\u001b[2J\nold"}}"#,
+        ));
+        let taken = post(&collector.endpoint, BODY, &BOUNDS).expect("taken");
+        collector.request();
+        assert_eq!(taken.rejected, Some((1, "too [2J old".to_string())));
         // Zero rejected is a full success, whatever else it says.
         let collector = Collector::answering(&answer(
             "200 OK",
