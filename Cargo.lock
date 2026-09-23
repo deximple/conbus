@@ -67,7 +67,7 @@ dependencies = [
 
 [[package]]
 name = "conbus"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "conbus-core",
  "libc",
@@ -78,7 +78,7 @@ dependencies = [
 
 [[package]]
 name = "conbus-core"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "aes-gcm",
  "getrandom 0.2.17",
