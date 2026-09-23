@@ -55,6 +55,19 @@ to the model. Do not use vendor trademarks in product or feature names.
 goes the same way, through `install::write_atomically`, carrying the mode the
 file already had.
 
+**The first start after an upgrade is refused once.** macOS's Background Task
+Management records a launch constraint for the agent in
+`~/Library/LaunchAgents`, and an ad-hoc-signed binary gets a new identity with
+every build. So the first start of a replaced binary exits at once with
+`OS_REASON_CODESIGNING | Launch Constraint Violation`, and launchd waits its
+`ThrottleInterval` before the next — ten seconds by default, which was the whole
+~14 s hook gap of both deploys on 2026-09-23 (`log show` with
+`eventMessage CONTAINS "sh.conbus.daemon"` shows it). The plist now asks for
+two seconds. A Developer ID signature would carry a stable team identity and
+should avoid the refusal altogether; that needs the operator's Apple account.
+The constraint is not applied to a job bootstrapped from any other directory,
+so a probe outside `LaunchAgents` does not reproduce it.
+
 ## Decisions that are closed — and the two that stage 1 reopened
 
 Argued through four review rounds; the reasoning is in the plan.

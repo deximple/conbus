@@ -4,6 +4,19 @@ All notable changes to conbus. Versions follow [Semantic Versioning](https://sem
 until 1.0 a minor version may change the command line or the log format, and
 the entry says so when it does.
 
+## [Unreleased]
+
+### Fixed
+
+- An upgrade leaves the hooks without a recorder for a few seconds, not ~14.
+  macOS refuses the first start of a replaced binary once (a Background Task
+  Management launch constraint: the build is ad-hoc signed, so every version is
+  a new identity), and launchd's default then waited ten seconds before trying
+  again. The launchd agent now sets `ThrottleInterval` to two seconds. When the
+  agent's file changed, `conbus install --apply` unloads and reloads it
+  (`bootout`, then `bootstrap`), because `kickstart -k` keeps the definition
+  launchd already read — run it once after upgrading to this version.
+
 ## [0.2.1] — 2026-09-23
 
 ### Fixed

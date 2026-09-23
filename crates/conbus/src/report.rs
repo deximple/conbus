@@ -395,13 +395,22 @@ pub fn install(apply: bool) -> io::Result<()> {
             std::fs::create_dir_all(parent)?;
         }
         let load = std::env::var_os("CONBUS_SKIP_LAUNCHCTL").is_none();
-        if crate::install::apply_daemon(&home, &binary, &log, load)? {
+        let changed = crate::install::apply_daemon(&home, &binary, &log, load)?;
+        if changed {
             println!("{:<12} written", "");
         } else {
             println!("{:<12} already loaded this file", "");
         }
         if load {
-            println!("{:<12} launchctl kickstart/bootstrap attempted", "");
+            println!(
+                "{:<12} {}",
+                "",
+                if changed {
+                    "reloaded: launchctl bootout, then bootstrap, so launchd reads the new file"
+                } else {
+                    "restarted: launchctl kickstart -k"
+                }
+            );
         }
     } else {
         println!("{:<12} would write the launchd agent on --apply", "");

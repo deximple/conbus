@@ -532,6 +532,11 @@ restarts the recorder on the new binary, which takes a few seconds. If `doctor`
 shows `daemon … DIFFERS`, this step was skipped. A hook newer than the running
 recorder is refused with "Restart the daemon" rather than half-understood.
 
+When the recorder's launchd file itself changed, as it did in 0.2.2, the same
+command unloads and reloads it (`bootout`, then `bootstrap`), because a restart
+alone keeps the old definition. macOS refuses the first start of a replaced
+binary once, so the hooks go unrecorded for a few seconds while it tries again.
+
 ---
 
 ## 13. Uninstalling
