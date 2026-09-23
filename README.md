@@ -136,11 +136,11 @@ and `rm -rf ~/.conbus` removes it if you want it gone.
 | `conbus daemon` · `conbus hook` | The recorder, and the hook it registers |
 | `conbus --version` | Version and the commit it was built from |
 
-`conbus <command> --help` prints the full usage.
+`conbus <command> --help` prints the full usage; the [manual](docs/manual.md) explains each one.
 
 ## More
 
-[Changelog](CHANGELOG.md) · [Security](SECURITY.md) · [Releasing](docs/release.md) ·
+[Manual](docs/manual.md) · [Changelog](CHANGELOG.md) · [Security](SECURITY.md) · [Releasing](docs/release.md) ·
 [Hop walkthrough](docs/hop-demo.md) · [Hook contract](docs/rfd/0001-hook-contract.md) ·
 [Fact schema](docs/fact-schema.md) · [운영자 매뉴얼 (한국어)](docs/beginner-manual.md) ·
 [License](LICENSE)
