@@ -115,14 +115,19 @@ Summarised here; the contract is [RFD 0002](rfd/0002-metadata-sync.md).
 Anchors: Swarmia's "AI adoption and cost" module $5 per developer, its full
 platform $45–55; LinearB $29–59; Langfuse $29–2,499 per month; Copilot Pro $10;
 Paseo's hosted hub €15 per seat; Conductor Teams $60 per user. The two surveys
-behind this file disagree on the band ($5–10 vs $15–30 per developer), which is
-the reason to test rather than pick.
+behind this file disagree on the band ($5–10 vs $15–30 per developer), and the
+operator's first proposal was higher still (Pro $15–25, Team $30–50 per user).
+The hypothesis starts at $8 because the Team tier sells counts, not an agent,
+and the nearest thing on sale — a cost-and-adoption module — is $5; there is no
+individual Pro tier because individuals use free tools. Those are reasons to
+test, not to pick, so the ladder below reaches the operator's band.
 
 The experiment, in the interviews and the pilots below:
 
 1. Van Westendorp's four questions (too cheap, cheap, expensive, too expensive)
    per active developer per month.
-2. A Gabor–Granger check at $5, $8, $12 and $15: "would your team pay this?"
+2. A Gabor–Granger check at $5, $8, $12, $15 and $25: "would your team pay
+   this?"
 3. At the end of a pilot, a paid ask: a letter of intent or a 30-day paid pilot
    at the price the answers point to.
 4. Only if the operator publishes a page: a pricing fake door (Team vs
