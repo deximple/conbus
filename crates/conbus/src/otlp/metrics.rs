@@ -45,7 +45,11 @@ use std::io;
 
 use conbus_core::clock::Timestamp;
 use conbus_core::usage::{Attendance, Counts, SharedRow};
-use serde::Serialize;
+
+use super::proto::{
+    AnyValue, Data, ExportMetricsServiceRequest, Gauge, KeyValue, Metric, NumberDataPoint,
+    Resource, ResourceMetrics, ScopeMetrics, Sum,
+};
 
 /// `AGGREGATION_TEMPORALITY_DELTA` in `metrics.proto`: each point is what
 /// changed in its own interval.
@@ -348,44 +352,6 @@ fn invalid(message: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
-// The wire, one type per proto message it stands for, each field named as the
-// proto names it; `rename_all` makes the lowerCamelCase that OTLP/JSON wants.
-
-/// `opentelemetry.proto.collector.metrics.v1.ExportMetricsServiceRequest`.
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ExportMetricsServiceRequest {
-    resource_metrics: Vec<ResourceMetrics>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ResourceMetrics {
-    resource: Resource,
-    scope_metrics: Vec<ScopeMetrics>,
-}
-
-#[derive(Serialize)]
-struct Resource {
-    attributes: Vec<KeyValue>,
-}
-
-/// With no `scope`: which program sent the points is the resource's to say.
-#[derive(Serialize)]
-struct ScopeMetrics {
-    metrics: Vec<Metric>,
-}
-
-#[derive(Serialize)]
-struct Metric {
-    name: &'static str,
-    description: &'static str,
-    unit: &'static str,
-    /// The proto's `oneof data`: `"sum": {…}` or `"gauge": {…}`.
-    #[serde(flatten)]
-    data: Data,
-}
-
 impl Metric {
     fn new(instrument: &'static Instrument, first: NumberDataPoint) -> Self {
         let data_points = vec![first];
@@ -406,64 +372,10 @@ impl Metric {
     }
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-enum Data {
-    Sum(Sum),
-    Gauge(Gauge),
-}
-
-impl Data {
-    fn points(&mut self) -> &mut Vec<NumberDataPoint> {
-        match self {
-            Data::Sum(sum) => &mut sum.data_points,
-            Data::Gauge(gauge) => &mut gauge.data_points,
-        }
-    }
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct Sum {
-    aggregation_temporality: u8,
-    is_monotonic: bool,
-    data_points: Vec<NumberDataPoint>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct Gauge {
-    data_points: Vec<NumberDataPoint>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct NumberDataPoint {
-    attributes: Vec<KeyValue>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    start_time_unix_nano: Option<String>,
-    time_unix_nano: String,
-    as_int: String,
-}
-
-#[derive(Serialize)]
-struct KeyValue {
-    key: &'static str,
-    value: AnyValue,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct AnyValue {
-    string_value: String,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use conbus_core::event::{Body, Entrypoint, Event, Harness, Source, ToolOutcome, TurnState};
-    use conbus_core::record::{Record, SCHEMA_VERSION};
-    use conbus_core::usage::{Counts, Ledger};
+    use conbus_core::usage::Counts;
     use serde_json::Value;
 
     const VERSION: &str = "0.2.4";
@@ -820,120 +732,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    fn record(ts: &str, bus_id: &str, source: Source, event: Event) -> Record {
-        Record {
-            schema_version: SCHEMA_VERSION,
-            seq: 1,
-            ts: ts.parse().expect("ts"),
-            bus_id: bus_id.parse().expect("id"),
-            vendor_turn_id: None,
-            vendor_agent_id: None,
-            source,
-            event,
-        }
-    }
-
-    #[test]
-    fn nothing_but_counts_reaches_the_body() {
-        // RFD 0002's never-sent list, with a canary for each kind of thing a
-        // log holds: a prompt, a reply, a tool, its input and its error, a
-        // stop reason, a folder, a raw entrypoint, a session id and a bus id.
-        const BUS: &str = "01996b1e-2c4a-7c31-9d0e-4f2a6b8c1d3e";
-        let source = || Source {
-            harness: Harness::new(Harness::CLAUDE_CODE),
-            harness_version: Some("9.9.9-canary".into()),
-            vendor_session_id: Some("sess-canary".into()),
-            workspace: Some("/Users/someone/secret-project".into()),
-            entrypoint: Some(Entrypoint::new("sdk-cli")),
-            backfilled_from: None,
-        };
-        let ledger = Ledger::fold(
-            &[
-                record(
-                    "2026-09-22T09:00:00.000Z",
-                    BUS,
-                    source(),
-                    Event::TurnStarted {
-                        author: None,
-                        prompt: Body::kept("the secret plan"),
-                    },
-                ),
-                record(
-                    "2026-09-22T09:00:01.000Z",
-                    BUS,
-                    source(),
-                    Event::ToolUse {
-                        tool: "Bash".into(),
-                        tool_use_id: None,
-                        duration_ms: Some(1_500),
-                        input: Body::kept("cargo test"),
-                        outcome: ToolOutcome::Failed {
-                            error: Body::kept("password=hunter2"),
-                            interrupted: false,
-                        },
-                    },
-                ),
-                record(
-                    "2026-09-22T09:00:02.000Z",
-                    BUS,
-                    source(),
-                    Event::TurnEnded {
-                        state: TurnState::InterruptedQuota {
-                            reason: "rate_limit: canary".into(),
-                        },
-                        assistant_message: Some(Body::kept("here is the plan")),
-                    },
-                ),
-            ],
-            "2026-09-22",
-        );
-        let rows = ledger.shareable();
-        let payload = encode(&rows, VERSION, later()).expect("encode");
-        let text = String::from_utf8(payload.body.clone()).expect("utf8");
-
-        for leaked in [
-            "secret plan",
-            "here is the plan",
-            "Bash",
-            "cargo test",
-            "hunter2",
-            "rate_limit",
-            "canary",
-            "secret-project",
-            "/Users",
-            "workspace",
-            "sdk-cli",
-            BUS,
-        ] {
-            assert!(!text.contains(leaked), "{leaked} reached the body: {text}");
-        }
-        let body: Value = serde_json::from_str(&text).expect("json");
-        let metrics = metrics_of(&body);
-        let value_of = |name: &str, kind: Option<&str>| {
-            metrics
-                .iter()
-                .filter(|m| m["name"] == name)
-                .flat_map(points_of)
-                .find(|p| attribute(p, "kind").as_deref() == kind)
-                .and_then(|p| p["asInt"].as_str().map(str::to_string))
-        };
-        assert_eq!(value_of("conbus.turns", None).as_deref(), Some("1"));
-        assert_eq!(
-            value_of("conbus.stops", Some("limit")).as_deref(),
-            Some("1")
-        );
-        assert_eq!(value_of("conbus.tool.failures", None).as_deref(), Some("1"));
-        assert_eq!(
-            value_of("conbus.tool.duration", None).as_deref(),
-            Some("1500")
-        );
-        assert_eq!(
-            attribute(&points_of(&metrics[1])[0], "attendance").as_deref(),
-            Some("unattended"),
-            "the class, never the entrypoint it came from"
-        );
     }
 
     #[test]

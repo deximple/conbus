@@ -20,6 +20,7 @@
 
 mod metrics;
 mod post;
+mod proto;
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -211,7 +212,10 @@ pub fn export(endpoint: &Endpoint, rows: &[SharedRow], now: Timestamp) -> io::Re
 mod tests {
     use super::post::fake::{Collector, answer};
     use super::*;
-    use conbus_core::usage::{Attendance, Counts};
+    use conbus_core::event::{Body, Entrypoint, Event, Harness, Source, ToolOutcome, TurnState};
+    use conbus_core::record::{Record, SCHEMA_VERSION};
+    use conbus_core::usage::{Attendance, Counts, Ledger};
+    use serde_json::Value;
 
     const OK: &str =
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}";
@@ -449,5 +453,139 @@ mod tests {
         let text = err.to_string();
         assert!(text.contains("rejected 20 of 20 data point(s)"), "{text}");
         assert!(text.contains("older than an hour"), "{text}");
+    }
+
+    const BUS: &str = "01996b1e-2c4a-7c31-9d0e-4f2a6b8c1d3e";
+
+    fn record(ts: &str, source: Source, event: Event) -> Record {
+        Record {
+            schema_version: SCHEMA_VERSION,
+            seq: 1,
+            ts: ts.parse().expect("ts"),
+            bus_id: BUS.parse().expect("id"),
+            vendor_turn_id: None,
+            vendor_agent_id: None,
+            source,
+            event,
+        }
+    }
+
+    /// The value the collector was sent for one metric and `kind` of it.
+    fn sent(body: &Value, name: &str, kind: Option<&str>) -> Option<String> {
+        body["resourceMetrics"][0]["scopeMetrics"][0]["metrics"]
+            .as_array()?
+            .iter()
+            .filter(|metric| metric["name"] == name)
+            .filter_map(|metric| metric.get("sum").or_else(|| metric.get("gauge")))
+            .filter_map(|data| data["dataPoints"].as_array())
+            .flatten()
+            .find(|point| {
+                let kind_of = point["attributes"].as_array().and_then(|kvs| {
+                    kvs.iter()
+                        .find(|kv| kv["key"] == "kind")
+                        .and_then(|kv| kv["value"]["stringValue"].as_str())
+                });
+                kind_of == kind
+            })
+            .and_then(|point| point["asInt"].as_str().map(str::to_string))
+    }
+
+    #[test]
+    fn nothing_but_counts_reaches_the_collector() {
+        // RFD 0002's never-sent list, with a canary for each kind of thing a
+        // log holds: a prompt, a reply, a tool, its input and its error, a
+        // stop reason, a folder, a raw entrypoint, a harness version, a
+        // session id and a bus id — looked for in the whole request, head and
+        // body, as the collector received it.
+        let source = || Source {
+            harness: Harness::new(Harness::CLAUDE_CODE),
+            harness_version: Some("9.9.9-canary".into()),
+            vendor_session_id: Some("sess-canary".into()),
+            workspace: Some("/Users/someone/secret-project".into()),
+            entrypoint: Some(Entrypoint::new("sdk-cli")),
+            backfilled_from: None,
+        };
+        let ledger = Ledger::fold(
+            &[
+                record(
+                    "2026-09-22T09:00:00.000Z",
+                    source(),
+                    Event::TurnStarted {
+                        author: None,
+                        prompt: Body::kept("the secret plan"),
+                    },
+                ),
+                record(
+                    "2026-09-22T09:00:01.000Z",
+                    source(),
+                    Event::ToolUse {
+                        tool: "Bash".into(),
+                        tool_use_id: None,
+                        duration_ms: Some(1_500),
+                        input: Body::kept("cargo test"),
+                        outcome: ToolOutcome::Failed {
+                            error: Body::kept("password=hunter2"),
+                            interrupted: false,
+                        },
+                    },
+                ),
+                record(
+                    "2026-09-22T09:00:02.000Z",
+                    source(),
+                    Event::TurnEnded {
+                        state: TurnState::InterruptedQuota {
+                            reason: "rate_limit: canary".into(),
+                        },
+                        assistant_message: Some(Body::kept("here is the plan")),
+                    },
+                ),
+            ],
+            "2026-09-22",
+        );
+        let collector = Collector::answering(OK);
+
+        export(&collector.endpoint, &ledger.shareable(), later()).expect("sent");
+
+        let request = String::from_utf8(collector.request()).expect("utf8");
+        for leaked in [
+            "secret plan",
+            "here is the plan",
+            "Bash",
+            "cargo test",
+            "hunter2",
+            "rate_limit",
+            "canary",
+            "secret-project",
+            "/Users",
+            "workspace",
+            "sdk-cli",
+            BUS,
+        ] {
+            assert!(
+                !request.contains(leaked),
+                "{leaked} reached the collector: {request}"
+            );
+        }
+        let (_, body) = request.split_once("\r\n\r\n").expect("a head");
+        let body: Value = serde_json::from_str(body).expect("json");
+        assert_eq!(sent(&body, "conbus.turns", None).as_deref(), Some("1"));
+        assert_eq!(
+            sent(&body, "conbus.stops", Some("limit")).as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            sent(&body, "conbus.tool.failures", None).as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            sent(&body, "conbus.tool.duration", None).as_deref(),
+            Some("1500")
+        );
+        let turns = &body["resourceMetrics"][0]["scopeMetrics"][0]["metrics"][1];
+        assert_eq!(turns["name"], "conbus.turns");
+        assert_eq!(
+            turns["sum"]["dataPoints"][0]["attributes"][1]["value"]["stringValue"], "unattended",
+            "the class, never the entrypoint it came from"
+        );
     }
 }
