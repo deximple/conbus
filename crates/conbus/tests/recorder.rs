@@ -543,6 +543,191 @@ fn a_codex_session_is_read_by_the_codex_adapter_not_merely_labelled_codex() {
     daemon.stop();
 }
 
+/// `conbus install --apply` into a throwaway HOME, as a person runs it. Never
+/// the runner's or the developer's launchd.
+fn install_into(home: &Path) {
+    let out = Command::new(bin())
+        .args(["install", "--apply"])
+        .env("HOME", home)
+        .env("CONBUS_SKIP_LAUNCHCTL", "1")
+        .env_remove("CONBUS_HOME")
+        .env_remove("XDG_STATE_HOME")
+        .env_remove("CODEX_HOME")
+        .output()
+        .expect("run install");
+    assert!(
+        out.status.success(),
+        "install failed:\n{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Every command a Claude-shaped hooks file registers for one event.
+fn commands_for(settings: &Path, event: &str) -> Vec<String> {
+    let text = std::fs::read_to_string(settings).unwrap_or_default();
+    let document: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+    document["hooks"][event]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|block| block["hooks"].as_array().into_iter().flatten())
+        .filter_map(|hook| hook["command"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// Run a registered command the way a vendor does — through a shell, with the
+/// payload on stdin — and insist it exited zero.
+fn run_registered(command: &str, home: &Path, conbus_home: &Path, payload: &str) {
+    let mut child = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(command)
+        .env("HOME", home)
+        .env("CONBUS_HOME", conbus_home)
+        .env_remove("CONBUS_HARNESS")
+        .env_remove("CONBUS_INTERNAL_SESSION")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn registered hook");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(payload.as_bytes())
+        .expect("write payload");
+    let out = child.wait_with_output().expect("hook exit");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{command}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// One Grok turn, an event per registration Grok's file carries, spelled the
+/// way `hook::grok` reads them: Claude's `hook_event_name` beside Grok's own
+/// camelCase names.
+const GROK_TURN: [(&str, &str); 5] = [
+    (
+        "SessionStart",
+        r#"{"hookEventName":"session_start","hook_event_name":"SessionStart",
+            "sessionId":"grok-1","source":"startup","cwd":"/repo","workspaceRoot":"/repo"}"#,
+    ),
+    (
+        "UserPromptSubmit",
+        r#"{"hookEventName":"user_prompt_submit","hook_event_name":"UserPromptSubmit",
+            "sessionId":"grok-1","promptId":"p-1","prompt":"count the twins",
+            "cwd":"/repo","workspaceRoot":"/repo"}"#,
+    ),
+    (
+        "PreToolUse",
+        r#"{"hookEventName":"pre_tool_use","hook_event_name":"PreToolUse",
+            "sessionId":"grok-1","promptId":"p-1","toolName":"Bash",
+            "toolInput":{"command":"ls"},"toolUseId":"call_1",
+            "cwd":"/repo","workspaceRoot":"/repo"}"#,
+    ),
+    (
+        "PostToolUse",
+        r#"{"hookEventName":"post_tool_use","hook_event_name":"PostToolUse",
+            "sessionId":"grok-1","promptId":"p-1","toolName":"Bash",
+            "toolInput":{"command":"ls"},"toolUseId":"call_1",
+            "cwd":"/repo","workspaceRoot":"/repo"}"#,
+    ),
+    (
+        "Stop",
+        r#"{"hookEventName":"stop","hook_event_name":"Stop",
+            "sessionId":"grok-1","promptId":"p-1","lastAssistantMessage":"one of each",
+            "cwd":"/repo","workspaceRoot":"/repo"}"#,
+    ),
+];
+
+const ONE_GROK_TURN: [&str; 5] = [
+    "session_candidate",
+    "turn_started",
+    "tool_requested",
+    "tool_use",
+    "turn_ended",
+];
+
+#[test]
+fn a_grok_event_reaches_the_log_once_though_grok_runs_both_registrations() {
+    // Grok reads Claude Code's settings file as well as its own hooks
+    // directory, and runs every hook it finds in either. From 2026-09-06 —
+    // the day `install` began writing `~/.grok/hooks/conbus.json` — every
+    // Grok event reached the live log twice: one conversation, the same ids
+    // and body, 30–330 ms apart, consecutive seqs, and both copies stamped
+    // grok, because the hook names the harness from the payload rather than
+    // from the registration that ran it.
+    let user = tempfile::tempdir().expect("home");
+    for vendor in [".claude", ".grok"] {
+        std::fs::create_dir_all(user.path().join(vendor)).expect("vendor");
+    }
+    install_into(user.path());
+    let registrations = [
+        user.path().join(".grok/hooks/conbus.json"),
+        user.path().join(".claude/settings.json"),
+    ];
+    let conbus = tempfile::tempdir().expect("conbus home");
+    let daemon = start_daemon(conbus.path());
+
+    for (event, payload) in GROK_TURN {
+        let commands: Vec<String> = registrations
+            .iter()
+            .flat_map(|file| commands_for(file, event))
+            .collect();
+        assert_eq!(
+            commands.len(),
+            2,
+            "Grok finds the recorder in both files for {event}: {commands:?}"
+        );
+        for command in &commands {
+            run_registered(command, user.path(), conbus.path(), payload);
+        }
+    }
+
+    let lines = log_lines(conbus.path());
+    let kinds: Vec<&str> = lines
+        .iter()
+        .map(|l| l["event"].as_str().expect("event"))
+        .collect();
+    assert_eq!(kinds, ONE_GROK_TURN, "{lines:#?}");
+    assert!(lines.iter().all(|l| l["harness"] == "grok"), "{lines:#?}");
+
+    daemon.stop();
+}
+
+#[test]
+fn a_grok_event_that_only_claude_codes_registration_carries_is_still_recorded() {
+    // Grok installed after conbus: `install` found no `~/.grok` and wrote
+    // nothing there, so Claude Code's registration is the only copy Grok
+    // runs. Treating that copy as an echo would lose every Grok event.
+    let user = tempfile::tempdir().expect("home");
+    std::fs::create_dir_all(user.path().join(".claude")).expect("claude");
+    install_into(user.path());
+    std::fs::create_dir_all(user.path().join(".grok")).expect("grok, installed afterwards");
+    let claude = user.path().join(".claude/settings.json");
+    let conbus = tempfile::tempdir().expect("conbus home");
+    let daemon = start_daemon(conbus.path());
+
+    for (event, payload) in GROK_TURN {
+        let commands = commands_for(&claude, event);
+        assert_eq!(commands.len(), 1, "{event}: {commands:?}");
+        run_registered(&commands[0], user.path(), conbus.path(), payload);
+    }
+
+    let lines = log_lines(conbus.path());
+    let kinds: Vec<&str> = lines
+        .iter()
+        .map(|l| l["event"].as_str().expect("event"))
+        .collect();
+    assert_eq!(kinds, ONE_GROK_TURN, "{lines:#?}");
+    assert!(lines.iter().all(|l| l["harness"] == "grok"), "{lines:#?}");
+
+    daemon.stop();
+}
+
 #[test]
 fn the_log_survives_a_daemon_restart_and_the_conversation_continues() {
     let home = tempfile::tempdir().expect("tempdir");

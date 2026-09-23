@@ -67,7 +67,9 @@ pub struct HookError(pub String);
 /// An unfamiliar harness is refused rather than guessed at. Cursor reads
 /// Claude Code's settings file and invokes this hook under that name, so
 /// dispatch is by payload (`cursor_version`), not by the argv harness. The
-/// fields were pinned by the live drop log, not by Claude's schema.
+/// fields were pinned by the live drop log, not by Claude's schema. Grok does
+/// the same while also running its own registration, which is why the client
+/// compares the two before sending (`client::grok_echo`).
 pub fn normalize(harness: &Harness, payload: &str) -> Result<Normalized, HookError> {
     if inference::looks_like(payload) {
         return inference::normalize(payload);

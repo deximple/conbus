@@ -178,6 +178,24 @@ Argued through four review rounds; the reasoning is in the plan.
   The bus is a passenger on any surface it did not spawn — the design said so;
   this is the measurement.
 
+**Grok**
+
+- **Grok runs Claude Code's hooks as well as its own.** Its hook docs name
+  `.claude/settings.json` and `.cursor/hooks.json` beside `~/.grok/hooks/*.json`,
+  and every registration it finds runs. From 2026-09-06, the day `install`
+  first wrote Grok's own file, every Grok event reached the log twice: one
+  conversation, identical ids and bodies, 30–330 ms apart, consecutive seqs,
+  both stamped `grok` because the harness is read from the payload. The hook
+  now answers the copy that did not come through `--harness grok` without
+  recording it, and only while Grok's own file registers that event through a
+  binary that exists (`hook::client::grok_echo`) — without the file, Claude
+  Code's registration is the only copy. The twins already written stay, since
+  the log is append-only; `conbus usage` counts them once.
+- `~/.grok/hooks/*.json` is trusted without asking. Its Claude-compatible
+  hooks shipped loaded and never dispatched in 1.0.3
+  (`xai-org/plugin-marketplace#236`), which is why Grok's own file is the copy
+  kept.
+
 **Both**
 
 - Global hooks mirror our own background sessions unless marked. The

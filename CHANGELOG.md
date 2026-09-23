@@ -20,6 +20,15 @@ the entry says so when it does.
   `--since` that is not a day like `2026-09-01` is refused rather than read as
   an empty window.
 
+### Fixed
+
+- A Grok event is recorded once. Grok runs the hooks in Claude Code's
+  settings file as well as its own, so with both registered every Grok prompt,
+  tool call and turn end reached the log twice. The copy that arrives through
+  Claude Code's registration is now answered and not recorded, as long as
+  `~/.grok/hooks/conbus.json` carries that event. Records already in the log
+  are left as they are.
+
 ## [0.1.1] — 2026-09-23
 
 ### Fixed
