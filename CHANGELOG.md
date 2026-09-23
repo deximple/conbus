@@ -4,6 +4,22 @@ All notable changes to conbus. Versions follow [Semantic Versioning](https://sem
 until 1.0 a minor version may change the command line or the log format, and
 the entry says so when it does.
 
+## [Unreleased]
+
+### Added
+
+- `conbus usage`: what the agents did, counted, per harness over the last 7 days
+  (`--days N`, `--since DAY`). Conversations split by whether a person was
+  there; turns stopped on quota, on policy, or by you; subagent runs; tool calls
+  that failed, that you stopped, that were refused; permission asks; the tools
+  that fail most and the folders with the most turns. `--json` prints one row
+  per day, harness, folder and attendance — counts only, never a body. A report
+  that reached the log twice — on the machine that built this, every Grok event
+  did, and some Cursor ones — is counted once and named in the header as
+  `repeated`. Cost is named as absent: no hook carries tokens or prices. A
+  `--since` that is not a day like `2026-09-01` is refused rather than read as
+  an empty window.
+
 ## [0.1.1] — 2026-09-23
 
 ### Fixed

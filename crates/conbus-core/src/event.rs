@@ -286,7 +286,7 @@ pub struct Source {
 }
 
 /// How a turn ended.
-#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum TurnState {
     Complete,
@@ -305,7 +305,7 @@ pub enum TurnState {
 ///
 /// Counted separately: failover (`displaced`) is how often a limit was hit,
 /// which we do not control; routing (`handed_off`) is the wedge.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Hop {
     /// The current leg said it could not continue — quota, or an account that
@@ -323,7 +323,7 @@ pub enum Hop {
 /// throwaway is not decidable from anything the daemon or `conbus hop` holds,
 /// and a path heuristic would put a guess in an append-only file. A probe
 /// declares itself or it is counted as unattributed.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HopProvenance {
     /// A vendor said it could not serve the turn, or its own quota reading
@@ -338,7 +338,7 @@ pub enum HopProvenance {
 }
 
 /// What a harness reported, normalised across vendors.
-#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum Event {
     /// A vendor session announced itself. No `bus_id` is minted here: some of
@@ -579,7 +579,7 @@ impl Event {
 /// an enum is deliberate: every consumer of a tool record has to handle both,
 /// and the compiler says so. A separate variant would let a reader forget the
 /// failing half, and forgetting is silent.
-#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum ToolOutcome {
     Succeeded {
@@ -608,7 +608,7 @@ fn is_zero(value: &usize) -> bool {
 ///
 /// The variant is on the record itself rather than implied by configuration, so
 /// that a reader can tell "the model said nothing" from "retention dropped it".
-#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Body {
     /// Written verbatim.
