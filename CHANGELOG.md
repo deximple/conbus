@@ -6,6 +6,19 @@ the entry says so when it does.
 
 ## [Unreleased]
 
+### Added
+
+- `conbus install --managed` prints, and never writes, the hooks block an
+  administrator adds to Claude Code's managed settings on Macs whose policy
+  sets `allowManagedHooksOnly` — which blocks the per-user hooks
+  `install --apply` registers, so conbus recorded nothing there. stdout is that
+  JSON alone: the same events and command `install --apply` registers, naming
+  the binary that was run. stderr says where it goes on macOS, how it merges
+  with the organisation's own hooks, why the StatusLine wrapper stays out, and
+  where Codex and Cursor take managed hooks. [docs/fleet.md](docs/fleet.md)
+  covers the rest of a managed deployment: the binary, the per-user recorder,
+  approving it as a managed login item, and removal.
+
 ### Fixed
 
 - The log is readable by its owner only. The data root was made with the

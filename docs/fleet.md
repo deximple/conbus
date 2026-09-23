@@ -93,11 +93,11 @@ event would be recorded twice.
   `statusLine` is one value that replaces every developer's; under
   `allowManagedHooksOnly` Claude Code reads it from managed settings only, and
   conbus's wrapper works by running the status command each person saved in
-  their `~/.claude` — a user-writable file run under the organisation's
-  authority, which is what that narrowing stops. What the wrapper reads,
-  `rate_limits`, reaches a status line only for claude.ai Pro and Max plans (or
-  behind a gateway with spend limits). The cost: `conbus quota` shows no Claude
-  reading on these Macs.
+  their `~/.claude` — a command from a user-writable file, run under the
+  organisation's authority, which is what that narrowing stops. What the
+  wrapper reads, `rate_limits`, reaches a status line only for claude.ai Pro
+  and Max plans (or behind a gateway with spend limits). The cost:
+  `conbus quota` shows no Claude reading on these Macs.
 
 After an upgrade, run `install --managed` again and compare: the block changes
 only when the events conbus registers do.
