@@ -403,13 +403,8 @@ pub fn install(apply: bool) -> io::Result<()> {
         }
         if load {
             println!(
-                "{:<12} {}",
-                "",
-                if changed {
-                    "reloaded: launchctl bootout, then bootstrap, so launchd reads the new file"
-                } else {
-                    "restarted: launchctl kickstart -k"
-                }
+                "{:<12} reloaded: launchctl bootout, then bootstrap, so macOS checks the new binary",
+                ""
             );
         }
     } else {

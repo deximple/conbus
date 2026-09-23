@@ -4,6 +4,19 @@ All notable changes to conbus. Versions follow [Semantic Versioning](https://sem
 until 1.0 a minor version may change the command line or the log format, and
 the entry says so when it does.
 
+## [0.2.3] — 2026-09-23
+
+### Fixed
+
+- `conbus install --apply` always reloads the recorder — `bootout`, then
+  `bootstrap` — instead of restarting it with `kickstart -k`. A bootstrap makes
+  macOS check the replaced binary, so an upgrade's first start is no longer
+  refused: on the 0.2.2 deploy the new daemon started 0.3 s after `install`,
+  and the hooks were unrecorded only for the recorder's own ~5 s start, with no
+  record dropped. 0.2.2 reloaded only when the launchd file changed, which it
+  will not on the next upgrade. If launchd will not load the file, `install`
+  now says so and exits non-zero instead of carrying on.
+
 ## [0.2.2] — 2026-09-23
 
 ### Fixed

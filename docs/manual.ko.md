@@ -1,6 +1,6 @@
 # conbus 매뉴얼
 
-이 매뉴얼은 macOS용 **conbus 0.2.2**를 설명합니다. 짧게 훑으려면
+이 매뉴얼은 macOS용 **conbus 0.2.3**을 설명합니다. 짧게 훑으려면
 [README](../README.md)를, 릴리스 사이에 무엇이 바뀌었는지는
 [CHANGELOG](../CHANGELOG.md)를 보세요. English: [manual.md](manual.md)
 
@@ -90,7 +90,7 @@ curl -fsSL https://raw.githubusercontent.com/deximple/conbus/main/install.sh | s
 
 | 변수 | 효과 |
 | --- | --- |
-| `CONBUS_VERSION=v0.2.2` | 최신 대신 그 릴리스를 설치 |
+| `CONBUS_VERSION=v0.2.3` | 최신 대신 그 릴리스를 설치 |
 | `CONBUS_REPO=owner/name` | 포크에서 설치 |
 | `CONBUS_BASE_URL=…` | 미러에서 받기. 로컬 빌드는 `file:///path/to/dist` |
 
@@ -149,7 +149,7 @@ Codex는 새 훅을 승인받은 뒤에만 실행합니다. Codex를 한 번 켜
 
 | 줄 | 정상 |
 | --- | --- |
-| `build` | `0.2.2 (<commit>)` |
+| `build` | `0.2.3 (<commit>)` |
 | `socket` | `listening` |
 | `daemon` | `build`와 같은 커밋. `DIFFERS`는 바이너리를 바꾸고 데몬을 다시 시작하지 않았다는 뜻입니다 |
 | `writable` | `appendable` |
@@ -308,7 +308,7 @@ hop은 지금 대화를 다른 레그로 옮깁니다. conbus는 그 결정을 �
 | 목적지도 소진됨 | 대신 **기다림** |
 | 무인 세션(프로그램) | **hop 안 함** |
 
-0.2.2에서 자동 hop은 실험적 기능입니다. 테스트와 요청에서는 동작했지만, 실제
+0.2.3에서 자동 hop은 실험적 기능입니다. 테스트와 요청에서는 동작했지만, 실제
 쿼터 중단에서 발동하는 것은 아직 관측되지 않았습니다.
 
 ### 직접 hop하기
@@ -516,10 +516,10 @@ conbus install --apply
 건너뛴 것입니다. 지금 도는 레코더보다 새로운 훅은 반쯤 알아듣는 대신
 "Restart the daemon"이라며 거부됩니다.
 
-0.2.2처럼 레코더의 launchd 파일 자체가 바뀐 경우, 같은 명령이 그 파일을 내렸다가
-다시 올립니다(`bootout` 후 `bootstrap`). 재시작만으로는 옛 정의가 그대로 쓰이기
-때문입니다. macOS는 교체된 바이너리의 첫 기동을 한 번 거부하므로, 다시 시도하는
-몇 초 동안 훅이 기록되지 않습니다.
+이 명령은 레코더를 재시작하지 않고 내렸다가 다시 올립니다(`bootout` 후
+`bootstrap`). macOS는 에이전트를 올릴 때 교체된 바이너리를 확인하고, 그냥
+재시작하면 한 번 거부하기 때문입니다. 레코더가 뜨는 몇 초 동안 훅은 기록되지
+않습니다.
 
 ---
 
