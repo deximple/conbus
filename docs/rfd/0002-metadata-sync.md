@@ -175,7 +175,7 @@ never-sent list applies, and every field is in the table below.
   (`aggregationTemporality: 1` is DELTA), and 64-bit integers — the timestamps
   and `asInt` — as decimal strings.
 - **Resource.** `service.name` = `conbus` and `service.version` = the release
-  (`0.2.4`), not the commit. No host, user, device or scope attribute; a
+  (`0.2.5`), not the commit. No host, user, device or scope attribute; a
   collector that adds its own does so by its own configuration.
 - **Points.** Every count of a row is one point, with `harness` and
   `attendance` as attributes and `kind` on `conbus.stops`. Sums are monotonic

@@ -4,7 +4,16 @@ All notable changes to conbus. Versions follow [Semantic Versioning](https://sem
 until 1.0 a minor version may change the command line or the log format, and
 the entry says so when it does.
 
-## [Unreleased]
+## [0.2.5] — 2026-09-24
+
+Ready for a pilot's security review and a managed fleet. The log is readable
+by its owner only, both halves of the release binary are signed,
+`install --managed` prints the hooks for Claude Code's managed settings, and
+`usage --otlp` sends the shareable counts to a collector on this Mac. The
+reviewer's page is [`docs/security-packet.md`](docs/security-packet.md), and
+[RFD 0003](docs/rfd/0003-security-design.md) drafts the sync's security before
+any sync code. After upgrading, run `conbus install --apply`: the recorder
+closes `~/.conbus` when it starts.
 
 ### Added
 
