@@ -206,6 +206,40 @@ conbus log --json                     # one JSON record per line, for scripts
 conbus log --reveal --bus-id 01a0c7f2 # decrypt sealed tool bodies (section 11)
 ```
 
+**Counting it:** `conbus usage` folds the log into what your agents did, per
+agent, over the last 7 days (`--days 30`, or `--since 2026-09-01`):
+
+```text
+usage     from 2026-09-17 (UTC) · 38284 live record(s) · not counted: backfilled 37559 · earlier 79767 · repeated 6081
+harness   claude_code — 249 conversation(s): attended 52 · unattended 197 · unknown 0
+          303 turn(s): quota 0 · policy 0 · interrupted 0 · subagents 268
+          7673 tool call(s): failed 134 · interrupted 0 · refused 1 · asks 139 · 6h in tools
+harness   codex — 35 conversation(s): attended 0 · unattended 0 · unknown 35
+          64 turn(s): quota 0 · policy 0 · interrupted 0 · subagents 0
+          610 tool call(s): failed 0 · interrupted 0 · refused 0 · asks 1 · 0s in tools
+failing   Bash 112 · Read 20 · WebFetch 2
+busiest   /Users/you/project 192 · /Users/you/other 53 (turns)
+cost      not in this log: no hook payload carries tokens or prices
+```
+
+- **attended · unattended · unknown**: whether a person was at the session,
+  from the front end it ran under. Only Claude Code says, so other agents are
+  almost always `unknown`.
+- **quota · policy · interrupted**: turns that stopped because the vendor
+  refused on quota, refused on policy or billing, or because you stopped them.
+  **subagents** are subagent runs that finished; they are not turns.
+- **failed · interrupted · refused · asks**: tool calls that ran and failed,
+  that you stopped, that the agent refused to run, and the times you were
+  asked for permission. **in tools** adds up the durations the agent reported;
+  Codex reports none.
+- **repeated**: a second delivery of the same report — with some agents one
+  event reaches the log twice. It is counted once.
+- History recovered by `backfill` is not counted: it is not activity the
+  recorder saw. Neither is cost: no hook carries tokens or prices.
+
+`conbus usage --json` prints one row per day, agent, folder and attendance:
+counts only, never a prompt, a reply or a tool body.
+
 A record looks like this (fields vary by event):
 
 ```json
@@ -571,6 +605,7 @@ line, the destination's quota, and whether the session was a program
 | `conbus run [HARNESS]` | Start an agent in this terminal; hops start the next one here |
 | `conbus backfill [--apply] [--gaps] [--chat-export PATH]` | Recover history |
 | `conbus summary --bus-id ID` | Ask the other leg's agent for a digest of a conversation |
+| `conbus usage [--days N] [--since DAY] [--json]` | What the agents did, counted (section 5) |
 | `conbus verdict` | Score a four-week trial of the hop (below) |
 | `conbus arena fact --workspace DIR --claim TEXT --anchor PATH [--type T]` | Accept a fact |
 | `conbus arena link --from DIR --to DIR` | Share one folder's facts with another |

@@ -23,6 +23,7 @@ mod runner;
 mod summarise;
 mod takeover;
 mod uninstall;
+mod usage;
 mod verdict;
 mod warm;
 mod window;
@@ -138,6 +139,7 @@ fn main() -> ExitCode {
         }
         Command::Summary { bus_id } => run(|paths| summarise::run(paths, bus_id)),
         Command::Verdict => run(verdict::run),
+        Command::Usage { days, since, json } => run(|paths| usage::run(paths, days, since, json)),
         Command::Run { harness } => run(|paths| runner::run(paths, &harness)),
         Command::Arena {
             action,

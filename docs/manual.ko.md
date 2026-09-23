@@ -201,6 +201,39 @@ conbus log --json                     # 한 줄에 JSON 레코드 하나, 스크
 conbus log --reveal --bus-id 01a0c7f2 # 봉인된 툴 본문 복호화 (11장)
 ```
 
+**세어 보기:** `conbus usage`는 로그를 에이전트별로 무엇을 했는지로 접어 보여
+줍니다. 기본은 최근 7일이고, `--days 30`이나 `--since 2026-09-01`로 바꿉니다.
+
+```text
+usage     from 2026-09-17 (UTC) · 38284 live record(s) · not counted: backfilled 37559 · earlier 79767 · repeated 6081
+harness   claude_code — 249 conversation(s): attended 52 · unattended 197 · unknown 0
+          303 turn(s): quota 0 · policy 0 · interrupted 0 · subagents 268
+          7673 tool call(s): failed 134 · interrupted 0 · refused 1 · asks 139 · 6h in tools
+harness   codex — 35 conversation(s): attended 0 · unattended 0 · unknown 35
+          64 turn(s): quota 0 · policy 0 · interrupted 0 · subagents 0
+          610 tool call(s): failed 0 · interrupted 0 · refused 0 · asks 1 · 0s in tools
+failing   Bash 112 · Read 20 · WebFetch 2
+busiest   /Users/you/project 192 · /Users/you/other 53 (turns)
+cost      not in this log: no hook payload carries tokens or prices
+```
+
+- **attended · unattended · unknown**: 그 세션에 사람이 있었는지입니다. 세션이
+  어떤 프런트엔드에서 돌았는지로 판단하는데, 이를 알려 주는 건 Claude Code뿐이라
+  다른 에이전트는 거의 항상 `unknown`입니다.
+- **quota · policy · interrupted**: 벤더가 쿼터로 거절했거나, 정책·결제로
+  거절했거나, 사용자가 멈춰서 끝난 턴입니다. **subagents**는 끝난 서브에이전트
+  실행 수이며 턴이 아닙니다.
+- **failed · interrupted · refused · asks**: 실행됐다가 실패한 툴 호출, 사용자가
+  멈춘 호출, 에이전트가 실행을 거부한 호출, 권한을 물어본 횟수입니다.
+  **in tools**는 에이전트가 알려 준 실행 시간의 합이고, Codex는 알려 주지 않습니다.
+- **repeated**: 같은 보고가 두 번 전달된 것입니다. 에이전트에 따라 이벤트 하나가
+  로그에 두 번 들어오는 경우가 있어, 한 번만 셉니다.
+- `backfill`로 복구한 기록은 세지 않습니다. 기록기가 직접 본 활동이 아니기
+  때문입니다. 비용도 없습니다. 토큰이나 가격을 싣는 훅이 없습니다.
+
+`conbus usage --json`은 날짜·에이전트·폴더·사람 여부마다 한 줄씩 출력합니다.
+숫자만 있고, 프롬프트·답변·툴 본문은 절대 들어가지 않습니다.
+
 레코드 하나는 이렇게 생겼습니다(필드는 이벤트마다 다릅니다).
 
 ```json
@@ -554,6 +587,7 @@ conbus uninstall --apply  # 지우기
 | `conbus run [HARNESS]` | 이 터미널에서 에이전트 시작. hop이 다음 에이전트를 여기서 띄움 |
 | `conbus backfill [--apply] [--gaps] [--chat-export PATH]` | 지난 기록 되살리기 |
 | `conbus summary --bus-id ID` | 다른 레그의 에이전트에게 대화 요약 요청 |
+| `conbus usage [--days N] [--since DAY] [--json]` | 에이전트가 한 일을 셈(5장) |
 | `conbus verdict` | hop의 4주 시험 채점(아래) |
 | `conbus arena fact --workspace DIR --claim TEXT --anchor PATH [--type T]` | 사실 받아들이기 |
 | `conbus arena link --from DIR --to DIR` | 한 폴더의 사실을 다른 폴더와 공유 |

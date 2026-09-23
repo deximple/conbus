@@ -59,6 +59,13 @@ pub enum Command {
     },
     /// Four-week dogfood score from the live log.
     Verdict,
+    /// What the agents did, counted: conversations, turns, stops, tool
+    /// failures, permission asks — per harness, from the live log.
+    Usage {
+        days: u32,
+        since: Option<String>,
+        json: bool,
+    },
     /// Same TTY: start a vendor, and exec the next one when a hop lands.
     Run {
         harness: String,
@@ -85,6 +92,9 @@ pub enum Command {
 /// Claude Code first; the other harnesses that read the same settings format
 /// arrive with `--harness`.
 pub const DEFAULT_HARNESS: &str = conbus_core::event::Harness::CLAUDE_CODE;
+
+/// `conbus usage` without `--days`: a week, ending today.
+pub const DEFAULT_USAGE_DAYS: u32 = 7;
 
 /// Which records `conbus log` should print.
 ///
@@ -177,6 +187,13 @@ where
             bus_id: flag_value(&args, "--bus-id"),
         },
         "verdict" => Command::Verdict,
+        "usage" => Command::Usage {
+            days: flag_value(&args, "--days")
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(DEFAULT_USAGE_DAYS),
+            since: flag_value(&args, "--since"),
+            json: args.iter().any(|a| a == "--json"),
+        },
         "run" => Command::Run {
             harness: args.get(1).cloned().unwrap_or_else(|| "claude_code".into()),
         },
@@ -251,6 +268,11 @@ USAGE:
     conbus go [HARNESS]           hop --apply for the current conversation
     conbus summary --bus-id ID    opposite-leg digest; never the protected leg
     conbus verdict                4-week dogfood score; open window is not a kill
+    conbus usage [--days N] [--since DAY] [--json]
+                                  what the agents did, per harness: turns, stops,
+                                  tool failures, permission asks (default 7 days);
+                                  --json prints one row per day, harness,
+                                  workspace and attendance — counts, never bodies
     conbus run [claude_code|codex|cursor|agy|opencode|grok]
                                   same TTY: start a vendor; hop execs the next
     conbus arena fact --workspace DIR --claim TEXT --anchor PATH
@@ -399,6 +421,43 @@ mod tests {
         );
         assert_eq!(parse(["go", "--help"], None), Command::Help);
         assert_eq!(parse(["hop", "-h"], None), Command::Help);
+    }
+
+    #[test]
+    fn usage_is_a_week_unless_told_otherwise() {
+        assert_eq!(
+            parse(["usage"], None),
+            Command::Usage {
+                days: 7,
+                since: None,
+                json: false
+            }
+        );
+        assert_eq!(
+            parse(["usage", "--days", "30", "--json"], None),
+            Command::Usage {
+                days: 30,
+                since: None,
+                json: true
+            }
+        );
+        assert_eq!(
+            parse(["usage", "--since", "2026-09-01"], None),
+            Command::Usage {
+                days: 7,
+                since: Some("2026-09-01".into()),
+                json: false
+            }
+        );
+        assert_eq!(
+            parse(["usage", "--days", "lots"], None),
+            Command::Usage {
+                days: 7,
+                since: None,
+                json: false
+            },
+            "a count that is not a number is ignored, the way --tail is"
+        );
     }
 
     #[test]
