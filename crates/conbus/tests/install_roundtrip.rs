@@ -208,3 +208,30 @@ fn install_registers_only_the_vendors_this_machine_has() {
     }
     assert!(out.contains("codex        not found"), "{out}");
 }
+
+#[test]
+fn install_offers_to_replace_the_opencode_plugin_an_older_conbus_wrote() {
+    // The plugin is wholly ours, and what it does changes with the build.
+    // `install` used to call it registered whenever it named the events it
+    // forwards — which the 0.2.3 plugin does — so a fixed plugin never
+    // reached a machine that already had one.
+    let machine = Machine::new();
+    let built = PathBuf::from(env!("CARGO_BIN_EXE_conbus"));
+    let plugin = machine.at(".config/opencode/plugins/conbus.js");
+    let older = include_str!("fixtures/opencode_plugin_0.2.3.js");
+    std::fs::create_dir_all(plugin.parent().expect("plugins")).expect("plugins");
+    std::fs::write(&plugin, older).expect("the older plugin");
+
+    let report = conbus(&built, &machine.home, &["install"]);
+
+    let line = report
+        .lines()
+        .find(|line| line.starts_with("opencode"))
+        .unwrap_or_else(|| panic!("no opencode line:\n{report}"));
+    assert!(line.contains("would replace"), "{report}");
+    assert_eq!(
+        std::fs::read_to_string(&plugin).expect("read"),
+        older,
+        "a report must not write"
+    );
+}

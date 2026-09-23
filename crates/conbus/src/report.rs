@@ -334,18 +334,19 @@ pub fn install(apply: bool) -> io::Result<()> {
     let plugin = crate::install::opencode_plugin_path(&home);
     if !crate::install::vendor_present("opencode", &home) {
         print_absent("opencode", &home);
-    } else if crate::install::opencode_plugin_registered(&home) {
+    } else if crate::install::opencode_plugin_current(&binary, &home) {
         println!(
             "{:<12} {} — already registered",
             "opencode",
             plugin.display()
         );
     } else {
-        println!(
-            "{:<12} {} — would register session.created, message.updated, session.error",
-            "opencode",
-            plugin.display()
-        );
+        let doing = if crate::install::opencode_plugin_registered(&home) {
+            "not the plugin this build writes — would replace it"
+        } else {
+            "would register session.created, message.updated, message.part.updated, session.error"
+        };
+        println!("{:<12} {} — {doing}", "opencode", plugin.display());
         if apply {
             crate::install::apply_opencode_plugin(&binary, &home)?;
             println!(

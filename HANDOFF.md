@@ -401,13 +401,31 @@ three.
   after a limit, one quota stop is also counted as a policy stop by `usage`.
   About 200 `tool_use` records a week share a `tool_use_id` without
   matching; only `postToolUse` writes `tool_use`, and it comes only through
-  Claude Code's registration, so they are not echoes. OpenCode: the plugin
-  reports a user message as `turn_started` on every `message.updated`, with
-  `summary.title` as the prompt — and OpenCode's summariser rewrites the user
-  message's `summary.diffs` on every agent step, so that event fires once per
-  step (`anomalyco/opencode#43551`). The plugin also forwards
-  `message.part.updated` text without checking the role. A `msg_…` id names
-  one message, so a second `turn_started` for it is always a re-report.
+  Claude Code's registration, so they are not echoes. OpenCode: **fixed in
+  the plugin, not yet on the log.** The 0.2.3 plugin sent a `turn_started` on
+  every `message.updated` of a person's message, with `summary.title` as the
+  prompt — OpenCode's summariser publishes that message again after every
+  agent step (`anomalyco/opencode#43551`) — and forwarded every text part
+  without asking whose it was, so the agent's replies and OpenCode's own
+  `synthetic` text were recorded as prompts: 61 `turn_started` for about 8
+  prompts in the week to 2026-09-23. It could also take OpenCode down: a hook
+  that closed its stdin unread raised an uncaught `EPIPE` in OpenCode's own
+  process. The plugin now learns whose a message is from `message.updated`
+  and sends a person's message once, from its first text part that is neither
+  `synthetic` nor `ignored` (OpenCode's own timeline rule); a part that comes
+  before its message waits for it, bounded. Checked against OpenCode's source
+  at 1.18.31, the version on this machine: `event` hooks are called in
+  publication order and never awaited, and a message is published before its
+  parts. What remains: the records already in the log stay — a `msg_…` id
+  names one message, so a second `turn_started` for it is always a re-report
+  and can be counted once — and a machine keeps the 0.2.3 plugin until
+  `conbus install --apply`, which now replaces a plugin this build did not
+  write instead of calling it registered. Two paths still put a person's
+  earlier words under a new id: an overflow compaction replays the last
+  prompt as a new message, and `session.fork` copies the history into the
+  new session. Not read: whether the first message of a `task` child
+  session, which the parent agent writes, reaches the plugin as a person's
+  text part.
 - Nothing produces `interrupted_user`; `is_interrupt` on a failed tool call is
   the only signal anywhere that a person stopped the work.
 - An older `v` is still read as if it were current. `scan` rejects a record
