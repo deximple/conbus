@@ -4,6 +4,17 @@ All notable changes to conbus. Versions follow [Semantic Versioning](https://sem
 until 1.0 a minor version may change the command line or the log format, and
 the entry says so when it does.
 
+## [Unreleased]
+
+### Fixed
+
+- A Grok event is recorded once. Grok runs the hooks in Claude Code's
+  settings file as well as its own, so with both registered every Grok prompt,
+  tool call and turn end reached the log twice. The copy that arrives through
+  Claude Code's registration is now answered and not recorded, as long as
+  `~/.grok/hooks/conbus.json` carries that event. Records already in the log
+  are left as they are.
+
 ## [0.2.0] — 2026-09-23
 
 A ledger of what the agents did, counted — the first local piece of the plan in
@@ -33,15 +44,6 @@ does not change.
   same counts with no folder field at all, rows that differed only by folder
   merged. Nothing is sent; it prints, so the payload can be read before any sync
   exists.
-
-### Fixed
-
-- A Grok event is recorded once. Grok runs the hooks in Claude Code's
-  settings file as well as its own, so with both registered every Grok prompt,
-  tool call and turn end reached the log twice. The copy that arrives through
-  Claude Code's registration is now answered and not recorded, as long as
-  `~/.grok/hooks/conbus.json` carries that event. Records already in the log
-  are left as they are.
 
 ## [0.1.1] — 2026-09-23
 
