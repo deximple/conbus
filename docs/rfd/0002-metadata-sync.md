@@ -1,0 +1,196 @@
+# RFD 0002 — What a sync may send
+
+Status: **draft**, 2026-09-23, revised the same day after review. No sync code
+exists. This RFD has to be accepted — and RFD 0003, the security design, written
+— before any is, and every field a sync sends has to be named here first.
+
+Context: Choice 3 in [`docs/saas-hypothesis.md`](../saas-hypothesis.md) and the
+plan in [`docs/saas-strategy.md`](../saas-strategy.md). The log itself never
+leaves the machine; this is the contract for the one thing that might.
+
+## Principles
+
+1. **Counts, never content.** A sync sends how many, never what.
+2. **The rows are the preview.** `conbus usage --json --shareable` prints exactly
+   the rows a sync would send, from the same code. The only additions on the
+   wire are the envelope fields named below.
+3. **One-way.** The service acknowledges. It cannot send the machine a command,
+   a rule or code. Settings travel in the invite, and the service can only ever
+   ask a machine to send *less* than its settings allow.
+4. **Opt-in per machine, revocable.** Nothing is sent until a person joins this
+   machine to an organisation; leaving stops it and forgets the credential.
+5. **Nothing the contract does not name.** A new field is an amendment here
+   first, and tests pin the key set so that a field cannot arrive by default.
+6. **It is personal data.** A row is tied to a member and a device, so it is
+   pseudonymous personal data (under GDPR, and a works-council matter in some
+   countries). A data processing agreement and a DPIA template exist before the
+   first pilot.
+
+## The unit: a row
+
+One row per UTC day, harness and attendance. It is `conbus_core::usage::SharedRow`,
+which `conbus usage --shareable` prints: the local `Row` with the workspace
+removed and rows that differed only by workspace merged. Their conversation
+counts add up rather than overlap, because a conversation is attributed to one
+workspace.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `day` | `YYYY-MM-DD` | UTC day |
+| `harness` | slug | `claude_code`, `codex`, `cursor`, `grok`, `opencode`, `agy`, `claude_chat`; any other name is sent as `other` |
+| `attendance` | `attended` \| `unattended` \| `unknown` | Whether a person was there, from the entrypoint class — never the raw entrypoint |
+| `conversations` | count | Conversations with a record that day (not additive across days) |
+| `turns` | count | Prompts submitted to a main thread |
+| `limit_stops`, `limit_episodes` | count | Turns stopped by a usage limit; runs of them (a new episode after an hour without one, per harness) |
+| `account_stops` | count | Stopped by authentication, billing, or a hold |
+| `vendor_errors` | count | The vendor was overloaded or failed |
+| `request_faults` | count | Invalid request, output too long, no such model |
+| `other_stops` | count | A stop reason this build does not recognise |
+| `user_stops` | count | A person interrupted the turn |
+| `subagents` | count | Subagent runs that finished |
+| `tool_calls`, `tool_failures`, `tool_interrupts`, `tool_denials` | count | Tool calls that ran, failed, were stopped by a person, were refused |
+| `permission_asks` | count | Times a person was asked whether a tool may run |
+| `tool_ms` | count | Summed tool durations the vendor reported |
+| `briefings`, `hops` | count | Briefings handed over; `routed` records |
+| `repeated` | count | Second deliveries of a report already counted — a data-quality signal |
+
+The envelope around one device-day adds `device` (a random id minted when the
+machine joins), `schema` (this RFD's version, `1`) and `day_closed` (the UTC day
+the batch is for). The member is known to the service from the device's
+credential; the row does not repeat it.
+
+## Never sent
+
+Named so that a reviewer can check the list rather than infer it:
+
+- prompts, replies, tool inputs and outputs, error text, digests;
+- reason strings (a limit or account reason, a session-end reason, a denial
+  reason), notification titles and messages — only the category in the table;
+- file-system paths, including the workspace as written;
+- commands, file names, branch names, commit messages, environment variables;
+- tool names and MCP server names (deferred, below);
+- `bus_id`, vendor session, turn, tool-use and agent ids;
+- the raw entrypoint, harness versions (deferred), hostnames, usernames;
+- anything read from a vendor's auth files — conbus reads none.
+
+The service does not store the client's IP address, and keeps no send time
+finer than the day.
+
+## When a day is sent
+
+Once, after it closes. A device sends day *D* after 00:00 UTC on *D+1* plus a
+random delay of up to an hour, and never a partial day. The service keeps the
+one version it receives; a late correction replaces it and leaves no history.
+
+Resending a growing "today" would let the service reconstruct when a device was
+active inside the day from the differences between sends. The cost is that the
+first version has daily digests, not same-day alerts; same-day alerts would be a
+separate opt-in with its own entry here.
+
+## Workspaces
+
+Off by default, and off in version 1. A view by repository is useful; it is also
+the one field that can say what a company is working on. Proposed for a later
+version, the organisation choosing:
+
+- **Keyed**: `workspace_key` is the first 16 hex characters of
+  `SHA-256(org_salt ‖ repo_id)`. `repo_id` is the normalised URL of the
+  checkout's `origin` remote (`github.com/acme/api`) **with any credentials
+  removed first** (`https://x-access-token:…@github.com/…` becomes
+  `github.com/…`), or `local:` plus the path when there is no remote — hashed,
+  never sent. Two machines with the same repository in different folders
+  produce the same key. Honest limit: the service knows the salt, so an operator
+  of the service who guesses a repository name can confirm the guess. Keying
+  keeps paths and names out of storage and logs; it does not make guessing
+  impossible.
+- **Named**: `workspace_label` is `host/owner/repo` from the normalised,
+  credential-free remote. A checkout with no remote is sent keyed, never by path.
+
+Either way, adding the field splits rows the merge above joins, and the upsert
+key grows to include it.
+
+## Proposed opt-in fields (not in version 1)
+
+- **`plan`** — a plan a member declares per vendor (`claude:max`, `cursor:pro`),
+  in the envelope, so a member's own view can say "N limit episodes on plan P".
+- **`automation_key`** — an organisation-salted hash of a label the person sets
+  for an unattended run (`CONBUS_JOB=nightly-triage`), so "which automation
+  fails" does not need workspaces or names. Needs a recorder field first.
+- **Coverage** — whether each member has a joined device, so a team view can say
+  "N of M members reporting".
+
+## Views the service may build from rows
+
+- A member's own rows, to that member.
+- Team aggregates by day, harness and attendance, where **every published cell
+  holds at least five members**, complementary cells that would let a small
+  group be recovered by subtraction are suppressed, and teams under ten members
+  see weekly cuts only.
+- Per-member views only when the organisation turns named members on — visible
+  to its admins, and shown to each member as on.
+
+## Transport
+
+- One HTTPS `POST` per device-day: the envelope and that day's rows.
+- The device credential is conbus's own, kept in the login keychain. It is not
+  and never becomes a vendor credential.
+- The service replies with an acknowledgement only.
+
+## Security requirements (RFD 0003, before any sync code)
+
+Authentication and rotation of device credentials; server-side revocation;
+replay protection (one accepted batch per device-day); a TLS policy; data
+residency; encryption at rest; backups inside the retention window; deletion by
+API with a receipt, per member and per device.
+
+The Enterprise audit export is not a sync feature and needs its own work first:
+hash-chained log segments and signed exports.
+
+## Commands (proposed, not built unless marked)
+
+- `conbus usage --json --shareable` — **built** (#31). Prints the rows a sync
+  would send, with the machine's settings applied. Works before joining, so
+  anyone can read the payload first.
+- `conbus sync --join INVITE [--apply]` — reports what would be sent and where;
+  writes the credential and the invite's settings only with `--apply`, like
+  `install`.
+- `conbus sync` — send the closed days not yet sent. `conbus sync --off` — stop,
+  forget the credential, and print how to delete what was sent.
+
+## Retention and deletion
+
+Rows are kept 90 days on Team; Enterprise sets its own. Deletion by member or by
+device, with a receipt. Nothing on the machine is deleted by leaving: the log is
+the person's.
+
+## Deferred, with the question each one needs answered
+
+- **Tool names.** Which tools fail is the most useful friction view. Built-in
+  names (`Bash`, `Read`, `Edit`) say little; MCP and custom tool names can name
+  internal systems. Proposal: built-ins by name, everything else counted as
+  `other`. Needs a pilot to show whether `other` is too coarse.
+- **Harness versions.** Useful for "this vendor release broke hooks", and a
+  fingerprint at small team sizes. Needs a threshold rule.
+- **Cost and tokens.** Not in the log today. If the recorder later receives a
+  vendor's OpenTelemetry locally, per-row token and cost sums are counts too, and
+  would be added here by amendment — never per request, never with the prompt.
+- **Quota readings.** A percentage used and a reset time per account window are
+  counts; which account they belong to is not. Needs a design that never keys a
+  reading to a credential. "Blocked time" waits for this.
+
+## Tests
+
+Built with `--shareable` (#31):
+
+1. A shared row serialises to exactly the key set in the table above.
+2. A canary body — a prompt, an error, a tool name, a path — never appears in a
+   shared row.
+3. With workspaces off, no workspace field exists — not an empty one — and rows
+   that differed only by workspace are merged with their counts summed.
+4. A harness name this build does not know is shared as `other`.
+
+Owed by the sync code:
+
+5. The rows a sync sends equal what `--shareable` printed for the same log.
+6. Credentials in a remote URL never reach a key or a label.
+7. A day is not sent before it closes, and is sent once.

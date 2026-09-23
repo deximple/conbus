@@ -9,7 +9,7 @@ briefed on what recent sessions there were doing, and when a vendor stops a
 turn for quota — or when you say so — the next leg picks the conversation up.
 The vendor TUIs stay the window; conbus is the part underneath.
 
-**0.1.1 · macOS · Apache-2.0.** Local only: no hosted service, no telemetry,
+**0.2.0 · macOS · Apache-2.0.** Local only: no hosted service, no telemetry,
 and conbus never reads or stores vendor auth tokens.
 
 > The repository is private today. Until it is public, installing from a
@@ -127,7 +127,7 @@ and `rm -rf ~/.conbus` removes it if you want it gone.
 | `conbus status` | Routing rules, quota, hop history, cost |
 | `conbus quota` | What each leg has left |
 | `conbus log [FILTERS]` | Read the conversation log back |
-| `conbus usage [--days N] [--since DAY] [--json]` | What the agents did, counted: stops, tool failures, permission asks |
+| `conbus usage [--days N] [--since DAY] [--json] [--shareable]` | What the agents did, counted: stops, tool failures, permission asks |
 | `conbus hop [HARNESS]` | Preview the next leg (`--apply` records it) |
 | `conbus go [HARNESS]` | Hop the current conversation |
 | `conbus run [HARNESS]` | Start a leg in this terminal; hops exec the next one |

@@ -21,7 +21,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use serde::Serialize;
 
 use crate::clock::Timestamp;
-use crate::event::{Entrypoint, Event, ToolOutcome, TurnState};
+use crate::event::{Entrypoint, Event, Harness, ToolOutcome, TurnState};
 use crate::ids::BusId;
 use crate::record::Record;
 
@@ -31,6 +31,22 @@ const DAY_SECS: i64 = 24 * 60 * 60;
 /// live machine is ~330 ms, from Grok, every one of whose events reached the log
 /// twice; a person typing the same thing again takes longer than this.
 const TWIN_WINDOW_SECS: i64 = 2;
+
+/// A limit stop this long after the harness's previous one starts a new
+/// episode. Retries inside a blocked window are one event for whoever has to
+/// deal with it; the vendors' windows are hours long.
+const EPISODE_GAP_SECS: i64 = 60 * 60;
+
+/// The harness names a shared row may carry. Anything else is `other`.
+const KNOWN_HARNESSES: &[&str] = &[
+    Harness::CLAUDE_CODE,
+    Harness::CODEX,
+    Harness::CURSOR,
+    Harness::GROK,
+    Harness::OPENCODE,
+    Harness::AGY,
+    Harness::CLAUDE_CHAT,
+];
 
 /// Entrypoints that mean a person is at the other end.
 ///
@@ -73,10 +89,20 @@ pub struct Counts {
     /// vendor reports more than once by design — Cursor writes it from two
     /// hooks — so a count of them measures the adapter, not the work.
     pub turns: u64,
-    /// Turns the vendor refused on quota.
-    pub quota_stops: u64,
-    /// Turns refused on policy, billing, or auth.
-    pub policy_stops: u64,
+    /// Turns stopped by a usage limit, whatever the vendor calls it.
+    pub limit_stops: u64,
+    /// Runs of limit stops: a new one after an hour without any.
+    pub limit_episodes: u64,
+    /// Turns stopped by the account: authentication, billing, a hold.
+    pub account_stops: u64,
+    /// Turns the vendor failed: overloaded, a server error.
+    pub vendor_errors: u64,
+    /// Turns the request itself could not be served: invalid, too long, no
+    /// such model.
+    pub request_faults: u64,
+    /// Stops whose reason this build does not recognise. Unclassified, not
+    /// guessed.
+    pub other_stops: u64,
     /// Turns a person interrupted.
     pub user_stops: u64,
     /// Subagent runs that finished. Not turns: the vendor opens a subagent
@@ -98,9 +124,54 @@ pub struct Counts {
     pub briefings: u64,
     /// `routed` records, whoever decided them.
     pub hops: u64,
+    /// Second deliveries of a report already counted here — which harness
+    /// double-delivers, and when.
+    pub repeated: u64,
 }
 
 impl Counts {
+    /// Every field by name, so that a new count cannot be left out of a sum.
+    fn add(&mut self, other: &Counts) {
+        let Counts {
+            turns,
+            limit_stops,
+            limit_episodes,
+            account_stops,
+            vendor_errors,
+            request_faults,
+            other_stops,
+            user_stops,
+            subagents,
+            tool_calls,
+            tool_failures,
+            tool_interrupts,
+            tool_denials,
+            permission_asks,
+            tool_ms,
+            briefings,
+            hops,
+            repeated,
+        } = other;
+        self.turns += turns;
+        self.limit_stops += limit_stops;
+        self.limit_episodes += limit_episodes;
+        self.account_stops += account_stops;
+        self.vendor_errors += vendor_errors;
+        self.request_faults += request_faults;
+        self.other_stops += other_stops;
+        self.user_stops += user_stops;
+        self.subagents += subagents;
+        self.tool_calls += tool_calls;
+        self.tool_failures += tool_failures;
+        self.tool_interrupts += tool_interrupts;
+        self.tool_denials += tool_denials;
+        self.permission_asks += permission_asks;
+        self.tool_ms += tool_ms;
+        self.briefings += briefings;
+        self.hops += hops;
+        self.repeated += repeated;
+    }
+
     /// Exhaustive on purpose: a new event has to be a decision here, not a
     /// silent zero.
     fn count(&mut self, record: &Record) {
@@ -110,11 +181,14 @@ impl Counts {
             Event::TurnStarted { .. } if subagent => {}
             Event::TurnStarted { .. } => self.turns += 1,
             Event::TurnEnded { .. } if subagent => self.subagents += 1,
-            Event::TurnEnded { state, .. } => match state {
-                TurnState::Complete => {}
-                TurnState::InterruptedQuota { .. } => self.quota_stops += 1,
-                TurnState::InterruptedPolicy { .. } => self.policy_stops += 1,
-                TurnState::InterruptedUser => self.user_stops += 1,
+            Event::TurnEnded { state, .. } => match Stop::of(state) {
+                None => {}
+                Some(Stop::Limit) => self.limit_stops += 1,
+                Some(Stop::Account) => self.account_stops += 1,
+                Some(Stop::Vendor) => self.vendor_errors += 1,
+                Some(Stop::Request) => self.request_faults += 1,
+                Some(Stop::Other) => self.other_stops += 1,
+                Some(Stop::Person) => self.user_stops += 1,
             },
             Event::ToolUse {
                 duration_ms,
@@ -148,6 +222,56 @@ impl Counts {
     }
 }
 
+/// What an operator would do about a stop.
+///
+/// The adapters split stops for the router — capacity or not — and keep the
+/// vendor's words. This reads those words again for a different question.
+/// Claude Code's reasons are the vendor's enum; Cursor, OpenCode and Grok
+/// report their own, and anything not named here is `Other`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Stop {
+    Limit,
+    Account,
+    Vendor,
+    Request,
+    Other,
+    Person,
+}
+
+impl Stop {
+    fn of(state: &TurnState) -> Option<Self> {
+        let first = |reason: &str| {
+            reason
+                .split(':')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_string()
+        };
+        match state {
+            TurnState::Complete => None,
+            TurnState::InterruptedUser => Some(Stop::Person),
+            // The router treats an overloaded vendor as capacity, rightly for
+            // a hop; for whoever is paying, it is the vendor's fault, not a
+            // limit they hit.
+            TurnState::InterruptedQuota { reason } => Some(match first(reason).as_str() {
+                "overloaded" => Stop::Vendor,
+                _ => Stop::Limit,
+            }),
+            TurnState::InterruptedPolicy { reason } => Some(match first(reason).as_str() {
+                "authentication_failed"
+                | "oauth_org_not_allowed"
+                | "account_on_hold"
+                | "billing_error"
+                | "cloud_credential_error" => Stop::Account,
+                "server_error" | "overloaded" => Stop::Vendor,
+                "invalid_request" | "model_not_found" | "max_output_tokens" => Stop::Request,
+                _ => Stop::Other,
+            }),
+        }
+    }
+}
+
 /// One day of one harness in one workspace, attended or not.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize)]
 pub struct Row {
@@ -160,6 +284,18 @@ pub struct Row {
     pub attendance: Attendance,
     /// Conversations with a record on this day. Not additive across days — a
     /// conversation that runs past midnight is in two rows.
+    pub conversations: u64,
+    #[serde(flatten)]
+    pub counts: Counts,
+}
+
+/// A row as a sync would send it: `docs/rfd/0002-metadata-sync.md` with
+/// workspaces off. There is no workspace field at all — absent, not empty.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize)]
+pub struct SharedRow {
+    pub day: String,
+    pub harness: String,
+    pub attendance: Attendance,
     pub conversations: u64,
     #[serde(flatten)]
     pub counts: Counts,
@@ -208,6 +344,29 @@ impl Ledger {
         }
         tally.finish()
     }
+
+    /// The rows RFD 0002 lets a sync send, with workspaces off.
+    ///
+    /// Rows that differed only by folder merge, and their conversation counts
+    /// add up rather than overlap: a conversation is attributed to one folder,
+    /// the first it reported, so it is in exactly one of the rows merged.
+    pub fn shareable(&self) -> Vec<SharedRow> {
+        let mut merged: BTreeMap<(&str, &str, Attendance), SharedRow> = BTreeMap::new();
+        for row in &self.rows {
+            let shared = merged
+                .entry((&row.day, shared_harness(&row.harness), row.attendance))
+                .or_insert_with(|| SharedRow {
+                    day: row.day.clone(),
+                    harness: shared_harness(&row.harness).to_string(),
+                    attendance: row.attendance,
+                    conversations: 0,
+                    counts: Counts::default(),
+                });
+            shared.conversations += row.conversations;
+            shared.counts.add(&row.counts);
+        }
+        merged.into_values().collect()
+    }
 }
 
 /// The fold's working state: sets where the ledger has counts.
@@ -219,6 +378,8 @@ struct Tally {
     repeated: u64,
     /// When each report that names a vendor thing was last counted.
     delivered: HashMap<(BusId, u64), Timestamp>,
+    /// Each harness's last limit stop, for telling episodes apart.
+    last_limit: HashMap<String, Timestamp>,
     rows: BTreeMap<RowKey, (HashSet<BusId>, Counts)>,
     harnesses: BTreeMap<String, (HashMap<BusId, Attendance>, Counts)>,
     failing: BTreeMap<String, u64>,
@@ -237,18 +398,6 @@ impl Tally {
             return;
         }
         self.records += 1;
-        if let Some(fingerprint) = fingerprint(record) {
-            let key = (record.bus_id, fingerprint);
-            let twin = self
-                .delivered
-                .get(&key)
-                .is_some_and(|first| record.ts.seconds_since(*first) < TWIN_WINDOW_SECS);
-            if twin {
-                self.repeated += 1;
-                return;
-            }
-            self.delivered.insert(key, record.ts);
-        }
         let place = places.get(&record.bus_id);
         let attendance = Attendance::of(place.and_then(|p| p.entrypoint.as_ref()));
         let workspace = place.and_then(|p| p.workspace.clone());
@@ -259,13 +408,50 @@ impl Tally {
             workspace: workspace.clone(),
             attendance,
         };
+        if self.is_twin(record) {
+            self.repeated += 1;
+            self.rows.entry(key).or_default().1.repeated += 1;
+            self.harnesses.entry(harness).or_default().1.repeated += 1;
+            return;
+        }
+        let episode = u64::from(self.starts_episode(record, &harness));
         let (seen, counts) = self.rows.entry(key).or_default();
         seen.insert(record.bus_id);
         counts.count(record);
+        counts.limit_episodes += episode;
         let (seen, counts) = self.harnesses.entry(harness).or_default();
         seen.insert(record.bus_id, attendance);
         counts.count(record);
+        counts.limit_episodes += episode;
         self.note_hotspots(record, workspace);
+    }
+
+    /// A second delivery of a report already counted, inside the twin window.
+    fn is_twin(&mut self, record: &Record) -> bool {
+        let Some(fingerprint) = fingerprint(record) else {
+            return false;
+        };
+        let key = (record.bus_id, fingerprint);
+        let twin = self
+            .delivered
+            .get(&key)
+            .is_some_and(|first| record.ts.seconds_since(*first) < TWIN_WINDOW_SECS);
+        if !twin {
+            self.delivered.insert(key, record.ts);
+        }
+        twin
+    }
+
+    /// Whether this record is a limit stop that begins a new episode.
+    fn starts_episode(&mut self, record: &Record, harness: &str) -> bool {
+        let Event::TurnEnded { state, .. } = &record.event else {
+            return false;
+        };
+        if record.vendor_agent_id.is_some() || Stop::of(state) != Some(Stop::Limit) {
+            return false;
+        }
+        let previous = self.last_limit.insert(harness.to_string(), record.ts);
+        previous.is_none_or(|last| record.ts.seconds_since(last) > EPISODE_GAP_SECS)
     }
 
     /// The tools that fail and the folders that are busy.
@@ -395,6 +581,15 @@ fn attribute(records: &[Record]) -> HashMap<BusId, Place> {
         }
     }
     places
+}
+
+/// A harness name as a shared row may carry it.
+fn shared_harness(harness: &str) -> &str {
+    if KNOWN_HARNESSES.contains(&harness) {
+        harness
+    } else {
+        "other"
+    }
 }
 
 /// Largest first; ties by name, so the same log prints the same report.
@@ -614,10 +809,145 @@ mod tests {
         );
 
         let counts = &ledger.rows[0].counts;
-        assert_eq!(counts.quota_stops, 1);
-        assert_eq!(counts.policy_stops, 1);
+        assert_eq!(counts.limit_stops, 1);
+        assert_eq!(counts.account_stops, 1);
         assert_eq!(counts.user_stops, 1);
         assert_eq!(ledger.rows[0].attendance, Attendance::Unattended);
+    }
+
+    #[test]
+    fn a_stop_is_filed_under_what_an_operator_would_do_about_it() {
+        // The adapters split stops for the router: capacity or not. An
+        // operator needs a different cut — wait, fix the account, page the
+        // vendor, fix the request. On the machine that built this, the
+        // "policy" bucket was 111 authentication failures over 34 hours, a
+        // generic Cursor `error` and three server errors.
+        let quota = |reason: &str| {
+            ended(TurnState::InterruptedQuota {
+                reason: reason.into(),
+            })
+        };
+        let policy = |reason: &str| {
+            ended(TurnState::InterruptedPolicy {
+                reason: reason.into(),
+            })
+        };
+        let stops = [
+            quota("rate_limit"),
+            quota("rate_limit: capacity"),
+            quota("request failed: PRO_USER_USAGE_LIMIT"),
+            quota("GoUsageLimitError"),
+            quota("overloaded"),
+            policy("server_error"),
+            policy("authentication_failed"),
+            policy("billing_error: card declined"),
+            policy("account_on_hold"),
+            policy("invalid_request"),
+            policy("max_output_tokens"),
+            policy("unknown"),
+            policy("error"),
+            policy("APIError"),
+            ended(TurnState::InterruptedUser),
+        ];
+        let records: Vec<Record> = stops
+            .into_iter()
+            .enumerate()
+            .map(|(i, event)| {
+                at(
+                    &on_day(&format!("09:00:{i:02}")),
+                    ONE,
+                    source("cursor"),
+                    event,
+                )
+            })
+            .collect();
+        let counts = &Ledger::fold(&records, DAY).rows[0].counts;
+
+        assert_eq!(counts.limit_stops, 4, "quota, whatever the vendor calls it");
+        assert_eq!(counts.vendor_errors, 2, "overloaded is the vendor, not you");
+        assert_eq!(counts.account_stops, 3);
+        assert_eq!(counts.request_faults, 2);
+        assert_eq!(counts.other_stops, 3, "unclassified, not guessed");
+        assert_eq!(counts.user_stops, 1);
+    }
+
+    #[test]
+    fn limit_stops_close_together_are_one_episode() {
+        // 200 unattended sessions that each hit the limit in one hour are one
+        // event for whoever has to deal with it, not two hundred.
+        let limit = || {
+            ended(TurnState::InterruptedQuota {
+                reason: "rate_limit".into(),
+            })
+        };
+        let ledger = Ledger::fold(
+            &[
+                at(&on_day("03:00:00"), ONE, source("claude_code"), limit()),
+                at(&on_day("03:20:00"), TWO, source("claude_code"), limit()),
+                at(&on_day("03:59:00"), ONE, source("claude_code"), limit()),
+                at(&on_day("03:59:30"), ONE, source("codex"), limit()),
+                at(&on_day("06:00:00"), TWO, source("claude_code"), limit()),
+            ],
+            DAY,
+        );
+
+        let claude = &ledger.harnesses[0];
+        assert_eq!(claude.harness, "claude_code");
+        assert_eq!(claude.counts.limit_stops, 4);
+        assert_eq!(
+            claude.counts.limit_episodes, 2,
+            "a gap of two hours is a new one"
+        );
+        let codex = &ledger.harnesses[1];
+        assert_eq!(codex.counts.limit_episodes, 1, "each harness has its own");
+    }
+
+    #[test]
+    fn a_second_delivery_is_counted_in_its_row() {
+        // The per-row count is a data-quality signal: which harness on which
+        // day double-delivers.
+        let failed = || ToolOutcome::Failed {
+            error: Body::kept("exit 1"),
+            interrupted: false,
+        };
+        let ledger = Ledger::fold(
+            &[
+                at(
+                    &on_day("09:00:00"),
+                    ONE,
+                    source("grok"),
+                    tool_with_id("c1", failed()),
+                ),
+                at(
+                    &on_day("09:00:00"),
+                    ONE,
+                    source("grok"),
+                    tool_with_id("c1", failed()),
+                ),
+            ],
+            DAY,
+        );
+
+        assert_eq!(ledger.rows[0].counts.repeated, 1);
+        assert_eq!(ledger.rows[0].counts.tool_calls, 1);
+        assert_eq!(ledger.harnesses[0].counts.repeated, 1);
+    }
+
+    #[test]
+    fn a_harness_this_build_does_not_know_is_shared_as_other() {
+        // Kept by name on the machine; a sync sends only names it knows.
+        let ledger = Ledger::fold(
+            &[at(
+                &on_day("09:00:00"),
+                ONE,
+                source("frobnicator"),
+                prompt("a"),
+            )],
+            DAY,
+        );
+
+        assert_eq!(ledger.rows[0].harness, "frobnicator");
+        assert_eq!(ledger.shareable()[0].harness, "other");
     }
 
     #[test]
@@ -833,15 +1163,19 @@ mod tests {
         assert_eq!(
             keys,
             vec![
+                "account_stops",
                 "attendance",
                 "briefings",
                 "conversations",
                 "day",
                 "harness",
                 "hops",
+                "limit_episodes",
+                "limit_stops",
+                "other_stops",
                 "permission_asks",
-                "policy_stops",
-                "quota_stops",
+                "repeated",
+                "request_faults",
                 "subagents",
                 "tool_calls",
                 "tool_denials",
@@ -850,6 +1184,7 @@ mod tests {
                 "tool_ms",
                 "turns",
                 "user_stops",
+                "vendor_errors",
                 "workspace",
             ]
         );
@@ -1072,6 +1407,115 @@ mod tests {
 
         assert_eq!(ledger.rows[0].counts.tool_calls, 2);
         assert_eq!(ledger.repeated, 0);
+    }
+
+    #[test]
+    fn a_shareable_row_has_no_folder_and_folders_merge() {
+        // RFD 0002 with workspaces off: the field is absent, not empty, and two
+        // conversations that differed only by folder are one row. Each
+        // conversation belongs to one folder, so their counts still add up.
+        let ledger = Ledger::fold(
+            &[
+                at(
+                    &on_day("09:00:00"),
+                    ONE,
+                    claude_in(Some("/Users/someone/secret-project"), Some("cli")),
+                    prompt("a"),
+                ),
+                at(
+                    &on_day("09:00:01"),
+                    TWO,
+                    claude_in(Some("/w"), Some("cli")),
+                    prompt("b"),
+                ),
+                at(
+                    &on_day("09:00:02"),
+                    TWO,
+                    claude_in(Some("/w"), Some("sdk-cli")),
+                    prompt("c"),
+                ),
+            ],
+            DAY,
+        );
+
+        let shared = ledger.shareable();
+        assert_eq!(ledger.rows.len(), 2, "two folders locally");
+        assert_eq!(shared.len(), 1, "{shared:?}");
+        assert_eq!(shared[0].conversations, 2);
+        assert_eq!(shared[0].counts.turns, 3);
+        assert_eq!(shared[0].attendance, Attendance::Attended);
+        let text = serde_json::to_string(&shared[0]).expect("json");
+        assert!(!text.contains("workspace"), "{text}");
+        assert!(!text.contains("secret-project"), "{text}");
+    }
+
+    #[test]
+    fn a_shareable_row_names_exactly_what_the_contract_names() {
+        // docs/rfd/0002-metadata-sync.md, "The unit: a row", with workspaces
+        // off. A new key here is an amendment to that RFD first.
+        let s = || claude_in(Some("/w"), Some("cli"));
+        let ledger = Ledger::fold(
+            &[
+                at(&on_day("09:00:00"), ONE, s(), prompt("the secret plan")),
+                at(
+                    &on_day("09:00:01"),
+                    ONE,
+                    s(),
+                    tool(
+                        "Bash",
+                        ToolOutcome::Failed {
+                            error: Body::kept("password=hunter2"),
+                            interrupted: false,
+                        },
+                        None,
+                    ),
+                ),
+            ],
+            DAY,
+        );
+
+        let json = serde_json::to_value(&ledger.shareable()[0]).expect("json");
+        let text = json.to_string();
+        for leaked in ["secret plan", "hunter2", "cargo test", "Bash", "/w"] {
+            assert!(
+                !text.contains(leaked),
+                "{leaked} reached a shared row: {text}"
+            );
+        }
+        let mut keys: Vec<&str> = json
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "account_stops",
+                "attendance",
+                "briefings",
+                "conversations",
+                "day",
+                "harness",
+                "hops",
+                "limit_episodes",
+                "limit_stops",
+                "other_stops",
+                "permission_asks",
+                "repeated",
+                "request_faults",
+                "subagents",
+                "tool_calls",
+                "tool_denials",
+                "tool_failures",
+                "tool_interrupts",
+                "tool_ms",
+                "turns",
+                "user_stops",
+                "vendor_errors",
+            ]
+        );
     }
 
     #[test]

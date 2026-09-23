@@ -2,9 +2,14 @@
 
 Operator notes for the next agent, and the knowledge this project paid for.
 
-SaaS scope is decided: conbus is a local tool (`docs/saas-hypothesis.md`,
-2026-09-23). Before any hosted bus, account, or price, reopen that file and
-write the new choice there. Do not start that host in the same turn.
+SaaS scope: **Choice 3 — open-core ops ledger, validation first**
+(`docs/saas-hypothesis.md`, 2026-09-23; plan `docs/saas-strategy.md`; data
+contract `docs/rfd/0002-metadata-sync.md`). No host exists and the product is
+still the local tool. The host waits for the gates in the plan — reach,
+problem, value, and money that has moved — and for an operator decision; do not
+start it in the turn that writes or changes the choice. No sync code before RFD
+0002 is accepted and RFD 0003 (security) is written, and no field 0002 does not
+name.
 
 Live bus ids, home paths, quota numbers and probe session ids do not belong
 here — they live in `HANDOFF.local.md` (gitignored) and in `~/.conbus/`.
