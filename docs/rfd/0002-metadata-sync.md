@@ -226,7 +226,16 @@ loopback and the file exporter.
 `tests/otlp_collector.rs` repeats the check when `CONBUS_OTELCOL` names a
 collector binary; it is ignored otherwise.
 
-Not settled by the spike: Grafana Alloy and the Datadog Agent were not tried.
+Grafana Alloy 1.19.2 (darwin arm64) was checked the same day. Its
+`otelcol.receiver.otlp` answered `200` to the same closed day, and its
+`otelcol.exporter.otlphttp` forwarded all 100 points unchanged to a local
+listener: values, units, types, `DELTA`, day-boundary timestamps, attributes
+and resource. A path it does not serve came back `404`. Alloy's anonymous
+usage reporting was off (`--disable-reporting`) and every listener was on
+loopback.
+
+Not settled by the spike: the Datadog Agent was not tried. It needs the
+operator's API key, which an agent does not handle.
 And backends keep their own rules for late points: Datadog does not ingest a point
 more than an hour old unless Historical Metrics Ingestion is on, and a
 Prometheus-style store takes an old sample only inside its out-of-order window,

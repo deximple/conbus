@@ -12,7 +12,7 @@ the entry says so when it does.
   real OpenTelemetry Collector, which runs when `CONBUS_OTELCOL` names one.
   Against otelcol 0.161.0 every point the collector kept equalled the row
   `--shareable` printed, and a wrong path or a stopped collector exited
-  non-zero.
+  non-zero. Grafana Alloy 1.19.2 forwarded every point unchanged too.
 
 ### Fixed
 
