@@ -2,7 +2,7 @@
 
 This manual describes **conbus 0.1.1** on macOS. For the short version, read
 the [README](../README.md); for what changed between releases, the
-[CHANGELOG](../CHANGELOG.md).
+[CHANGELOG](../CHANGELOG.md). 한국어: [manual.ko.md](manual.ko.md)
 
 - [1. What conbus is](#1-what-conbus-is)
 - [2. Before you install](#2-before-you-install)
