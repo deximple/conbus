@@ -150,11 +150,96 @@ API with a receipt, per member and per device.
 The Enterprise audit export is not a sync feature and needs its own work first:
 hash-chained log segments and signed exports.
 
+## The pipe: the same rows, into a collector the person runs
+
+`conbus usage --otlp URL` — **built**, as a spike. It sends the rows
+`--shareable` prints for the window, and nothing else, as OpenTelemetry metrics
+to a collector on the person's own machine — the OpenTelemetry Collector,
+Grafana Alloy and the Datadog Agent all take OTLP/HTTP on `127.0.0.1:4318` —
+which forwards them to the monitoring the team already runs. That collector is
+not the conbus service. There is no device id, member, credential, envelope or
+conbus host, and the service's rules above (cells of five, one version per day)
+are not in play: the person sends their own counts to their own system, when
+they run the command. What conbus puts on the wire is still bound here — the
+never-sent list applies, and every field is in the table below.
+
+- **Wire.** One `POST {URL}/v1/metrics` (the URL as given when it already ends
+  in `/v1/metrics`), `Content-Type: application/json`, plain HTTP/1.1 to a
+  loopback address. `https://`, any other host, and a URL with a user name or
+  password are refused before a connection is made; TLS onward is the
+  collector's job. A refusal, a failed connection, an answer other than 2xx or
+  a partial success is an error and a non-zero exit. Nothing is retried: a
+  delta the collector took without acknowledging it would count twice.
+- **Encoding.** `ExportMetricsServiceRequest` in OTLP's JSON encoding: proto
+  field names in lowerCamelCase, enum values as integers
+  (`aggregationTemporality: 1` is DELTA), and 64-bit integers — the timestamps
+  and `asInt` — as decimal strings.
+- **Resource.** `service.name` = `conbus` and `service.version` = the release
+  (`0.2.4`), not the commit. No host, user, device or scope attribute; a
+  collector that adds its own does so by its own configuration.
+- **Points.** Every count of a row is one point, with `harness` and
+  `attendance` as attributes and `kind` on `conbus.stops`. Sums are monotonic
+  deltas from `startTimeUnixNano`, 00:00 UTC of the row's day, to
+  `timeUnixNano`, the next 00:00 — or the moment of sending, for a day that has
+  not ended. The gauge carries only `timeUnixNano`, since OTLP ignores a
+  gauge's start.
+- **Once a day.** Deltas add up, so a day sent twice is counted twice, and
+  today is still growing: the unit is a closed `--day`, sent once.
+
+| Row field | Metric | Type | Unit | Attributes |
+| --- | --- | --- | --- | --- |
+| `day` | the points' `startTimeUnixNano` and `timeUnixNano` | | | |
+| `harness`, `attendance` | an attribute on every point | | | |
+| `conversations` | `conbus.conversations` | Gauge | `{conversation}` | |
+| `turns` | `conbus.turns` | Sum | `{turn}` | |
+| `limit_stops` | `conbus.stops` | Sum | `{stop}` | `kind` = `limit` |
+| `account_stops` | `conbus.stops` | Sum | `{stop}` | `kind` = `account` |
+| `vendor_errors` | `conbus.stops` | Sum | `{stop}` | `kind` = `vendor` |
+| `request_faults` | `conbus.stops` | Sum | `{stop}` | `kind` = `request` |
+| `other_stops` | `conbus.stops` | Sum | `{stop}` | `kind` = `other` |
+| `user_stops` | `conbus.stops` | Sum | `{stop}` | `kind` = `person` |
+| `limit_episodes` | `conbus.limit_episodes` | Sum | `{episode}` | |
+| `subagents` | `conbus.subagents` | Sum | `{run}` | |
+| `tool_calls` | `conbus.tool.calls` | Sum | `{call}` | |
+| `tool_failures` | `conbus.tool.failures` | Sum | `{call}` | |
+| `tool_interrupts` | `conbus.tool.interrupts` | Sum | `{call}` | |
+| `tool_denials` | `conbus.tool.denials` | Sum | `{call}` | |
+| `permission_asks` | `conbus.permission_asks` | Sum | `{ask}` | |
+| `tool_ms` | `conbus.tool.duration` | Sum | `ms` | |
+| `briefings` | `conbus.briefings` | Sum | `{briefing}` | |
+| `hops` | `conbus.hops` | Sum | `{hop}` | |
+| `repeated` | `conbus.repeated` | Sum | `{record}` | |
+| `recovered` | `conbus.recovered` | Sum | `{record}` | |
+
+Not settled by the spike. It has been driven only against a loopback listener
+that checks the request and parses the body, never a real collector. And
+backends keep their own rules for late points: Datadog does not ingest a point
+more than an hour old unless Historical Metrics Ingestion is on, and a
+Prometheus-style store takes an old sample only inside its out-of-order window,
+and wants cumulative sums (the collector's `deltatocumulative` processor, or
+Prometheus's own). A day's points end at 00:00 UTC, so a send soon after that is
+the one most backends keep.
+
+Sources: [OTLP 1.11.0](https://opentelemetry.io/docs/specs/otlp/), "JSON
+Protobuf Encoding" and "OTLP/HTTP";
+[`metrics.proto`](https://github.com/open-telemetry/opentelemetry-proto/blob/main/opentelemetry/proto/metrics/v1/metrics.proto)
+and [`metrics_service.proto`](https://github.com/open-telemetry/opentelemetry-proto/blob/main/opentelemetry/proto/collector/metrics/v1/metrics_service.proto);
+the [metrics data model](https://opentelemetry.io/docs/specs/otel/metrics/data-model/)
+on delta intervals; the
+[OTLP exporter configuration](https://opentelemetry.io/docs/specs/otel/protocol/exporter/)
+on appending `/v1/metrics`; the
+[semantic conventions for metrics](https://opentelemetry.io/docs/specs/semconv/general/metrics/)
+on units; Datadog's
+[historical metrics](https://docs.datadoghq.com/metrics/custom_metrics/historical_metrics/);
+Prometheus's [OpenTelemetry guide](https://prometheus.io/docs/guides/opentelemetry/).
+
 ## Commands (proposed, not built unless marked)
 
 - `conbus usage --json --shareable` — **built** (#31). Prints the rows a sync
   would send, with the machine's settings applied. Works before joining, so
   anyone can read the payload first.
+- `conbus usage --otlp URL` — **built**, a spike. Sends those rows to a
+  collector on this machine; see "The pipe" above. Not a sync.
 - `conbus sync --join INVITE [--apply]` — reports what would be sent and where;
   writes the credential and the invite's settings only with `--apply`, like
   `install`.
@@ -198,3 +283,17 @@ Owed by the sync code:
 5. The rows a sync sends equal what `--shareable` printed for the same log.
 6. Credentials in a remote URL never reach a key or a label.
 7. A day is not sent before it closes, and is sent once.
+
+Built with `--otlp`, the pipe:
+
+8. Every count of a row is one point of the metric the table names, and the
+   body carries no workspace, path, prompt, reply, tool name, stop reason, raw
+   entrypoint or id.
+9. The body uses OTLP/JSON's keys and no others, and its resource names only
+   the program.
+10. `https://`, a host other than this machine, and a malformed URL are refused
+    before a connection is made — by the binary, before it prints anything.
+11. The request is one `POST /v1/metrics` with `Content-Type: application/json`,
+    and its body is the encoding of the rows `--shareable` printed.
+12. A closed port, an answer other than 2xx, a partial success and a collector
+    that never answers are errors that say so, and the command exits non-zero.

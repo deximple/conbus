@@ -266,8 +266,31 @@ cost      not in this log: no hook payload carries tokens or prices
 `conbus usage --json` prints one row per day, agent, folder and attendance:
 counts only, never a prompt, a reply or a tool body. `conbus usage --shareable`
 prints the same rows with the folder removed — what a sync would send, if one
-existed ([RFD 0002](rfd/0002-metadata-sync.md)). Nothing is sent anywhere; the
-point is that you can read it first.
+existed ([RFD 0002](rfd/0002-metadata-sync.md)). `--shareable` itself sends
+nothing; the point is that you can read it first.
+
+**Into your own monitoring:** `--otlp URL` sends those same rows, as
+OpenTelemetry metrics, to a collector on this Mac — the OpenTelemetry
+Collector, Grafana Alloy and the Datadog Agent all listen on
+`http://127.0.0.1:4318` — which forwards them wherever it is set up to send:
+Grafana, Datadog, CloudWatch. Each count is a metric (`conbus.turns`,
+`conbus.stops` by `kind`, `conbus.tool.failures` and the rest, listed in
+[RFD 0002](rfd/0002-metadata-sync.md#the-pipe-the-same-rows-into-a-collector-the-person-runs)),
+labelled with the agent and attendance. Nothing is sent without the flag.
+
+```bash
+conbus usage --day 2026-09-22 --shareable --otlp http://127.0.0.1:4318   # print a closed day's rows, and send them
+```
+
+`--day` is the unit to send: yesterday, once, after it has closed. Each point
+is what happened that day, so a day sent twice is counted twice, and today is
+still growing — conbus says so if you send it. Send soon after 00:00 UTC: some
+backends drop points stamped hours ago (Datadog keeps none more than an hour
+old unless Historical Metrics Ingestion is on). This first version speaks plain
+HTTP to a collector on this Mac only — `https://` and other hosts are refused,
+and TLS onward is the collector's job — and it does not retry: a refused URL, a
+failed connection, an answer other than 2xx, or points the collector says it
+rejected are errors, and the command exits non-zero.
 
 A record looks like this (fields vary by event):
 
@@ -525,6 +548,10 @@ like any other context:
 - `conbus summary --bus-id ID`, which asks the *other* leg's agent to summarise a
   conversation — only when you run it.
 
+`conbus usage --otlp URL` sends counts — the `--shareable` rows, never text — to
+a collector on this Mac that you name, and only when you run it (section 5).
+Where they go from there is that collector's configuration.
+
 To read quota, conbus runs the agents' own CLIs (section 8); deciding a hop asks
 `gh` about the folder's pull request.
 
@@ -645,7 +672,7 @@ line, the destination's quota, and whether the session was a program
 | `conbus run [HARNESS]` | Start an agent in this terminal; hops start the next one here |
 | `conbus backfill [--apply] [--gaps] [--chat-export PATH]` | Recover history |
 | `conbus summary --bus-id ID` | Ask the other leg's agent for a digest of a conversation |
-| `conbus usage [--days N] [--since DAY] [--day DAY] [--json] [--shareable]` | What the agents did, counted (section 5) |
+| `conbus usage [--days N] [--since DAY] [--day DAY] [--json] [--shareable] [--otlp URL]` | What the agents did, counted; `--otlp` sends the `--shareable` rows to a collector on this Mac (section 5) |
 | `conbus verdict` | Score a four-week trial of the hop (below) |
 | `conbus arena fact --workspace DIR --claim TEXT --anchor PATH [--type T]` | Accept a fact |
 | `conbus arena link --from DIR --to DIR` | Share one folder's facts with another |

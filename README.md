@@ -88,6 +88,9 @@ is treated like `conbus go cursor`.
   - `conbus summary`, which asks the *other* vendor to digest a conversation,
     only when you run it.
 
+  `conbus usage --otlp URL` sends counts, never text, to an OpenTelemetry
+  collector on this Mac that you name — only when you run it.
+
   To read quota, conbus asks the vendor CLIs you already use (`codex
   app-server`, `agy`); deciding a hop asks `gh` for the checkout's pull request.
 - **What conbus never reads.** Vendor auth tokens and credentials. Vendor
@@ -127,7 +130,7 @@ and `rm -rf ~/.conbus` removes it if you want it gone.
 | `conbus status` | Routing rules, quota, hop history, cost |
 | `conbus quota` | What each leg has left |
 | `conbus log [FILTERS]` | Read the conversation log back |
-| `conbus usage [--days N] [--since DAY] [--json] [--shareable]` | What the agents did, counted: stops, tool failures, permission asks |
+| `conbus usage [--days N] [--since DAY] [--day DAY] [--json] [--shareable] [--otlp URL]` | What the agents did, counted: stops, tool failures, permission asks; `--otlp` sends the counts to a collector on this Mac |
 | `conbus hop [HARNESS]` | Preview the next leg (`--apply` records it) |
 | `conbus go [HARNESS]` | Hop the current conversation |
 | `conbus run [HARNESS]` | Start a leg in this terminal; hops exec the next one |
