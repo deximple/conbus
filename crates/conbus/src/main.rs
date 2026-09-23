@@ -102,7 +102,23 @@ fn main() -> ExitCode {
         }
         Command::Daemon => run(|paths| daemon::serve(paths, Retention::from_env())),
         Command::Log { json, filter } => run(|paths| report::log(paths, json, &filter)),
-        Command::Install { apply } => run(|_| report::install(apply)),
+        // Printed, never written, and without the data directory `run`
+        // resolves first: the block needs no log, and an MDM script may run
+        // it with no HOME at all.
+        Command::Install {
+            apply,
+            managed: true,
+        } => match install::managed::run(apply) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("conbus: {err}");
+                ExitCode::FAILURE
+            }
+        },
+        Command::Install {
+            apply,
+            managed: false,
+        } => run(|_| report::install(apply)),
         Command::Uninstall { apply } => run(|_| uninstall::run(apply)),
         Command::Backfill {
             apply,

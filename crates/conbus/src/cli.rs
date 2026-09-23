@@ -21,6 +21,10 @@ pub enum Command {
     /// writes, after backing up whatever was there.
     Install {
         apply: bool,
+        /// Print the hooks block for Claude Code's managed settings instead,
+        /// and write nothing. Wins over `--apply`: managed settings belong to
+        /// the organisation's device tooling, never to conbus.
+        managed: bool,
     },
     /// Take back everything `install --apply` wrote. Reports by default; the
     /// log is never removed.
@@ -153,6 +157,7 @@ where
         },
         "install" => Command::Install {
             apply: args.iter().any(|a| a == "--apply"),
+            managed: args.iter().any(|a| a == "--managed"),
         },
         "uninstall" => Command::Uninstall {
             apply: args.iter().any(|a| a == "--apply"),
@@ -258,6 +263,11 @@ USAGE:
                                   decrypts sealed tool bodies (explicit only)
     conbus install [--apply]      register the hooks with every vendor found;
                                   reports unless told to write
+    conbus install --managed      print, and never write, the hooks block for
+                                  Claude Code's managed settings (fleets with
+                                  allowManagedHooksOnly): JSON on stdout, where
+                                  it goes and the Codex and Cursor managed
+                                  hooks on stderr; docs/fleet.md
     conbus uninstall [--apply]    take them all back out; the log is kept
     conbus backfill [--apply] [--gaps] [--chat-export PATH]
                                   recover history; --gaps fills missed turns of live sessions;
@@ -590,10 +600,44 @@ mod tests {
     fn install_reports_unless_told_to_apply() {
         // The default has to be the safe one: these are the user's own settings
         // files and they usually already hold their own hooks.
-        assert_eq!(parse(["install"], None), Command::Install { apply: false });
+        assert_eq!(
+            parse(["install"], None),
+            Command::Install {
+                apply: false,
+                managed: false
+            }
+        );
         assert_eq!(
             parse(["install", "--apply"], None),
-            Command::Install { apply: true }
+            Command::Install {
+                apply: true,
+                managed: false
+            }
+        );
+    }
+
+    #[test]
+    fn install_managed_is_a_flag_of_its_own() {
+        // The block an administrator puts in managed settings. It only ever
+        // prints; `main` lets --managed win over --apply, so the parse keeps
+        // both and the report says --apply did nothing.
+        assert_eq!(
+            parse(["install", "--managed"], None),
+            Command::Install {
+                apply: false,
+                managed: true
+            }
+        );
+        assert_eq!(
+            parse(["install", "--managed", "--apply"], None),
+            Command::Install {
+                apply: true,
+                managed: true
+            }
+        );
+        assert_eq!(
+            parse(["install", "--managed", "--help"], None),
+            Command::Help
         );
     }
 

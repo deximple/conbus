@@ -10,7 +10,9 @@ describes `main` from 0.2.5 (2026-09-24).
 conbus records coding-agent sessions on the machine they run on. It is one
 Rust binary at `~/.local/bin/conbus`, plus a launchd agent
 (`sh.conbus.daemon`) that runs it as the person, with no root and no system
-extension. It also adds hook entries to each agent's own settings. There is no
+extension. It also adds hook entries to each agent's own settings. On a
+managed Mac the organisation also places a copy the managed hooks name
+([below](#on-a-managed-mac)); conbus itself writes no system file. There is no
 server, account or telemetry, and conbus makes no outbound connection of its
 own. In a pilot, the only thing shared is the counts file described below, and
 the participant sends it themselves.
@@ -99,6 +101,27 @@ each rewrite it keeps a `*.json.conbus-backup` copy. It replaces files
 atomically and refuses a file it cannot parse. `uninstall --apply` removes
 every entry that runs conbus and nothing else.
 
+### On a managed Mac
+
+`install --managed` changes nothing, with or without `--apply`, and starts no
+process: it prints the hooks block for Claude Code's managed settings, and
+pointers for Codex and Cursor. The [fleet guide](fleet.md) asks the
+organisation's own device tooling, with admin rights, to place these:
+
+| What | Where | New process |
+| --- | --- | --- |
+| The binary the managed hooks name | a root-owned path every account can run, such as `/usr/local/bin/conbus` | none of its own: each agent starts `conbus hook` as the person, as it does the per-user hook |
+| Claude Code's hooks block | `/Library/Application Support/ClaudeCode/managed-settings.d/conbus.json`, or the organisation's own `managed-settings.json` or `com.anthropic.claudecode` profile | none |
+| Codex's managed hooks, optional | `[hooks]` in `/etc/codex/requirements.toml` or the `com.openai.codex` profile | none |
+| A Login Items rule, optional | a `com.apple.servicemanagement` profile with a `Label` rule for `sh.conbus.daemon` | none |
+
+Cursor's enterprise hooks file is not used: `install --apply` registers
+Cursor per user. Each person still runs `install --apply` for the recorder,
+which works on the per-user files above. The block holds only `hooks`: not
+the StatusLine wrapper, which runs a command from the person's own
+`~/.claude`, and not `allowManagedHooksOnly`, which stays the organisation's
+to set.
+
 ## What it never does
 
 - Read, store or forward a vendor credential or token.
@@ -147,7 +170,10 @@ reads the file before sending it. No sync code exists, and none will before
 
 Run `conbus uninstall --apply`, then `rm -rf ~/.conbus`. With
 `encrypted_tools`, also delete the key:
-`security delete-generic-password -s sh.conbus -a log-kek`.
+`security delete-generic-password -s sh.conbus -a log-kek`. On a managed Mac,
+remove the managed entries first and the system-wide binary last;
+[the fleet guide](fleet.md#7-taking-it-back-out) gives the order.
+`uninstall` touches neither.
 
 ## Known gaps
 
@@ -156,7 +182,9 @@ Run `conbus uninstall --apply`, then `rm -rf ~/.conbus`. With
   process can read the log already.
 - A hook runs on every agent turn with the person's privileges. Whoever can
   replace `~/.local/bin/conbus` therefore runs code in every session, as with
-  any hook.
+  any hook. On a managed Mac the same holds for the system-wide binary the
+  managed hooks name, across every account, so it belongs in a directory only
+  root can write.
 - It is not notarized, has had no third-party audit, and has no SBOM beyond
   `Cargo.lock`.
 

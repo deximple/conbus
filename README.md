@@ -143,7 +143,7 @@ and `rm -rf ~/.conbus` removes it if you want it gone.
 ## More
 
 [Manual](docs/manual.md) · [Changelog](CHANGELOG.md) · [Security](SECURITY.md) · [Releasing](docs/release.md) ·
-[Hop walkthrough](docs/hop-demo.md) · [Hook contract](docs/rfd/0001-hook-contract.md) ·
+[Managed Macs](docs/fleet.md) · [Hop walkthrough](docs/hop-demo.md) · [Hook contract](docs/rfd/0001-hook-contract.md) ·
 [Fact schema](docs/fact-schema.md) · [매뉴얼 (한국어)](docs/manual.ko.md) · [운영자 매뉴얼 (한국어)](docs/beginner-manual.md) ·
 [License](LICENSE)
 
