@@ -4,6 +4,17 @@ All notable changes to conbus. Versions follow [Semantic Versioning](https://sem
 until 1.0 a minor version may change the command line or the log format, and
 the entry says so when it does.
 
+## [Unreleased]
+
+### Fixed
+
+- The log is readable by its owner only. The data root was made with the
+  default umask, and a macOS home directory is 0755, so every other account on
+  the Mac could read `~/.conbus/log` — prompts and replies included. The root
+  and the log directory are now 0700 and new segments 0600, and the daemon
+  closes a root an older build left open when it starts, so upgrading and
+  running `conbus install --apply` is enough.
+
 ## [0.2.4] — 2026-09-23
 
 Counts an operator can trust: recovered turns, one stop per Cursor turn, one

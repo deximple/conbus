@@ -99,6 +99,17 @@ impl Paths {
         self.origin
     }
 
+    /// Keep the data root to its owner: make it 0700, and close one an
+    /// older build left open.
+    ///
+    /// The log under it holds prompts and replies, and a macOS home directory
+    /// is 0755, so a root made with the default umask let every other account
+    /// on the Mac read the conversations. A closed root closes everything in
+    /// it, whatever the files' own modes.
+    pub fn keep_private(&self) -> std::io::Result<()> {
+        keep_dir_private(&self.root)
+    }
+
     /// The append-only log directory.
     pub fn log_dir(&self) -> PathBuf {
         self.root.join("log")
@@ -171,9 +182,43 @@ impl Paths {
     }
 }
 
+/// Make `dir` (and any parent it needs) 0700, and close it if it exists open.
+pub fn keep_dir_private(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_data_root_is_kept_to_its_owner() {
+        // A root an older build made 0755 is closed when the daemon starts,
+        // and one that does not exist yet is made closed.
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().expect("tempdir");
+        let open = home.path().join("open");
+        std::fs::create_dir(&open).expect("dir");
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let fresh = home.path().join("fresh").join("conbus");
+
+        for root in [&open, &fresh] {
+            let paths =
+                Paths::from_env(Some(root.to_str().expect("utf-8")), None, None).expect("paths");
+            paths.keep_private().expect("private");
+            let mode = std::fs::metadata(root)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o700, "{}", root.display());
+        }
+    }
 
     #[test]
     fn xdg_state_home_wins_over_the_home_default() {

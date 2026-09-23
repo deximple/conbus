@@ -997,6 +997,8 @@ pub fn serve(paths: &Paths, retention: Retention) -> io::Result<()> {
     if let Some(problem) = paths.socket_problem() {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, problem));
     }
+    // Before anything is written: an older build left the root 0755.
+    paths.keep_private()?;
     let listener = bind(&paths.socket())?;
     // Named before restore. `doctor` and the recorder tests wait on the
     // socket; a stamp that lands after a long scan looks like no daemon.

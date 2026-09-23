@@ -103,7 +103,7 @@ pub fn record(dropped: &Dropped) -> bool {
     let Ok(paths) = Paths::resolve() else {
         return true;
     };
-    let _ = fs::create_dir_all(paths.root());
+    let _ = paths.keep_private();
     record_at(&paths, dropped)
 }
 
