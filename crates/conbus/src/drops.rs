@@ -100,13 +100,19 @@ impl std::fmt::Display for Dropped {
 /// Never fails and never panics: it runs on the path that exists in order not
 /// to fail.
 pub fn record(dropped: &Dropped) -> bool {
-    let Ok(paths) = Paths::resolve() else {
+    record_in(Paths::resolve().ok().as_ref(), dropped)
+}
+
+/// As [`record`], under a root the caller names — the Inference listener's,
+/// or a test's own. With no root there is nowhere to write, so say it.
+pub fn record_in(paths: Option<&Paths>, dropped: &Dropped) -> bool {
+    let Some(paths) = paths else {
         return true;
     };
     // Best effort: the drop is written whether or not the root can be
     // closed, and the recorder reports a root it cannot close.
     let _ = paths.keep_private();
-    record_at(&paths, dropped)
+    record_at(paths, dropped)
 }
 
 fn record_at(paths: &Paths, dropped: &Dropped) -> bool {

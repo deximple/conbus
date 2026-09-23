@@ -4,6 +4,21 @@ All notable changes to conbus. Versions follow [Semantic Versioning](https://sem
 until 1.0 a minor version may change the command line or the log format, and
 the entry says so when it does.
 
+## [Unreleased]
+
+### Fixed
+
+- conbus's own tests no longer reach the recorder of the person running them.
+  Two Inference-listener tests went through the real data root: every
+  `cargo test` sent their fixture frame to the running recorder, which
+  logged it as a Chat turn (session `22222222-…`, request `req_abc123`), and
+  wrote a drop and a `claude_chat` field-name file into `~/.conbus`. And the
+  `quota` and `doctor` tests ran the machine's real `agy` and
+  `codex app-server`. The listener now resolves the root once and hands it
+  down, tests give it one of their own, and every test that runs `conbus`
+  names its data root and vendor binaries. Records already in a developer's
+  log stay, as everything in the log does; they are one conversation.
+
 ## [0.2.5] — 2026-09-24
 
 Ready for a pilot's security review and a managed fleet. The log is readable

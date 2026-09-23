@@ -9,6 +9,11 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_conbus")
 }
 
+/// A vendor binary that is not there: `doctor` reads quota through the real
+/// `agy` and `codex app-server` unless told otherwise, and a test has no
+/// business starting either.
+const NOT_THERE: &str = "/nonexistent/conbus-test-vendor";
+
 /// A running daemon that is stopped and reaped however the test ends, so a
 /// failing assertion cannot leave a process holding the socket.
 struct Daemon(Child);
@@ -1063,6 +1068,8 @@ fn a_drop_is_recorded_where_doctor_can_find_it() {
 
     let doctor = Command::new(bin())
         .arg("doctor")
+        .env("CONBUS_AGY_BIN", NOT_THERE)
+        .env("CONBUS_CODEX_BIN", NOT_THERE)
         .env("CONBUS_HOME", home.path())
         .output()
         .expect("doctor");
@@ -1092,6 +1099,8 @@ fn doctor_reports_a_log_it_cannot_append_to() {
 
     let doctor = Command::new(bin())
         .arg("doctor")
+        .env("CONBUS_AGY_BIN", NOT_THERE)
+        .env("CONBUS_CODEX_BIN", NOT_THERE)
         .env("CONBUS_HOME", home.path())
         .output()
         .expect("doctor");
@@ -1554,6 +1563,8 @@ fn the_daemon_leaves_its_build_where_doctor_can_compare_it() {
 
     let doctor = Command::new(bin())
         .arg("doctor")
+        .env("CONBUS_AGY_BIN", NOT_THERE)
+        .env("CONBUS_CODEX_BIN", NOT_THERE)
         .env("CONBUS_HOME", home.path())
         .output()
         .expect("run doctor");
@@ -1591,6 +1602,8 @@ fn doctor_says_when_the_daemon_runs_a_different_build() {
 
     let doctor = Command::new(bin())
         .arg("doctor")
+        .env("CONBUS_AGY_BIN", NOT_THERE)
+        .env("CONBUS_CODEX_BIN", NOT_THERE)
         .env("CONBUS_HOME", home.path())
         .output()
         .expect("run doctor");

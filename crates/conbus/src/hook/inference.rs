@@ -13,6 +13,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use conbus_core::event::{Body, Event, Harness, VendorTurnId};
+use conbus_core::paths::Paths;
 use conbus_core::registry::{Observed, SessionKey};
 
 use super::{HookError, Normalized};
@@ -152,6 +153,7 @@ fn first_text(blocks: &[Block]) -> Option<String> {
 /// No new crate — one request at a time, same record path as stdin.
 pub fn serve(addr: &str, harness: &str) -> std::io::Result<()> {
     let listener = std::net::TcpListener::bind(addr)?;
+    let paths = Paths::resolve().ok();
     eprintln!(
         "conbus hook: inference listen {} — POST official prompt frames, always allow",
         listener.local_addr()?
@@ -169,7 +171,7 @@ pub fn serve(addr: &str, harness: &str) -> std::io::Result<()> {
             eprintln!("conbus hook: inference connection not bounded ({err})");
             continue;
         }
-        let _ = handle_http(&mut stream, harness);
+        let _ = handle_http(&mut stream, harness, paths.as_ref());
     }
     Ok(())
 }
@@ -191,12 +193,13 @@ fn bound(stream: &std::net::TcpStream, silence: std::time::Duration) -> std::io:
 fn handle_http(
     stream: &mut (impl std::io::Read + std::io::Write),
     harness: &str,
+    paths: Option<&Paths>,
 ) -> std::io::Result<()> {
     let body = read_http_body(stream).unwrap_or_default();
-    let reply = match crate::hook::client::run(harness, &mut body.as_bytes()) {
+    let reply = match crate::hook::client::run_in(paths, harness, &mut body.as_bytes()) {
         Ok(reply) => reply,
         Err(err) => {
-            if crate::drops::record(&err) {
+            if crate::drops::record_in(paths, &err) {
                 eprintln!("conbus hook: record dropped: {err}");
             }
             // ALLOW, not the generic failure reply. Everything that reaches
@@ -356,7 +359,8 @@ mod tests {
             read: std::io::Cursor::new(request.into_bytes()),
             write: Vec::new(),
         };
-        handle_http(&mut stream, Harness::CLAUDE_CODE).expect("http");
+        let (_home, paths) = sandbox();
+        handle_http(&mut stream, Harness::CLAUDE_CODE, Some(&paths)).expect("http");
         let reply = String::from_utf8(stream.write).expect("utf8");
         assert!(reply.starts_with("HTTP/1.1 200 OK"), "{reply}");
         assert!(reply.contains(ALLOW), "{reply}");
@@ -400,6 +404,34 @@ mod tests {
         );
     }
 
+    /// A data root of the test's own. These tests used the person's: every
+    /// `cargo test` sent the fixture frame to the running recorder and wrote a
+    /// drop into their `drops.jsonl` — 80 fixture records on the operator's
+    /// Mac by 2026-09-23, counted by `usage` as Chat turns.
+    fn sandbox() -> (tempfile::TempDir, Paths) {
+        let home = tempfile::tempdir().expect("tempdir");
+        let paths =
+            Paths::from_env(home.path().join("conbus").to_str(), None, None).expect("paths");
+        (home, paths)
+    }
+
+    #[test]
+    fn a_frame_is_recorded_under_the_root_it_was_given() {
+        let (_home, paths) = sandbox();
+        let mut mock = Mock {
+            read: std::io::Cursor::new(
+                b"POST / HTTP/1.1\r\nHost: conbus\r\nContent-Length: 0\r\n\r\n".to_vec(),
+            ),
+            write: Vec::new(),
+        };
+
+        handle_http(&mut mock, Harness::CLAUDE_CHAT, Some(&paths)).expect("answered");
+
+        let drops = std::fs::read_to_string(paths.root().join("drops.jsonl"))
+            .expect("the drop is written under the root the listener was given");
+        assert!(drops.contains("EOF while parsing"), "{drops}");
+    }
+
     #[test]
     fn a_frame_the_terminator_could_not_read_still_answers_allow() {
         // A timed-out peer yields an empty body, and the reply on this socket
@@ -412,7 +444,8 @@ mod tests {
             write: Vec::new(),
         };
 
-        handle_http(&mut mock, Harness::CLAUDE_CHAT).expect("answered");
+        let (_home, paths) = sandbox();
+        handle_http(&mut mock, Harness::CLAUDE_CHAT, Some(&paths)).expect("answered");
 
         let reply = String::from_utf8_lossy(&mock.write).into_owned();
         assert!(reply.starts_with("HTTP/1.1 200 OK"), "{reply}");

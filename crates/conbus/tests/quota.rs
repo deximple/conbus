@@ -4,6 +4,22 @@
 
 use std::process::Command;
 
+/// A vendor binary that is not there. A test that does not name one runs
+/// `conbus` against nothing on this machine: left unset, `quota` and `doctor`
+/// ran the real `agy` and `codex app-server` on every `cargo test`.
+const NOT_THERE: &str = "/nonexistent/conbus-test-vendor";
+
+/// `conbus` with a data root of the test's own and no real vendor CLI. Each
+/// test names the fakes it wants on top.
+fn conbus(root: &std::path::Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_conbus"));
+    command
+        .env("CONBUS_HOME", root)
+        .env("CONBUS_AGY_BIN", NOT_THERE)
+        .env("CONBUS_CODEX_BIN", NOT_THERE);
+    command
+}
+
 /// A stand-in `codex app-server`: speaks just enough JSON-RPC over stdio to
 /// answer `initialize` and `account/rateLimits/read` with the captured shape.
 const FAKE_APP_SERVER: &str = r#"#!/usr/bin/env python3
@@ -40,7 +56,8 @@ fn fake_app_server() -> (tempfile::TempDir, std::path::PathBuf) {
 fn quota_reads_the_accounts_windows_through_the_app_server() {
     let (_dir, codex) = fake_app_server();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_conbus"))
+    let root = tempfile::tempdir().expect("tempdir");
+    let output = conbus(root.path())
         .arg("quota")
         .env("CONBUS_CODEX_BIN", &codex)
         .output()
@@ -64,7 +81,8 @@ fn quota_reads_the_accounts_windows_through_the_app_server() {
 
 #[test]
 fn quota_says_so_when_the_app_server_is_not_there() {
-    let output = Command::new(env!("CARGO_BIN_EXE_conbus"))
+    let root = tempfile::tempdir().expect("tempdir");
+    let output = conbus(root.path())
         .arg("quota")
         .env("CONBUS_CODEX_BIN", "/nonexistent/codex")
         .output()
@@ -86,11 +104,10 @@ fn quota_says_so_when_the_app_server_is_not_there() {
 fn doctor_carries_the_quota_line() {
     // The router's signal belongs where every other health fact is.
     let (_dir, codex) = fake_app_server();
-    let home = tempfile::tempdir().expect("tempdir");
+    let root = tempfile::tempdir().expect("tempdir");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_conbus"))
+    let output = conbus(root.path())
         .arg("doctor")
-        .env("CONBUS_HOME", home.path())
         .env("CONBUS_CODEX_BIN", &codex)
         .output()
         .expect("run doctor");
@@ -130,7 +147,8 @@ for line in sys.stdin:
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_conbus"))
+    let root = tempfile::tempdir().expect("tempdir");
+    let output = conbus(root.path())
         .arg("quota")
         .env("CONBUS_CODEX_BIN", &path)
         .output()
@@ -164,7 +182,8 @@ print(json.dumps(json.loads({reply:?})), flush=True)
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_conbus"))
+    let root = tempfile::tempdir().expect("tempdir");
+    let output = conbus(root.path())
         .arg("quota")
         .env("CONBUS_CODEX_BIN", "/nonexistent/codex")
         .env("CONBUS_AGY_BIN", &path)
@@ -188,11 +207,10 @@ print(json.dumps(json.loads({reply:?})), flush=True)
 
 #[test]
 fn doctor_says_when_the_quota_cannot_be_read() {
-    let home = tempfile::tempdir().expect("tempdir");
+    let root = tempfile::tempdir().expect("tempdir");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_conbus"))
+    let output = conbus(root.path())
         .arg("doctor")
-        .env("CONBUS_HOME", home.path())
         .env("CONBUS_CODEX_BIN", "/nonexistent/codex")
         .output()
         .expect("run doctor");
