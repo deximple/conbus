@@ -204,6 +204,17 @@ pub fn briefing_reply(harness: &str, hook_event_name: &str, context: &str, messa
 /// record did not land; the caller reports it, prints the silent reply, and
 /// still exits zero.
 pub fn run(harness: &str, stdin: &mut impl Read) -> Result<Reply, Dropped> {
+    run_in(Paths::resolve().ok().as_ref(), harness, stdin)
+}
+
+/// As [`run`], with the data root named rather than read from the
+/// environment: the Inference listener resolves it once, and a test hands
+/// over a root of its own instead of reaching the person's recorder.
+pub fn run_in(
+    paths: Option<&Paths>,
+    harness: &str,
+    stdin: &mut impl Read,
+) -> Result<Reply, Dropped> {
     if std::env::var_os(INTERNAL_MARKER).is_some_and(|value| !value.is_empty()) {
         return Ok(silent_reply(harness).to_string());
     }
@@ -253,7 +264,7 @@ pub fn run(harness: &str, stdin: &mut impl Read) -> Result<Reply, Dropped> {
         return Ok(silent_reply(harness).to_string());
     }
     named_session(&key, &hook_event_name)?;
-    let paths = Paths::resolve().map_err(|_| "no home directory to resolve".to_string())?;
+    let paths = paths.ok_or_else(|| "no home directory to resolve".to_string())?;
     if let Some(problem) = paths.socket_problem() {
         return Err(Dropped::new(problem));
     }
@@ -263,7 +274,7 @@ pub fn run(harness: &str, stdin: &mut impl Read) -> Result<Reply, Dropped> {
         || key.harness.as_str() == Harness::GROK
         || key.harness.as_str() == Harness::CLAUDE_CHAT
     {
-        crate::quota::observe_hook_keys(&paths, key.harness.as_str(), &payload);
+        crate::quota::observe_hook_keys(paths, key.harness.as_str(), &payload);
     }
     let socket = paths.socket();
     let request = Request {
