@@ -484,10 +484,11 @@ first:
      on 2026-09-24: every point it kept equalled the `--shareable` row.
      `tests/otlp_collector.rs` repeats that with `CONBUS_OTELCOL` set;
      rerun it before a pilot relies on the pipe. Grafana Alloy 1.19.2
-     passed the same check that day. Still unchecked: the Datadog Agent.
-     It needs the operator's API key, which an agent does not handle, and
-     it drops points more than an hour old unless Historical Metrics
-     Ingestion is on. The pipe also counts any 2xx as sent where OTLP says
+     passed the same check that day. So did the Datadog Agent 7.83.2, with
+     the operator entering the key: Datadog kept a closed day sent 2.4 h
+     after it ended, with every value equal, and dropped one sent 26 h
+     after. Send each day within a couple of hours of 00:00 UTC; RFD 0002
+     has the table. The pipe also counts any 2xx as sent where OTLP says
      200.
    - `--inference-listen` authenticates nothing and binds whatever address it
      is given.
