@@ -4,6 +4,16 @@ All notable changes to conbus. Versions follow [Semantic Versioning](https://sem
 until 1.0 a minor version may change the command line or the log format, and
 the entry says so when it does.
 
+## [Unreleased]
+
+### Changed
+
+- The pipe was checked through the Datadog Agent 7.83.2 as well. Datadog kept
+  a closed day sent 2.4 hours after it ended, with every value equal to the
+  `--shareable` row, and dropped one sent 26 hours after. RFD 0002 now says to
+  send each day within a couple of hours of 00:00 UTC, rather than citing a
+  one-hour limit.
+
 ## [0.2.6] — 2026-09-24
 
 Release tooling and checks; the recorder does what 0.2.5 did. The pipe was

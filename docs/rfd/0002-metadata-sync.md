@@ -234,14 +234,29 @@ and resource. A path it does not serve came back `404`. Alloy's anonymous
 usage reporting was off (`--disable-reporting`) and every listener was on
 loopback.
 
-Not settled by the spike: the Datadog Agent was not tried. It needs the
-operator's API key, which an agent does not handle.
-And backends keep their own rules for late points: Datadog does not ingest a point
-more than an hour old unless Historical Metrics Ingestion is on, and a
-Prometheus-style store takes an old sample only inside its out-of-order window,
-and wants cumulative sums (the collector's `deltatocumulative` processor, or
-Prometheus's own). A day's points end at 00:00 UTC, so a send soon after that is
-the one most backends keep.
+The Datadog Agent 7.83.2 was checked the same day. It ran in a throwaway
+container with OTLP/HTTP on loopback, against a trial organisation on the
+`ap1` site; the operator entered the API key. Every send was answered `200`,
+and the Agent forwarded without error: nothing dropped, requeued or retried.
+What Datadog kept is only visible in Datadog, since the Agent reports success
+either way:
+
+| Sent | Points stamped | Kept |
+| --- | --- | --- |
+| 9/23, 2.4 h after it ended | 2026-09-24 00:00 UTC | yes |
+| 9/24, the day not yet ended | the send time | yes |
+| 9/22, 26 h after it ended | 2026-09-23 00:00 UTC | no |
+
+For 9/23, every harness's turns, conversations and tool calls, and all six
+stop kinds, equalled the `--shareable` rows. So the cut-off lies between 2.4
+and 26 hours, not at the hour Datadog's metrics documentation gives for
+submitted points. Send each day within a couple of hours of 00:00 UTC.
+
+Other backends keep their own rules for late points. A Prometheus-style store
+takes an old sample only inside its out-of-order window, and wants cumulative
+sums: the collector's `deltatocumulative` processor, or Prometheus's own. A
+day's points end at 00:00 UTC, so a send soon after that is the one most
+backends keep.
 
 Sources: [OTLP 1.11.0](https://opentelemetry.io/docs/specs/otlp/), "JSON
 Protobuf Encoding" and "OTLP/HTTP";
