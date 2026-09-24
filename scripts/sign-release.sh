@@ -86,20 +86,36 @@ if ! $rehearsal; then
 fi
 "$bin" --version >/dev/null || die "the signed binary does not run"
 
-# 3. Notarization: Apple checks a zip of the binary and keeps the ticket.
+# 3. Notarization: Apple checks a zip of the binary and keeps the ticket,
+# keyed to the code's hash. Signing the same binary the same way again gives
+# the same hash, so a run after a failure finds the ticket and does not wait
+# on Apple twice.
+#
+# Gatekeeper's `--type execute` assesses apps only, and says a command-line
+# binary "does not seem to be an app" whether or not it is notarized. This is
+# the assessment for a file that is not an app.
+notarized() {
+  spctl --assess --type open --context context:primary-signature --verbose "$1" 2>&1 |
+    grep -q 'source=Notarized Developer ID'
+}
 if ! $rehearsal; then
-  ditto -c -k --keepParent "$bin" "$work/conbus.zip"
-  xcrun notarytool submit "$work/conbus.zip" --keychain-profile "$profile" \
-    --wait --output-format json > "$work/notary.json" ||
-    die "notarytool could not submit; is the $profile profile stored?"
-  grep -q '"status" *: *"Accepted"' "$work/notary.json" || {
-    cat "$work/notary.json" >&2
-    id=$(sed -n 's/.*"id" *: *"\([^"]*\)".*/\1/p' "$work/notary.json" | head -1)
-    [ -n "$id" ] && xcrun notarytool log "$id" --keychain-profile "$profile" >&2
-    die "Apple did not accept $tag for notarization"
-  }
-  spctl --assess --type execute --verbose "$bin" ||
-    die "Gatekeeper does not accept the notarized binary"
+  if notarized "$bin"; then
+    echo "sign-release.sh: Apple has already notarized this code; not submitting again"
+  else
+    ditto -c -k --keepParent "$bin" "$work/conbus.zip"
+    xcrun notarytool submit "$work/conbus.zip" --keychain-profile "$profile" \
+      --wait --output-format json > "$work/notary.json" ||
+      die "notarytool could not submit; is the $profile profile stored?"
+    grep -q '"status" *: *"Accepted"' "$work/notary.json" || {
+      cat "$work/notary.json" >&2
+      id=$(sed -n 's/.*"id" *: *"\([^"]*\)".*/\1/p' "$work/notary.json" | head -1)
+      [ -n "$id" ] && xcrun notarytool log "$id" --keychain-profile "$profile" >&2
+      die "Apple did not accept $tag for notarization"
+    }
+  fi
+  notarized "$bin" || die "Gatekeeper does not report the binary as notarized"
+  codesign --verify --test-requirement="=notarized" "$bin" ||
+    die "the binary does not satisfy the notarized requirement"
 fi
 
 # 4. The same package, members in the same order, with the signed binary.
