@@ -110,12 +110,16 @@ These are not engineering steps and no agent takes them on its own.
   public is `gh repo edit deximple/conbus --visibility public
   --accept-visibility-change-consequences`, and it publishes the whole history.
   Read `docs/publication-review.md` first.
-- **Notarization.** The workflow's binary is ad-hoc signed, not notarized.
-  `curl` does not quarantine what it downloads, so `install.sh` works; a copy
-  downloaded in a browser needs `xattr -d com.apple.quarantine conbus`.
-  Signing and notarizing a release is "Signing with a Developer ID" above. It
-  waits on the operator's certificate and stored notary profile, and neither
-  goes into the repository.
+- **Notarization.** The workflow's binary is ad-hoc signed. Each release is
+  then signed and notarized on the operator's Mac, as in "Signing with a
+  Developer ID" above.
+  - The certificate and the `conbus-notary` profile live in that Mac's login
+    keychain. `HANDOFF.local.md` names them; they never go into the
+    repository.
+  - Apple's first review, of v0.2.6 on 2026-09-24, took about three hours. A
+    re-run finds the ticket by code hash and does not submit again.
+  - Until the signed package replaces the workflow's, a copy downloaded in a
+    browser needs `xattr -d com.apple.quarantine conbus`.
 - **The name.** `conbus.sh` is the public name (`docs/www/README.md`). DNS and
   hosting for the landing page are not set up.
 - **Scope.** conbus is a local tool; there is no hosted service

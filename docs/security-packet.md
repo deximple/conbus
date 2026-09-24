@@ -173,9 +173,16 @@ reads the file before sending it. No sync code exists, and none will before
   `macos-latest` from a tag, and publishes it with a SHA-256 that
   `install.sh` checks. The checksum comes from the same release, so it catches
   a damaged download but not a replaced release.
-- **Signing.** From 0.2.5 both halves of the universal binary are ad-hoc
-  signed, and packaging refuses a binary that is not. 0.2.4 and earlier
-  shipped the Intel half unsigned. The binary is **not notarized**.
+- **Signing.** From v0.2.6, each release is signed with a Developer ID
+  (team `4UN6WC576K`) and notarized by Apple.
+  - The signature has the hardened runtime and one entitlement,
+    `com.apple.security.automation.apple-events`.
+  - The workflow first publishes an ad-hoc package, which
+    `scripts/sign-release.sh` on the operator's Mac replaces
+    (`docs/release.md`). Neither the certificate nor the notary credentials
+    is in the repository or CI.
+  - 0.2.5 was ad-hoc signed on both halves. 0.2.4 and earlier shipped the
+    Intel half unsigned.
 - **Licence.** Apache-2.0.
 
 ## Removing it
@@ -200,7 +207,8 @@ remove the managed entries first and the system-wide binary last;
   any hook. On a managed Mac the same holds for the system-wide binary the
   managed hooks name, across every account, so it belongs in a directory only
   root can write.
-- It is not notarized, has had no third-party audit, and has no SBOM beyond
-  `Cargo.lock`.
+- It has had no third-party audit and has no SBOM beyond `Cargo.lock`.
+- A release is ad-hoc signed and not notarized for the time between the
+  workflow publishing it and the signed package replacing it.
 
 To report a vulnerability privately, see [SECURITY.md](../SECURITY.md).
