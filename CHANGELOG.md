@@ -8,11 +8,26 @@ the entry says so when it does.
 
 ### Changed
 
+- v0.2.6's release package is signed with a Developer ID and notarized by
+  Apple. The binary, `CDHash 402c2287…`, is otherwise the one the workflow
+  built. A copy downloaded in a browser opens without removing the
+  quarantine, and a device-management rule can require the team identifier
+  `4UN6WC576K`. Later releases go through `scripts/sign-release.sh` after the
+  workflow publishes them.
+
 - The pipe was checked through the Datadog Agent 7.83.2 as well. Datadog kept
   a closed day sent 2.4 hours after it ended, with every value equal to the
   `--shareable` row, and dropped one sent 26 hours after. RFD 0002 now says to
   send each day within a couple of hours of 00:00 UTC, rather than citing a
   one-hour limit.
+
+### Fixed
+
+- `scripts/sign-release.sh` checked a notarized command-line binary with
+  Gatekeeper's app assessment, which rejects anything that is not an app. It
+  now uses the assessment for other files, and requires "Notarized Developer
+  ID" and the `=notarized` code requirement. A run after a failure finds
+  Apple's ticket by code hash instead of submitting again.
 
 ## [0.2.6] — 2026-09-24
 

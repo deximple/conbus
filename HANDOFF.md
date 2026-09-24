@@ -67,9 +67,11 @@ every build. So the first start of a replaced binary exits at once with
 the item again ("registerLaunchItem: checking for an updated legacy agent …
 updated item"), and the new daemon started 0.3 s after `install --apply`. So
 `install --apply` always reloads and never kickstarts; the plist's
-`ThrottleInterval` of two seconds is the backstop for any other restart. A
-Developer ID signature would carry a stable team identity instead; that needs
-the operator's Apple account. The constraint is not applied to a job
+`ThrottleInterval` of two seconds is the backstop for any other restart.
+From v0.2.6 the binary carries a Developer ID, a stable team identity. Its
+first deploy (2026-09-24) started on the first try (`runs = 1`), but that
+deploy also reloaded, so whether the signature alone ends the refusal is
+still unmeasured. The constraint is not applied to a job
 bootstrapped from any other directory, so a probe outside `LaunchAgents` does
 not reproduce it.
 
@@ -344,8 +346,9 @@ Stranger path (0.1.0): `install.sh` (download, checksum, place, report) →
 and keeps the log; `tests/install_roundtrip.rs` holds that promise, key order
 included. Chat orders and `conbus go <leg>` are directed hops. Cursor landing is
 `cursor -n`. Releases come from a `vX.Y.Z` tag (`.github/workflows/release.yml`);
-CI gates every pull request. Repo visibility, notarization and DNS stay
-operator actions.
+CI gates every pull request. Each release is then signed with the Developer
+ID and notarized on the operator's Mac (`scripts/sign-release.sh`,
+`docs/release.md`). Repo visibility and DNS stay operator actions.
 
 ## What the counters mean
 
@@ -465,10 +468,14 @@ release tooling and checks, and the recorder does what 0.2.5 did:
 - `scripts/sign-release.sh` (#48);
 - tests that stay out of the person's recorder (#45).
 
-Its Developer ID signing waits on the operator's certificate (`docs/release.md`).
-Sign `v0.2.6` in place with `--upload`, then deploy it and measure the upgrade
-gap with a stable signing identity. Next, each its own PR with a failing test
-first:
+v0.2.6 was then signed with the Developer ID and notarized: Apple's first
+review took about three hours. Its package on the release was replaced, and it
+was deployed on 2026-09-24. On that deploy:
+- the recorder started on the first try (`runs = 1`);
+- it answered 5 s after it started;
+- two hooks were dropped, in the 0.1 s before it bound its socket.
+
+Next, each its own PR with a failing test first:
 
 1. Score the dogfood window with `conbus verdict` when it closes (2026-09-28)
    and record the result against Option 2 in `docs/saas-hypothesis.md` — do
@@ -496,11 +503,8 @@ first:
    "where should this show up?" answers. Nothing is hosted before the gates,
    and no sync code is written before RFD 0002 and RFD 0003 are accepted.
 
-Waiting on the operator: the V0 desk count, the weekly hour budget, a Developer ID
-certificate and a stored notary profile (`docs/release.md`, "Signing with a
-Developer ID": `scripts/sign-release.sh` is written and rehearsed ad hoc,
-and the Apple ID to use is in `HANDOFF.local.md`; see also "The first start
-after an upgrade is refused once"), and repository visibility. A model digest is `conbus summary --bus-id`; hop-path
+Waiting on the operator: the V0 desk count, the weekly hour budget, and
+repository visibility. A model digest is `conbus summary --bus-id`; hop-path
 model calls stay zero.
 
 After 0.1.0, watch two things on a live machine. Drops with the

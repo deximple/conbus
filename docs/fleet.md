@@ -42,10 +42,11 @@ mv -f /usr/local/bin/conbus.next /usr/local/bin/conbus
 - **Beside, then rename — never over the running file.** Overwriting a signed
   binary in place while a process has it mapped makes macOS kill every later
   start of that path; conbus lost two hours of hooks that way (`HANDOFF.md`).
-- The binary is ad-hoc signed (`codesign -dv` says `Signature=adhoc`,
-  `TeamIdentifier=not set`) and not notarized. `curl` does not quarantine what
-  it downloads; a copy downloaded in a browser needs
-  `xattr -d com.apple.quarantine`.
+- From v0.2.6 the binary is signed with a Developer ID and notarized.
+  `codesign -dv` says `TeamIdentifier=4UN6WC576K`, and `spctl --assess --type
+  open --context context:primary-signature` says `Notarized Developer ID`.
+  Earlier releases are ad-hoc signed (`TeamIdentifier=not set`). A copy of one
+  of those downloaded in a browser needs `xattr -d com.apple.quarantine`.
 
 ## 2. Claude Code: the managed hooks
 
@@ -172,11 +173,13 @@ auto-enables and auto-allows items that match its rules. Rule types:
 `TeamIdentifier`; a rule can also carry an optional `TeamIdentifier`
 constraint.
 
-- **What works now:** a `Label` rule, which matches the launchd plist's `Label`
-  exactly — `sh.conbus.daemon`. conbus is ad-hoc signed, so its signature has no
-  team identifier and neither a `TeamIdentifier` rule nor the constraint can
-  match it. A bare `Label` rule approves any agent with that label, whoever
-  signed it.
+- **A `Label` rule** matches the launchd plist's `Label` exactly,
+  `sh.conbus.daemon`. On its own it approves any agent with that label,
+  whoever signed it. From v0.2.6 it can carry the `TeamIdentifier` constraint
+  `4UN6WC576K`, so that only conbus's own binary is approved. A
+  `TeamIdentifier` rule for that team works as well. Before v0.2.6 the
+  binary was ad-hoc signed, with no team identifier, so only the bare
+  `Label` rule could match it.
 
   ```xml
   <key>Rules</key>
@@ -184,18 +187,19 @@ constraint.
     <dict>
       <key>RuleType</key><string>Label</string>
       <key>RuleValue</key><string>sh.conbus.daemon</string>
-      <key>Comment</key><string>conbus recorder, one per user</string>
+      <key>TeamIdentifier</key><string>4UN6WC576K</string>
+      <key>Comment</key><string>conbus recorder, one per user; v0.2.6 or later</string>
     </dict>
   </array>
   ```
 
-- **What a Developer ID would change:** the signature would carry the
-  operator's team identifier, so the rule could be `TeamIdentifier`, or the
-  `Label` rule constrained to that team — only conbus's own binary approved.
-  It would also allow notarization. And it is expected, not yet measured, to
-  end the one refused start after each upgrade that `HANDOFF.md` describes
-  ("The first start after an upgrade is refused once"): an ad-hoc signature is
-  a new identity with every build. That needs the operator's Apple account.
+- **The one refused start after each upgrade** that `HANDOFF.md` describes
+  ("The first start after an upgrade is refused once") came from ad-hoc
+  signatures, which are a new identity with every build. The first
+  Developer ID build started on the first try when it was deployed
+  (2026-09-24, `runs = 1`). But `install --apply` also reloads the agent,
+  which avoided the refusal on its own, so one deploy does not show that the
+  signature alone ends it.
 
 `sfltool dumpbtm` prints the state of login and background items, including
 loaded service management payloads. conbus neither generates nor installs a

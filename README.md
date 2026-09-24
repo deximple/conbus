@@ -116,9 +116,10 @@ and `rm -rf ~/.conbus` removes it if you want it gone.
   StatusLine; the desktop app and SDK sessions never send one.
 - The automatic hop is experimental: it has fired in probes and on request, not
   yet on an organic quota stop on a hooked leg.
-- The binary is not notarized. `install.sh` uses `curl`, which does not
-  quarantine; a copy downloaded in a browser needs
-  `xattr -d com.apple.quarantine conbus` first.
+- From v0.2.6 the release binary is signed with a Developer ID and notarized
+  by Apple, so a copy downloaded in a browser opens without
+  `xattr -d com.apple.quarantine`. Releases before that still need it.
+  `install.sh` uses `curl`, which does not quarantine either way.
 
 ## Commands
 

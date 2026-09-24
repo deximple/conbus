@@ -72,8 +72,7 @@ stops second, counted in episodes.
 | One append-only local log, retention levels, sealed tool bodies | Forensics without sending content anywhere |
 | `conbus usage` rows and the `--shareable` preview, both pinned by tests | The payload a counts-only sync would send, readable first |
 
-What it does not have yet: cost and tokens; a Linux build; Copilot; a notarized
-binary; a managed-settings package; any team feature; gap-filled activity in
+What it does not have yet: cost and tokens; a Linux build; Copilot; any team feature; gap-filled activity in
 the ledger; exclusion of its own probe traffic; one end per Cursor turn at the
 adapter (a single Cursor exhaustion can be written three times, and one hook
 matches quota words in the assistant's own reply).

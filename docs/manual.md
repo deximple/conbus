@@ -713,6 +713,8 @@ all, inconclusive. Until 28 days have passed it says so and scores nothing.
 - Some Cursor sessions send tool events without saying which session they
   belong to; conbus drops those instead of guessing.
 - Codex hooks need your approval inside Codex.
-- The binary is not notarized (section 14 for browser downloads).
+- Releases before v0.2.6 are not notarized (section 14 for browser
+  downloads). From v0.2.6 the binary is signed with a Developer ID and
+  notarized.
 - Cursor, grok and opencode do not report remaining quota, so conbus cannot
   plan a hop ahead of their limits.
