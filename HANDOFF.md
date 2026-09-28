@@ -489,6 +489,14 @@ was deployed on 2026-09-24. On that deploy:
 - it answered 5 s after it started;
 - two hooks were dropped, in the 0.1 s before it bound its socket.
 
+0.2.7 (2026-09-28) follows the dogfood verdict:
+- **Memory.** The recorder no longer holds the log in memory (#54, #55). Its
+  start-up gap fill and split repair run in a child, `daemon --prepare`, and
+  it folds its state from a streaming read. On a copy of the operator's log
+  its footprint went from 946 MB to 235 MB.
+- **Hops.** A hop's `gh` and `git` calls give up after 5 s, and every
+  automatic hop writes its route and time to `daemon.log` (#56).
+
 Next, each its own PR with a failing test first:
 
 1. ~~Score the dogfood window with `conbus verdict` when it closes

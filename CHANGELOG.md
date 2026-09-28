@@ -4,7 +4,16 @@ All notable changes to conbus. Versions follow [Semantic Versioning](https://sem
 until 1.0 a minor version may change the command line or the log format, and
 the entry says so when it does.
 
-## [Unreleased]
+## [0.2.7] — 2026-09-28
+
+A recorder that stays small, and hops that say what they did. The recorder no
+longer holds the log in memory. On a log of 298k records its footprint drops
+from 946 MB to 235 MB, peak included, and it no longer grows with every record.
+The first organic hop happened on 2026-09-27 and reached its next leg 21.6
+minutes late. The GitHub and git calls on that path now give up after 5 s, and
+every automatic hop writes what it decided and how long it took. This is the
+first release signed with a Developer ID and notarized from the start. Run
+`conbus install --apply` after upgrading.
 
 ### Fixed (recorder memory)
 

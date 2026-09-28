@@ -1,6 +1,6 @@
 # conbus manual
 
-This manual describes **conbus 0.2.6** on macOS. For the short version, read
+This manual describes **conbus 0.2.7** on macOS. For the short version, read
 the [README](../README.md); for what changed between releases, the
 [CHANGELOG](../CHANGELOG.md). 한국어: [manual.ko.md](manual.ko.md)
 
@@ -92,7 +92,7 @@ Nothing in your agents' settings has changed at this point. Options:
 
 | Variable | Effect |
 | --- | --- |
-| `CONBUS_VERSION=v0.2.6` | Install that release instead of the latest |
+| `CONBUS_VERSION=v0.2.7` | Install that release instead of the latest |
 | `CONBUS_REPO=owner/name` | Install from a fork |
 | `CONBUS_BASE_URL=…` | Download from a mirror, or `file:///path/to/dist` for a local build |
 
@@ -163,7 +163,7 @@ and taking it all back out.
 
 | Line | Healthy |
 | --- | --- |
-| `build` | `0.2.6 (<commit>)` |
+| `build` | `0.2.7 (<commit>)` |
 | `socket` | `listening` |
 | `daemon` | the same commit as `build`. `DIFFERS` means the binary was replaced and the daemon was not restarted |
 | `writable` | `appendable` |
@@ -360,8 +360,10 @@ and brings you there.
 | The destination is exhausted too | **wait** instead |
 | The session is unattended (a program) | **no hop** |
 
-The automatic hop is experimental in 0.2.6: it has worked in probes and on
-request, but has not yet been seen firing on a real quota stop.
+The automatic hop is experimental in 0.2.7. It has fired on one real quota stop
+(2026-09-27), and its next leg was ready 21.6 minutes after the decision, when
+the limit had already lifted. `daemon.log` now says what each automatic hop
+decided and how long it took.
 
 ### Hopping on purpose
 
