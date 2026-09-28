@@ -991,33 +991,23 @@ fn repair_splits(held: &[Record], log: &mut SegmentLog) -> io::Result<u64> {
     Ok(n)
 }
 
-/// Run the daemon until the process is stopped.
-pub fn serve(paths: &Paths, retention: Retention) -> io::Result<()> {
-    let _ = harden::harden();
-    if let Some(problem) = paths.socket_problem() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, problem));
-    }
-    // Before anything is written: an older build left the root 0755. A root
-    // that cannot be closed — someone else's, or on a volume without modes —
-    // is still used, and said so: the log directory under it is closed on
-    // its own.
-    if let Err(err) = paths.keep_private() {
-        note!(
-            "{} could not be made private ({err}); the log under it still is",
-            paths.root().display()
-        );
-    }
-    let listener = bind(&paths.socket())?;
-    // Named before restore. `doctor` and the recorder tests wait on the
-    // socket; a stamp that lands after a long scan looks like no daemon.
-    if let Err(err) = crate::build_info::stamp(paths) {
-        note!("could not write the build stamp: {err}");
-    }
-    // The registry is derived state, so it is rebuilt from the segments rather
-    // than starting empty — otherwise a restart forks every live conversation.
-    // But a log we cannot read must not stop us recording: an empty registry
-    // costs a forked conversation, which the vendor session id on every record
-    // still makes recoverable, while refusing to start costs every future turn.
+/// What a daemon keeps from the log it starts on: the bindings, the chapters,
+/// and two counts for its start line. Not the records.
+struct Restored {
+    registry: Registry,
+    chapters: HashMap<BusId, Chapter>,
+    records: usize,
+    unreadable: usize,
+}
+
+/// Read the log at start, fill gaps and repair splits in it, and fold what the
+/// daemon runs on. The records go when this returns.
+///
+/// `serve` used to hold this scan for the life of the process, which is weeks.
+/// On 2026-09-28 that was 564 MB of parsed records for a log of 298k, locked
+/// into RAM by `relock_derived` with the rest of the derived state, and it
+/// grows with every record the machine writes.
+fn restore(paths: &Paths, retention: Retention) -> io::Result<(SegmentLog, Restored)> {
     let mut scan = SegmentLog::scan(paths.log_dir()).unwrap_or_else(|err| {
         note!(
             "could not read {} ({err}); starting with no bindings, \
@@ -1046,9 +1036,44 @@ pub fn serve(paths: &Paths, retention: Retention) -> io::Result<()> {
         }
         Err(err) => note!("split alias skipped ({err})"),
     }
-    let registry = Registry::restore(&scan.records);
-    let chapters = Daemon::chapters(&scan.records);
-    let mut daemon = Daemon::new(log, registry, chapters)
+    let restored = Restored {
+        registry: Registry::restore(&scan.records),
+        chapters: Daemon::chapters(&scan.records),
+        records: scan.records.len(),
+        unreadable: scan.defects.len(),
+    };
+    Ok((log, restored))
+}
+
+/// Run the daemon until the process is stopped.
+pub fn serve(paths: &Paths, retention: Retention) -> io::Result<()> {
+    let _ = harden::harden();
+    if let Some(problem) = paths.socket_problem() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, problem));
+    }
+    // Before anything is written: an older build left the root 0755. A root
+    // that cannot be closed — someone else's, or on a volume without modes —
+    // is still used, and said so: the log directory under it is closed on
+    // its own.
+    if let Err(err) = paths.keep_private() {
+        note!(
+            "{} could not be made private ({err}); the log under it still is",
+            paths.root().display()
+        );
+    }
+    let listener = bind(&paths.socket())?;
+    // Named before restore. `doctor` and the recorder tests wait on the
+    // socket; a stamp that lands after a long scan looks like no daemon.
+    if let Err(err) = crate::build_info::stamp(paths) {
+        note!("could not write the build stamp: {err}");
+    }
+    // The registry is derived state, so it is rebuilt from the segments rather
+    // than starting empty — otherwise a restart forks every live conversation.
+    // But a log we cannot read must not stop us recording: an empty registry
+    // costs a forked conversation, which the vendor session id on every record
+    // still makes recoverable, while refusing to start costs every future turn.
+    let (log, restored) = restore(paths, retention)?;
+    let mut daemon = Daemon::new(log, restored.registry, restored.chapters)
         .with_arena(paths.root().to_path_buf())
         .watch_chat_exports(paths);
 
@@ -1070,8 +1095,8 @@ pub fn serve(paths: &Paths, retention: Retention) -> io::Result<()> {
         crate::build_info::BUILD,
         paths.socket().display(),
         paths.log_dir().display(),
-        scan.records.len(),
-        scan.defects.len(),
+        restored.records,
+        restored.unreadable,
         report.core_dumps_disabled,
         report.memory_locked,
         report
@@ -1517,6 +1542,36 @@ mod tests {
         });
         assert_eq!(routed, Some(Harness::CODEX));
         assert_eq!(daemon.take_pending_warm(), Some(scan.records[0].bus_id));
+    }
+
+    #[test]
+    fn restore_keeps_what_the_daemon_runs_on_and_not_the_records() {
+        // `serve` held its start-up scan for the life of the process: on
+        // 2026-09-28 that was 564 MB of parsed records for a log of 298k,
+        // locked into RAM with the rest of the derived state. What a daemon
+        // runs on is the bindings, the chapters and two counts for its start
+        // line, and `restore` returns exactly that.
+        let home = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::from_env(home.path().join("bus").to_str(), None, None).expect("paths");
+        {
+            let log = SegmentLog::open(paths.log_dir(), Retention::default()).expect("open");
+            let mut daemon = Daemon::new(log, Registry::new(), HashMap::new());
+            daemon.handle(request(Event::TurnStarted {
+                author: None,
+                prompt: Body::kept("hello"),
+            }));
+        }
+        let written = SegmentLog::scan(paths.log_dir())
+            .expect("scan")
+            .records
+            .len();
+        assert!(written > 0);
+
+        let (_log, restored) = restore(&paths, Retention::default()).expect("restore");
+
+        assert_eq!(restored.records, written);
+        assert_eq!(restored.unreadable, 0);
+        assert_eq!(restored.chapters.len(), 1, "one conversation");
     }
 
     #[test]

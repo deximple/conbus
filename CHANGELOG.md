@@ -6,6 +6,15 @@ the entry says so when it does.
 
 ## [Unreleased]
 
+### Fixed (recorder memory)
+
+- The recorder no longer keeps the whole log in memory while it runs. It read
+  the log at start to rebuild its bindings, then held those parsed records for
+  as long as it lived, locked into RAM with the rest of its state: 564 MB for
+  a log of 298k records, growing with every record. On that log it now holds
+  108 MB of live state and a 597 MB footprint, down from 946 MB. What is left
+  is heap freed after the start-up read, which the next change addresses.
+
 ### Changed
 
 - v0.2.6's release package is signed with a Developer ID and notarized by
