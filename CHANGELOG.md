@@ -4,6 +4,15 @@ All notable changes to conbus. Versions follow [Semantic Versioning](https://sem
 until 1.0 a minor version may change the command line or the log format, and
 the entry says so when it does.
 
+## [Unreleased]
+
+### Fixed
+
+- `scripts/sign-release.sh` waits up to ten minutes for Gatekeeper to see a
+  ticket Apple has just issued. Apple publishes it a few minutes after
+  accepting; v0.2.7's check straight after acceptance failed, and passed on
+  its own about two and a half minutes later.
+
 ## [0.2.7] — 2026-09-28
 
 A recorder that stays small, and hops that say what they did. The recorder no

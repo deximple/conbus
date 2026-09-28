@@ -113,7 +113,17 @@ if ! $rehearsal; then
       die "Apple did not accept $tag for notarization"
     }
   fi
-  notarized "$bin" || die "Gatekeeper does not report the binary as notarized"
+  # Apple publishes a ticket a few minutes after accepting it: v0.2.7 was
+  # accepted at 09:02Z on 2026-09-28 and Gatekeeper first saw it at 09:04:42Z.
+  # A check straight after acceptance fails without this wait.
+  tries=0
+  until notarized "$bin"; do
+    tries=$((tries + 1))
+    [ "$tries" -lt 40 ] ||
+      die "Gatekeeper still does not report the binary as notarized after 10 minutes; run again later, and the ticket Apple issued will be found"
+    [ "$tries" -eq 1 ] && echo "sign-release.sh: waiting for Apple to publish the ticket"
+    sleep 15
+  done
   codesign --verify --test-requirement="=notarized" "$bin" ||
     die "the binary does not satisfy the notarized requirement"
 fi

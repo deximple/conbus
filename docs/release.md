@@ -91,7 +91,10 @@ This writes `target/signed/` and uploads nothing. Run it again with
 - asks Gatekeeper to assess the result, then repackages.
 
 A bare binary cannot carry a stapled ticket, so Gatekeeper looks the
-notarization up online the first time it checks it.
+notarization up online the first time it checks it. Apple publishes the ticket
+a few minutes after accepting it. v0.2.7 was accepted at 09:02Z on 2026-09-28,
+and Gatekeeper first saw it at 09:04:42Z. So the script waits up to ten
+minutes for Gatekeeper before it packages anything.
 
 `CONBUS_SIGN_IDENTITY=-` is a rehearsal. It signs ad hoc with the same
 runtime and entitlements, and never contacts Apple or uploads. conbus has
