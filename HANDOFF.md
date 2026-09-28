@@ -477,10 +477,12 @@ was deployed on 2026-09-24. On that deploy:
 
 Next, each its own PR with a failing test first:
 
-1. Score the dogfood window with `conbus verdict` when it closes (2026-09-28)
-   and record the result against Option 2 in `docs/saas-hypothesis.md` — do
-   not declare the 4-week clock closed unless the command says it is; it
-   refuses to score a window with no organic hop at all.
+1. ~~Score the dogfood window with `conbus verdict` when it closes
+   (2026-09-28) and record the result against Option 2 in
+   `docs/saas-hypothesis.md`.~~ **Done 2026-09-28:** the window closed with 0
+   organic routing hops and 1 failover hop — "routing hop < 3/week — no
+   routing wedge" — so Option 2 stays closed; the output is quoted in
+   `docs/saas-hypothesis.md` under "Fall back".
 2. Loose ends from week 2, none needed until a pilot asks:
    - `doctor` reads only per-user registrations, so on a managed Mac its
      `hooks` line describes a file the lock ignores; and `install --apply`

@@ -75,6 +75,23 @@ bus, account or price." — because it describes what exists.
 - **Option 2** reopens only when `conbus verdict` scores a window with organic
   routing hops at or above the kill criterion, as before.
 
+*Verdict, 2026-09-28.* The dogfood window opened with the first live record at
+2026-08-31T05:41Z and closed at 2026-09-28T05:41Z. `conbus verdict`, run at
+07:00Z that day, printed:
+
+```
+window    closed · 28.1 day(s) of 28 · 258842 record(s)
+hops      routing 0 (0.00/week) · failover 1 (0.25/week) [organic only]
+excluded  directed 0 · declared synthetic 0 · unattributed 27 · duplicate 141
+verdict   routing hop < 3/week — no routing wedge
+```
+
+The window is scored: it closed, and one organic failover hop means the
+command did not call it inconclusive. It holds zero organic routing hops,
+under a kill criterion of three a week, so Option 2 stays closed. The 27
+unattributed and 141 duplicate hops are left out by the command and are not
+counted here either. Choice 3 does not rest on hops and does not change.
+
 ## Previous choice (kept)
 
 **1 — Local tool.** Written 2026-09-23. The README says the same in one
