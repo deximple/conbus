@@ -1880,3 +1880,67 @@ fn a_split_left_in_the_log_is_repaired_at_start_by_a_short_lived_child() {
     );
     assert!(!said.contains("in the daemon itself"), "{said}");
 }
+
+#[test]
+fn an_automatic_hop_leaves_its_route_and_its_time_in_the_daemon_log() {
+    // On 2026-09-27 the first organic hop reached its Codex thread 21.6
+    // minutes after the decision, and the daemon's log had nothing on it: an
+    // automatic `hop --apply` that finished, or chose to wait, left no line.
+    // Each now says what it decided and how long it took.
+    let home = tempfile::tempdir().expect("tempdir");
+    let nowhere = home.path().join("nowhere");
+    let said = home.path().join("daemon.log");
+    let child = Command::new(bin())
+        .arg("daemon")
+        .env("CONBUS_HOME", home.path())
+        .env("HOME", home.path())
+        .env("CONBUS_CODEX_BIN", &nowhere)
+        .env("CONBUS_CLAUDE_BIN", &nowhere)
+        .env("CONBUS_AGY_BIN", &nowhere)
+        .env("CONBUS_GH", &nowhere)
+        .stdout(Stdio::null())
+        .stderr(std::fs::File::create(&said).expect("stderr"))
+        .spawn()
+        .expect("spawn daemon");
+    let daemon = Daemon(child);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !daemon_stamp_is_settled(home.path()) {
+        assert!(
+            Instant::now() < deadline,
+            "the daemon never finished starting"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let home_str = home.path().to_str().expect("utf-8");
+    let env = [("HOME", home_str), ("CLAUDE_CODE_ENTRYPOINT", "cli")];
+    run_hook(
+        home.path(),
+        r#"{"session_id":"s-hop","hook_event_name":"UserPromptSubmit","prompt":"keep going","prompt_id":"T-1","cwd":"/repo"}"#,
+        &env,
+    );
+    run_hook(
+        home.path(),
+        r#"{"session_id":"s-hop","hook_event_name":"StopFailure","error":"rate_limit","cwd":"/repo"}"#,
+        &env,
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let text = loop {
+        let text = std::fs::read_to_string(&said).unwrap_or_default();
+        if text.contains("automatic hop --apply for") {
+            break text;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no line for the automatic hop: {text}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    daemon.stop();
+    let line = text
+        .lines()
+        .find(|line| line.contains("automatic hop --apply for"))
+        .expect("the line");
+    assert!(line.contains(" ms"), "{line}");
+    assert!(line.contains("codex"), "the route it decided: {line}");
+}

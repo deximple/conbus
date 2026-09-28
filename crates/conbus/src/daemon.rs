@@ -1260,22 +1260,36 @@ fn spawn_hop_apply(bus_id: BusId, to: Option<String>) {
         if let Some(dest) = to.as_deref() {
             cmd.args(["--to", dest]);
         }
+        // Timed and quoted, whatever it did. On 2026-09-27 the first organic
+        // hop reached its Codex thread 21.6 minutes after the decision, and
+        // this said nothing: success and a decision to wait both left no line.
+        let started = std::time::Instant::now();
         let output = cmd
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .output();
+        let ms = started.elapsed().as_millis();
         match output {
-            Ok(out) if out.status.success() => {}
             Ok(out) => {
-                let err = String::from_utf8_lossy(&out.stderr);
-                note!(
-                    "automatic hop --apply for {bus_id} exited {}: {}",
-                    out.status,
-                    err.trim()
-                );
+                let said = String::from_utf8_lossy(&out.stdout);
+                let route = said
+                    .lines()
+                    .find_map(|line| line.strip_prefix("route"))
+                    .map(str::trim)
+                    .unwrap_or("no route line");
+                if out.status.success() {
+                    note!("automatic hop --apply for {bus_id} in {ms} ms: {route}");
+                } else {
+                    let err = String::from_utf8_lossy(&out.stderr);
+                    note!(
+                        "automatic hop --apply for {bus_id} exited {} after {ms} ms ({route}): {}",
+                        out.status,
+                        err.trim()
+                    );
+                }
             }
-            Err(err) => note!("automatic hop --apply failed: {err}"),
+            Err(err) => note!("automatic hop --apply failed after {ms} ms: {err}"),
         }
     });
 }
