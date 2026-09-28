@@ -18,6 +18,17 @@ the entry says so when it does.
   same log its footprint is 235 MB, peak included, and it starts in about 3 s.
   `daemon.log` says where the repair ran and how long it took.
 
+### Fixed (hops)
+
+- A hop is not held up by GitHub. Deciding one asks `git` and `gh` about the
+  checkout for the handoff's freshness line, and neither call had a limit; each
+  now gets 5 s and is marked stale after that. The first organic hop, on
+  2026-09-27, reached its Codex thread 21.6 minutes after the decision, with
+  those calls on its path.
+- Every automatic `hop --apply` now writes its route and how long it took to
+  `daemon.log`, whether it hopped, waited or failed. A successful one used to
+  leave no line at all.
+
 ### Changed
 
 - v0.2.6's release package is signed with a Developer ID and notarized by

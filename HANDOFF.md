@@ -376,11 +376,25 @@ three.
   `effort.level`.
 - `Notification`'s quota-lifted spelling is unpinned until a capture names it,
   so the registration has no matcher and the router does not branch on it.
-- **No organic hop has ever happened.** Every hop on the log was typed or
-  staged. The first real one is the first evidence the router works, and it
-  cannot be manufactured — the same position `StopFailure` was in before
-  2026-09-05, and the reason `verdict` now refuses to score a window without
-  one.
+- **The first organic hop happened on 2026-09-27 and arrived too late to
+  matter.** A Claude desktop session doing background work was stopped by a
+  vendor `rate_limit` at 12:25:32Z, and the daemon decided `displaced →
+  codex` (`provenance: vendor_signal`). The turn was a `<task-notification>`,
+  not a typed prompt. The limit lifted by 12:41, and the app's own "usage
+  limit ... has reset now" prompt carried the session on in Claude. The Codex
+  warm thread was created at 12:47:08 (its UUIDv7 says so), with the leases at
+  12:47:10 and 12:47:25 and `continued` at 12:48:16 — **21.6 minutes after
+  the decision**, and unused.
+  - **What ruled things out:** the automatic `hop --apply` left no line in
+    `daemon.log` then, so the cause is not pinned down. No agent transcript or
+    shell history ran `hop`, and the daemon did not restart. Replaying the
+    decision on a copy of the log cut at it took 2.0 s.
+  - **Candidates:** calls on that path that had no limit (`gh pr view`,
+    `git`), and the launchd agent's default resource limits: the daemon runs
+    at priority 20, and on 9/27 its start-up took 34 s against 5 s on 9/24.
+  - **Fixed since:** `gh` and `git` are bounded to 5 s (`code::LIMIT`), and
+    every automatic hop now writes its route and its time to `daemon.log`.
+    The next one will say where the minutes go.
 - **42 Cursor conversations were lost before 2026-09-09** and are not
   recoverable: their tool events were dropped as orphans because no
   `beforeSubmitPrompt` ever arrived for them. Letting a Cursor tool call mint
@@ -512,6 +526,8 @@ model calls stay zero.
 After 0.1.0, watch two things on a live machine. Drops with the
 `NO_SESSION` reason and a `preToolUse`/`postToolUse` detail are Cursor worker
 sessions; one captured payload decides whether they can be keyed at all. And
-the runaway guard's per-conversation half (`pending_hop`) has still never been
-exercised by a real quota stop — its unattended half was, on 2026-09-16, when
-200 SDK sessions hit `rate_limit` and none was routed.
+the runaway guard's per-conversation half (`pending_hop`) was exercised by a
+real quota stop on 2026-09-27: 13 more `rate_limit` stops in the next fifteen
+minutes, main thread and subagents, and no second decision. Its unattended half
+was, on 2026-09-16, when 200 SDK sessions hit `rate_limit` and none was
+routed.
