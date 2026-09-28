@@ -497,6 +497,15 @@ was deployed on 2026-09-24. On that deploy:
 - **Hops.** A hop's `gh` and `git` calls give up after 5 s, and every
   automatic hop writes its route and time to `daemon.log` (#56).
 
+v0.2.7 was notarized a few minutes after its tag, and deployed on the
+operator's Mac:
+- the recorder's footprint went from 757 MB to 243 MB, peak included, with
+  108 MB live;
+- its start took 5.0 s, of which the child's repair was 4.4 s (7 gap records);
+- it started on the first try (`runs = 1`);
+- five hooks were dropped while it started: the socket is bound first, and a
+  hook gets no reply until the repair and the fold finish.
+
 Next, each its own PR with a failing test first:
 
 1. ~~Score the dogfood window with `conbus verdict` when it closes
