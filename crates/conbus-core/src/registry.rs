@@ -112,6 +112,44 @@ pub struct Registry {
     pending: HashMap<(String, String), Seat>,
 }
 
+/// A registry being rebuilt from the log, one record at a time.
+///
+/// [`Registry::restore`] folds a collected slice with it. The daemon folds a
+/// streaming scan instead, so that rebuilding its state at start does not cost
+/// as much memory as the log itself.
+#[derive(Default)]
+pub struct Restoring {
+    registry: Registry,
+    /// Sessions a record mirrored live has claimed; a reconstruction binds only
+    /// the rest (see [`Registry::restore`]).
+    seen_live: HashSet<SessionKey>,
+}
+
+impl Restoring {
+    /// Fold one record, in log order.
+    pub fn absorb(&mut self, record: &Record) {
+        let Some(vendor_session_id) = &record.source.vendor_session_id else {
+            return;
+        };
+        let key = SessionKey::new(record.source.harness.clone(), vendor_session_id.clone());
+        let reconstructed = record.source.backfilled_from.is_some();
+        if reconstructed && self.seen_live.contains(&key) {
+            return;
+        }
+        if !reconstructed {
+            self.seen_live.insert(key.clone());
+        }
+        self.registry.bound.insert(key, record.bus_id);
+        self.registry.alias_warm_leg(record.bus_id, &record.event);
+        self.registry.note_route_record(record);
+    }
+
+    /// The registry the records folded so far describe.
+    pub fn finish(self) -> Registry {
+        self.registry
+    }
+}
+
 impl Registry {
     pub fn new() -> Self {
         Self::default()
@@ -140,25 +178,11 @@ impl Registry {
     /// Cost is one pass over the log; the derived SQLite index the plan
     /// schedules is what replaces it once the log stops being small.
     pub fn restore(records: &[Record]) -> Self {
-        let mut registry = Registry::new();
-        let mut seen_live: HashSet<SessionKey> = HashSet::new();
+        let mut restoring = Restoring::default();
         for record in records {
-            let Some(vendor_session_id) = &record.source.vendor_session_id else {
-                continue;
-            };
-            let key = SessionKey::new(record.source.harness.clone(), vendor_session_id.clone());
-            let reconstructed = record.source.backfilled_from.is_some();
-            if reconstructed && seen_live.contains(&key) {
-                continue;
-            }
-            if !reconstructed {
-                seen_live.insert(key.clone());
-            }
-            registry.bound.insert(key, record.bus_id);
-            registry.alias_warm_leg(record.bus_id, &record.event);
-            registry.note_route_record(record);
+            restoring.absorb(record);
         }
-        registry
+        restoring.finish()
     }
 
     /// The conversation a vendor session is bound to, if any.
@@ -444,6 +468,31 @@ mod tests {
         let registry = Registry::restore(&records);
 
         assert_eq!(registry.bus_id(&key()), Some(live));
+    }
+
+    #[test]
+    fn restoring_one_record_at_a_time_binds_what_restore_binds() {
+        // The daemon folds its registry from a streaming scan, not a collected
+        // one. The same records handed over one at a time must bind the same
+        // way, the rule that a live record outranks a reconstruction included.
+        let live = BusId::mint();
+        let copy = BusId::mint();
+        let records = vec![
+            logged(0, live, None, prompt("seen live")),
+            logged(1, copy, Some(CLAUDE_TRANSCRIPT), prompt("seen live")),
+        ];
+
+        let mut restoring = Restoring::default();
+        for record in &records {
+            restoring.absorb(record);
+        }
+        let streamed = restoring.finish();
+
+        assert_eq!(streamed.bus_id(&key()), Some(live));
+        assert_eq!(
+            streamed.bus_id(&key()),
+            Registry::restore(&records).bus_id(&key())
+        );
     }
 
     #[test]

@@ -1805,3 +1805,78 @@ fn every_line_of_the_daemon_log_says_when_it_happened() {
         "the silence drop should be in the log: {text}"
     );
 }
+
+#[test]
+fn a_split_left_in_the_log_is_repaired_at_start_by_a_short_lived_child() {
+    // The start-up gap fill and split repair read the whole log. They run in
+    // a child process, so the recorder that stays up for weeks never holds
+    // the log: on 2026-09-28 holding it cost 564 MB for 298k records. This is
+    // the child's work seen from outside — the pair aliased both ways, and
+    // the daemon saying where it ran.
+    use conbus_core::event::{Body, Event, Harness, Source};
+    use conbus_core::ids::BusId;
+    use conbus_core::record::Entry;
+    use conbus_core::retention::Retention;
+    use conbus_core::segment::SegmentLog;
+
+    let home = tempfile::tempdir().expect("tempdir");
+    let log_dir = home.path().join("log");
+    {
+        let mut log = SegmentLog::open(&log_dir, Retention::default()).expect("open");
+        for bus_id in [BusId::mint(), BusId::mint()] {
+            log.append(Entry {
+                bus_id,
+                observed_at: None,
+                source: Source {
+                    harness: Harness::new(Harness::CLAUDE_CODE),
+                    harness_version: None,
+                    vendor_session_id: Some("split-session".into()),
+                    workspace: None,
+                    entrypoint: None,
+                    backfilled_from: None,
+                },
+                vendor_turn_id: None,
+                vendor_agent_id: None,
+                event: Event::TurnStarted {
+                    author: None,
+                    prompt: Body::kept("hi"),
+                },
+            })
+            .expect("append");
+        }
+    }
+    let said = home.path().join("daemon.log");
+    let child = Command::new(bin())
+        .arg("daemon")
+        .env("CONBUS_HOME", home.path())
+        // No real transcripts for the gap fill to read.
+        .env("HOME", home.path())
+        .stdout(Stdio::null())
+        .stderr(std::fs::File::create(&said).expect("stderr"))
+        .spawn()
+        .expect("spawn daemon");
+    let daemon = Daemon(child);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !daemon_stamp_is_settled(home.path()) {
+        assert!(
+            Instant::now() < deadline,
+            "the daemon never finished starting"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let aliased = SegmentLog::scan(&log_dir)
+        .expect("scan")
+        .records
+        .iter()
+        .filter(|record| matches!(record.event, Event::Aliased { .. }))
+        .count();
+    daemon.stop();
+    let said = std::fs::read_to_string(&said).expect("daemon output");
+    assert_eq!(aliased, 2, "one pair, aliased both ways: {said}");
+    assert!(
+        said.contains("start-up repair ran in a separate process"),
+        "{said}"
+    );
+    assert!(!said.contains("in the daemon itself"), "{said}");
+}

@@ -286,7 +286,24 @@ impl SegmentLog {
 
     /// Read every segment in `dir` back, in append order.
     pub fn scan(dir: impl AsRef<Path>) -> io::Result<Scan> {
-        let mut scan = Scan::default();
+        let mut records = Vec::new();
+        let defects = Self::scan_each(dir, |record| records.push(record))?;
+        Ok(Scan { records, defects })
+    }
+
+    /// Read every segment in `dir` back, in append order, handing each record
+    /// to `each` as it is parsed rather than collecting them, and return what
+    /// could not be read.
+    ///
+    /// For a reader that folds the log and keeps only the fold. The daemon's
+    /// start-up fold over a collected scan cost as much memory as the log
+    /// itself — 564 MB for 298k records on 2026-09-28 — and most of it stayed
+    /// with the process for weeks.
+    pub fn scan_each(
+        dir: impl AsRef<Path>,
+        mut each: impl FnMut(Record),
+    ) -> io::Result<Vec<Defect>> {
+        let mut defects = Vec::new();
         for segment in segment_paths(dir.as_ref())? {
             for (index, line) in byte_lines(&segment)?.into_iter().enumerate() {
                 if line.is_empty() {
@@ -298,18 +315,16 @@ impl SegmentLog {
                 match serde_json::from_slice::<Record>(&line) {
                     // A newer writer may have changed what a field means. Reading
                     // it as though we understood it is worse than reporting it.
-                    Ok(record) if record.schema_version > SCHEMA_VERSION => {
-                        scan.defects.push(Defect {
-                            segment: segment.clone(),
-                            line: index as u64 + 1,
-                            reason: format!(
-                                "record schema v{} is newer than this build's v{SCHEMA_VERSION}",
-                                record.schema_version
-                            ),
-                        })
-                    }
-                    Ok(record) => scan.records.push(record),
-                    Err(err) => scan.defects.push(Defect {
+                    Ok(record) if record.schema_version > SCHEMA_VERSION => defects.push(Defect {
+                        segment: segment.clone(),
+                        line: index as u64 + 1,
+                        reason: format!(
+                            "record schema v{} is newer than this build's v{SCHEMA_VERSION}",
+                            record.schema_version
+                        ),
+                    }),
+                    Ok(record) => each(record),
+                    Err(err) => defects.push(Defect {
                         segment: segment.clone(),
                         line: index as u64 + 1,
                         reason: err.to_string(),
@@ -317,7 +332,7 @@ impl SegmentLog {
                 }
             }
         }
-        Ok(scan)
+        Ok(defects)
     }
 }
 
@@ -465,6 +480,40 @@ mod tests {
             Some(42),
             "resumed on top of a sequence already on disk"
         );
+    }
+
+    #[test]
+    fn scanning_record_by_record_reads_what_a_whole_scan_reads() {
+        // A daemon folds its state from the log once at start. Collecting the
+        // whole log first cost as much memory as the log; handed over one at
+        // a time, the records must still be exactly the ones `scan` returns,
+        // in order, with damaged lines reported the same way.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut log = SegmentLog::open_with_segment_size(dir.path(), Retention::default(), 200)
+            .expect("open");
+        for text in ["one", "two", "three"] {
+            log.append(entry(BusId::mint(), prompt(text)))
+                .expect("append");
+        }
+        drop(log);
+        let first = dir.path().join("segment-00000000.jsonl");
+        let mut body = std::fs::read_to_string(&first).expect("read");
+        body.push_str("{not json\n");
+        std::fs::write(&first, body).expect("write");
+
+        let whole = SegmentLog::scan(dir.path()).expect("scan");
+        let mut each = Vec::new();
+        let defects =
+            SegmentLog::scan_each(dir.path(), |record| each.push(record)).expect("scan_each");
+
+        assert!(
+            segment_paths(dir.path()).expect("segments").len() > 1,
+            "the records span segments"
+        );
+        assert_eq!(whole.records.len(), 3);
+        assert_eq!(each, whole.records);
+        assert_eq!(defects, whole.defects);
+        assert_eq!(defects.len(), 1);
     }
 
     #[test]

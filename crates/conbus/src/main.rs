@@ -101,7 +101,12 @@ fn main() -> ExitCode {
             println!("{reply}");
             ExitCode::SUCCESS
         }
-        Command::Daemon => run(|paths| daemon::serve(paths, Retention::from_env())),
+        Command::Daemon { prepare: false } => {
+            run(|paths| daemon::serve(paths, Retention::from_env()))
+        }
+        Command::Daemon { prepare: true } => {
+            run(|paths| daemon::prepare(paths, Retention::from_env()))
+        }
         Command::Log { json, filter } => run(|paths| report::log(paths, json, &filter)),
         // Printed, never written, and without the data directory `run`
         // resolves first: the block needs no log, and an MDM script may run
