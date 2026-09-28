@@ -8,12 +8,15 @@ the entry says so when it does.
 
 ### Fixed (recorder memory)
 
-- The recorder no longer keeps the whole log in memory while it runs. It read
-  the log at start to rebuild its bindings, then held those parsed records for
-  as long as it lived, locked into RAM with the rest of its state: 564 MB for
-  a log of 298k records, growing with every record. On that log it now holds
-  108 MB of live state and a 597 MB footprint, down from 946 MB. What is left
-  is heap freed after the start-up read, which the next change addresses.
+- The recorder no longer holds the log in memory. It read the whole log at
+  start to rebuild its bindings, then kept those records as long as it ran,
+  locked into RAM with the rest of its state: on a log of 298k records a
+  946 MB footprint, growing with every record. The start-up gap fill and split
+  repair, which do need the whole log, now run in a short-lived child
+  (`conbus daemon --prepare`) whose memory goes back to the system when it
+  exits. The recorder then folds its state from one streaming read. On the
+  same log its footprint is 235 MB, peak included, and it starts in about 3 s.
+  `daemon.log` says where the repair ran and how long it took.
 
 ### Changed
 

@@ -1000,25 +1000,25 @@ struct Restored {
     unreadable: usize,
 }
 
-/// Read the log at start, fill gaps and repair splits in it, and fold what the
-/// daemon runs on. The records go when this returns.
+/// Fill the gaps the official transcripts show and alias split conversations,
+/// writing both to the log. `conbus daemon --prepare`.
 ///
-/// `serve` used to hold this scan for the life of the process, which is weeks.
-/// On 2026-09-28 that was 564 MB of parsed records for a log of 298k, locked
-/// into RAM by `relock_derived` with the rest of the derived state, and it
-/// grows with every record the machine writes.
-fn restore(paths: &Paths, retention: Retention) -> io::Result<(SegmentLog, Restored)> {
+/// Both read the whole log, so the recorder runs this in a short-lived child of
+/// itself, whose memory goes back to the system when it exits, and folds its
+/// own state afterwards from a streaming read.
+pub fn prepare(paths: &Paths, retention: Retention) -> io::Result<()> {
+    // No core dump of a process holding every prompt on the machine.
+    let _ = harden::harden();
     let mut scan = SegmentLog::scan(paths.log_dir()).unwrap_or_else(|err| {
         note!(
-            "could not read {} ({err}); starting with no bindings, \
-             so a session that outlived the last daemon will get a second bus_id",
+            "could not read {} ({err}); nothing to fill or repair from",
             paths.log_dir().display()
         );
         Scan::default()
     });
     let mut log = SegmentLog::open(paths.log_dir(), retention)?;
     // Official transcripts only, same parser as `backfill --gaps`. Turns
-    // that happened while this process was dead join the live `bus_id`
+    // that happened while no recorder was running join the live `bus_id`
     // before hooks are accepted, so the registry sees one conversation.
     match crate::backfill::append_gaps_at_start(paths, &scan.records, &mut log) {
         Ok(0) => {}
@@ -1030,18 +1030,79 @@ fn restore(paths: &Paths, retention: Retention) -> io::Result<(SegmentLog, Resto
     }
     match repair_splits(&scan.records, &mut log) {
         Ok(0) => {}
-        Ok(n) => {
-            note!("aliased {n} split conversation pair(s)");
-            scan = SegmentLog::scan(paths.log_dir()).unwrap_or(scan);
-        }
+        Ok(n) => note!("aliased {n} split conversation pair(s)"),
         Err(err) => note!("split alias skipped ({err})"),
     }
-    let restored = Restored {
-        registry: Registry::restore(&scan.records),
-        chapters: Daemon::chapters(&scan.records),
-        records: scan.records.len(),
-        unreadable: scan.defects.len(),
+    Ok(())
+}
+
+/// Run [`prepare`] in a child process, and in this one only if the child could
+/// not run.
+fn prepare_in_child(paths: &Paths, retention: Retention) {
+    let started = std::time::Instant::now();
+    let status = std::env::current_exe().and_then(|bin| {
+        Command::new(bin)
+            .args(["daemon", "--prepare"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            // The child's notes belong in the same place as the daemon's.
+            .stderr(Stdio::inherit())
+            .status()
+    });
+    let why = match status {
+        Ok(status) if status.success() => {
+            note!(
+                "start-up repair ran in a separate process in {} ms",
+                started.elapsed().as_millis()
+            );
+            return;
+        }
+        Ok(status) => format!("it exited {status}"),
+        Err(err) => format!("it could not start ({err})"),
     };
+    note!("start-up repair in a separate process failed: {why}; running it in the daemon itself");
+    if let Err(err) = prepare(paths, retention) {
+        note!("start-up repair skipped ({err})");
+    }
+}
+
+/// Fold what the daemon runs on from one streaming read of the log. The records
+/// are not collected.
+///
+/// `serve` used to hold a collected scan for the life of the process, which is
+/// weeks: 564 MB of parsed records for a log of 298k on 2026-09-28, locked into
+/// RAM by `relock_derived`, and growing with every record the machine writes.
+fn restore(paths: &Paths, retention: Retention) -> io::Result<(SegmentLog, Restored)> {
+    let mut registry = conbus_core::registry::Restoring::default();
+    let mut chapters = HashMap::new();
+    let mut records = 0;
+    let folded = SegmentLog::scan_each(paths.log_dir(), |record| {
+        registry.absorb(&record);
+        Chapter::apply(&mut chapters, &record);
+        records += 1;
+    });
+    let restored = match folded {
+        Ok(defects) => Restored {
+            registry: registry.finish(),
+            chapters,
+            records,
+            unreadable: defects.len(),
+        },
+        Err(err) => {
+            note!(
+                "could not read {} ({err}); starting with no bindings, \
+                 so a session that outlived the last daemon will get a second bus_id",
+                paths.log_dir().display()
+            );
+            Restored {
+                registry: Registry::new(),
+                chapters: HashMap::new(),
+                records: 0,
+                unreadable: 0,
+            }
+        }
+    };
+    let log = SegmentLog::open(paths.log_dir(), retention)?;
     Ok((log, restored))
 }
 
@@ -1072,6 +1133,7 @@ pub fn serve(paths: &Paths, retention: Retention) -> io::Result<()> {
     // But a log we cannot read must not stop us recording: an empty registry
     // costs a forked conversation, which the vendor session id on every record
     // still makes recoverable, while refusing to start costs every future turn.
+    prepare_in_child(paths, retention);
     let (log, restored) = restore(paths, retention)?;
     let mut daemon = Daemon::new(log, restored.registry, restored.chapters)
         .with_arena(paths.root().to_path_buf())

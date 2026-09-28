@@ -4,7 +4,12 @@
 /// How the binary was invoked.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Command {
-    Daemon,
+    /// Run the recorder. `--prepare` is its own start-up repair, which it runs
+    /// in a short-lived child of itself: fill gaps from the official
+    /// transcripts and alias split conversations, then exit.
+    Daemon {
+        prepare: bool,
+    },
     /// Read a vendor hook payload on stdin and mirror it.
     Hook {
         harness: String,
@@ -147,7 +152,9 @@ where
         return Command::Help;
     }
     match first.as_str() {
-        "daemon" => Command::Daemon,
+        "daemon" => Command::Daemon {
+            prepare: args.iter().any(|a| a == "--prepare"),
+        },
         "hook" => Command::Hook {
             harness: flag_value(&args, "--harness")
                 .or(env_harness)
