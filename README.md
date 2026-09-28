@@ -9,7 +9,7 @@ briefed on what recent sessions there were doing, and when a vendor stops a
 turn for quota — or when you say so — the next leg picks the conversation up.
 The vendor TUIs stay the window; conbus is the part underneath.
 
-**0.2.6 · macOS · Apache-2.0.** Local only: no hosted service, no telemetry,
+**0.2.7 · macOS · Apache-2.0.** Local only: no hosted service, no telemetry,
 and conbus never reads or stores vendor auth tokens.
 
 > The repository is private today. Until it is public, installing from a
@@ -114,8 +114,9 @@ and `rm -rf ~/.conbus` removes it if you want it gone.
 - macOS only.
 - Claude's remaining quota is visible only through the terminal `claude`
   StatusLine; the desktop app and SDK sessions never send one.
-- The automatic hop is experimental: it has fired in probes and on request, not
-  yet on an organic quota stop on a hooked leg.
+- The automatic hop is experimental. It has fired on one organic quota stop
+  (2026-09-27), and its next leg arrived after the limit had already lifted.
+  Probes and requests aside, that is the only one so far.
 - From v0.2.6 the release binary is signed with a Developer ID and notarized
   by Apple, so a copy downloaded in a browser opens without
   `xattr -d com.apple.quarantine`. Releases before that still need it.
