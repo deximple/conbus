@@ -6,6 +6,15 @@ the entry says so when it does.
 
 ## [Unreleased]
 
+## [0.2.8] — 2026-10-09
+
+The log, by folder. `conbus progress` shows, for each checkout, which agents
+worked there, how much, what handed work between them, and the commits its
+`HEAD` gained. Tool bodies can now be kept sealed without cost:
+`encrypted_tools` no longer starts a Keychain process per body, and an
+upgrade no longer drops the level you set. Run `conbus install --apply`
+after upgrading.
+
 ### Added
 
 - `conbus progress`: the `usage` counts regrouped by the folder the work was
