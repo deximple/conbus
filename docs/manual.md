@@ -558,6 +558,18 @@ The socket path must stay under 104 bytes; `doctor` tells you if a
 At every level, a single body longer than 16 KiB is clipped in the log and
 its full size noted.
 
+The recorder runs under launchd, so "where the recorder runs" is its plist.
+`conbus install --apply` keeps what you put there:
+
+```bash
+/usr/libexec/PlistBuddy -c 'Add :EnvironmentVariables dict' \
+  -c 'Add :EnvironmentVariables:CONBUS_RETENTION string encrypted_tools' \
+  ~/Library/LaunchAgents/sh.conbus.daemon.plist
+conbus install --apply   # reloads the recorder with it
+```
+
+The level applies from then on; what was written before stays as it was.
+
 ### What leaves your Mac
 
 conbus has no server, no account and no telemetry. Three features put text

@@ -534,6 +534,18 @@ conbus arena link --from ~/src/shop --to ~/src/shop-admin
 어느 수준에서든 16 KiB보다 긴 본문 하나는 로그에서 잘리고, 원래 크기가 함께
 기록됩니다.
 
+레코더는 launchd로 돌기 때문에 "레코더가 도는 환경"은 그 plist입니다. 거기에 넣은
+값은 `conbus install --apply`가 그대로 둡니다.
+
+```bash
+/usr/libexec/PlistBuddy -c 'Add :EnvironmentVariables dict' \
+  -c 'Add :EnvironmentVariables:CONBUS_RETENTION string encrypted_tools' \
+  ~/Library/LaunchAgents/sh.conbus.daemon.plist
+conbus install --apply   # 그 값으로 레코더를 다시 띄움
+```
+
+수준은 그때부터 적용되고, 그 전에 쓰인 기록은 그대로입니다.
+
 ### Mac 밖으로 나가는 것
 
 conbus에는 서버도, 계정도, 텔레메트리도 없습니다. 기능 세 가지가 내 로그의 글을
