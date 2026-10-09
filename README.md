@@ -9,7 +9,7 @@ briefed on what recent sessions there were doing, and when a vendor stops a
 turn for quota — or when you say so — the next leg picks the conversation up.
 The vendor TUIs stay the window; conbus is the part underneath.
 
-**0.2.7 · macOS · Apache-2.0.** Local only: no hosted service, no telemetry,
+**0.2.8 · macOS · Apache-2.0.** Local only: no hosted service, no telemetry,
 and conbus never reads or stores vendor auth tokens.
 
 > The repository is private today. Until it is public, installing from a
