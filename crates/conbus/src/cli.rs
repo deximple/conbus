@@ -83,6 +83,17 @@ pub enum Command {
         /// read as "do not send".
         otlp: Option<String>,
     },
+    /// The same counts as `Usage`, grouped by folder, with the commits each
+    /// folder's `HEAD` gained.
+    Progress {
+        days: u32,
+        since: Option<String>,
+        /// One closed UTC day; wins over `days` and `since`.
+        day: Option<String>,
+        /// Only this folder and what is under it.
+        workspace: Option<String>,
+        json: bool,
+    },
     /// Same TTY: start a vendor, and exec the next one when a hop lands.
     Run {
         harness: String,
@@ -220,6 +231,15 @@ where
                 .any(|a| a == "--otlp")
                 .then(|| flag_value(&args, "--otlp").unwrap_or_default()),
         },
+        "progress" => Command::Progress {
+            days: flag_value(&args, "--days")
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(DEFAULT_USAGE_DAYS),
+            since: flag_value(&args, "--since"),
+            day: flag_value(&args, "--day"),
+            workspace: flag_value(&args, "--workspace"),
+            json: args.iter().any(|a| a == "--json"),
+        },
         "run" => Command::Run {
             harness: args.get(1).cloned().unwrap_or_else(|| "claude_code".into()),
         },
@@ -310,6 +330,11 @@ USAGE:
                                   --otlp sends those rows as OTLP metrics to a
                                   collector on this machine over plain HTTP
                                   (http://127.0.0.1:4318); send a --day once
+    conbus progress [--days N] [--since DAY] [--day DAY] [--workspace DIR] [--json]
+                                  the same counts per folder: which agents worked
+                                  there, how much, what handed work between them,
+                                  and the commits HEAD gained (default 7 days);
+                                  --json prints one folder per line
     conbus run [claude_code|codex|cursor|agy|opencode|grok]
                                   same TTY: start a vendor; hop execs the next
     conbus arena fact --workspace DIR --claim TEXT --anchor PATH
@@ -458,6 +483,33 @@ mod tests {
         );
         assert_eq!(parse(["go", "--help"], None), Command::Help);
         assert_eq!(parse(["hop", "-h"], None), Command::Help);
+    }
+
+    #[test]
+    fn progress_is_a_week_of_every_folder_unless_told_otherwise() {
+        assert_eq!(
+            parse(["progress"], None),
+            Command::Progress {
+                days: 7,
+                since: None,
+                day: None,
+                workspace: None,
+                json: false
+            }
+        );
+        assert_eq!(
+            parse(
+                ["progress", "--workspace", ".", "--days", "30", "--json"],
+                None
+            ),
+            Command::Progress {
+                days: 30,
+                since: None,
+                day: None,
+                workspace: Some(".".into()),
+                json: true
+            }
+        );
     }
 
     #[test]

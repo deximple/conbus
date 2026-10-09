@@ -10,9 +10,11 @@
 //! `"async": true` is *dropped* by 0.147.0 with a warning, so registering `Stop`
 //! that way would silently cost every turn-end record.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use serde_json::{Map, Value, json};
 
@@ -575,8 +577,24 @@ pub const DAEMON_THROTTLE_SECS: u32 = 2;
 const BOOTSTRAP_TRIES: u32 = 5;
 const LAUNCHCTL_PAUSE: std::time::Duration = std::time::Duration::from_millis(200);
 
-/// launchd agent that keeps one daemon on the socket.
-pub fn daemon_plist(binary: &Path, log: &Path) -> String {
+/// launchd agent that keeps one daemon on the socket, with the environment
+/// the recorder runs in — where `CONBUS_RETENTION` is set for it.
+pub fn daemon_plist(binary: &Path, log: &Path, env: &BTreeMap<String, String>) -> String {
+    let env = if env.is_empty() {
+        String::new()
+    } else {
+        let entries: String = env
+            .iter()
+            .map(|(key, value)| {
+                format!(
+                    "    <key>{}</key><string>{}</string>\n",
+                    xml_escape(key),
+                    xml_escape(value)
+                )
+            })
+            .collect();
+        format!("  <key>EnvironmentVariables</key>\n  <dict>\n{entries}  </dict>\n")
+    };
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -593,19 +611,53 @@ pub fn daemon_plist(binary: &Path, log: &Path) -> String {
   <key>ThrottleInterval</key><integer>{DAEMON_THROTTLE_SECS}</integer>
   <key>StandardOutPath</key><string>{}</string>
   <key>StandardErrorPath</key><string>{}</string>
-</dict>
+{env}</dict>
 </plist>
 "#,
-        binary.display(),
-        log.display(),
-        log.display()
+        xml_escape(&binary.display().to_string()),
+        xml_escape(&log.display().to_string()),
+        xml_escape(&log.display().to_string())
     )
+}
+
+fn xml_escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// The string variables the plist at `path` already gives the recorder.
+///
+/// The manual tells an operator to set `CONBUS_RETENTION` here, and an
+/// install rewrote the file from the template, so an upgrade put the log back
+/// to its default level without a word. `plutil` reads whatever form the file
+/// was left in; a missing file, or one it cannot read, has none.
+pub fn environment_of(path: &Path) -> BTreeMap<String, String> {
+    if !path.exists() {
+        return BTreeMap::new();
+    }
+    let mut plutil = Command::new("plutil");
+    plutil
+        .args(["-extract", "EnvironmentVariables", "json", "-o", "-"])
+        .arg(path);
+    let Ok(out) = crate::code::output_within(plutil, crate::code::LIMIT) else {
+        return BTreeMap::new();
+    };
+    if !out.status.success() {
+        return BTreeMap::new();
+    }
+    let Ok(serde_json::Value::Object(vars)) = serde_json::from_slice(&out.stdout) else {
+        return BTreeMap::new();
+    };
+    vars.into_iter()
+        .filter_map(|(key, value)| Some((key, value.as_str()?.to_string())))
+        .collect()
 }
 
 /// Write the plist. `load` talks to launchctl; tests leave it false.
 pub fn apply_daemon(home: &Path, binary: &Path, log: &Path, load: bool) -> io::Result<bool> {
     let path = launch_agent_path(home);
-    let body = daemon_plist(binary, log);
+    let body = daemon_plist(binary, log, &environment_of(&path));
     let unchanged = fs::read_to_string(&path).is_ok_and(|existing| existing == body);
     if !unchanged {
         write_atomically(&path, &body)?;
@@ -1065,6 +1117,7 @@ mod tests {
         let body = daemon_plist(
             Path::new("/Users/x/.local/bin/conbus"),
             Path::new("/Users/x/.conbus/daemon.log"),
+            &BTreeMap::new(),
         );
         assert!(body.contains("/Users/x/.local/bin/conbus"));
         assert!(body.contains("<string>daemon</string>"));
@@ -1080,7 +1133,11 @@ mod tests {
         // constraint ("Launch Constraint Violation", OS_REASON_CODESIGNING),
         // and launchd pushed the next start out by its default ten seconds:
         // both deploys on 2026-09-23 left the hooks with no daemon for ~14 s.
-        let body = daemon_plist(Path::new("/opt/conbus"), Path::new("/tmp/daemon.log"));
+        let body = daemon_plist(
+            Path::new("/opt/conbus"),
+            Path::new("/tmp/daemon.log"),
+            &BTreeMap::new(),
+        );
         assert!(
             body.contains(&format!(
                 "<key>ThrottleInterval</key><integer>{DAEMON_THROTTLE_SECS}</integer>"
@@ -1168,7 +1225,67 @@ mod tests {
         assert!(apply_daemon(home.path(), bin, &log, false).expect("write"));
         assert!(!apply_daemon(home.path(), bin, &log, false).expect("again"));
         let written = fs::read_to_string(launch_agent_path(home.path())).expect("plist");
-        assert_eq!(written, daemon_plist(bin, &log));
+        assert_eq!(written, daemon_plist(bin, &log, &BTreeMap::new()));
+    }
+
+    /// The plist as an operator leaves it after following the manual: an
+    /// environment added with PlistBuddy, which rewrites the file its own way.
+    const EDITED_BY_HAND: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>CONBUS_RETENTION</key>
+		<string>encrypted_tools</string>
+		<key>CONBUS_BRIEFING</key>
+		<string>a &amp; b</string>
+	</dict>
+	<key>Label</key>
+	<string>sh.conbus.daemon</string>
+</dict>
+</plist>
+"#;
+
+    #[test]
+    fn reinstalling_keeps_the_environment_an_operator_gave_the_recorder() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let bin = Path::new("/opt/conbus");
+        let log = home.path().join(".conbus").join("daemon.log");
+        let path = launch_agent_path(home.path());
+        fs::create_dir_all(path.parent().expect("dir")).expect("dir");
+        fs::write(&path, EDITED_BY_HAND).expect("plist");
+
+        assert!(apply_daemon(home.path(), bin, &log, false).expect("write"));
+        let env = environment_of(&path);
+        assert_eq!(
+            env.get("CONBUS_RETENTION").map(String::as_str),
+            Some("encrypted_tools")
+        );
+        assert_eq!(
+            env.get("CONBUS_BRIEFING").map(String::as_str),
+            Some("a & b")
+        );
+        // And it is the file conbus writes, so the next install changes nothing.
+        assert!(!apply_daemon(home.path(), bin, &log, false).expect("again"));
+        let written = fs::read_to_string(&path).expect("plist");
+        assert!(
+            written.contains("<string>/opt/conbus</string>"),
+            "{written}"
+        );
+        assert!(written.contains("<string>a &amp; b</string>"), "{written}");
+    }
+
+    #[test]
+    fn a_plist_with_no_environment_gets_none() {
+        let body = daemon_plist(
+            Path::new("/opt/conbus"),
+            Path::new("/tmp/d.log"),
+            &BTreeMap::new(),
+        );
+        assert!(!body.contains("EnvironmentVariables"), "{body}");
+        let home = tempfile::tempdir().expect("tempdir");
+        assert!(environment_of(&home.path().join("missing.plist")).is_empty());
     }
 }
 

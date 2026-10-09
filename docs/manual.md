@@ -269,6 +269,25 @@ prints the same rows with the folder removed — what a sync would send, if one
 existed ([RFD 0002](rfd/0002-metadata-sync.md)). `--shareable` itself sends
 nothing; the point is that you can read it first.
 
+**Per folder:** `conbus progress` regroups the same counts by the folder the
+work was in. For each one it names the agents that worked there, their turns
+(and how many a person was there for), their tool calls and failures, the hops
+and briefings that carried work from one agent to another, and the commits the
+folder's `HEAD` gained in the window, asked of `git` with a five-second bound
+per call and fifteen seconds for the whole report. A checkout and its
+worktrees are one place, under the main checkout, and so is a worktree removed
+since: it is placed by the folder it was in. A folder `git` cannot place stands
+for itself and shows no commit count rather than a zero. The busiest eight are
+printed, by turns a person was there for. `--workspace DIR` keeps one folder,
+what is under it and, for a repository, its worktrees wherever they are; and
+`--json` prints every one, one per line. Like `usage`, it holds counts and
+never a body.
+
+```bash
+conbus progress --workspace .     # this checkout, the last 7 days
+conbus progress --days 30 --json  # every folder, a month
+```
+
 **Into your own monitoring:** `--otlp URL` sends those same rows, as
 OpenTelemetry metrics, to a collector on this Mac — the OpenTelemetry
 Collector, Grafana Alloy and the Datadog Agent all listen on
@@ -539,6 +558,18 @@ The socket path must stay under 104 bytes; `doctor` tells you if a
 At every level, a single body longer than 16 KiB is clipped in the log and
 its full size noted.
 
+The recorder runs under launchd, so "where the recorder runs" is its plist.
+`conbus install --apply` keeps what you put there:
+
+```bash
+/usr/libexec/PlistBuddy -c 'Add :EnvironmentVariables dict' \
+  -c 'Add :EnvironmentVariables:CONBUS_RETENTION string encrypted_tools' \
+  ~/Library/LaunchAgents/sh.conbus.daemon.plist
+conbus install --apply   # reloads the recorder with it
+```
+
+The level applies from then on; what was written before stays as it was.
+
 ### What leaves your Mac
 
 conbus has no server, no account and no telemetry. Three features put text
@@ -675,6 +706,7 @@ line, the destination's quota, and whether the session was a program
 | `conbus backfill [--apply] [--gaps] [--chat-export PATH]` | Recover history |
 | `conbus summary --bus-id ID` | Ask the other leg's agent for a digest of a conversation |
 | `conbus usage [--days N] [--since DAY] [--day DAY] [--json] [--shareable] [--otlp URL]` | What the agents did, counted; `--otlp` sends the `--shareable` rows to a collector on this Mac (section 5) |
+| `conbus progress [--days N] [--since DAY] [--day DAY] [--workspace DIR] [--json]` | The same counts per folder, with the agents that worked there, the handovers between them and the commits `HEAD` gained (section 5) |
 | `conbus verdict` | Score a four-week trial of the hop (below) |
 | `conbus arena fact --workspace DIR --claim TEXT --anchor PATH [--type T]` | Accept a fact |
 | `conbus arena link --from DIR --to DIR` | Share one folder's facts with another |

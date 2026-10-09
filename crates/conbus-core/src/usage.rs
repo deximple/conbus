@@ -134,7 +134,7 @@ pub struct Counts {
 
 impl Counts {
     /// Every field by name, so that a new count cannot be left out of a sum.
-    fn add(&mut self, other: &Counts) {
+    pub fn add(&mut self, other: &Counts) {
         let Counts {
             turns,
             limit_stops,

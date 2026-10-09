@@ -260,6 +260,21 @@ cost      not in this log: no hook payload carries tokens or prices
 ([RFD 0002](rfd/0002-metadata-sync.md))입니다. `--shareable` 자체는 아무것도
 보내지 않습니다. 보내기 전에 먼저 읽어 볼 수 있게 하려는 것입니다.
 
+**폴더별로:** `conbus progress`는 같은 숫자를 작업한 폴더별로 다시 묶습니다.
+폴더마다 거기서 일한 에이전트, 턴 수(그중 사람이 있던 턴), 툴 호출과 실패, 한
+에이전트의 일을 다른 에이전트로 넘긴 hop과 브리핑, 그리고 기간 동안 그 폴더의
+`HEAD`에 쌓인 커밋 수를 보여 줍니다. `git`에는 호출마다 5초, 보고서 전체에 15초
+제한을 두고 묻습니다. 체크아웃과 그 작업 트리는 본 체크아웃 아래 한 곳으로
+묶이고, 이미 지운 작업 트리도 그것이 있던 폴더로 자리를 찾습니다. `git`이 어디에도
+넣지 못하는 폴더는 따로 나오고, 커밋 수는 0이 아니라 빈칸으로 둡니다. 사람이 있던 턴이 많은 순으로 여덟 곳을 출력합니다.
+`--workspace DIR`은 그 폴더와 그 아래, 저장소라면 어디에 있든 그 작업 트리까지 남기고, `--json`은 모든 폴더를 한 줄에
+하나씩 출력합니다. `usage`와 마찬가지로 숫자만 있고 본문은 없습니다.
+
+```bash
+conbus progress --workspace .     # 이 체크아웃, 최근 7일
+conbus progress --days 30 --json  # 모든 폴더, 한 달
+```
+
 **내가 쓰는 모니터링으로:** `--otlp URL`은 같은 줄을 OpenTelemetry 메트릭으로 이
 Mac의 컬렉터에 보냅니다. OpenTelemetry Collector, Grafana Alloy, Datadog Agent는
 모두 `http://127.0.0.1:4318`에서 받고, 설정된 곳(Grafana, Datadog, CloudWatch)으로
@@ -519,6 +534,18 @@ conbus arena link --from ~/src/shop --to ~/src/shop-admin
 어느 수준에서든 16 KiB보다 긴 본문 하나는 로그에서 잘리고, 원래 크기가 함께
 기록됩니다.
 
+레코더는 launchd로 돌기 때문에 "레코더가 도는 환경"은 그 plist입니다. 거기에 넣은
+값은 `conbus install --apply`가 그대로 둡니다.
+
+```bash
+/usr/libexec/PlistBuddy -c 'Add :EnvironmentVariables dict' \
+  -c 'Add :EnvironmentVariables:CONBUS_RETENTION string encrypted_tools' \
+  ~/Library/LaunchAgents/sh.conbus.daemon.plist
+conbus install --apply   # 그 값으로 레코더를 다시 띄움
+```
+
+수준은 그때부터 적용되고, 그 전에 쓰인 기록은 그대로입니다.
+
 ### Mac 밖으로 나가는 것
 
 conbus에는 서버도, 계정도, 텔레메트리도 없습니다. 기능 세 가지가 내 로그의 글을
@@ -651,6 +678,7 @@ conbus uninstall --apply  # 지우기
 | `conbus backfill [--apply] [--gaps] [--chat-export PATH]` | 지난 기록 되살리기 |
 | `conbus summary --bus-id ID` | 다른 레그의 에이전트에게 대화 요약 요청 |
 | `conbus usage [--days N] [--since DAY] [--day DAY] [--json] [--shareable] [--otlp URL]` | 에이전트가 한 일을 셈. `--otlp`는 `--shareable`의 줄을 이 Mac의 컬렉터로 보냄(5장) |
+| `conbus progress [--days N] [--since DAY] [--day DAY] [--workspace DIR] [--json]` | 같은 숫자를 폴더별로: 거기서 일한 에이전트, 에이전트 사이의 넘김, `HEAD`에 쌓인 커밋(5장) |
 | `conbus verdict` | hop의 4주 시험 채점(아래) |
 | `conbus arena fact --workspace DIR --claim TEXT --anchor PATH [--type T]` | 사실 받아들이기 |
 | `conbus arena link --from DIR --to DIR` | 한 폴더의 사실을 다른 폴더와 공유 |
