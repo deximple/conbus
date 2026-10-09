@@ -18,6 +18,7 @@ mod install;
 mod intent;
 mod landing;
 mod otlp;
+mod progress;
 mod quota;
 mod report;
 mod runner;
@@ -181,6 +182,25 @@ fn main() -> ExitCode {
                 usage::window(days, since.as_deref(), day.as_deref(), Timestamp::now())?,
                 usage::Output::of(json, shareable),
                 collector.as_ref(),
+            )
+        }),
+        Command::Progress {
+            days,
+            since,
+            day,
+            workspace,
+            json,
+        } => run(|paths| {
+            let cwd = std::env::current_dir()?;
+            let pwd = std::env::var_os("PWD").map(std::path::PathBuf::from);
+            let within = workspace
+                .as_deref()
+                .map(|arg| progress::folder_named(arg, &cwd, pwd.as_deref()));
+            progress::run(
+                paths,
+                usage::window(days, since.as_deref(), day.as_deref(), Timestamp::now())?,
+                within.as_deref(),
+                json,
             )
         }),
         Command::Run { harness } => run(|paths| runner::run(paths, &harness)),

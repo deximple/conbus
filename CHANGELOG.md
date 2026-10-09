@@ -6,8 +6,20 @@ the entry says so when it does.
 
 ## [Unreleased]
 
+### Added
+
+- `conbus progress`: the `usage` counts regrouped by the folder the work was
+  in — which agents worked there, how much, what handed work between them, and
+  how many commits the folder's `HEAD` gained in the window. A checkout and its
+  worktrees are one place. `--workspace DIR` keeps one folder, `--json` prints
+  one folder per line. Counts only, like `usage`.
+
 ### Fixed
 
+- `CONBUS_RETENTION=encrypted_tools` read the sealing key from the Keychain
+  once per tool body, starting a `security` process for every tool input and
+  output the recorder wrote, with no bound on how long it could take. The key
+  is now read once per process, and `security` is given five seconds.
 - `scripts/sign-release.sh` waits up to ten minutes for Gatekeeper to see a
   ticket Apple has just issued. Apple publishes it a few minutes after
   accepting; v0.2.7's check straight after acceptance failed, and passed on

@@ -65,6 +65,7 @@ conbus go cursor         # hop the current conversation now
 conbus hop               # preview where the next hop would go
 conbus status            # routing rules, quota, hop history, cost
 conbus usage             # what the agents did this week: stops, failures, permission asks
+conbus progress          # the same, per folder: which agents worked there, and the commits
 conbus log --bus-id ID   # one conversation, across every harness it touched
 ```
 
@@ -133,6 +134,7 @@ and `rm -rf ~/.conbus` removes it if you want it gone.
 | `conbus quota` | What each leg has left |
 | `conbus log [FILTERS]` | Read the conversation log back |
 | `conbus usage [--days N] [--since DAY] [--day DAY] [--json] [--shareable] [--otlp URL]` | What the agents did, counted: stops, tool failures, permission asks; `--otlp` sends the counts to a collector on this Mac |
+| `conbus progress [--days N] [--since DAY] [--day DAY] [--workspace DIR] [--json]` | The same counts per folder: the agents that worked there, the handovers between them, the commits `HEAD` gained |
 | `conbus hop [HARNESS]` | Preview the next leg (`--apply` records it) |
 | `conbus go [HARNESS]` | Hop the current conversation |
 | `conbus run [HARNESS]` | Start a leg in this terminal; hops exec the next one |
