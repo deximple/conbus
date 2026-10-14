@@ -72,6 +72,8 @@ jobs:
 
   release-linux:
     runs-on: ubuntu-latest
+    # `release` owns `gh release create`; this job only uploads to it.
+    needs: release
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -104,14 +106,7 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          # The macOS job owns `gh release create`; wait for the release it
-          # makes, then add the Linux tarball to it.
-          for attempt in $(seq 1 40); do
-            gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 && break
-            sleep 15
-          done
-          gh release upload "$GITHUB_REF_NAME" dist-linux/* --clobber
+        run: gh release upload "$GITHUB_REF_NAME" dist-linux/* --clobber
 
       - name: Keep the dry run's package
         if: ${{ !startsWith(github.ref, 'refs/tags/') }}
