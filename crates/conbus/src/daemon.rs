@@ -255,6 +255,9 @@ impl Daemon {
                     // start and the prompt that proves the session real.
                     workspace: None,
                     backfilled_from: None,
+                    // Same shape as `entrypoint`: the profile is a property of
+                    // the session, read from the hook child's own env.
+                    profile: request.profile.clone(),
                 };
                 // A conversation nothing has ever been folded for is one
                 // whose first prompt this is — the registry mints on exactly
@@ -968,6 +971,7 @@ fn repair_splits(held: &[Record], log: &mut SegmentLog) -> io::Result<u64> {
                 workspace: None,
                 entrypoint: None,
                 backfilled_from: None,
+                profile: None,
             };
             log.append(Entry {
                 bus_id: *canonical,
@@ -1432,6 +1436,7 @@ mod tests {
             brief: true,
             provenance: None,
             event,
+            profile: None,
         }
     }
 
@@ -1543,6 +1548,35 @@ mod tests {
             scan.records[0].source.vendor_session_id.as_deref(),
             Some("abc123"),
             "the vendor session id must be recorded as an alias of the bus_id"
+        );
+    }
+
+    #[test]
+    fn a_hook_under_a_profile_stamps_the_record_with_it() {
+        // `CLAUDE_CONFIG_DIR=$HOME/.claude-work claude` puts every hook child
+        // under the work account; the records it makes say so.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = SegmentLog::open(dir.path(), Retention::default()).expect("open");
+        let mut daemon = Daemon::new(log, Registry::new(), HashMap::new());
+
+        let response = daemon.handle(Request {
+            profile: Some("work".into()),
+            ..request(Event::TurnStarted {
+                author: None,
+                prompt: Body::kept("a prompt from the work account"),
+            })
+        });
+
+        assert!(
+            matches!(response, Response::Recorded { .. }),
+            "{response:?}"
+        );
+        let scan = SegmentLog::scan(dir.path()).expect("scan");
+        assert!(
+            scan.records
+                .iter()
+                .all(|r| r.source.profile.as_deref() == Some("work")),
+            "every record the request wrote is stamped with the profile"
         );
     }
 
@@ -1984,6 +2018,7 @@ mod tests {
                     )
                 }),
                 backfilled_from: None,
+                profile: None,
             },
             event: Event::SessionCandidate {
                 trigger: trigger.map(str::to_string),

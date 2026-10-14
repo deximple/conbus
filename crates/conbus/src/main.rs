@@ -19,6 +19,7 @@ mod intent;
 mod landing;
 mod otlp;
 mod policy;
+mod profile;
 mod progress;
 mod quota;
 mod report;
@@ -61,14 +62,26 @@ fn main() -> ExitCode {
                 let mut stdin = String::new();
                 let _ = std::io::stdin().read_to_string(&mut stdin);
                 let paths = Paths::resolve().ok();
-                let forward = std::env::var_os("HOME").map(|home| {
-                    std::path::PathBuf::from(home)
-                        .join(".claude")
-                        .join("conbus-statusline-forward")
-                });
+                // The saved user command sits beside the settings.json that
+                // registered this one — the profile's own directory when the
+                // vendor ran this under a CLAUDE_CONFIG_DIR.
+                let settings_dir = std::env::var_os("CLAUDE_CONFIG_DIR")
+                    .map(std::path::PathBuf::from)
+                    .or_else(|| {
+                        std::env::var_os("HOME")
+                            .map(|home| std::path::PathBuf::from(home).join(".claude"))
+                    });
+                let forward = settings_dir
+                    .map(|dir| install::statusline_forward_path(&dir.join("settings.json")));
+                let profile = crate::profile::current();
                 print!(
                     "{}",
-                    quota::observe_statusline(paths.as_ref(), forward.as_deref(), &stdin)
+                    quota::observe_statusline(
+                        paths.as_ref(),
+                        forward.as_deref(),
+                        &stdin,
+                        profile.as_deref(),
+                    )
                 );
                 return ExitCode::SUCCESS;
             }
@@ -126,6 +139,7 @@ fn main() -> ExitCode {
         Command::Install {
             apply,
             managed: true,
+            profile: None,
         } => match install::managed::run(apply) {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
@@ -134,10 +148,22 @@ fn main() -> ExitCode {
             }
         },
         Command::Install {
+            managed: true,
+            profile: Some(_),
+            ..
+        } => {
+            eprintln!(
+                "conbus: --managed prints an organisation's settings block; \
+                 --profile registers a personal one — use one or the other"
+            );
+            ExitCode::FAILURE
+        }
+        Command::Install {
             apply,
             managed: false,
-        } => run(|_| report::install(apply)),
-        Command::Uninstall { apply } => run(|_| uninstall::run(apply)),
+            profile,
+        } => run(|_| report::install(apply, profile.as_deref())),
+        Command::Uninstall { apply, profile } => run(|_| uninstall::run(apply, profile.as_deref())),
         Command::Backfill {
             apply,
             gaps,
@@ -226,7 +252,9 @@ fn main() -> ExitCode {
                 json,
             )
         }),
-        Command::Run { harness } => run(|paths| runner::run(paths, &harness)),
+        Command::Run { harness, profile } => {
+            run(|paths| runner::run(paths, &harness, profile.as_deref()))
+        }
         Command::Arena {
             action,
             workspace,

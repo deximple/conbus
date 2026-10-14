@@ -405,6 +405,7 @@ mod tests {
                 workspace: None,
                 entrypoint: None,
                 backfilled_from: backfilled_from.map(str::to_string),
+                profile: None,
             },
             event,
         }

@@ -30,6 +30,7 @@ fn a_day_of_work(home: &Path) {
         workspace: Some("/Users/someone/secret-project".into()),
         entrypoint: Some(Entrypoint::new("sdk-cli")),
         backfilled_from: None,
+        profile: None,
     };
     let events = [
         Event::TurnStarted {

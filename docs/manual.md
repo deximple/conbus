@@ -744,15 +744,55 @@ running it.
 
 A decision is not recorded in the log; the tool request is, as it always was.
 
-## 16. Reference
+## 16. Claude Code profiles: a second account, switched by hand
+
+Claude Code lets you run more than one account side by side: a profile `NAME`
+is the directory `$HOME/.claude-NAME`, and `CLAUDE_CONFIG_DIR` tells `claude`
+which one it is. conbus supports exactly that — your own accounts, logged in
+through the vendor's own flow, switched only when you say so.
+
+```bash
+# 1. Create the profile and log in — the vendor's own flow, not ours:
+CLAUDE_CONFIG_DIR=$HOME/.claude-work claude
+/login
+
+# 2. Register the same hooks and StatusLine wrap into the profile's
+#    settings.json:
+conbus install --apply --profile work
+
+# 3. Run the profile:
+conbus run claude_code --profile work
+```
+
+A profile name is `[a-z0-9-]+`. If `$HOME/.claude-NAME` does not exist yet,
+`install --profile` refuses and prints the login command — conbus never
+creates the directory, never logs anyone in, and never reads anything but
+`settings.json` inside it. `uninstall --profile NAME` takes the registration
+back out of that file and leaves the machine's own settings alone.
+
+Records from a profiled session carry `profile` in their source stamp, and
+the profile's StatusLine readings land in their own file —
+`conbus quota` shows them as `claude_code@NAME` — so routing reads the quota
+of the account a conversation actually runs under. Backfill and gap fill
+stay default-profile only; the vendor's transcripts there are the default
+profile's.
+
+**Switching is manual only.** The vendor's terms forbid circumventing its
+usage limits, so conbus never switches profiles on a limit: no quota signal,
+route or hop moves a conversation from one of your accounts to another, and a
+hop back into Claude from a profiled run keeps the run's profile — it does
+not resume the default profile's warm session, which the profile cannot see;
+the fresh session is briefed from the checkout by the hooks instead.
+
+## 17. Reference
 
 ### Commands
 
 | Command | |
 | --- | --- |
-| `conbus install [--apply]` | Register the hooks with every installed agent; reports unless `--apply` |
+| `conbus install [--apply] [--profile NAME]` | Register the hooks with every installed agent; reports unless `--apply`. `--profile` registers Claude Code in `$HOME/.claude-NAME` only |
 | `conbus install --managed` | Print the hooks block for Claude Code's managed settings (JSON on stdout) and where it goes; writes nothing ([Managed Macs](fleet.md)) |
-| `conbus uninstall [--apply]` | Take them all back out; the log is kept |
+| `conbus uninstall [--apply] [--profile NAME]` | Take them all back out; the log is kept. `--profile` removes only `$HOME/.claude-NAME`'s registration |
 | `conbus doctor` | What is wired up and what is not |
 | `conbus status` | Routing rules, quota, hop history, cost |
 | `conbus quota` | What each leg has left |
@@ -761,7 +801,7 @@ A decision is not recorded in the log; the tool request is, as it always was.
 | `conbus log [--json] [--bus-id ID] [--since TS] [--tail N] [--grep TEXT] [--reveal]` | Read the log |
 | `conbus hop [HARNESS] [--from ID] [--to HARNESS] [--apply] [--demo]` | Preview, or with `--apply` make, a hop |
 | `conbus go [HARNESS] [--from ID]` | `hop --apply` for the current conversation |
-| `conbus run [HARNESS]` | Start an agent in this terminal; hops start the next one here |
+| `conbus run [HARNESS] [--profile NAME]` | Start an agent in this terminal; hops start the next one here. `--profile` runs `claude_code` under `$HOME/.claude-NAME` |
 | `conbus backfill [--apply] [--gaps] [--chat-export PATH]` | Recover history |
 | `conbus summary --bus-id ID` | Ask the other leg's agent for a digest of a conversation |
 | `conbus usage [--days N] [--since DAY] [--day DAY] [--json] [--shareable] [--otlp URL]` | What the agents did, counted; `--otlp` sends the `--shareable` rows to a collector on this Mac (section 5) |
@@ -798,7 +838,7 @@ all, inconclusive. Until 28 days have passed it says so and scores nothing.
 
 ---
 
-## 17. Known limitations
+## 18. Known limitations
 
 - macOS and Linux only.
 - On Linux there is no OS key store, so `encrypted_tools` elides tool bodies

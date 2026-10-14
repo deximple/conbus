@@ -160,6 +160,7 @@ pub fn parse_claude_transcript(text: &str, bus_id: BusId) -> Recovered {
             workspace: out.workspace.clone(),
             entrypoint: out.entrypoint.clone(),
             backfilled_from: Some(CLAUDE_TRANSCRIPT.to_string()),
+            profile: None,
         };
         if harness_version.is_none() {
             harness_version.clone_from(&line.version);
@@ -243,6 +244,7 @@ fn prepend_session_candidate(out: &mut Recovered, bus_id: BusId, harness_version
                 workspace: out.workspace.clone(),
                 entrypoint: out.entrypoint.clone(),
                 backfilled_from: Some(CLAUDE_TRANSCRIPT.to_string()),
+                profile: None,
             },
             vendor_turn_id: None,
             vendor_agent_id: None,
@@ -294,6 +296,7 @@ pub fn parse_codex_thread(thread: &serde_json::Value, turns: &[serde_json::Value
         workspace: out.workspace.clone(),
         entrypoint: out.entrypoint.clone(),
         backfilled_from: Some(CODEX_THREAD.to_string()),
+        profile: None,
     };
 
     // A reply belongs to the most recent prompt, and the last reply is the
@@ -545,6 +548,7 @@ fn parse_chat_conversation(conversation: &Value) -> Recovered {
         workspace: None,
         entrypoint: Some(Entrypoint::new("claude_ai_chat")),
         backfilled_from: Some(CLAUDE_CHAT_EXPORT.to_string()),
+        profile: None,
     };
     let Some(messages) = conversation.get("chat_messages").and_then(Value::as_array) else {
         out.skip("conversation has no chat_messages");

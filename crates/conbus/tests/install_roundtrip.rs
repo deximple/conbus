@@ -243,3 +243,147 @@ fn install_offers_to_replace_the_opencode_plugin_an_older_conbus_wrote() {
         "a report must not write"
     );
 }
+
+/// Like `conbus`, but the exit status is the answer — for the refusal paths.
+fn conbus_status(binary: &Path, home: &Path, args: &[&str]) -> (bool, String, String) {
+    let out = Command::new(binary)
+        .args(args)
+        .env("HOME", home)
+        .env("CONBUS_SKIP_LAUNCHCTL", "1")
+        .env_remove("CONBUS_HOME")
+        .env_remove("XDG_STATE_HOME")
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("CODEX_HOME")
+        .output()
+        .expect("run conbus");
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+#[test]
+fn install_profile_registers_that_profile_and_nothing_else() {
+    // `install --apply --profile work` is the same Claude Code registration —
+    // hooks and the StatusLine wrap — aimed at $HOME/.claude-work. The default
+    // profile and every other vendor stay untouched.
+    let machine = Machine::new();
+    let built = PathBuf::from(env!("CARGO_BIN_EXE_conbus"));
+    let theirs = json!({
+        "model": "opus",
+        "statusLine": { "type": "command", "command": "their-status-bar" }
+    });
+    write(&machine.at(".claude-work/settings.json"), &theirs);
+    let default = json!({ "model": "sonnet" });
+    write(&machine.at(".claude/settings.json"), &default);
+    write(&machine.at(".codex/hooks.json"), &json!({ "hooks": {} }));
+
+    let out = conbus(
+        &built,
+        &machine.home,
+        &["install", "--apply", "--profile", "work"],
+    );
+    assert!(out.contains("written"), "{out}");
+
+    let settings = read(&machine.at(".claude-work/settings.json"));
+    let hooks = settings["hooks"].as_object().expect("hooks").len();
+    assert!(hooks >= 10, "the full Claude registration: {settings}");
+    assert!(
+        settings["statusLine"]["command"]
+            .as_str()
+            .is_some_and(|c| c.ends_with("conbus hook --statusline")),
+        "{settings}"
+    );
+    assert_eq!(settings["model"], "opus", "their keys kept: {settings}");
+    assert_eq!(
+        std::fs::read_to_string(machine.at(".claude-work/conbus-statusline-forward"))
+            .expect("forward"),
+        "their-status-bar"
+    );
+    assert_eq!(
+        read(&machine.at(".claude/settings.json")),
+        default,
+        "the default profile's settings are the default profile's"
+    );
+    assert_eq!(
+        read(&machine.at(".codex/hooks.json")),
+        json!({ "hooks": {} }),
+        "codex is the machine's, not the profile's"
+    );
+    assert!(!machine.at(".claude/conbus-statusline-forward").exists());
+}
+
+#[test]
+fn install_profile_refuses_a_directory_that_is_not_there() {
+    // A profile exists only once the vendor's own login created its
+    // directory; conbus never creates it for them.
+    let machine = Machine::new();
+    let built = PathBuf::from(env!("CARGO_BIN_EXE_conbus"));
+
+    let (ok, _out, err) = conbus_status(
+        &built,
+        &machine.home,
+        &["install", "--apply", "--profile", "work"],
+    );
+
+    assert!(!ok, "a missing profile directory must refuse");
+    let want = format!(
+        "CLAUDE_CONFIG_DIR={} claude",
+        machine.at(".claude-work").display()
+    );
+    assert!(err.contains(&want), "{err}");
+    assert!(err.contains("/login"), "{err}");
+    assert!(!machine.at(".claude-work").exists(), "never created");
+
+    let (ok, _out, err) = conbus_status(&built, &machine.home, &["install", "--profile", "Work"]);
+    assert!(!ok);
+    assert!(err.contains("[a-z0-9-]"), "{err}");
+}
+
+#[test]
+fn uninstall_profile_takes_back_only_the_profile() {
+    let machine = Machine::new();
+    let built = PathBuf::from(env!("CARGO_BIN_EXE_conbus"));
+    let theirs = json!({ "model": "opus" });
+    write(&machine.at(".claude-work/settings.json"), &theirs);
+    let default = json!({ "model": "sonnet" });
+    write(&machine.at(".claude/settings.json"), &default);
+    conbus(
+        &built,
+        &machine.home,
+        &["install", "--apply", "--profile", "work"],
+    );
+    conbus(&built, &machine.home, &["install", "--apply"]);
+    let installed = machine.at(".local/bin/conbus");
+
+    let report = conbus(
+        &installed,
+        &machine.home,
+        &["uninstall", "--profile", "work"],
+    );
+    assert!(report.contains("would remove"), "{report}");
+    let (ok, _, _) = conbus_status(
+        &installed,
+        &machine.home,
+        &["uninstall", "--apply", "--profile", "work"],
+    );
+    assert!(ok);
+
+    assert_eq!(
+        read(&machine.at(".claude-work/settings.json")),
+        theirs,
+        "the profile's own settings come back exactly"
+    );
+    assert!(
+        !machine
+            .at(".claude-work/conbus-statusline-forward")
+            .exists()
+    );
+    assert!(
+        read(&machine.at(".claude/settings.json"))["hooks"]
+            .as_object()
+            .is_some_and(|h| !h.is_empty()),
+        "the default profile keeps its registration"
+    );
+}

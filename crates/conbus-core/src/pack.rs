@@ -581,6 +581,7 @@ mod tests {
                 workspace: Some("/repo".into()),
                 entrypoint: None,
                 backfilled_from: None,
+                profile: None,
             },
             event,
         }

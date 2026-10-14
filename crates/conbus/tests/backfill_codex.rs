@@ -81,6 +81,7 @@ fn codex_history_is_recovered_through_the_app_server_and_a_live_session_is_left_
             workspace: Some("/repo".into()),
             entrypoint: None,
             backfilled_from: None,
+            profile: None,
         },
         vendor_turn_id: None,
         vendor_agent_id: None,

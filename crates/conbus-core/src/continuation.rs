@@ -1025,6 +1025,7 @@ mod tests {
                 workspace: Some(WORKSPACE.into()),
                 entrypoint: None,
                 backfilled_from: None,
+                profile: None,
             },
             event,
         }

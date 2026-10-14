@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 /// this field existed ignores it, so the first deploy still needs the daemon
 /// restarted by hand. `the_wire_shape_is_pinned_to_the_protocol_version` below
 /// is what stops the constant falling behind the struct.
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// One observed vendor event, on its way to the log.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -60,6 +60,11 @@ pub struct Request {
     /// in the probe's environment. Absent is not a claim of anything.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provenance: Option<conbus_core::event::HopProvenance>,
+    /// The Claude Code profile the hook child runs under, from its own
+    /// `CLAUDE_CONFIG_DIR` — the payload does not carry it either. Claude
+    /// Code only, and absent on the default profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
     pub event: Event,
 }
 
@@ -131,6 +136,7 @@ mod tests {
             // yes, which is what every hook before it meant.
             brief: false,
             provenance: None,
+            profile: Some("work".into()),
             event: Event::TurnStarted {
                 author: None,
                 prompt: Body::kept("p"),
@@ -154,6 +160,7 @@ mod tests {
                 "event",
                 "harness",
                 "harness_version",
+                "profile",
                 "pv",
                 "vendor_agent_id",
                 "vendor_session_id",
@@ -162,6 +169,6 @@ mod tests {
             ],
             "the wire shape changed; bump PROTOCOL_VERSION (now {PROTOCOL_VERSION})"
         );
-        assert_eq!(PROTOCOL_VERSION, 5);
+        assert_eq!(PROTOCOL_VERSION, 6);
     }
 }

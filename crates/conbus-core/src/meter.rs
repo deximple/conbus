@@ -153,6 +153,7 @@ mod tests {
                 workspace: None,
                 entrypoint: None,
                 backfilled_from: None,
+                profile: None,
             },
             event,
         }

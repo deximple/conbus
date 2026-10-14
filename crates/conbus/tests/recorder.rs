@@ -1835,6 +1835,7 @@ fn a_split_left_in_the_log_is_repaired_at_start_by_a_short_lived_child() {
                     workspace: None,
                     entrypoint: None,
                     backfilled_from: None,
+                    profile: None,
                 },
                 vendor_turn_id: None,
                 vendor_agent_id: None,

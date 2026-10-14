@@ -145,6 +145,9 @@ pub fn run(paths: &Paths) -> io::Result<()> {
         Err(err) => println!("agy       unavailable — {err}"),
     }
     println!("claude    {}", describe_claude(paths, now));
+    for name in claude_profiles(paths) {
+        println!("{name:<9} {}", describe_claude_named(paths, &name, now));
+    }
     for slug in conbus_core::attach::slugs() {
         if slug == Harness::CLAUDE_CODE || slug == Harness::CODEX || slug == Harness::AGY {
             continue;
@@ -548,11 +551,41 @@ const CLAUDE_SURFACES: &str =
 /// whether the channel is alive at all. Reporting the first as the second told
 /// a person their StatusLine "had not fired" for thirteen days while it had run
 /// a week earlier with nothing to report.
+/// The `claude_code@NAME` readings on this machine, sorted. A profile's
+/// StatusLine writes beside the default's rather than into it, so each
+/// account's quota is read against its own account.
+fn claude_profiles(paths: &Paths) -> Vec<String> {
+    let dir = paths.quota_cache("x");
+    let Some(dir) = dir.parent() else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            let name = name
+                .strip_suffix(".seen.json")
+                .or_else(|| name.strip_suffix(".json"))?;
+            name.starts_with("claude_code@").then(|| name.to_string())
+        })
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    names
+}
+
 pub fn describe_claude(paths: &Paths, now: i64) -> String {
-    let ran = read_seen(paths, Harness::CLAUDE_CODE)
+    describe_claude_named(paths, Harness::CLAUDE_CODE, now)
+}
+
+fn describe_claude_named(paths: &Paths, name: &str, now: i64) -> String {
+    let ran = read_seen(paths, name)
         .map(|at| format!("StatusLine last ran {} ago", ago(now.saturating_sub(at))));
-    if let Some(quota) = read_cached_at(paths, Harness::CLAUDE_CODE, now) {
-        let age = cached_observed_at(paths, Harness::CLAUDE_CODE)
+    if let Some(quota) = read_cached_at(paths, name, now) {
+        let age = cached_observed_at(paths, name)
             .map(|at| now.saturating_sub(at))
             .unwrap_or_default();
         if age > CACHE_TTL_SECS {
@@ -604,13 +637,27 @@ fn write_seen(paths: &Paths, harness: &str, has_rate_limits: bool) -> io::Result
 /// Persist `rate_limits` from StatusLine stdin, then run the person's own
 /// statusLine command if install wrapped one. Stdout is the status bar, never
 /// hook JSON.
-pub fn observe_statusline(paths: Option<&Paths>, forward: Option<&Path>, stdin: &str) -> String {
+///
+/// A statusLine child of a profiled `claude` inherits `CLAUDE_CONFIG_DIR`,
+/// and its readings belong to that account: `profile` scopes the cache to
+/// `quota/claude_code@NAME.json` so the default profile's file stays the
+/// default profile's.
+pub fn observe_statusline(
+    paths: Option<&Paths>,
+    forward: Option<&Path>,
+    stdin: &str,
+    profile: Option<&str>,
+) -> String {
     if let Some(paths) = paths {
+        let name = profile.map_or_else(
+            || Harness::CLAUDE_CODE.to_string(),
+            |name| format!("{}@{name}", Harness::CLAUDE_CODE),
+        );
         let parsed = serde_json::from_str::<serde_json::Value>(stdin).ok();
         let quota = parsed.as_ref().and_then(parse_statusline);
-        let _ = write_seen(paths, Harness::CLAUDE_CODE, quota.is_some());
+        let _ = write_seen(paths, &name, quota.is_some());
         if let Some(quota) = quota {
-            let _ = write_cached(paths, Harness::CLAUDE_CODE, &quota);
+            let _ = write_cached(paths, &name, &quota);
         }
     }
     if let Some(path) = forward
@@ -767,7 +814,7 @@ mod tests {
         let payload =
             include_str!("../tests/fixtures/claude_code_2.1.263_statusline_rate_limits.json");
 
-        let out = observe_statusline(Some(&paths), Some(&forward), payload);
+        let out = observe_statusline(Some(&paths), Some(&forward), payload, None);
 
         assert_eq!(out.trim(), "FORWARDED");
         let cached = read_cached(&paths, Harness::CLAUDE_CODE).expect("cache");
@@ -781,10 +828,40 @@ mod tests {
         let paths =
             Paths::from_env(root.path().join("conbus").to_str(), None, None).expect("paths");
         std::fs::create_dir_all(paths.root()).expect("root");
-        observe_statusline(Some(&paths), None, r#"{"cwd":"/repo"}"#);
+        observe_statusline(Some(&paths), None, r#"{"cwd":"/repo"}"#, None);
         assert!(read_cached(&paths, Harness::CLAUDE_CODE).is_none());
         assert!(read_seen(&paths, Harness::CLAUDE_CODE).is_some());
         assert!(describe_claude(&paths, 0).contains("no rate_limits reading yet"));
+    }
+
+    #[test]
+    fn a_profiled_statusline_writes_beside_the_default_reading() {
+        // `CLAUDE_CONFIG_DIR=$HOME/.claude-work claude` puts the statusLine
+        // child under the work account too: its reading lands in
+        // `claude_code@work` files and lists as its own `conbus quota` line,
+        // never mixed into the default account's.
+        let root = tempfile::tempdir().expect("tempdir");
+        let paths =
+            Paths::from_env(root.path().join("conbus").to_str(), None, None).expect("paths");
+        std::fs::create_dir_all(paths.root()).expect("root");
+        let payload =
+            include_str!("../tests/fixtures/claude_code_2.1.263_statusline_rate_limits.json");
+
+        observe_statusline(Some(&paths), None, payload, Some("work"));
+
+        assert_eq!(
+            claude_profiles(&paths),
+            vec!["claude_code@work".to_string()]
+        );
+        let quota = read_cached(&paths, "claude_code@work").expect("profile cache");
+        assert_eq!(quota.primary.as_ref().map(|w| w.used_percent), Some(72));
+        assert!(read_seen(&paths, "claude_code@work").is_some());
+        assert!(
+            read_cached(&paths, Harness::CLAUDE_CODE).is_none(),
+            "the default profile's file stays the default profile's"
+        );
+        let line = describe_claude_named(&paths, "claude_code@work", 1_788_385_869);
+        assert!(line.contains("72% used"), "{line}");
     }
 
     #[test]
@@ -803,7 +880,7 @@ mod tests {
 
         let status =
             Paths::from_env(home.path().join("status").to_str(), None, None).expect("paths");
-        observe_statusline(Some(&status), None, r#"{"cwd":"/repo"}"#);
+        observe_statusline(Some(&status), None, r#"{"cwd":"/repo"}"#, None);
         assert_eq!(mode(status.root()), 0o700, "the status line");
 
         let hook = Paths::from_env(home.path().join("hook").to_str(), None, None).expect("paths");

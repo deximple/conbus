@@ -169,11 +169,46 @@ pub fn restore_statusline(document: &mut Value, forward: Option<&str>) -> bool {
 }
 
 /// `conbus uninstall [--apply]`. Reports by default, like `install`.
-pub fn run(apply: bool) -> io::Result<()> {
+///
+/// `--profile NAME` scopes the whole command to `$HOME/.claude-NAME` — the
+/// exact same Claude Code removal (hooks plus the StatusLine unwrap), from
+/// the profile's own `settings.json`. The machine's registrations are left
+/// alone.
+pub fn run(apply: bool, profile: Option<&str>) -> io::Result<()> {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .ok_or_else(|| io::Error::other("no HOME to uninstall from"))?;
     let binary = install::installed_binary(&home);
+
+    if let Some(name) = profile {
+        if !crate::profile::valid(name) {
+            return Err(io::Error::other(format!(
+                "a profile name is [a-z0-9-]; {name:?} is not one"
+            )));
+        }
+        let dir = crate::profile::dir(&home, name);
+        if !dir.is_dir() {
+            return Err(io::Error::other(format!(
+                "{} is not a profile yet — {}",
+                dir.display(),
+                crate::profile::login_hint(&home, name)
+            )));
+        }
+        let target = install::Target {
+            harness: "claude_code",
+            settings: dir.join("settings.json"),
+            events: &install::CLAUDE_EVENTS,
+            command: install::hook_command(&binary, "claude_code"),
+        };
+        let changed = settings_file(&target, apply)?;
+        if !changed {
+            println!("Nothing of conbus is registered in {}.", dir.display());
+        } else if !apply {
+            println!("\nNothing was changed. Re-run with --apply to remove.");
+        }
+        return Ok(());
+    }
+
     let mut changed = false;
 
     for target in install::targets(&binary, &home) {
