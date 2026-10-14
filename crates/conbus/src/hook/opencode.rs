@@ -50,6 +50,7 @@ pub fn normalize(json: &str) -> Result<Normalized, HookError> {
         "session.error" => Event::TurnEnded {
             state: error_state(payload.error.as_ref()),
             assistant_message: None,
+            tokens: None,
         },
         other => {
             return Ok(Normalized::Unknown {

@@ -207,6 +207,7 @@ fn a_day_of_work(home: &Path) {
                 reason: "rate_limit".into(),
             },
             assistant_message: None,
+            tokens: None,
         },
     ];
     let codex = [

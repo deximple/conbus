@@ -11,7 +11,8 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use conbus_core::event::{
-    Body, Event, Harness, ToolOutcome, TurnState, VendorAgentId, VendorToolUseId, VendorTurnId,
+    Body, Event, Harness, ToolOutcome, TurnState, TurnTokens, VendorAgentId, VendorToolUseId,
+    VendorTurnId,
 };
 use conbus_core::registry::{Observed, SessionKey};
 
@@ -71,6 +72,16 @@ struct Payload {
     /// `cache_write_tokens`. Those are turn usage, not remaining quota.
     #[serde(default)]
     text: Option<String>,
+    /// `afterAgentResponse` turn usage, as four counts. The fields are
+    /// optional in Cursor's payload; absent means not reported.
+    #[serde(default)]
+    input_tokens: Option<u64>,
+    #[serde(default)]
+    output_tokens: Option<u64>,
+    #[serde(default)]
+    cache_read_tokens: Option<u64>,
+    #[serde(default)]
+    cache_write_tokens: Option<u64>,
 }
 
 /// Whether this payload is Cursor's, not Claude Code's wearing the same command.
@@ -128,12 +139,14 @@ pub fn normalize(harness: &Harness, json: &str) -> Result<Normalized, HookError>
         "stop" | "subagentStop" => Event::TurnEnded {
             state: stop_or_quota(payload.status.as_deref()),
             assistant_message: None,
+            tokens: None,
         },
         "sessionEnd" => {
             if let Some(message) = session_end_quota(&payload) {
                 Event::TurnEnded {
                     state: TurnState::InterruptedQuota { reason: message },
                     assistant_message: None,
+                    tokens: None,
                 }
             } else {
                 Event::SessionEnded {
@@ -142,11 +155,13 @@ pub fn normalize(harness: &Harness, json: &str) -> Result<Normalized, HookError>
             }
         }
         "afterAgentResponse" => {
+            let tokens = turn_tokens(&payload);
             let text = payload.text.unwrap_or_default();
             if response_is_quota_error(&text) {
                 Event::TurnEnded {
                     state: TurnState::InterruptedQuota { reason: text },
                     assistant_message: None,
+                    tokens,
                 }
             } else {
                 // Official last bubble. `stop` does not carry it; this event
@@ -156,6 +171,7 @@ pub fn normalize(harness: &Harness, json: &str) -> Result<Normalized, HookError>
                 Event::TurnEnded {
                     state: TurnState::Complete,
                     assistant_message: Some(Body::kept(text)),
+                    tokens,
                 }
             }
         }
@@ -247,6 +263,25 @@ fn stop_state(status: Option<&str>) -> TurnState {
         },
         _ => TurnState::Complete,
     }
+}
+
+/// The turn's token counts when the payload reports any of them. The four
+/// are one group on Cursor's side, but a partial group is still what the
+/// vendor said — a missing field reads as zero rather than dropping the rest.
+fn turn_tokens(payload: &Payload) -> Option<TurnTokens> {
+    if payload.input_tokens.is_none()
+        && payload.output_tokens.is_none()
+        && payload.cache_read_tokens.is_none()
+        && payload.cache_write_tokens.is_none()
+    {
+        return None;
+    }
+    Some(TurnTokens {
+        input: payload.input_tokens.unwrap_or(0),
+        output: payload.output_tokens.unwrap_or(0),
+        cache_read: payload.cache_read_tokens.unwrap_or(0),
+        cache_write: payload.cache_write_tokens.unwrap_or(0),
+    })
 }
 
 fn body_of(value: Option<Value>) -> Body {
@@ -551,6 +586,60 @@ mod tests {
         }
     }
 
+    #[test]
+    fn an_after_agent_response_reports_the_turns_tokens() {
+        let json = serde_json::json!({
+            "hook_event_name": "afterAgentResponse",
+            "cursor_version": "3.19.13",
+            "conversation_id": "conv-1",
+            "generation_id": "gen-1",
+            "text": "done",
+            "input_tokens": 1200,
+            "output_tokens": 80,
+            "cache_read_tokens": 900,
+            "cache_write_tokens": 100,
+        })
+        .to_string();
+        match event_of(&json) {
+            Event::TurnEnded {
+                state: TurnState::Complete,
+                tokens:
+                    Some(TurnTokens {
+                        input: 1200,
+                        output: 80,
+                        cache_read: 900,
+                        cache_write: 100,
+                    }),
+                ..
+            } => {}
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_quota_after_agent_response_still_carries_its_tokens() {
+        // The fixture's `request failed: PRO_USER_USAGE_LIMIT` bubble reports
+        // the turn's usage too; a refused turn still spent tokens.
+        let json = include_str!("../../tests/fixtures/cursor_3.19_after_agent_response.json");
+        match event_of(json) {
+            Event::TurnEnded {
+                tokens: Some(tokens),
+                ..
+            } => assert_eq!((tokens.input, tokens.output), (1, 1)),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_after_agent_response_without_token_fields_carries_none() {
+        // Older builds and other senders never had the fields; absent is
+        // "not reported", not zero.
+        match after_agent_response("done") {
+            Event::TurnEnded { tokens: None, .. } => {}
+            other => panic!("{other:?}"),
+        }
+    }
+
     fn after_agent_response(text: &str) -> Event {
         event_of(
             &serde_json::json!({
@@ -575,6 +664,7 @@ mod tests {
             Event::TurnEnded {
                 state: TurnState::Complete,
                 assistant_message: Some(Body::Kept { text }),
+                ..
             } => assert_eq!(text, reply),
             other => panic!("{other:?}"),
         }
@@ -619,6 +709,7 @@ mod tests {
             Event::TurnEnded {
                 state: TurnState::Complete,
                 assistant_message: Some(Body::Kept { text }),
+                ..
             } => assert_eq!(text, "the tests passed"),
             other => panic!("{other:?}"),
         }

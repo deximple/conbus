@@ -11,9 +11,12 @@
 //! records written before a harness reported its `cwd` are not a second,
 //! placeless conversation.
 //!
-//! Tokens and cost are not here because they are not in the log. No hook
-//! payload carries them; a reader that wants them needs the vendor's own
-//! telemetry, and this module says so rather than inventing a number.
+//! Tokens are here only where a vendor's hook reported them — today that is
+//! Cursor's `afterAgentResponse`, so the `tokens_*` counts stay zero for every
+//! harness that does not meter its turns, and zero means "not reported", not
+//! "spent nothing". Cost is still not here: no hook carries a price, and a
+//! reader that wants one needs the vendor's own telemetry rather than an
+//! invented number.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -130,6 +133,15 @@ pub struct Counts {
     /// Records counted here that were recovered — gap fill or backfill —
     /// rather than seen by a hook as they happened.
     pub recovered: u64,
+    /// Input-side tokens the vendor's hook summed for the turn. Cursor's
+    /// `input_tokens` includes the two cache counts below.
+    pub tokens_input: u64,
+    /// Completion tokens the vendor's hook summed for the turn.
+    pub tokens_output: u64,
+    /// Tokens the vendor served from its prompt cache.
+    pub tokens_cache_read: u64,
+    /// Tokens the vendor wrote to its prompt cache.
+    pub tokens_cache_write: u64,
 }
 
 impl Counts {
@@ -155,6 +167,10 @@ impl Counts {
             hops,
             repeated,
             recovered,
+            tokens_input,
+            tokens_output,
+            tokens_cache_read,
+            tokens_cache_write,
         } = other;
         self.turns += turns;
         self.limit_stops += limit_stops;
@@ -175,6 +191,10 @@ impl Counts {
         self.hops += hops;
         self.repeated += repeated;
         self.recovered += recovered;
+        self.tokens_input += tokens_input;
+        self.tokens_output += tokens_output;
+        self.tokens_cache_read += tokens_cache_read;
+        self.tokens_cache_write += tokens_cache_write;
     }
 
     /// Exhaustive on purpose: a new event has to be a decision here, not a
@@ -185,16 +205,27 @@ impl Counts {
             // A subagent's prompt is the parent's tool call, not a person's.
             Event::TurnStarted { .. } if subagent => {}
             Event::TurnStarted { .. } => self.turns += 1,
-            Event::TurnEnded { .. } if subagent => self.subagents += 1,
-            Event::TurnEnded { state, .. } => match Stop::of(state) {
-                None => {}
-                Some(Stop::Limit) => self.limit_stops += 1,
-                Some(Stop::Account) => self.account_stops += 1,
-                Some(Stop::Vendor) => self.vendor_errors += 1,
-                Some(Stop::Request) => self.request_faults += 1,
-                Some(Stop::Other) => self.other_stops += 1,
-                Some(Stop::Person) => self.user_stops += 1,
-            },
+            Event::TurnEnded { state, tokens, .. } => {
+                if let Some(tokens) = tokens {
+                    self.tokens_input += tokens.input;
+                    self.tokens_output += tokens.output;
+                    self.tokens_cache_read += tokens.cache_read;
+                    self.tokens_cache_write += tokens.cache_write;
+                }
+                if subagent {
+                    self.subagents += 1;
+                } else {
+                    match Stop::of(state) {
+                        None => {}
+                        Some(Stop::Limit) => self.limit_stops += 1,
+                        Some(Stop::Account) => self.account_stops += 1,
+                        Some(Stop::Vendor) => self.vendor_errors += 1,
+                        Some(Stop::Request) => self.request_faults += 1,
+                        Some(Stop::Other) => self.other_stops += 1,
+                        Some(Stop::Person) => self.user_stops += 1,
+                    }
+                }
+            }
             Event::ToolUse {
                 duration_ms,
                 outcome,
@@ -765,7 +796,7 @@ pub fn next_day(day: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::{Body, Harness, Source};
+    use crate::event::{Body, Harness, Source, TurnTokens};
     use crate::record::SCHEMA_VERSION;
 
     const ONE: &str = "01996b1e-2c4a-7c31-9d0e-4f2a6b8c1d3e";
@@ -824,6 +855,7 @@ mod tests {
         Event::TurnEnded {
             state,
             assistant_message: None,
+            tokens: None,
         }
     }
 
@@ -1525,6 +1557,7 @@ mod tests {
                     Event::TurnEnded {
                         state: TurnState::Complete,
                         assistant_message: Some(Body::kept("here is the plan")),
+                        tokens: None,
                     },
                 ),
             ],
@@ -1561,6 +1594,10 @@ mod tests {
                 "repeated",
                 "request_faults",
                 "subagents",
+                "tokens_cache_read",
+                "tokens_cache_write",
+                "tokens_input",
+                "tokens_output",
                 "tool_calls",
                 "tool_denials",
                 "tool_failures",
@@ -1701,6 +1738,115 @@ mod tests {
         assert_eq!(counts.turns, 2);
         assert_eq!(counts.user_stops, 1);
         assert_eq!(ledger.repeated, 2);
+    }
+
+    fn ended_with_tokens(input: u64, output: u64, cache_read: u64, cache_write: u64) -> Event {
+        Event::TurnEnded {
+            state: TurnState::Complete,
+            assistant_message: None,
+            tokens: Some(TurnTokens {
+                input,
+                output,
+                cache_read,
+                cache_write,
+            }),
+        }
+    }
+
+    #[test]
+    fn a_turns_reported_tokens_sum_into_the_row() {
+        // Cursor's afterAgentResponse reports the turn's four counts; each
+        // turn's report adds to the day's row.
+        let s = || source("cursor");
+        let ledger = Ledger::fold(
+            &[
+                in_turn(
+                    at(
+                        &on_day("09:00:00"),
+                        ONE,
+                        s(),
+                        ended_with_tokens(10, 4, 6, 2),
+                    ),
+                    "t1",
+                ),
+                in_turn(
+                    at(
+                        &on_day("09:00:01"),
+                        ONE,
+                        s(),
+                        ended_with_tokens(20, 8, 0, 0),
+                    ),
+                    "t2",
+                ),
+            ],
+            DAY,
+        );
+
+        let counts = &ledger.rows[0].counts;
+        assert_eq!(counts.tokens_input, 30);
+        assert_eq!(counts.tokens_output, 12);
+        assert_eq!(counts.tokens_cache_read, 6);
+        assert_eq!(counts.tokens_cache_write, 2);
+    }
+
+    #[test]
+    fn a_token_report_delivered_twice_is_counted_once() {
+        // A twin delivery is set aside as `repeated` before anything counts
+        // it — tokens included, or every double-delivered turn would spend
+        // twice.
+        let s = || source("cursor");
+        let ledger = Ledger::fold(
+            &[
+                in_turn(
+                    at(
+                        &on_day("09:00:00"),
+                        ONE,
+                        s(),
+                        ended_with_tokens(10, 4, 6, 2),
+                    ),
+                    "t1",
+                ),
+                in_turn(
+                    at(
+                        &on_day("09:00:00"),
+                        ONE,
+                        s(),
+                        ended_with_tokens(10, 4, 6, 2),
+                    ),
+                    "t1",
+                ),
+            ],
+            DAY,
+        );
+
+        assert_eq!(ledger.repeated, 1);
+        assert_eq!(ledger.rows[0].counts.tokens_input, 10);
+    }
+
+    #[test]
+    fn a_recovered_turns_tokens_are_counted_like_its_other_counts() {
+        // Gap fill and backfill land on the same path as a live record, so a
+        // recovered turn that carried tokens counts them too.
+        let s = || Source {
+            backfilled_from: Some("gap_fill".into()),
+            ..source("cursor")
+        };
+        let ledger = Ledger::fold(
+            &[in_turn(
+                at(
+                    &on_day("09:00:00"),
+                    ONE,
+                    s(),
+                    ended_with_tokens(10, 4, 6, 2),
+                ),
+                "t1",
+            )],
+            DAY,
+        );
+
+        let counts = &ledger.rows[0].counts;
+        assert_eq!(counts.tokens_input, 10);
+        assert_eq!(counts.recovered, 1);
     }
 
     #[test]
@@ -1891,6 +2037,10 @@ mod tests {
                 "repeated",
                 "request_faults",
                 "subagents",
+                "tokens_cache_read",
+                "tokens_cache_write",
+                "tokens_input",
+                "tokens_output",
                 "tool_calls",
                 "tool_denials",
                 "tool_failures",

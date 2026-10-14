@@ -78,7 +78,9 @@ pub struct Entry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::{Author, Body, Harness, ToolOutcome, TurnState, VendorToolUseId};
+    use crate::event::{
+        Author, Body, Harness, ToolOutcome, TurnState, TurnTokens, VendorToolUseId,
+    };
 
     fn source() -> Source {
         Source {
@@ -234,6 +236,12 @@ mod tests {
                 .map(|state| Event::TurnEnded {
                     state,
                     assistant_message: Some(Body::kept("done")),
+                    tokens: Some(TurnTokens {
+                        input: 1,
+                        output: 2,
+                        cache_read: 3,
+                        cache_write: 4,
+                    }),
                 }),
         );
         all.extend(
@@ -405,6 +413,7 @@ mod tests {
             let record = fully_populated(Event::TurnEnded {
                 state: state.clone(),
                 assistant_message: None,
+                tokens: None,
             });
 
             let line = serde_json::to_string(&record).expect("serialise");
@@ -507,6 +516,7 @@ mod tests {
                     reason: "rate_limit".into(),
                 },
                 assistant_message: None,
+                tokens: None,
             },
             ..sample()
         };

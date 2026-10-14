@@ -51,6 +51,7 @@ fn a_day_of_work(home: &Path) {
                 reason: "rate_limit".into(),
             },
             assistant_message: None,
+            tokens: None,
         },
     ];
     for (second, event) in events.into_iter().enumerate() {
@@ -127,7 +128,7 @@ fn the_rows_shareable_prints_are_what_the_collector_receives() {
     assert!(out.status.success(), "{stderr}");
     assert!(
         stderr.contains(&format!(
-            "otlp: sent 1 row(s) as 20 data point(s) to {url}/v1/metrics (200 OK)"
+            "otlp: sent 1 row(s) as 24 data point(s) to {url}/v1/metrics (200 OK)"
         )),
         "{stderr}"
     );

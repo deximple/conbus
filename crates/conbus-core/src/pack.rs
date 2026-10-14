@@ -877,6 +877,7 @@ mod tests {
                 Event::TurnEnded {
                     state: TurnState::Complete,
                     assistant_message: Some(Body::kept("an answer from last week")),
+                    tokens: None,
                 },
             ),
             logged(bus_id, ago(120), prompt("EodNdHead 매핑도 마저 고쳐")),
@@ -886,6 +887,7 @@ mod tests {
                 Event::TurnEnded {
                     state: TurnState::Complete,
                     assistant_message: Some(Body::kept("완료했습니다")),
+                    tokens: None,
                 },
             ),
         ];

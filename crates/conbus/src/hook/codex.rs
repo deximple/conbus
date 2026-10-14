@@ -97,6 +97,7 @@ pub fn normalize(harness: &Harness, json: &str) -> Result<Normalized, HookError>
             // from the app-server's `account/rateLimits` instead.
             state: TurnState::Complete,
             assistant_message: payload.last_assistant_message.map(Body::kept),
+            tokens: None,
         },
         "SessionEnd" => Event::SessionEnded {
             reason: payload.reason,
@@ -226,6 +227,7 @@ mod tests {
             Event::TurnEnded {
                 state: TurnState::Complete,
                 assistant_message: Some(Body::kept("ported.")),
+                tokens: None,
             }
         );
     }

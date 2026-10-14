@@ -22,6 +22,7 @@
 //! | `hops` | `conbus.hops` | sum | `{hop}` |
 //! | `repeated` | `conbus.repeated` | sum | `{record}` |
 //! | `recovered` | `conbus.recovered` | sum | `{record}` |
+//! | `tokens_input` … `tokens_cache_write` | `conbus.tokens`, `type` = `input` `output` `cacheRead` `cacheCreation` | sum | `{token}` |
 //!
 //! Sums are monotonic, with delta temporality: a point is what happened
 //! between 00:00 UTC of its day (`startTimeUnixNano`) and the next 00:00
@@ -144,14 +145,31 @@ static RECOVERED: Instrument = sum(
     "Records recovered by gap fill or backfill rather than seen by a hook",
     "{record}",
 );
+static TOKENS: Instrument = sum(
+    "conbus.tokens",
+    "Tokens a vendor's hook reported for its turns",
+    "{token}",
+);
 
-/// Every count of one row as (metric, `kind` of stop, value), in the order the
-/// metrics are sent.
+/// One point before it is stamped: the metric, the point's distinguishing
+/// attribute as (key, value) where it has one, and the value.
+type Point = (
+    &'static Instrument,
+    Option<(&'static str, &'static str)>,
+    u64,
+);
+
+/// Every count of one row as (metric, the point's distinguishing attribute as
+/// (key, value), value), in the order the metrics are sent.
 ///
 /// Destructured field by field with no `..`, the way `Counts::add` is: a count
 /// added to the row stops this compiling until someone decides what it is sent
 /// as — or that it is not sent — which is an amendment to RFD 0002 either way.
-fn values(row: &SharedRow) -> [(&'static Instrument, Option<&'static str>, u64); 20] {
+///
+/// `conbus.tokens` is `type`-split rather than `kind`-split so its points line
+/// up with the `claude_code.token.usage` series a team may already collect:
+/// same metric shape, same four attribute values.
+fn values(row: &SharedRow) -> [Point; 24] {
     let SharedRow {
         day: _,
         harness: _,
@@ -179,16 +197,20 @@ fn values(row: &SharedRow) -> [(&'static Instrument, Option<&'static str>, u64);
         hops,
         repeated,
         recovered,
+        tokens_input,
+        tokens_output,
+        tokens_cache_read,
+        tokens_cache_write,
     } = counts;
     [
         (&CONVERSATIONS, None, *conversations),
         (&TURNS, None, *turns),
-        (&STOPS, Some("limit"), *limit_stops),
-        (&STOPS, Some("account"), *account_stops),
-        (&STOPS, Some("vendor"), *vendor_errors),
-        (&STOPS, Some("request"), *request_faults),
-        (&STOPS, Some("other"), *other_stops),
-        (&STOPS, Some("person"), *user_stops),
+        (&STOPS, Some(("kind", "limit")), *limit_stops),
+        (&STOPS, Some(("kind", "account")), *account_stops),
+        (&STOPS, Some(("kind", "vendor")), *vendor_errors),
+        (&STOPS, Some(("kind", "request")), *request_faults),
+        (&STOPS, Some(("kind", "other")), *other_stops),
+        (&STOPS, Some(("kind", "person")), *user_stops),
         (&LIMIT_EPISODES, None, *limit_episodes),
         (&SUBAGENTS, None, *subagents),
         (&TOOL_CALLS, None, *tool_calls),
@@ -201,6 +223,14 @@ fn values(row: &SharedRow) -> [(&'static Instrument, Option<&'static str>, u64);
         (&HOPS, None, *hops),
         (&REPEATED, None, *repeated),
         (&RECOVERED, None, *recovered),
+        (&TOKENS, Some(("type", "input")), *tokens_input),
+        (&TOKENS, Some(("type", "output")), *tokens_output),
+        (&TOKENS, Some(("type", "cacheRead")), *tokens_cache_read),
+        (
+            &TOKENS,
+            Some(("type", "cacheCreation")),
+            *tokens_cache_write,
+        ),
     ]
 }
 
@@ -239,8 +269,8 @@ pub fn encode(rows: &[SharedRow], version: &str, now: Timestamp) -> io::Result<P
         if span.open && !open_days.contains(&row.day) {
             open_days.push(row.day.clone());
         }
-        for (instrument, kind, value) in values(row) {
-            let point = span.point(instrument, attributes(row, kind), value)?;
+        for (instrument, tag, value) in values(row) {
+            let point = span.point(instrument, attributes(row, tag), value)?;
             points += 1;
             match metrics
                 .iter_mut()
@@ -270,11 +300,11 @@ pub fn encode(rows: &[SharedRow], version: &str, now: Timestamp) -> io::Result<P
     })
 }
 
-fn attributes(row: &SharedRow, kind: Option<&'static str>) -> Vec<KeyValue> {
+fn attributes(row: &SharedRow, tag: Option<(&'static str, &'static str)>) -> Vec<KeyValue> {
     [
         Some(text("harness", &row.harness)),
         Some(text("attendance", attendance(row.attendance))),
-        kind.map(|kind| text("kind", kind)),
+        tag.map(|(key, value)| text(key, value)),
     ]
     .into_iter()
     .flatten()
@@ -462,6 +492,10 @@ mod tests {
                 hops: 17,
                 repeated: 18,
                 recovered: 19,
+                tokens_input: 21,
+                tokens_output: 22,
+                tokens_cache_read: 23,
+                tokens_cache_write: 24,
             },
         };
         let body = body_of(&[row], later());
@@ -469,9 +503,14 @@ mod tests {
         let mut sent = Vec::new();
         for metric in metrics_of(&body) {
             for point in points_of(metric) {
+                // The attribute that splits a metric's points, as `key=value`
+                // so `kind` on stops and `type` on tokens are both pinned.
+                let tag = ["kind", "type"]
+                    .iter()
+                    .find_map(|key| attribute(point, key).map(|value| format!("{key}={value}")));
                 sent.push((
                     metric["name"].as_str().expect("name").to_string(),
-                    attribute(point, "kind"),
+                    tag,
                     point["asInt"].as_str().expect("asInt").to_string(),
                 ));
             }
@@ -479,12 +518,12 @@ mod tests {
         let expected: Vec<(String, Option<String>, String)> = [
             ("conbus.conversations", None, "20"),
             ("conbus.turns", None, "1"),
-            ("conbus.stops", Some("limit"), "2"),
-            ("conbus.stops", Some("account"), "4"),
-            ("conbus.stops", Some("vendor"), "5"),
-            ("conbus.stops", Some("request"), "6"),
-            ("conbus.stops", Some("other"), "7"),
-            ("conbus.stops", Some("person"), "8"),
+            ("conbus.stops", Some("kind=limit"), "2"),
+            ("conbus.stops", Some("kind=account"), "4"),
+            ("conbus.stops", Some("kind=vendor"), "5"),
+            ("conbus.stops", Some("kind=request"), "6"),
+            ("conbus.stops", Some("kind=other"), "7"),
+            ("conbus.stops", Some("kind=person"), "8"),
             ("conbus.limit_episodes", None, "3"),
             ("conbus.subagents", None, "9"),
             ("conbus.tool.calls", None, "10"),
@@ -497,6 +536,10 @@ mod tests {
             ("conbus.hops", None, "17"),
             ("conbus.repeated", None, "18"),
             ("conbus.recovered", None, "19"),
+            ("conbus.tokens", Some("type=input"), "21"),
+            ("conbus.tokens", Some("type=output"), "22"),
+            ("conbus.tokens", Some("type=cacheRead"), "23"),
+            ("conbus.tokens", Some("type=cacheCreation"), "24"),
         ]
         .into_iter()
         .map(|(name, kind, value)| {
@@ -536,6 +579,7 @@ mod tests {
                 ("conbus.hops", "{hop}"),
                 ("conbus.repeated", "{record}"),
                 ("conbus.recovered", "{record}"),
+                ("conbus.tokens", "{token}"),
             ]
         );
     }
@@ -593,7 +637,7 @@ mod tests {
         ];
         let payload = encode(&rows, VERSION, later()).expect("encode");
         assert!(payload.open_days.is_empty(), "{:?}", payload.open_days);
-        assert_eq!((payload.rows, payload.points), (2, 40));
+        assert_eq!((payload.rows, payload.points), (2, 48));
         let body: Value = serde_json::from_slice(&payload.body).expect("json");
 
         let metrics = metrics_of(&body);
@@ -630,6 +674,8 @@ mod tests {
                     .collect();
                 let expected = if metric["name"] == "conbus.stops" {
                     vec!["harness", "attendance", "kind"]
+                } else if metric["name"] == "conbus.tokens" {
+                    vec!["harness", "attendance", "type"]
                 } else {
                     vec!["harness", "attendance"]
                 };

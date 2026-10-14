@@ -116,6 +116,7 @@ fn two_agents_in_one_repository(home: &Path, main: &str, worktree: &str) {
             Event::TurnEnded {
                 state: TurnState::Complete,
                 assistant_message: Some(Body::kept("the secret reply")),
+                tokens: None,
             },
         ];
         for (second, event) in events.into_iter().enumerate() {

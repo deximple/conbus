@@ -695,6 +695,7 @@ mod tests {
         let ended = Event::TurnEnded {
             state: TurnState::Complete,
             assistant_message: None,
+            tokens: None,
         };
 
         let Disposition::Write { bus_id, .. } =
@@ -710,6 +711,7 @@ mod tests {
                 observed: vec![Observed::bare(Event::TurnEnded {
                     state: TurnState::Complete,
                     assistant_message: None,
+                    tokens: None,
                 })],
             }
         );
@@ -752,6 +754,7 @@ mod tests {
             Observed::bare(Event::TurnEnded {
                 state: TurnState::Complete,
                 assistant_message: None,
+                tokens: None,
             }),
         );
 
@@ -769,6 +772,7 @@ mod tests {
                 observed: vec![Observed::bare(Event::TurnEnded {
                     state: TurnState::Complete,
                     assistant_message: None,
+                    tokens: None,
                 })],
             }
         );
@@ -829,6 +833,7 @@ mod tests {
             Observed::bare(Event::TurnEnded {
                 state: TurnState::Complete,
                 assistant_message: None,
+                tokens: None,
             }),
         );
 

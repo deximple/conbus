@@ -470,6 +470,11 @@ pub enum Event {
         /// text blocks only, and absent when that message is pure tool use.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         assistant_message: Option<Body>,
+        /// Token counts the vendor's own hook reported for the turn —
+        /// Cursor's `afterAgentResponse` today. Absent on every turn end a
+        /// vendor did not meter, which is almost all of them.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tokens: Option<TurnTokens>,
     },
     /// A briefing about this checkout was built and handed to the hook.
     ///
@@ -570,6 +575,16 @@ impl Event {
             _ => None,
         }
     }
+}
+
+/// What a vendor's hook said a turn spent, in tokens. Four counts, none
+/// derived: what the vendor reported is what the log holds.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
+pub struct TurnTokens {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
 }
 
 /// How a tool call ended.
