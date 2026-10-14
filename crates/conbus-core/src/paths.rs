@@ -150,6 +150,12 @@ impl Paths {
         self.root.join("facts.jsonl")
     }
 
+    /// The local PreToolUse policy: operator-written rules that tighten what
+    /// a hook allows. Read by the hook process before the daemon is asked.
+    pub fn policy(&self) -> PathBuf {
+        self.root.join("policy.json")
+    }
+
     /// Workspace links: facts from `from` are visible in `to`.
     pub fn links(&self) -> PathBuf {
         self.root.join("links.jsonl")
@@ -272,6 +278,7 @@ mod tests {
         assert_eq!(paths.socket(), Path::new("/tmp/bus/conbus.sock"));
         assert_eq!(paths.takeover(), Path::new("/tmp/bus/takeover.json"));
         assert_eq!(paths.facts(), Path::new("/tmp/bus/facts.jsonl"));
+        assert_eq!(paths.policy(), Path::new("/tmp/bus/policy.json"));
         assert_eq!(paths.links(), Path::new("/tmp/bus/links.jsonl"));
         assert_eq!(
             paths.quota_cache("claude_code"),

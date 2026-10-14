@@ -531,6 +531,7 @@ folder's facts visible in another.
 | `quota/` | the last quota readings |
 | `takeover.json` | a hop waiting for `conbus run`, while one is |
 | `facts.jsonl`, `links.jsonl` | section 10 |
+| `policy.json` | your `PreToolUse` rules, if you wrote any (section 15) |
 | `chat-export/` | Claude.ai exports you dropped in |
 
 Only your account can read any of it: the folder is `0700` and the log's
@@ -684,7 +685,51 @@ line, the destination's quota, and whether the session was a program
 
 ---
 
-## 15. Reference
+## 15. The local policy
+
+`policy.json` in the data folder is your own list of `PreToolUse` decisions.
+With no file, policy is off and every tool call passes through exactly as the
+agent's vendor already decides. With one, the hook — not the recorder —
+checks each call against the rules before the call runs, so a stopped
+recorder cannot lift a deny.
+
+```json
+{
+  "version": 1,
+  "rules": [
+    {
+      "harness": "claude_code",
+      "tool": "Bash",
+      "input_contains": ["rm -rf /"],
+      "decision": "deny",
+      "reason": "no agent wipes this disk"
+    }
+  ]
+}
+```
+
+- `harness` is optional. Leave it out and the rule applies to every agent
+  that takes decisions at all — today Claude Code and Codex. Cursor's reply
+  contract has no decision, so a Cursor call is never ruled on.
+- `tool` is the payload's `tool_name`, spelled exactly; `"*"` is every tool.
+- `input_contains` is any number of substrings; the rule matches when one of
+  them appears in the tool input's compact JSON. Leave it out and every
+  input matches.
+- `decision` is `deny` or `ask`. There is no `allow` on purpose: a policy can
+  tighten what runs, never lift a prompt the vendor would have shown.
+- `reason` is shown to you, so it is required and cannot be empty.
+
+Every rule is tried in order; any matching `deny` beats every matching `ask`,
+and between equals the first rule's reason stands. A file that does not
+parse, has the wrong version, or names an unknown field decides nothing —
+`conbus doctor` says so, and `conbus policy check` prints the rules or the
+error. `conbus policy test --harness claude_code --tool Bash --input
+'{"command":"ls"}'` shows what the file would do with one call without
+running it.
+
+A decision is not recorded in the log; the tool request is, as it always was.
+
+## 16. Reference
 
 ### Commands
 
@@ -696,6 +741,8 @@ line, the destination's quota, and whether the session was a program
 | `conbus doctor` | What is wired up and what is not |
 | `conbus status` | Routing rules, quota, hop history, cost |
 | `conbus quota` | What each leg has left |
+| `conbus policy check` | The effective `policy.json` rules, or why there are none (section 15) |
+| `conbus policy test --harness H --tool T --input JSON` | What the rules would decide for one call |
 | `conbus log [--json] [--bus-id ID] [--since TS] [--tail N] [--grep TEXT] [--reveal]` | Read the log |
 | `conbus hop [HARNESS] [--from ID] [--to HARNESS] [--apply] [--demo]` | Preview, or with `--apply` make, a hop |
 | `conbus go [HARNESS] [--from ID]` | `hop --apply` for the current conversation |
@@ -736,7 +783,7 @@ all, inconclusive. Until 28 days have passed it says so and scores nothing.
 
 ---
 
-## 16. Known limitations
+## 17. Known limitations
 
 - macOS only.
 - Claude's quota is visible only from the terminal `claude` StatusLine.

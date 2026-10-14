@@ -1116,6 +1116,22 @@ pub fn doctor(paths: &Paths) -> io::Result<()> {
         crate::drops::describe(&crate::drops::summary(paths))
     );
 
+    // The local PreToolUse policy: a file that cannot be a policy decides
+    // nothing, and the line says so because fail-open is silent by design.
+    match crate::policy::load(&paths.policy()) {
+        crate::policy::Load::Absent => {
+            println!("policy    off — no {}", paths.policy().display())
+        }
+        crate::policy::Load::Invalid(err) => {
+            println!("policy    {err} — decides nothing")
+        }
+        crate::policy::Load::Ready(policy) => println!(
+            "policy    {} rule(s) in {}",
+            policy.rule_count(),
+            paths.policy().display()
+        ),
+    }
+
     let scan = SegmentLog::scan(paths.log_dir())?;
     let conversations: std::collections::HashSet<_> =
         scan.records.iter().map(|r| r.bus_id).collect();
