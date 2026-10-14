@@ -22,7 +22,10 @@
   "vars": {
     "CONTACT_EMAIL": "you@example.com"
   },
+  // Off on purpose: Workers Logs invocation logs carry request metadata
+  // (URL, method, headers, cf fields, timestamps) — more than privacy.html
+  // promises to keep. https://developers.cloudflare.com/workers/observability/logs/workers-logs/
   "observability": {
-    "enabled": true
+    "enabled": false
   }
 }
