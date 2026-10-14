@@ -71,6 +71,7 @@ mod tests {
             code_freshness: None,
             tool_calls: 2,
             tools_unanswered: 1,
+            claude_profile: None,
         }
     }
 

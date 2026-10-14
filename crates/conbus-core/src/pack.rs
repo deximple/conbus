@@ -70,6 +70,12 @@ pub struct Chapter {
     /// session can act on — but a request that never came back is the only
     /// structural sign in the log that something was left half-done.
     pub tools_unanswered: u64,
+    /// The Claude Code profile the conversation's most recent `claude_code`
+    /// record ran under. Absent on the default profile, and on conversations
+    /// no Claude leg has carried. An automatic hop back to `claude_code`
+    /// lands on the default account, which is a different one — this is what
+    /// that refusal reads.
+    pub claude_profile: Option<String>,
 }
 
 impl Chapter {
@@ -97,12 +103,19 @@ impl Chapter {
             code_freshness: None,
             tool_calls: 0,
             tools_unanswered: 0,
+            claude_profile: None,
         });
 
         let mut one = HashMap::from([(record.bus_id, chapter.about.clone())]);
         Candidate::apply(&mut one, record);
         if let Some(updated) = one.remove(&record.bus_id) {
             chapter.about = updated;
+        }
+
+        // Latest wins: the account the conversation's Claude legs most
+        // recently ran under is the one an automatic hop back would leave.
+        if record.source.harness.as_str() == crate::event::Harness::CLAUDE_CODE {
+            chapter.claude_profile.clone_from(&record.source.profile);
         }
 
         match &record.event {
@@ -558,6 +571,7 @@ mod tests {
             pending_hop: None,
             code_freshness: None,
             tool_calls: 31,
+            claude_profile: None,
             tools_unanswered: 2,
         }
     }

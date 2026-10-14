@@ -490,6 +490,18 @@ impl Daemon {
         if conbus_core::continuation::unattended(source.entrypoint.as_ref()) {
             return;
         }
+        // Nor a profiled conversation back onto the default account: a hop to
+        // `claude_code` lands on the default profile, which is another of the
+        // person's accounts, and switching is manual only. Writing the line
+        // anyway would record a hop the router is about to refuse.
+        if next.as_str() == Harness::CLAUDE_CODE
+            && self
+                .chapters
+                .get(&bus_id)
+                .is_some_and(|chapter| chapter.claude_profile.is_some())
+        {
+            return;
+        }
         let already_going = self
             .chapters
             .get(&bus_id)

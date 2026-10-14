@@ -215,8 +215,37 @@ fn plan(paths: &Paths, records: &[Record], from: Option<&str>) -> io::Result<(Le
         .unwrap_or_else(|| Harness::new(Harness::CODEX));
     let other_turn = latest_turn(records, other_harness.as_str());
     let other = leg(paths, &other_harness, other_turn, now, None);
-    let decision = route::decide_driven(&current, &other, focus.machine_driven);
+    let mut decision = route::decide_driven(&current, &other, focus.machine_driven);
+    // An automatic hop back to claude_code lands on the default account —
+    // every landing (`warm-claude:` resume, a fresh window) is the default
+    // profile's. For a conversation whose Claude legs ran under a profile
+    // that is moving it between two of the person's accounts with no hand on
+    // it, so the decision waits and says who the conversation is under.
+    // `--to`/`go` skips this — the person chose.
+    if let Decision::Hop { to, .. } = &decision
+        && to.as_str() == Harness::CLAUDE_CODE
+        && let Some(name) = claude_profile_of(records, focus.bus_id)
+    {
+        decision = Decision::Wait {
+            reason: format!(
+                "this conversation runs under Claude profile {name}; switching accounts is \
+                 manual — conbus go claude_code, or conbus run claude_code --profile {name}"
+            ),
+        };
+    }
     Ok((current, other, decision))
+}
+
+/// The profile the conversation's most recent `claude_code` record ran
+/// under — the account an automatic hop back would silently bypass.
+fn claude_profile_of(records: &[Record], bus_id: BusId) -> Option<&str> {
+    records
+        .iter()
+        .rev()
+        .find(|record| {
+            record.bus_id == bus_id && record.source.harness.as_str() == Harness::CLAUDE_CODE
+        })
+        .and_then(|record| record.source.profile.as_deref())
 }
 
 struct Focus {
@@ -627,7 +656,7 @@ fn lease_only(paths: &Paths, focus: &Focus, holder: &str) -> io::Result<()> {
             entrypoint: None,
             brief: false,
             provenance: None,
-            profile: None,
+            profile: focus.profile.clone(),
             event: Event::Leased {
                 holder: holder.into(),
             },
@@ -708,7 +737,7 @@ fn record_hop(
         entrypoint: None,
         brief: false,
         provenance: None,
-        profile: None,
+        profile: focus.profile.clone(),
         event,
     };
     match submit(paths, &request) {
@@ -1118,6 +1147,125 @@ mod tests {
         // read as "routing 4 (3.35/week)" against a kill criterion of three.
         assert_eq!(provenance_of(true), HopProvenance::Directed);
         assert_eq!(provenance_of(false), HopProvenance::VendorSignal);
+    }
+
+    /// A turn ended on `harness` in `state`, under `profile` when that leg
+    /// names one.
+    fn ended(bus_id: BusId, harness: &str, profile: Option<&str>, state: TurnState) -> Record {
+        Record {
+            schema_version: conbus_core::record::SCHEMA_VERSION,
+            ts: conbus_core::clock::Timestamp::now(),
+            seq: 1,
+            bus_id,
+            vendor_turn_id: None,
+            vendor_agent_id: None,
+            source: conbus_core::event::Source {
+                harness: Harness::new(harness),
+                harness_version: None,
+                vendor_session_id: Some("sess".into()),
+                workspace: Some("/repo".into()),
+                entrypoint: None,
+                backfilled_from: None,
+                profile: profile.map(str::to_string),
+            },
+            event: Event::TurnEnded {
+                state,
+                assistant_message: None,
+                tokens: None,
+            },
+        }
+    }
+
+    #[test]
+    fn an_automatic_hop_back_to_claude_never_lands_on_another_account() {
+        // The laundering path: the conversation ran under profile `work`,
+        // hopped to codex when `work` was spent, and now codex is spent too.
+        // Routing it back to `claude_code` would land on the DEFAULT account
+        // — a switch between two of the person's accounts with no hand on
+        // it. The decision waits and says whose profile it is.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::from_env(dir.path().to_str(), None, None).expect("paths");
+        std::fs::create_dir_all(paths.root()).expect("root");
+        let bus = BusId::mint();
+        let records = [
+            ended(bus, Harness::CLAUDE_CODE, Some("work"), TurnState::Complete),
+            ended(
+                bus,
+                Harness::CODEX,
+                None,
+                TurnState::InterruptedQuota {
+                    reason: "rate_limit".into(),
+                },
+            ),
+        ];
+
+        let (_, _, decision) = plan(&paths, &records, None).expect("plan");
+
+        let Decision::Wait { reason } = decision else {
+            panic!("a profiled conversation must not be hopped to another account: {decision:?}");
+        };
+        assert!(
+            reason.contains("work"),
+            "the reason names the profile: {reason}"
+        );
+        assert!(reason.contains("manual"), "{reason}");
+    }
+
+    #[test]
+    fn a_directed_hop_back_to_claude_is_the_persons_choice() {
+        // `conbus go claude_code` / `--to` is the person moving the
+        // conversation by hand — allowed, profile or no.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::from_env(dir.path().to_str(), None, None).expect("paths");
+        std::fs::create_dir_all(paths.root()).expect("root");
+        let bus = BusId::mint();
+        let records = [
+            ended(bus, Harness::CLAUDE_CODE, Some("work"), TurnState::Complete),
+            ended(
+                bus,
+                Harness::CODEX,
+                None,
+                TurnState::InterruptedQuota {
+                    reason: "rate_limit".into(),
+                },
+            ),
+        ];
+        let (current, other, _) = plan(&paths, &records, None).expect("plan");
+
+        let decision = directed(&current, &other, "claude_code").expect("directed");
+
+        assert!(
+            matches!(decision, Decision::Hop { ref to, .. } if to.as_str() == Harness::CLAUDE_CODE),
+            "a directed hop may name claude_code: {decision:?}"
+        );
+    }
+
+    #[test]
+    fn a_default_profile_history_still_overflows_back_to_claude() {
+        // No profile anywhere: the automatic hop home is exactly what it
+        // always was.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::from_env(dir.path().to_str(), None, None).expect("paths");
+        std::fs::create_dir_all(paths.root()).expect("root");
+        let bus = BusId::mint();
+        let records = [
+            ended(bus, Harness::CLAUDE_CODE, None, TurnState::Complete),
+            ended(
+                bus,
+                Harness::CODEX,
+                None,
+                TurnState::InterruptedQuota {
+                    reason: "rate_limit".into(),
+                },
+            ),
+        ];
+
+        let (_, _, decision) = plan(&paths, &records, None).expect("plan");
+
+        assert!(
+            matches!(decision, Decision::Hop { ref to, .. } if to.as_str() == Harness::CLAUDE_CODE),
+            "unprofiled conversations route home as before: {decision:?}"
+        );
     }
 
     /// A record under a profiled `claude` — `source.profile` is the only

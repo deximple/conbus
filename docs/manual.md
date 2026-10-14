@@ -18,8 +18,10 @@ the [README](../README.md); for what changed between releases, the
 - [12. Upgrading](#12-upgrading)
 - [13. Uninstalling](#13-uninstalling)
 - [14. Troubleshooting](#14-troubleshooting)
-- [15. Reference](#15-reference)
-- [16. Known limitations](#16-known-limitations)
+- [15. The local policy](#15-the-local-policy)
+- [16. Claude Code profiles: a second account, switched by hand](#16-claude-code-profiles-a-second-account-switched-by-hand)
+- [17. Reference](#17-reference)
+- [18. Known limitations](#18-known-limitations)
 
 ---
 
@@ -782,7 +784,11 @@ usage limits, so conbus never switches profiles on a limit: no quota signal,
 route or hop moves a conversation from one of your accounts to another, and a
 hop back into Claude from a profiled run keeps the run's profile — it does
 not resume the default profile's warm session, which the profile cannot see;
-the fresh session is briefed from the checkout by the hooks instead.
+the fresh session is briefed from the checkout by the hooks instead. When a
+conversation's last Claude leg ran under a profile, an automatic hop back to
+`claude_code` would land on the *default* account, so the route waits instead
+and says so — `conbus go claude_code` (your choice, on the default account)
+or `conbus run claude_code --profile NAME`.
 
 ## 17. Reference
 
@@ -843,6 +849,9 @@ all, inconclusive. Until 28 days have passed it says so and scores nothing.
 - macOS and Linux only.
 - On Linux there is no OS key store, so `encrypted_tools` elides tool bodies
   rather than sealing them — nothing is sealed under a key kept in a file.
+- On Linux the release tarball is x86_64 only, and the recorder is a systemd
+  user unit, not a launchd agent (`systemctl --user`; where no user manager
+  answers, `conbus daemon` in the background does the same job).
 - On Linux the hop window lands in the current TTY only: there is no
   osascript, so no new Terminal window opens on its own.
 - Claude's quota is visible only from the terminal `claude` StatusLine.
