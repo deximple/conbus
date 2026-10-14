@@ -99,6 +99,9 @@ fn tui_binary(harness: &str) -> String {
         .unwrap_or_else(|| default.into())
 }
 
+/// AppleScript's osascript runs the command through a shell; only the macOS
+/// branch builds one.
+#[cfg(target_os = "macos")]
 fn shell_single(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }

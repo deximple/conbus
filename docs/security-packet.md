@@ -9,8 +9,9 @@ describes `main` from 0.2.5 (2026-09-24).
 
 conbus records coding-agent sessions on the machine they run on. It is one
 Rust binary at `~/.local/bin/conbus`, plus a launchd agent
-(`sh.conbus.daemon`) that runs it as the person, with no root and no system
-extension. It also adds hook entries to each agent's own settings. On a
+(`sh.conbus.daemon`) on macOS or a systemd user unit
+(`sh.conbus.daemon.service`) on Linux that runs it as the person, with no
+root and no system extension. It also adds hook entries to each agent's own settings. On a
 managed Mac the organisation also places a copy the managed hooks name
 ([below](#on-a-managed-mac)); conbus itself writes no system file. There is no
 server, account or telemetry. conbus opens one connection of its own, and only
@@ -35,7 +36,9 @@ else `~/.conbus`.
   outputs are not written, only their size. `CONBUS_RETENTION` changes that:
   - `full` keeps tool bodies.
   - `encrypted_tools` seals tool bodies with AES-256-GCM, under a key in the
-    login Keychain (service `sh.conbus`, account `log-kek`).
+    login Keychain (service `sh.conbus`, account `log-kek`). On Linux there is
+    no OS key store and conbus keeps no file-based key, so `encrypted_tools`
+    elides tool bodies instead of sealing them; `conbus doctor` says so.
   - `ephemeral` writes nothing.
 
   Any single body is clipped at 16 KiB.
@@ -51,7 +54,8 @@ else `~/.conbus`.
   a volume without modes. The log directory is closed either way.
 - **Name a directory of its own for `CONBUS_HOME`.** conbus makes it `0700`,
   whatever else is in it.
-- The recorder turns off core dumps, and locks its memory where macOS allows.
+- The recorder turns off core dumps, and locks its memory where the OS allows
+  — `mlockall` is not implemented on macOS, so it reports rather than assumes.
 - **The policy file is read, never written.** If `policy.json` exists, the
   hook process checks each `PreToolUse` payload against its rules itself —
   before and independently of the recorder — and answers `deny` or `ask` in
@@ -97,8 +101,8 @@ Anything that leaves goes through a program the person already runs:
 
 | Program | When |
 | --- | --- |
-| `launchctl` | `install` and `uninstall` load and unload the agent |
-| `security` | only with `encrypted_tools`: to create and read the sealing key |
+| `launchctl` (macOS), `systemctl --user` (Linux) | `install` and `uninstall` load and unload the recorder's service |
+| `security` | only with `encrypted_tools` on macOS: to create and read the sealing key |
 | `/bin/sh -c` | to forward the person's own status-line command; `doctor` uses it to check that a registered hook command starts |
 | `codex app-server`, `claude`, `agy`, and the CLI `conbus run` or `warm` starts | quota reads, hops, `summary`, `run`, `warm` |
 | `open`, `osascript`, `cursor -n` | opening the window where a hop lands |
@@ -113,8 +117,9 @@ Anything that leaves goes through a program the person already runs:
   `$CODEX_HOME/hooks.json` and `~/.cursor/hooks.json`.
 - **Writes** `~/.grok/hooks/conbus.json`,
   `~/.config/opencode/plugins/conbus.js`,
-  `~/.claude/conbus-statusline-forward` and
-  `~/Library/LaunchAgents/sh.conbus.daemon.plist`.
+  `~/.claude/conbus-statusline-forward` and the recorder's service file —
+  `~/Library/LaunchAgents/sh.conbus.daemon.plist` on a Mac,
+  `~/.config/systemd/user/sh.conbus.daemon.service` on Linux.
 
 `install` without `--apply` prints the change instead of making it. Before
 each rewrite it keeps a `*.json.conbus-backup` copy. It replaces files
@@ -196,8 +201,9 @@ reads the file before sending it. No sync code exists, and none will before
 ## Removing it
 
 Run `conbus uninstall --apply`, then `rm -rf ~/.conbus`. With
-`encrypted_tools`, also delete the key:
-`security delete-generic-password -s sh.conbus -a log-kek`. On a managed Mac,
+`encrypted_tools` on macOS, also delete the key:
+`security delete-generic-password -s sh.conbus -a log-kek` (Linux keeps no
+key; its tool bodies were elided). On a managed Mac,
 remove the managed entries first and the system-wide binary last;
 [the fleet guide](fleet.md#7-taking-it-back-out) gives the order.
 `uninstall` touches neither.

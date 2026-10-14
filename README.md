@@ -9,9 +9,9 @@ briefed on what recent sessions there were doing, and when a vendor stops a
 turn for quota — or when you say so — the next leg picks the conversation up.
 The vendor TUIs stay the window; conbus is the part underneath.
 
-**0.2.9 · macOS · Apache-2.0.** Local only: no hosted service, no telemetry,
-and conbus never reads or stores vendor auth tokens. One harness on one laptop
-does not need it.
+**0.2.9 · macOS · Linux · Apache-2.0.** Local only: no hosted service, no
+telemetry, and conbus never reads or stores vendor auth tokens. One harness
+on one laptop does not need it.
 
 ## Why a local log, and not a sync tool
 
@@ -77,9 +77,10 @@ different key, minted only by `conbus sync --join INVITE --apply`.
 curl -fsSL https://raw.githubusercontent.com/deximple/conbus/main/install.sh | sh
 ```
 
-The script downloads the universal macOS binary from the latest release,
-checks its SHA-256, places it at `~/.local/bin/conbus`, and shows what it would
-register. **Nothing in your vendor settings changes yet.** Then:
+The script downloads the binary for your OS — the universal macOS one or
+`conbus-linux-x86_64` — from the latest release, checks its SHA-256, places it
+at `~/.local/bin/conbus`, and shows what it would register. **Nothing in your
+vendor settings changes yet.** Then:
 
 ```bash
 conbus install --apply   # register the hooks, start the recorder
@@ -89,8 +90,12 @@ conbus doctor            # what is wired up, and what is not
 `install --apply` merges one hook into each vendor it finds — `~/.claude/settings.json`
 (and the StatusLine, wrapped so yours still shows), `~/.codex/hooks.json`,
 `~/.cursor/hooks.json`, `~/.grok/hooks/conbus.json`, an opencode plugin — keeps a
-`.conbus-backup` of every file it changes, and starts a launchd agent
-(`sh.conbus.daemon`). Your own hooks and settings stay exactly as they were.
+`.conbus-backup` of every file it changes, and starts the recorder as a launchd
+agent (`sh.conbus.daemon`) on a Mac or a systemd user unit
+(`~/.config/systemd/user/sh.conbus.daemon.service`) on Linux. Where no
+`systemctl --user` answers — a container, a remote shell — install still writes
+everything and prints the one command that runs `conbus daemon` by hand. Your
+own hooks and settings stay exactly as they were.
 
 **Codex asks first.** Codex runs a new hook only after you approve it: start
 Codex once and trust the hooks it lists. conbus never writes that trust record

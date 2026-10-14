@@ -181,7 +181,11 @@ pub fn run(apply: bool) -> io::Result<()> {
     }
     changed |= cursor_file(&install::cursor_hooks_path(&home), apply)?;
     changed |= plugin_file(&install::opencode_plugin_path(&home), apply)?;
-    changed |= launch_agent(&install::launch_agent_path(&home), apply)?;
+    #[cfg(target_os = "macos")]
+    let service = install::launch_agent_path(&home);
+    #[cfg(not(target_os = "macos"))]
+    let service = install::daemon_unit_path(&home);
+    changed |= daemon_service(&service, apply)?;
     changed |= binary_file(&binary, apply)?;
 
     let root = std::env::var_os("CONBUS_HOME")
@@ -309,31 +313,54 @@ fn plugin_file(path: &Path, apply: bool) -> io::Result<bool> {
     Ok(true)
 }
 
-fn launch_agent(plist: &Path, apply: bool) -> io::Result<bool> {
-    if !plist.exists() {
+fn daemon_service(path: &Path, apply: bool) -> io::Result<bool> {
+    if !path.exists() {
         return Ok(false);
     }
     println!(
         "{:<12} {} — {}",
         "daemon",
-        plist.display(),
+        path.display(),
         if apply {
             "stopped and deleted"
         } else {
-            "would stop the daemon and delete the agent"
+            "would stop the daemon and delete the service"
         }
     );
     if apply {
         // After the hooks are gone, so nothing is left calling a stopped daemon.
-        if std::env::var_os("CONBUS_SKIP_LAUNCHCTL").is_none() {
-            let uid = unsafe { libc::getuid() };
-            let _ = std::process::Command::new("launchctl")
-                .args(["bootout", &format!("gui/{uid}/{}", install::DAEMON_LABEL)])
-                .status();
-        }
-        fs::remove_file(plist)?;
+        stop_daemon_service();
+        fs::remove_file(path)?;
     }
     Ok(true)
+}
+
+#[cfg(target_os = "macos")]
+fn stop_daemon_service() {
+    if std::env::var_os("CONBUS_SKIP_LAUNCHCTL").is_none() {
+        let uid = unsafe { libc::getuid() };
+        let _ = std::process::Command::new("launchctl")
+            .args(["bootout", &format!("gui/{uid}/{}", install::DAEMON_LABEL)])
+            .status();
+    }
+}
+
+/// `disable --now` stops the unit and unlinks it in one act; a machine with
+/// no `systemctl --user` answers nothing and the file still comes out.
+#[cfg(not(target_os = "macos"))]
+fn stop_daemon_service() {
+    if std::env::var_os("CONBUS_SKIP_LAUNCHCTL").is_none() {
+        let _ = std::process::Command::new("systemctl")
+            .args([
+                "--user",
+                "disable",
+                "--now",
+                &format!("{}.service", install::DAEMON_LABEL),
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
 }
 
 fn binary_file(binary: &Path, apply: bool) -> io::Result<bool> {

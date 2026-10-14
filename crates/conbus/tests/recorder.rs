@@ -557,6 +557,7 @@ fn install_into(home: &Path) {
         .env("CONBUS_SKIP_LAUNCHCTL", "1")
         .env_remove("CONBUS_HOME")
         .env_remove("XDG_STATE_HOME")
+        .env_remove("XDG_CONFIG_HOME")
         .env_remove("CODEX_HOME")
         .output()
         .expect("run install");

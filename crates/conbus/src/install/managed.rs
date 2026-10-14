@@ -1,13 +1,14 @@
 //! `conbus install --managed`: the hooks an administrator puts in Claude
-//! Code's managed settings, for Macs whose policy sets `allowManagedHooksOnly`.
+//! Code's managed settings, for machines whose policy sets
+//! `allowManagedHooksOnly`.
 //!
 //! That lock blocks the user-level hooks `install --apply` registers, so on a
 //! managed fleet — the first buyer in `docs/saas-strategy.md` — conbus records
 //! nothing unless its hooks sit in the organisation's own policy. This module
 //! builds that block and says where it goes. It writes nothing, `--apply` or
 //! not: managed settings belong to the organisation's device tooling, and a
-//! program that edited `/Library/Application Support/ClaudeCode` itself would
-//! be doing the very thing that policy exists to control.
+//! program that edited them itself would be doing the very thing that policy
+//! exists to control.
 //!
 //! The block is not restated here. It is `install`'s own merge of `install`'s
 //! own Claude Code events and command into an empty document, so it cannot
@@ -27,12 +28,19 @@ use serde_json::Value;
 
 use super::{CLAUDE_EVENTS, CODEX_EVENTS, CURSOR_EVENTS, empty_document, hook_command, merge};
 
-/// Claude Code's managed settings directory on macOS. `managed-settings.json`
-/// lives here, and the `managed-settings.d/` drop-ins beside it.
+/// Claude Code's managed settings directory: `/Library/Application
+/// Support/ClaudeCode` on a Mac, `/etc/claude-code` on Linux.
+/// `managed-settings.json` lives here, and the `managed-settings.d/` drop-ins
+/// beside it.
+#[cfg(target_os = "macos")]
 pub const CLAUDE_MANAGED_DIR: &str = "/Library/Application Support/ClaudeCode";
+#[cfg(not(target_os = "macos"))]
+pub const CLAUDE_MANAGED_DIR: &str = "/etc/claude-code";
 
 /// The managed preferences domain a configuration profile delivers Claude
-/// Code's policy through: the same keys as `managed-settings.json`.
+/// Code's policy through: the same keys as `managed-settings.json`. A macOS
+/// mechanism — Linux fleets write the directory, not a profile.
+#[cfg(target_os = "macos")]
 pub const CLAUDE_PROFILE_DOMAIN: &str = "com.anthropic.claudecode";
 
 /// Codex's system requirements file on macOS and Linux. Managed hooks go
@@ -40,12 +48,20 @@ pub const CLAUDE_PROFILE_DOMAIN: &str = "com.anthropic.claudecode";
 pub const CODEX_REQUIREMENTS: &str = "/etc/codex/requirements.toml";
 
 /// Codex's managed preferences domain, and the key that carries a
-/// base64-encoded `requirements.toml`.
+/// base64-encoded `requirements.toml`. A macOS configuration-profile
+/// mechanism.
+#[cfg(target_os = "macos")]
 pub const CODEX_PROFILE_DOMAIN: &str = "com.openai.codex";
+#[cfg(target_os = "macos")]
 pub const CODEX_PROFILE_KEY: &str = "requirements_toml_base64";
 
-/// Cursor's enterprise hooks file on macOS: system-wide, placed by MDM.
+/// Cursor's enterprise hooks file: `/Library/Application
+/// Support/Cursor/hooks.json` on a Mac, `/etc/cursor/hooks.json` on Linux —
+/// system-wide, placed by the organisation's device tooling.
+#[cfg(target_os = "macos")]
 pub const CURSOR_ENTERPRISE_HOOKS: &str = "/Library/Application Support/Cursor/hooks.json";
+#[cfg(not(target_os = "macos"))]
+pub const CURSOR_ENTERPRISE_HOOKS: &str = "/etc/cursor/hooks.json";
 
 const CLAUDE_DOCS: &str = "https://code.claude.com/docs/en/managed-settings";
 const CODEX_DOCS: &str =
@@ -194,7 +210,7 @@ fn warnings(binary: &Path, home: Option<&Path>, apply: bool) -> String {
     let in_home = home.is_some_and(|home| home.parent().is_some() && binary.starts_with(home));
     let home_warning = [
         format!("{shown} is inside this account's home, and one"),
-        "managed file serves every account on every Mac. Place the binary where all".into(),
+        "managed file serves every account on every machine. Place the binary where all".into(),
         "of them can run it, such as /usr/local/bin/conbus, and run this from there.".into(),
     ];
     let shell_warning = [
@@ -231,14 +247,22 @@ fn claude_code_summary(binary: &Path) -> String {
 }
 
 fn claude_code_where() -> Vec<String> {
+    #[cfg(target_os = "macos")]
+    let sources = vec![
+        "Claude Code applies one managed source, the first that has a policy key:".into(),
+        format!("server-managed settings, then a {CLAUDE_PROFILE_DOMAIN} profile,"),
+        format!("then the files in {CLAUDE_MANAGED_DIR}, unless"),
+        "managedSourcesBehavior is \"merge\". Use the one your Macs get; /status names it.".into(),
+    ];
+    #[cfg(not(target_os = "macos"))]
+    let sources = vec![
+        "Claude Code applies one managed source, the first that has a policy key:".into(),
+        format!("server-managed settings, then the files in {CLAUDE_MANAGED_DIR}, unless"),
+        "managedSourcesBehavior is \"merge\". Use the one your machines get;".into(),
+        "/status names it.".into(),
+    ];
     [
-        vec![
-            "Claude Code applies one managed source, the first that has a policy key:".into(),
-            format!("server-managed settings, then a {CLAUDE_PROFILE_DOMAIN} profile,"),
-            format!("then the files in {CLAUDE_MANAGED_DIR}, unless"),
-            "managedSourcesBehavior is \"merge\". Use the one your Macs get; /status names it."
-                .into(),
-        ],
+        sources,
         sub(
             "file",
             vec![
@@ -253,6 +277,7 @@ fn claude_code_where() -> Vec<String> {
                 format!("{CLAUDE_MANAGED_DIR}/managed-settings.json"),
             ],
         ),
+        #[cfg(target_os = "macos")]
         sub(
             "profile",
             vec![
@@ -289,13 +314,21 @@ fn claude_code_statusline() -> Vec<String> {
 
 fn codex_pointer(binary: &Path) -> Vec<String> {
     let directory = binary.parent().unwrap_or(binary).display();
+    #[cfg(target_os = "macos")]
+    let where_it_goes = vec![
+        format!("managed hooks: [hooks] in {CODEX_REQUIREMENTS}, or the profile key"),
+        format!("{CODEX_PROFILE_KEY} for {CODEX_PROFILE_DOMAIN}. Codex trusts those"),
+        "by policy, where the copy install --apply writes waits until each developer".into(),
+        "trusts it in /hooks. conbus writes neither.".into(),
+    ];
+    #[cfg(not(target_os = "macos"))]
+    let where_it_goes = vec![
+        format!("managed hooks: [hooks] in {CODEX_REQUIREMENTS}. Codex trusts it"),
+        "by policy, where the copy install --apply writes waits until each developer".into(),
+        "trusts it in /hooks. conbus writes neither.".into(),
+    ];
     [
-        vec![
-            format!("managed hooks: [hooks] in {CODEX_REQUIREMENTS}, or the profile key"),
-            format!("{CODEX_PROFILE_KEY} for {CODEX_PROFILE_DOMAIN}. Codex trusts those"),
-            "by policy, where the copy install --apply writes waits until each developer".into(),
-            "trusts it in /hooks. conbus writes neither.".into(),
-        ],
+        where_it_goes,
         sub("events", wrapped(&CODEX_EVENTS, LIST_WIDTH)),
         sub(
             "command",
@@ -332,7 +365,10 @@ fn cursor_pointer(binary: &Path) -> Vec<String> {
 fn per_user() -> Vec<String> {
     [
         "the recorder runs per user: each person runs `conbus install --apply` once,",
+        #[cfg(target_os = "macos")]
         "which writes and loads ~/Library/LaunchAgents/sh.conbus.daemon.plist.",
+        #[cfg(not(target_os = "macos"))]
+        "which writes and enables ~/.config/systemd/user/sh.conbus.daemon.service.",
         "docs/fleet.md covers approving it by MDM and taking everything back out.",
     ]
     .map(String::from)

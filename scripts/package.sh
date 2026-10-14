@@ -1,40 +1,62 @@
 #!/bin/sh
-# Package the two release builds as one universal macOS binary.
+# Package the release build for this OS.
 #
-#   cargo build --release --locked -p conbus --target aarch64-apple-darwin
-#   cargo build --release --locked -p conbus --target x86_64-apple-darwin
-#   scripts/package.sh dist
+#   macOS:
+#     cargo build --release --locked -p conbus --target aarch64-apple-darwin
+#     cargo build --release --locked -p conbus --target x86_64-apple-darwin
+#     scripts/package.sh dist          → conbus-macos-universal.tar.gz
+#   Linux:
+#     cargo build --release --locked -p conbus --target x86_64-unknown-linux-gnu
+#     scripts/package.sh dist          → conbus-linux-x86_64.tar.gz
 #
-# Writes dist/conbus-macos-universal.tar.gz, its .sha256, and a copy of
-# install.sh; the release notes for this version go to target/release-notes.md.
+# Writes the tarball, its .sha256, and a copy of install.sh; the release notes
+# for this version go to target/release-notes.md.
 # Asset names carry no version on purpose: install.sh fetches
 # releases/latest/download/<name>, which only works with a stable name.
 set -eu
 
 out=${1:-dist}
-arm=target/aarch64-apple-darwin/release/conbus
-x86=target/x86_64-apple-darwin/release/conbus
-asset=conbus-macos-universal.tar.gz
-
-for slice in "$arm" "$x86"; do
-  [ -x "$slice" ] || { echo "package.sh: missing $slice — build both targets first" >&2; exit 1; }
-done
 
 rm -rf "$out"
 mkdir -p "$out/stage"
-lipo -create -output "$out/stage/conbus" "$arm" "$x86"
-# `lipo` keeps the arm64 slice's linker signature and leaves the x86_64 one
-# unsigned (0.2.4 and earlier shipped it so). Sign the whole binary ad hoc,
-# and refuse to package one whose halves are not both signed.
-codesign --force --sign - --identifier sh.conbus "$out/stage/conbus"
-codesign --verify --strict "$out/stage/conbus"
-lipo -info "$out/stage/conbus"
+
+case "$(uname -s)" in
+  Darwin)
+    arm=target/aarch64-apple-darwin/release/conbus
+    x86=target/x86_64-apple-darwin/release/conbus
+    asset=conbus-macos-universal.tar.gz
+    for slice in "$arm" "$x86"; do
+      [ -x "$slice" ] || { echo "package.sh: missing $slice — build both targets first" >&2; exit 1; }
+    done
+    lipo -create -output "$out/stage/conbus" "$arm" "$x86"
+    # `lipo` keeps the arm64 slice's linker signature and leaves the x86_64 one
+    # unsigned (0.2.4 and earlier shipped it so). Sign the whole binary ad hoc,
+    # and refuse to package one whose halves are not both signed.
+    codesign --force --sign - --identifier sh.conbus "$out/stage/conbus"
+    codesign --verify --strict "$out/stage/conbus"
+    lipo -info "$out/stage/conbus"
+    ;;
+  Linux)
+    bin=target/x86_64-unknown-linux-gnu/release/conbus
+    asset=conbus-linux-x86_64.tar.gz
+    [ -x "$bin" ] || { echo "package.sh: missing $bin — build the target first" >&2; exit 1; }
+    cp "$bin" "$out/stage/conbus"
+    ;;
+  *)
+    echo "package.sh: unsupported OS $(uname -s)" >&2
+    exit 1
+    ;;
+esac
+
 version=$("$out/stage/conbus" --version | awk '{print $2}')
 echo "package.sh: conbus $version"
 
 cp LICENSE README.md CHANGELOG.md "$out/stage/"
 tar -czf "$out/$asset" -C "$out/stage" conbus LICENSE README.md CHANGELOG.md
-(cd "$out" && shasum -a 256 "$asset" > "$asset.sha256")
+case "$(uname -s)" in
+  Darwin) (cd "$out" && shasum -a 256 "$asset" > "$asset.sha256") ;;
+  *)      (cd "$out" && sha256sum "$asset" > "$asset.sha256") ;;
+esac
 cp install.sh "$out/install.sh"
 rm -rf "$out/stage"
 

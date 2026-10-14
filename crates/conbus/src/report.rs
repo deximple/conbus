@@ -380,11 +380,13 @@ pub fn install(apply: bool) -> io::Result<()> {
         }
     }
 
-    let log = match std::env::var_os("CONBUS_HOME") {
-        Some(root) => std::path::PathBuf::from(root).join("daemon.log"),
-        None => home.join(".conbus").join("daemon.log"),
-    };
-    let agent = crate::install::launch_agent_path(&home);
+    // Where the service manager's redirection writes the daemon's log — the
+    // same root `paths` resolves, so an XDG_STATE_HOME install does not point
+    // the unit at a `~/.conbus` the recorder never uses.
+    let log = conbus_core::paths::Paths::resolve()
+        .map(|paths| paths.root().join("daemon.log"))
+        .unwrap_or_else(|_| home.join(".conbus").join("daemon.log"));
+    let agent = daemon_service_path(&home);
     println!(
         "{:<12} {} — {}",
         "daemon",
@@ -396,20 +398,44 @@ pub fn install(apply: bool) -> io::Result<()> {
             conbus_core::paths::keep_dir_private(parent)?;
         }
         let load = std::env::var_os("CONBUS_SKIP_LAUNCHCTL").is_none();
-        let changed = crate::install::apply_daemon(&home, &binary, &log, load)?;
-        if changed {
+        let applied = crate::install::apply_daemon(&home, &binary, &log, load)?;
+        if applied.changed {
             println!("{:<12} written", "");
         } else {
             println!("{:<12} already loaded this file", "");
         }
-        if load {
-            println!(
-                "{:<12} reloaded: launchctl bootout, then bootstrap, so macOS checks the new binary",
-                ""
-            );
+        match applied.manager {
+            crate::install::Manager::Loaded => {
+                #[cfg(target_os = "macos")]
+                println!(
+                    "{:<12} reloaded: launchctl bootout, then bootstrap, so macOS checks the new binary",
+                    ""
+                );
+                #[cfg(not(target_os = "macos"))]
+                println!(
+                    "{:<12} reloaded: systemctl --user daemon-reload, then enable --now",
+                    ""
+                );
+            }
+            #[cfg(any(test, not(target_os = "macos")))]
+            crate::install::Manager::Unavailable => {
+                println!(
+                    "{:<12} no systemctl --user answered — the unit is written but nothing starts it here;",
+                    ""
+                );
+                println!(
+                    "{:<12} run the recorder yourself: {} daemon &",
+                    "",
+                    binary.display()
+                );
+            }
+            crate::install::Manager::NotAsked => {}
         }
     } else {
+        #[cfg(target_os = "macos")]
         println!("{:<12} would write the launchd agent on --apply", "");
+        #[cfg(not(target_os = "macos"))]
+        println!("{:<12} would write the systemd user unit on --apply", "");
     }
 
     if !apply {
@@ -421,6 +447,20 @@ pub fn install(apply: bool) -> io::Result<()> {
          forge. Until you approve there, Codex hooks are registered and silently do not fire."
     );
     Ok(())
+}
+
+/// The service file `install --apply` manages: the launchd agent on a Mac,
+/// the systemd user unit on Linux.
+#[cfg(target_os = "macos")]
+fn daemon_service_path(home: &std::path::Path) -> std::path::PathBuf {
+    crate::install::launch_agent_path(home)
+}
+
+/// The service file `install --apply` manages: the launchd agent on a Mac,
+/// the systemd user unit on Linux.
+#[cfg(not(target_os = "macos"))]
+fn daemon_service_path(home: &std::path::Path) -> std::path::PathBuf {
+    crate::install::daemon_unit_path(home)
 }
 
 /// A vendor this machine does not have: say so, and how to add it later.
@@ -1096,6 +1136,12 @@ pub fn doctor(paths: &Paths) -> io::Result<()> {
     }
 
     println!("{}", describe_hardening(paths));
+
+    // There is no OS key store to hold a sealing key here, and conbus keeps
+    // none of its own: on Linux `encrypted_tools` elides tool bodies rather
+    // than sealing them under a key kept in a file.
+    #[cfg(not(target_os = "macos"))]
+    println!("sealing   none — no OS key store; tool bodies are elided, not sealed");
 
     println!("writable  {}", describe_appendable(&appendable(paths)));
 

@@ -1,6 +1,6 @@
 # conbus manual
 
-This manual describes **conbus 0.2.9** on macOS. For the short version, read
+This manual describes **conbus 0.2.9** on macOS and Linux. For the short version, read
 the [README](../README.md); for what changed between releases, the
 [CHANGELOG](../CHANGELOG.md). 한국어: [manual.ko.md](manual.ko.md)
 
@@ -56,8 +56,9 @@ The agents' own terminals and apps stay the window. conbus has no chat UI.
 
 ## 2. Before you install
 
-- **macOS** on Apple silicon or Intel. conbus uses launchd and the vendors'
-  macOS apps; it does not run on Linux or Windows yet.
+- **macOS** on Apple silicon or Intel, or **Linux** on x86_64. The recorder is
+  a launchd agent on a Mac and a systemd user unit on Linux; it does not run
+  on Windows yet.
 - **At least one agent, already signed in** through its own binary: Claude Code
   (`claude`), Codex (`codex` or Codex.app), Cursor, the Grok Build CLI (`grok`),
   or opencode. conbus never signs in for you and never reads their credentials.
@@ -77,8 +78,10 @@ curl -fsSL https://raw.githubusercontent.com/deximple/conbus/main/install.sh | s
 
 The script:
 
-1. downloads `conbus-macos-universal.tar.gz` from the latest release (falling
-   back to `gh release download` when the anonymous download is refused);
+1. downloads the release asset for this OS — `conbus-macos-universal.tar.gz`
+   on a Mac, `conbus-linux-x86_64.tar.gz` on Linux — from the latest release
+   (falling back to `gh release download` when the anonymous download is
+   refused);
 2. checks it against its published SHA-256, and stops without installing
    anything if they differ;
 3. places the binary at `~/.local/bin/conbus`, written beside and then renamed,
@@ -110,7 +113,7 @@ cargo build --release -p conbus
 conbus install --apply
 ```
 
-For each agent **that is installed on this Mac** — recognised by its own
+For each agent **that is installed on this machine** — recognised by its own
 configuration directory — conbus merges one hook into that agent's settings.
 Agents that are not installed are skipped; run `install --apply` again after
 installing one.
@@ -124,8 +127,12 @@ installing one.
 | opencode | `~/.config/opencode/plugins/conbus.js` | a plugin that forwards session and message events |
 
 It also places the binary at `~/.local/bin/conbus` if it is not there yet, and
-writes a launchd agent, `~/Library/LaunchAgents/sh.conbus.daemon.plist`, which
-keeps the recorder running and starts it at login.
+writes the service that keeps the recorder running and starts it at login: a
+launchd agent, `~/Library/LaunchAgents/sh.conbus.daemon.plist`, on a Mac, or a
+systemd user unit, `~/.config/systemd/user/sh.conbus.daemon.service`, on
+Linux. Where no `systemctl --user` answers — a container or a CI runner —
+install still writes everything else and prints the one command that runs
+`conbus daemon` by hand.
 
 Every file it changes keeps a copy beside it (`…json.conbus-backup`), your own
 hooks and settings stay exactly as they were — including their order — and a
@@ -476,7 +483,8 @@ marked as recovered. A session the recorder already saw live is not duplicated.
 the same file. Stop it, backfill, start it again:
 
 ```bash
-launchctl bootout gui/$(id -u)/sh.conbus.daemon
+launchctl bootout gui/$(id -u)/sh.conbus.daemon            # macOS
+systemctl --user disable --now sh.conbus.daemon.service   # Linux
 conbus backfill --apply
 conbus install --apply     # starts the recorder again
 ```
@@ -550,19 +558,25 @@ The socket path must stay under 104 bytes; `doctor` tells you if a
 | --- | --- | --- |
 | *(unset)* | kept | not written — only their size |
 | `full` | kept | kept (each body clipped at 16 KiB) |
-| `encrypted_tools` | kept | sealed with AES-256-GCM under a key in your login Keychain; `conbus log --reveal` opens them |
+| `encrypted_tools` | kept | sealed with AES-256-GCM under a key in your login Keychain; `conbus log --reveal` opens them. On Linux there is no OS key store and conbus keeps none of its own, so bodies are elided, not sealed |
 | `ephemeral` | nothing is written | nothing is written |
 
 At every level, a single body longer than 16 KiB is clipped in the log and
 its full size noted.
 
-The recorder runs under launchd, so "where the recorder runs" is its plist.
-`conbus install --apply` keeps what you put there:
+The recorder runs under launchd on a Mac and systemd on Linux, so "where the
+recorder runs" is its plist or its unit. `conbus install --apply` keeps what
+you put there:
 
 ```bash
+# macOS
 /usr/libexec/PlistBuddy -c 'Add :EnvironmentVariables dict' \
   -c 'Add :EnvironmentVariables:CONBUS_RETENTION string encrypted_tools' \
   ~/Library/LaunchAgents/sh.conbus.daemon.plist
+
+# Linux
+systemctl --user edit sh.conbus.daemon.service   # add Environment=CONBUS_RETENTION=…
+
 conbus install --apply   # reloads the recorder with it
 ```
 
@@ -614,9 +628,10 @@ shows `daemon … DIFFERS`, this step was skipped. A hook newer than the running
 recorder is refused with "Restart the daemon" rather than half-understood.
 
 The command unloads the recorder and loads it again (`bootout`, then
-`bootstrap`) rather than restarting it: macOS checks a replaced binary when the
-agent is loaded, and refuses a plain restart of one once. The hooks go
-unrecorded for the few seconds the recorder takes to start.
+`bootstrap`, on a Mac; `daemon-reload` and `enable --now` on Linux) rather
+than restarting it: macOS checks a replaced binary when the agent is loaded,
+and refuses a plain restart of one once. The hooks go unrecorded for the few
+seconds the recorder takes to start.
 
 ---
 
@@ -630,8 +645,8 @@ conbus uninstall --apply  # remove it
 - Every hook entry that runs conbus comes out of every agent's settings, and
   nothing else does — your own hooks stay, including any in the same block.
 - The StatusLine goes back to your own command.
-- The opencode plugin, the grok hook file, the launchd agent (after stopping
-  the recorder) and `~/.local/bin/conbus` are deleted.
+- The opencode plugin, the grok hook file, the launchd agent or systemd user
+  unit (after stopping the recorder) and `~/.local/bin/conbus` are deleted.
 - Each rewritten settings file keeps a `…json.conbus-uninstall-backup`.
 - Codex remembers approvals by position: if other hooks move up a place,
   uninstall says so, and Codex will ask you to approve them again.
@@ -650,8 +665,8 @@ install with `install.sh`, which uses `curl`.
 
 **`socket … not answering`** — the recorder is not running. `conbus install --apply`
 starts it. If it keeps stopping, `~/.conbus/daemon.log` says why. Do not run
-`conbus daemon` by hand while the launchd agent is loaded; they compete for
-the socket.
+`conbus daemon` by hand while the launchd agent or systemd unit is loaded;
+they compete for the socket.
 
 **`socket … UNUSABLE — the socket path … is N bytes`** — set `CONBUS_HOME` to a
 shorter directory.
@@ -785,7 +800,11 @@ all, inconclusive. Until 28 days have passed it says so and scores nothing.
 
 ## 17. Known limitations
 
-- macOS only.
+- macOS and Linux only.
+- On Linux there is no OS key store, so `encrypted_tools` elides tool bodies
+  rather than sealing them — nothing is sealed under a key kept in a file.
+- On Linux the hop window lands in the current TTY only: there is no
+  osascript, so no new Terminal window opens on its own.
 - Claude's quota is visible only from the terminal `claude` StatusLine.
 - The automatic hop has not yet fired on a real quota stop.
 - Some Cursor sessions send tool events without saying which session they

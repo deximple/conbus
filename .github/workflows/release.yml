@@ -3,9 +3,10 @@
 #   git tag v0.1.0 && git push origin v0.1.0
 #
 # Tests again on the tagged commit, builds both Apple architectures, joins them
-# into one universal binary, and attaches it with its SHA-256 and install.sh.
-# Run by hand (workflow_dispatch) it does everything except publish, and keeps
-# the package as a workflow artifact — the dry run for a release.
+# into one universal binary, builds x86_64 Linux, and attaches both tarballs
+# with their SHA-256s and install.sh. Run by hand (workflow_dispatch) it does
+# everything except publish, and keeps the packages as workflow artifacts —
+# the dry run for a release.
 name: release
 
 on:
@@ -68,3 +69,53 @@ jobs:
         with:
           name: conbus-macos-universal
           path: dist/
+
+  release-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal \
+            --target x86_64-unknown-linux-gnu
+          rustup default "$RUST_TOOLCHAIN"
+
+      - name: The tag names the version being released
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          version=$(cargo pkgid -p conbus | sed 's/.*[#@]//')
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "tag $GITHUB_REF_NAME does not match the workspace version $version" >&2
+            exit 1
+          fi
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+      - name: Build
+        run: cargo build --release --locked -p conbus --target x86_64-unknown-linux-gnu
+
+      - name: Package
+        run: sh scripts/package.sh dist-linux
+
+      - name: Publish
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # The macOS job owns `gh release create`; wait for the release it
+          # makes, then add the Linux tarball to it.
+          for attempt in $(seq 1 40); do
+            gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 && break
+            sleep 15
+          done
+          gh release upload "$GITHUB_REF_NAME" dist-linux/* --clobber
+
+      - name: Keep the dry run's package
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: conbus-linux-x86_64
+          path: dist-linux/

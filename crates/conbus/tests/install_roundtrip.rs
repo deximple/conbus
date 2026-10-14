@@ -19,6 +19,7 @@ fn conbus(binary: &Path, home: &Path, args: &[&str]) -> String {
         .env("CONBUS_SKIP_LAUNCHCTL", "1")
         .env_remove("CONBUS_HOME")
         .env_remove("XDG_STATE_HOME")
+        .env_remove("XDG_CONFIG_HOME")
         .env_remove("CODEX_HOME")
         .output()
         .expect("run conbus");
@@ -43,6 +44,13 @@ fn read(path: &Path) -> Value {
 fn keys(value: &Value) -> Vec<String> {
     value.as_object().expect("object").keys().cloned().collect()
 }
+
+/// The recorder's service file, relative to HOME: the launchd agent on a Mac,
+/// the systemd user unit on Linux.
+#[cfg(target_os = "macos")]
+const DAEMON_SERVICE: &str = "Library/LaunchAgents/sh.conbus.daemon.plist";
+#[cfg(not(target_os = "macos"))]
+const DAEMON_SERVICE: &str = ".config/systemd/user/sh.conbus.daemon.service";
 
 struct Machine {
     _dir: tempfile::TempDir,
@@ -114,7 +122,7 @@ fn uninstall_takes_back_everything_install_wrote_and_nothing_else() {
         ".local/bin/conbus",
         ".grok/hooks/conbus.json",
         ".config/opencode/plugins/conbus.js",
-        "Library/LaunchAgents/sh.conbus.daemon.plist",
+        DAEMON_SERVICE,
         ".claude/conbus-statusline-forward",
     ] {
         assert!(machine.at(owned).exists(), "install did not write {owned}");
@@ -144,7 +152,7 @@ fn uninstall_takes_back_everything_install_wrote_and_nothing_else() {
         ".local/bin/conbus",
         ".grok/hooks/conbus.json",
         ".config/opencode/plugins/conbus.js",
-        "Library/LaunchAgents/sh.conbus.daemon.plist",
+        DAEMON_SERVICE,
         ".claude/conbus-statusline-forward",
     ] {
         assert!(!machine.at(owned).exists(), "uninstall left {owned}");
