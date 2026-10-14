@@ -422,7 +422,7 @@ mod tests {
         );
         let text = render(&ledger, "from 2026-09-17").join("\n");
         assert!(
-            text.contains("tokens: in 10 · out 4 · cache read 6 · cache write 2"),
+            text.contains("tokens: in 2 · out 4 · cache read 6 · cache write 2"),
             "{text}"
         );
 

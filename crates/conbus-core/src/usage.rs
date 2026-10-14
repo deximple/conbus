@@ -133,8 +133,9 @@ pub struct Counts {
     /// Records counted here that were recovered — gap fill or backfill —
     /// rather than seen by a hook as they happened.
     pub recovered: u64,
-    /// Input-side tokens the vendor's hook summed for the turn. Cursor's
-    /// `input_tokens` includes the two cache counts below.
+    /// Input-side tokens the vendor's hook summed for the turn, excluding
+    /// the two cache counts below — Claude Code reports it that way, and the
+    /// fold subtracts them from Cursor's inclusive `input_tokens`.
     pub tokens_input: u64,
     /// Completion tokens the vendor's hook summed for the turn.
     pub tokens_output: u64,
@@ -207,7 +208,17 @@ impl Counts {
             Event::TurnStarted { .. } => self.turns += 1,
             Event::TurnEnded { state, tokens, .. } => {
                 if let Some(tokens) = tokens {
-                    self.tokens_input += tokens.input;
+                    // Cursor's `input_tokens` is inclusive of its two cache
+                    // counts; the row counts input like the other harnesses,
+                    // ex-cache. The record itself keeps what Cursor sent.
+                    let input = if record.source.harness.as_str() == Harness::CURSOR {
+                        tokens
+                            .input
+                            .saturating_sub(tokens.cache_read.saturating_add(tokens.cache_write))
+                    } else {
+                        tokens.input
+                    };
+                    self.tokens_input += input;
                     self.tokens_output += tokens.output;
                     self.tokens_cache_read += tokens.cache_read;
                     self.tokens_cache_write += tokens.cache_write;
@@ -1783,10 +1794,56 @@ mod tests {
         );
 
         let counts = &ledger.rows[0].counts;
-        assert_eq!(counts.tokens_input, 30);
+        assert_eq!(counts.tokens_input, 22);
         assert_eq!(counts.tokens_output, 12);
         assert_eq!(counts.tokens_cache_read, 6);
         assert_eq!(counts.tokens_cache_write, 2);
+    }
+
+    #[test]
+    fn a_cursor_turns_input_excludes_the_cache_it_reported() {
+        // Cursor's `input_tokens` is inclusive of both cache counts — the
+        // vendor's own answer at forum.cursor.com/t/168317/8 says to subtract
+        // the two and clamp at zero — so the row counts the same "input" the
+        // other harnesses report. The record itself keeps what Cursor sent.
+        let s = || source("cursor");
+        let ledger = Ledger::fold(
+            &[in_turn(
+                at(
+                    &on_day("09:00:00"),
+                    ONE,
+                    s(),
+                    ended_with_tokens(1200, 50, 900, 100),
+                ),
+                "t1",
+            )],
+            DAY,
+        );
+
+        let counts = &ledger.rows[0].counts;
+        assert_eq!(counts.tokens_input, 200);
+        assert_eq!(counts.tokens_output, 50);
+        assert_eq!(counts.tokens_cache_read, 900);
+        assert_eq!(counts.tokens_cache_write, 100);
+    }
+
+    #[test]
+    fn a_cursor_turn_with_more_cache_than_input_clamps_at_zero() {
+        let s = || source("cursor");
+        let ledger = Ledger::fold(
+            &[in_turn(
+                at(
+                    &on_day("09:00:00"),
+                    ONE,
+                    s(),
+                    ended_with_tokens(100, 5, 90, 30),
+                ),
+                "t1",
+            )],
+            DAY,
+        );
+
+        assert_eq!(ledger.rows[0].counts.tokens_input, 0);
     }
 
     #[test]
@@ -1820,7 +1877,7 @@ mod tests {
         );
 
         assert_eq!(ledger.repeated, 1);
-        assert_eq!(ledger.rows[0].counts.tokens_input, 10);
+        assert_eq!(ledger.rows[0].counts.tokens_input, 2);
     }
 
     #[test]
@@ -1845,7 +1902,7 @@ mod tests {
         );
 
         let counts = &ledger.rows[0].counts;
-        assert_eq!(counts.tokens_input, 10);
+        assert_eq!(counts.tokens_input, 2);
         assert_eq!(counts.recovered, 1);
     }
 
