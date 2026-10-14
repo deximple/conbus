@@ -1,0 +1,28 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "conbus",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-06",
+  // Static files are served first; /api/* always reaches the Worker.
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "run_worker_first": ["/api/*"]
+  },
+  // Created once by hand: `wrangler d1 create conbus-waitlist`, then paste
+  // the printed id here. The placeholder keeps `deploy --dry-run` honest.
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "conbus-waitlist",
+      "database_id": "00000000-0000-0000-0000-000000000000"
+    }
+  ],
+  // Shown on the privacy page; not a secret.
+  "vars": {
+    "CONTACT_EMAIL": "you@example.com"
+  },
+  "observability": {
+    "enabled": true
+  }
+}
