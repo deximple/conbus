@@ -177,6 +177,26 @@ tests are about the unit and the bundle, and only money that moves counts.
 
 ## Gates and kill criteria
 
+**Revised 2026-10-14: the ladder below replaces V0–V1.** One operator cannot
+run twelve live interviews, so the problem gate is earned asynchronously, from
+signals a stranger produces without a call. The money gate is V2 as before,
+and the host gate is unchanged. The original table is kept underneath for the
+record.
+
+| Gate | Evidence | Pass | Kill |
+| --- | --- | --- | --- |
+| **E1 — exposure** (by 2026-11-04) | The repository public; a release with Linux and macOS binaries; the landing page live; at least two posts in places agent operators read | All four exist | — (a to-do, not a test) |
+| **E2 — interest** (30 days after E1) | Waitlist signups, each with self-reported team size and the agent vendors the team pays for; release downloads from GitHub's own counts | ≥30 signups, of which ≥10 fit the buyer profile (10–200 developers, two or more supported vendors) | <10 signups after two separate posts: change the message or the profile before anything else |
+| **E3 — problem** (by 2026-12-22) | From the waitlist: a pasted `conbus usage --shareable` week, or the five-question form with a dated incident in the last 30 days, its cost and the workaround | ≥5 fitting signups show an account stop in an unattended run, a failing tool or a permission wait they say cost them something; ≥3 ask for a pilot | ≤2 |
+| **V2 — money** (by 2027-01-31) | A prepaid pilot of at least $250, or a signed order form | ≥1 | 0: fall back to Choice 1 |
+
+- Fake-door price clicks on the landing page (per member at $8 and $15, flat
+  at $249 per organisation, one shown at random per visitor) are colour, not a
+  gate: a click costs nothing.
+- At most a third of E2 and E3 from the operator's own network, as before.
+
+The original gates, superseded:
+
 | Gate | Pass | Kill |
 | --- | --- | --- |
 | **V0 — reach** (desk count, by 2026-10-07) | ≥6 of the first 30 reachable organisations meet the buyer profile | <6 of 30: change the profile first |
