@@ -65,9 +65,6 @@ The agents' own terminals and apps stay the window. conbus has no chat UI.
   binary by its absolute path, so they work either way; your shell needs it to
   find `conbus`.
 
-While the repository is private, installing from a release also needs the
-GitHub CLI signed in with access: `gh auth login`.
-
 ---
 
 ## 3. Install
