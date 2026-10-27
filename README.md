@@ -12,11 +12,6 @@ The vendor TUIs stay the window; conbus is the part underneath.
 **0.2.8 · macOS · Apache-2.0.** Local only: no hosted service, no telemetry,
 and conbus never reads or stores vendor auth tokens.
 
-> The repository is private today. Until it is public, installing from a
-> release works for people who have been given access and are signed in with
-> `gh auth login`. Making it public is an operator decision
-> ([docs/release.md](docs/release.md)).
-
 ## Install
 
 ```bash
