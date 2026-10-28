@@ -33,6 +33,16 @@ State assumptions before implementing, and say so when a simpler approach exists
 
 Self-improve is `docs/self-improve.md`. Observe the live bus, pick one live defect, fix it, verify, ledger, repeat. Do not treat a stale HANDOFF paragraph as current.
 
+## Cursor Cloud specific instructions
+
+CI is macOS (`macos-latest`, Rust `1.94.1` in `.github/workflows/ci.yml`). Cloud Agent VMs are Linux, and the same toolchain is what `cargo` must be. The product still runs here: `conbus daemon`, then `conbus hook --harness cursor` with a `beforeSubmitPrompt` payload on stdin, then `conbus log --tail 5`. `conbus hop --demo` needs no daemon. Set `CONBUS_HOME` when the log should not land in `~/.conbus`.
+
+- `cargo fmt --all --check` passes on Linux.
+- `cargo test --workspace --locked` passes except `install::tests::reinstalling_keeps_the_environment_an_operator_gave_the_recorder`, which shells out to macOS `plutil`.
+- `cargo clippy --workspace --all-targets --locked -- -D warnings` fails on Linux: `KEYCHAIN_LIMIT` in `crates/conbus-core/src/seal.rs` and `shell_single` in `crates/conbus/src/landing.rs` are used only inside `target_os = "macos"` and clippy reports them as dead code. That gate is green on the macOS runner.
+- `conbus doctor` may show `memory_locked=false` because the VM refuses `mlockall`. The daemon still records.
+- CI sets `CONBUS_SKIP_LAUNCHCTL=1`. `conbus install --apply` rewrites vendor hook files and expects launchd; do not apply it into this VM unless that is the task.
+
 
 
 
