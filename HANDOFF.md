@@ -7,7 +7,9 @@ SaaS scope: **Choice 3 — open-core ops ledger, validation first**
 contract `docs/rfd/0002-metadata-sync.md`). No host exists and the product is
 still the local tool. The host waits for the gates in the plan — reach,
 problem, value, and money that has moved — and for an operator decision; do not
-start it in the turn that writes or changes the choice. The sync **client**
+start it in the turn that writes or changes the choice. The reach gate (V0,
+the desk count) passed on 2026-10-09: at least six of the first thirty
+reachable organisations met the buyer profile. The sync **client**
 ships in 0.2.9 (`docs/sync-client-plan.md`, implemented against the drafts);
 RFD 0002 and RFD 0003 stay drafts until accepted together, a service still
 needs that acceptance first, and no field they do not name may be sent.
@@ -19,11 +21,10 @@ tracked: it took weeks to learn and a clone should not have to learn it again.
 
 ## Where things are
 
-- Repo: `deximple/conbus`, **private** until an operator flips visibility.
-  The README and the landing page install from a release with `install.sh`;
-  until the repo is public that works only for people signed in to `gh` with
-  access, which both pages say. Releasing: `docs/release.md`; what going public
-  would expose: `docs/publication-review.md`.
+- Repo: `deximple/conbus`, **public**. The README and the landing page
+  install from a release with `install.sh`, which works for anyone — no `gh`
+  sign-in, no access needed. Releasing: `docs/release.md`; what going public
+  exposed: `docs/publication-review.md`.
 - Design SSOT: `.cursor/plans/shared_workspace_context_3f7139b8.plan.md`.
   The filename is a generated id and no longer matches the content; leave it
   so the Cursor plan UI keeps its association.
@@ -224,8 +225,10 @@ Argued through four review rounds; the reasoning is in the plan.
 
 **Both**
 
-- Global hooks mirror our own background sessions unless marked. The
-  `CONBUS_INTERNAL_SESSION` marker makes the hook exit before reading stdin.
+- Global hooks mirror our own background sessions unless marked. A hook
+  carrying the `CONBUS_INTERNAL_SESSION` marker still reads all of stdin
+  first — the vendor never writes into a closed pipe — and is then answered
+  with the silent reply and left unrecorded.
 - The two vendors cannot share a session id: Claude Code takes
   `--session-id <uuid>`, Codex assigns thread ids and its `ThreadStartParams`
   has no `threadId`. Identity is carried by the registry's alias map and never
@@ -396,6 +399,11 @@ three.
   - **Fixed since:** `gh` and `git` are bounded to 5 s (`code::LIMIT`), and
     every automatic hop now writes its route and its time to `daemon.log`.
     The next one will say where the minutes go.
+- **The second organic hop, on 2026-10-30, did not repeat the wait.** The
+  daemon's own line — `automatic hop --apply for <bus> in 67571 ms: hop
+  displaced claude_code → codex (current turn hit quota)` — says 67.6 s end
+  to end: far better than 21.6 minutes, and still slower than a hop should
+  be; where those seconds go is not yet measured.
 - **42 Cursor conversations were lost before 2026-09-09** and are not
   recoverable: their tool events were dropped as orphans because no
   `beforeSubmitPrompt` ever arrived for them. Letting a Cursor tool call mint
@@ -546,9 +554,8 @@ Next, each its own PR with a failing test first:
    "where should this show up?" answers. Nothing is hosted before the gates,
    and no sync code is written before RFD 0002 and RFD 0003 are accepted.
 
-Waiting on the operator: the V0 desk count, the weekly hour budget, and
-repository visibility. A model digest is `conbus summary --bus-id`; hop-path
-model calls stay zero.
+Waiting on the operator: the weekly hour budget. A model digest is `conbus
+summary --bus-id`; hop-path model calls stay zero.
 
 After 0.1.0, watch two things on a live machine. Drops with the
 `NO_SESSION` reason and a `preToolUse`/`postToolUse` detail are Cursor worker
