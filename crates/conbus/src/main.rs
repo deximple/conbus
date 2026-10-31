@@ -23,6 +23,7 @@ mod quota;
 mod report;
 mod runner;
 mod summarise;
+mod sync;
 mod takeover;
 mod uninstall;
 mod usage;
@@ -163,6 +164,14 @@ fn main() -> ExitCode {
         }
         Command::Summary { bus_id } => run(|paths| summarise::run(paths, bus_id)),
         Command::Verdict => run(verdict::run),
+        Command::Sync { join, apply, off } => run(|paths| {
+            let rows = if off || join.is_some() {
+                Vec::new()
+            } else {
+                usage::shareable_rows(paths)?
+            };
+            sync::run(paths, sync::Args { join, apply, off }, &rows)
+        }),
         Command::Usage {
             days,
             since,

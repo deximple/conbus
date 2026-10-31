@@ -110,6 +110,12 @@ pub enum Command {
         bus_id: Option<String>,
         seq: Option<u64>,
     },
+    /// Send closed-day counts. Writes nothing unless `--apply` or a joined `sync`.
+    Sync {
+        join: Option<String>,
+        apply: bool,
+        off: bool,
+    },
     /// Say which build this binary is.
     Version,
     Help,
@@ -218,6 +224,11 @@ where
             bus_id: flag_value(&args, "--bus-id"),
         },
         "verdict" => Command::Verdict,
+        "sync" => Command::Sync {
+            join: flag_value(&args, "--join"),
+            apply: args.iter().any(|arg| arg == "--apply"),
+            off: args.iter().any(|arg| arg == "--off"),
+        },
         "usage" => Command::Usage {
             days: flag_value(&args, "--days")
                 .and_then(|n| n.parse().ok())
@@ -330,6 +341,12 @@ USAGE:
                                   --otlp sends those rows as OTLP metrics to a
                                   collector on this machine over plain HTTP
                                   (http://127.0.0.1:4318); send a --day once
+    conbus sync --join INVITE    print the invite; write nothing
+    conbus sync --join INVITE --apply
+                                  store the device key and the invite settings
+    conbus sync                   send closed days not yet sent
+    conbus sync --off             delete the device key even if the service
+                                  cannot be reached; the log is kept
     conbus progress [--days N] [--since DAY] [--day DAY] [--workspace DIR] [--json]
                                   the same counts per folder: which agents worked
                                   there, how much, what handed work between them,
@@ -620,6 +637,36 @@ mod tests {
         );
         assert!(USAGE.contains("[--shareable] [--otlp URL]"), "{USAGE}");
         assert!(USAGE.contains("--otlp sends those rows"), "{USAGE}");
+    }
+
+    #[test]
+    fn sync_has_join_apply_and_off() {
+        assert_eq!(
+            parse(["sync", "--join", "{\"org\":\"acme\"}"], None),
+            Command::Sync {
+                join: Some("{\"org\":\"acme\"}".into()),
+                apply: false,
+                off: false,
+            }
+        );
+        assert_eq!(
+            parse(["sync", "--join", "invite", "--apply"], None),
+            Command::Sync {
+                join: Some("invite".into()),
+                apply: true,
+                off: false,
+            }
+        );
+        assert_eq!(
+            parse(["sync", "--off"], None),
+            Command::Sync {
+                join: None,
+                apply: false,
+                off: true,
+            }
+        );
+        assert!(USAGE.contains("conbus sync --join INVITE"), "{USAGE}");
+        assert!(USAGE.contains("conbus sync --off"), "{USAGE}");
     }
 
     #[test]
