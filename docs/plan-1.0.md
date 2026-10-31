@@ -384,7 +384,7 @@ Copilot CLI 어댑터(설치·실 payload 필요), Gemini CLI 어댑터, 프롬�
 
 | 단계 | 상태 | PR | 측정값 | 메모 |
 | --- | --- | --- | --- | --- |
-| M0 | | | | |
+| M0 | 완료 | #70 #71 #72 | `main` 테스트 707 통과·0 실패·1 무시(1.94와 1.99.1 같음) | 1.99.1 clippy가 계획의 2건 외에 4건(`needless_late_init` 1, `collapsible_match` 3)을 더 잡아 M0.2에서 함께 고침. M0.5: private vulnerability reporting·Dependabot alerts·secret scanning·push protection 켬, `main` 보호(필수 `gate`, strict 끔, 리뷰 없음, force push·삭제 금지). M0.6: v0.2.9 서명·공증 후 교체, 내려받아 `TeamIdentifier=4UN6WC576K`·`Notarized Developer ID` 확인, `latest`는 v0.2.9. 랜딩의 "공증 안 됨"·"실제 한도를 만난 적 없음" 문구도 사실과 달라 함께 고침 |
 | M1 | | | | |
 | M2 | | | | |
 | M3 | | | | |
