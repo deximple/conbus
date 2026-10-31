@@ -7,9 +7,10 @@ SaaS scope: **Choice 3 — open-core ops ledger, validation first**
 contract `docs/rfd/0002-metadata-sync.md`). No host exists and the product is
 still the local tool. The host waits for the gates in the plan — reach,
 problem, value, and money that has moved — and for an operator decision; do not
-start it in the turn that writes or changes the choice. No sync code before RFD
-0002 and RFD 0003 (security, drafted 2026-09-24) are both accepted, and no field
-they do not name.
+start it in the turn that writes or changes the choice. The sync **client**
+ships in 0.2.9 (`docs/sync-client-plan.md`, implemented against the drafts);
+RFD 0002 and RFD 0003 stay drafts until accepted together, a service still
+needs that acceptance first, and no field they do not name may be sent.
 
 Live bus ids, home paths, quota numbers and probe session ids do not belong
 here — they live in `HANDOFF.local.md` (gitignored) and in `~/.conbus/`.
@@ -505,6 +506,15 @@ operator's Mac:
 - it started on the first try (`runs = 1`);
 - five hooks were dropped while it started: the socket is bound first, and a
   hook gets no reply until the repair and the fold finish.
+
+0.2.9 (2026-11-01) ships the sync client — `conbus sync --join [--apply]`,
+`sync`, `sync --off` from `docs/sync-client-plan.md`. Not yet verified on a
+live Mac: a real `--join --apply` writes the keychain item, `--off` removes
+it, and a trusted HTTPS endpoint has checked the signature — all three need a
+service that does not exist. One fix missed the tag: an unjoined `sync` no
+longer scans the log (#68, merged after v0.2.9 was cut; it rides the next
+release). The package on the release is CI-built and unsigned until
+`scripts/sign-release.sh` replaces it.
 
 Next, each its own PR with a failing test first:
 
