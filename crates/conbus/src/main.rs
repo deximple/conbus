@@ -165,7 +165,7 @@ fn main() -> ExitCode {
         Command::Summary { bus_id } => run(|paths| summarise::run(paths, bus_id)),
         Command::Verdict => run(verdict::run),
         Command::Sync { join, apply, off } => run(|paths| {
-            let rows = if off || join.is_some() {
+            let rows = if off || join.is_some() || !sync::has_state(paths) {
                 Vec::new()
             } else {
                 usage::shareable_rows(paths)?

@@ -120,6 +120,12 @@ trait Transport {
     fn post(&mut self, post: &Post) -> io::Result<Vec<u8>>;
 }
 
+/// Whether this machine has joined. A caller can skip computing `rows`
+/// when it is false: an unjoined `sync` posts nothing.
+pub fn has_state(paths: &Paths) -> bool {
+    state_path(paths).exists()
+}
+
 pub fn run(paths: &Paths, args: Args, rows: &[SharedRow]) -> io::Result<()> {
     let now = Timestamp::now();
     #[cfg(target_os = "macos")]
