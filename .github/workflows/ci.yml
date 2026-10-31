@@ -23,7 +23,6 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  RUST_TOOLCHAIN: "1.94.1"
   # Install paths under test must never talk to the runner's launchd.
   CONBUS_SKIP_LAUNCHCTL: "1"
 
@@ -36,8 +35,7 @@ jobs:
 
       - name: Toolchain
         run: |
-          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component rustfmt,clippy
-          rustup default "$RUST_TOOLCHAIN"
+          rustup toolchain install
           rustc --version
 
       - uses: actions/cache@v4
@@ -47,8 +45,8 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: cargo-${{ runner.os }}-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-${{ runner.os }}-${{ env.RUST_TOOLCHAIN }}-
+          key: cargo-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}-
 
       - name: fmt
         run: cargo fmt --all --check
