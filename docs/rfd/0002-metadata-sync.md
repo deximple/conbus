@@ -1,9 +1,9 @@
 # RFD 0002 — What a sync may send
 
-Status: **draft**, 2026-09-23, revised the same day after review. No sync code
-exists. This RFD and [RFD 0003](0003-security-design.md), the security design,
-have to be accepted before any is, and every field a sync sends has to be named
-here first.
+Status: **draft**, 2026-09-23, revised the same day after review. The client
+ships in 0.2.9; no service exists. This RFD and
+[RFD 0003](0003-security-design.md), the security design, have to be accepted
+before a service runs, and every field a sync sends has to be named here first.
 
 Context: Choice 3 in [`docs/saas-hypothesis.md`](../saas-hypothesis.md) and the
 plan in [`docs/saas-strategy.md`](../saas-strategy.md). The log itself never
@@ -278,11 +278,12 @@ Prometheus's [OpenTelemetry guide](https://prometheus.io/docs/guides/opentelemet
   anyone can read the payload first.
 - `conbus usage --otlp URL` — **built**, a spike. Sends those rows to a
   collector on this machine; see "The pipe" above. Not a sync.
-- `conbus sync --join INVITE [--apply]` — reports what would be sent and where;
-  writes the credential and the invite's settings only with `--apply`, like
-  `install`.
-- `conbus sync` — send the closed days not yet sent. `conbus sync --off` — stop,
-  forget the credential, and print how to delete what was sent.
+- `conbus sync --join INVITE [--apply]` — **built** (0.2.9). Reports what would
+  be sent and where; writes the credential and the invite's settings only with
+  `--apply`, like `install`.
+- `conbus sync` — **built** (0.2.9). Send the closed days not yet sent.
+  `conbus sync --off` — **built** (0.2.9). Stop, forget the credential, and
+  print how to delete what was sent.
 
 ## Retention and deletion
 

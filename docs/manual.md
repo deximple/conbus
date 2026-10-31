@@ -1,6 +1,6 @@
 # conbus manual
 
-This manual describes **conbus 0.2.8** on macOS. For the short version, read
+This manual describes **conbus 0.2.9** on macOS. For the short version, read
 the [README](../README.md); for what changed between releases, the
 [CHANGELOG](../CHANGELOG.md). 한국어: [manual.ko.md](manual.ko.md)
 

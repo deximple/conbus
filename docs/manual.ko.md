@@ -1,6 +1,6 @@
 # conbus 매뉴얼
 
-이 매뉴얼은 macOS용 **conbus 0.2.8**을 설명합니다. 짧게 훑으려면
+이 매뉴얼은 macOS용 **conbus 0.2.9**를 설명합니다. 짧게 훑으려면
 [README](../README.md)를, 릴리스 사이에 무엇이 바뀌었는지는
 [CHANGELOG](../CHANGELOG.md)를 보세요. English: [manual.md](manual.md)
 

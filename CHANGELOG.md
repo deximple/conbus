@@ -6,6 +6,22 @@ the entry says so when it does.
 
 ## [Unreleased]
 
+## [0.2.9] — 2026-11-01
+
+`conbus sync`, the device side of the draft sync contract. There is still no
+host: nothing joins, and nothing leaves this Mac until an invite's `--apply`
+says so. Prompts stay in the log; only closed days' counts can be sent.
+
+### Added
+
+- `conbus sync --join INVITE` prints what the invite asks and writes nothing.
+  With `--apply` it mints an Ed25519 device key, keeps the seed only in the
+  login Keychain, and records the invite's settings in `sync.json`.
+- `conbus sync` sends the closed UTC days not yet sent — the rows
+  `conbus usage --shareable` prints — signed, bounded, and only to the origin
+  the invite named. `conbus sync --off` leaves: it deletes the device key and
+  the sync state even when the service cannot be reached, and the log is kept.
+
 ## [0.2.8] — 2026-10-09
 
 The log, by folder. `conbus progress` shows, for each checkout, which agents
