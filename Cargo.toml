@@ -5,7 +5,7 @@ members = ["crates/conbus", "crates/conbus-core"]
 [workspace.package]
 version = "0.2.9"
 edition = "2024"
-rust-version = "1.94"
+rust-version = "1.99"
 license = "Apache-2.0"
 repository = "https://github.com/deximple/conbus"
 publish = false

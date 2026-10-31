@@ -6,6 +6,11 @@ the entry says so when it does.
 
 ## [Unreleased]
 
+### Changed
+
+- Building from source needs Rust 1.99.1, pinned in `rust-toolchain.toml`;
+  CI reads the same file.
+
 ## [0.2.9] — 2026-11-01
 
 `conbus sync`, the device side of the draft sync contract. There is still no

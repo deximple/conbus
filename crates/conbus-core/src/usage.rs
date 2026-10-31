@@ -548,7 +548,7 @@ impl Tally {
             })
             .collect();
         // Stable over the map's name order, so ties print by name.
-        harnesses.sort_by(|a, b| b.conversations.cmp(&a.conversations));
+        harnesses.sort_by_key(|h| std::cmp::Reverse(h.conversations));
         Ledger {
             records: self.records,
             recovered: self.recovered,
@@ -738,7 +738,7 @@ fn shared_harness(harness: &str) -> &str {
 /// Largest first; ties by name, so the same log prints the same report.
 fn most_first(counts: BTreeMap<String, u64>) -> Vec<(String, u64)> {
     let mut sorted: Vec<(String, u64)> = counts.into_iter().collect();
-    sorted.sort_by(|a, b| b.1.cmp(&a.1));
+    sorted.sort_by_key(|entry| std::cmp::Reverse(entry.1));
     sorted
 }
 

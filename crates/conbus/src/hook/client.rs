@@ -226,19 +226,12 @@ pub fn run_in(
 
     let inference = hook::inference::looks_like(&payload);
     let normalized = hook::normalize(&Harness::new(harness), &payload).map_err(|err| err.0)?;
-    let key;
-    let observed;
-    let hook_event_name;
-    match normalized {
+    let (key, hook_event_name, observed) = match normalized {
         Normalized::Event {
             key: k,
             hook_event_name: name,
             observed: o,
-        } => {
-            key = k;
-            hook_event_name = name;
-            observed = *o;
-        }
+        } => (k, name, *o),
         // A decision, so nothing to say. Inference frames still need the
         // archival verdict — Claude hook JSON would fail Anthropic's parse.
         Normalized::Ignored { .. } => {
@@ -258,7 +251,7 @@ pub fn run_in(
             )
             .into());
         }
-    }
+    };
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
     if grok_echo(harness, &key, &hook_event_name, home.as_deref()) {
         return Ok(silent_reply(harness).to_string());

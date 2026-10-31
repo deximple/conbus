@@ -96,7 +96,7 @@ curl -fsSL https://raw.githubusercontent.com/deximple/conbus/main/install.sh | s
 
 ### 소스에서 빌드
 
-Rust 1.94 이상:
+Rust 1.99 이상:
 
 ```bash
 git clone https://github.com/deximple/conbus

@@ -96,7 +96,7 @@ conbus doctor            # what is wired up, and what is not
 Codex once and trust the hooks it lists. conbus never writes that trust record
 for you.
 
-From source instead (Rust 1.94+):
+From source instead (Rust 1.99+):
 
 ```bash
 git clone https://github.com/deximple/conbus && cd conbus

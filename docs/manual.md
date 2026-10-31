@@ -95,7 +95,7 @@ Nothing in your agents' settings has changed at this point. Options:
 
 ### From source
 
-Rust 1.94 or newer:
+Rust 1.99 or newer:
 
 ```bash
 git clone https://github.com/deximple/conbus

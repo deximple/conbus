@@ -539,14 +539,13 @@ pub fn live_warm_threads(records: &[Record]) -> Vec<String> {
                     by_bus.insert(record.bus_id, Some(id.to_string()));
                 }
             }
-            Event::SessionEnded { .. } => {
+            Event::SessionEnded { .. }
                 if by_bus
                     .get(&record.bus_id)
                     .and_then(|id| id.as_deref())
-                    .is_none()
-                {
-                    by_bus.insert(record.bus_id, None);
-                }
+                    .is_none() =>
+            {
+                by_bus.insert(record.bus_id, None);
             }
             _ => {}
         }
@@ -736,10 +735,8 @@ fn lease_of(records: &[Record], bus_id: BusId) -> Lease {
                     None => Lease::Held(holder.clone()),
                 };
             }
-            Event::SessionEnded { .. } => {
-                if !matches!(lease, Lease::Warm(_)) {
-                    lease = Lease::Free;
-                }
+            Event::SessionEnded { .. } if !matches!(lease, Lease::Warm(_)) => {
+                lease = Lease::Free;
             }
             _ => {}
         }

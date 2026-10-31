@@ -224,15 +224,11 @@ pub fn parse_agy(result: &serde_json::Value) -> io::Result<Quota> {
                 continue;
             };
             match window.minutes {
-                300 => {
-                    if five.is_none_or(|cur| window.used_percent > cur.used_percent) {
-                        five = Some(window);
-                    }
+                300 if five.is_none_or(|cur| window.used_percent > cur.used_percent) => {
+                    five = Some(window);
                 }
-                10080 => {
-                    if week.is_none_or(|cur| window.used_percent > cur.used_percent) {
-                        week = Some(window);
-                    }
+                10080 if week.is_none_or(|cur| window.used_percent > cur.used_percent) => {
+                    week = Some(window);
                 }
                 _ => {}
             }
