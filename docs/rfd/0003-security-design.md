@@ -1,6 +1,7 @@
 # RFD 0003 — Security design for the sync
 
-Status: **draft**, 2026-09-24. No sync code exists. RFD 0003 and
+Status: **draft**, 2026-09-24. The client side ships in 0.2.9; no service
+exists. RFD 0003 and
 [RFD 0002](0002-metadata-sync.md) are accepted together or not at all.
 [RFD 0002](0002-metadata-sync.md) says *what* a sync may send; this RFD says how
 it is protected on the way, at rest, and when it is deleted.

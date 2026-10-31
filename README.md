@@ -9,7 +9,7 @@ briefed on what recent sessions there were doing, and when a vendor stops a
 turn for quota — or when you say so — the next leg picks the conversation up.
 The vendor TUIs stay the window; conbus is the part underneath.
 
-**0.2.8 · macOS · Apache-2.0.** Local only: no hosted service, no telemetry,
+**0.2.9 · macOS · Apache-2.0.** Local only: no hosted service, no telemetry,
 and conbus never reads or stores vendor auth tokens. One harness on one laptop
 does not need it.
 
@@ -19,22 +19,24 @@ The record is an append-only JSONL stream. Git, a shared folder, and a remote
 database of the text each handle that stream badly. conbus keeps the stream on
 this Mac.
 
-| Approach | What happens to the stream | What 0.2.8 does |
+| Approach | What happens to the stream | What 0.2.9 does |
 | --- | --- | --- |
 | Git or dotfiles | High-frequency JSONL collides, and prompts land in the repository history. | Segments stay in `~/.conbus/log`. They are the source of truth (`crates/conbus-core/src/segment.rs`). |
 | A file sync | The copy does not know where a record ends, and it is a copy of the prompts. | The log directory is mode `0700` and each segment is `0600`. conbus does not upload them. |
 | A remote database of the text | Prompts leave the machine, and revoking an API token does not delete the local log. | There is no hosted bus. Uninstall leaves the log where it is; `rm -rf ~/.conbus` removes it. |
 
 Counts, never the text, are a separate contract.
-[RFD 0002](docs/rfd/0002-metadata-sync.md) names the rows a future sync may send:
-one row per device, UTC day, harness and attendance.
+[RFD 0002](docs/rfd/0002-metadata-sync.md) names the rows a sync may send: one
+row per device, UTC day, harness and attendance.
 [RFD 0003](docs/rfd/0003-security-design.md) names device signing and
-`conbus sync --off` as the leave command. Both documents are drafts, and 0.2.8
-has no `conbus sync` command. What you can run today:
+`conbus sync --off` as the leave command. Both documents stay drafts. The
+client ships in 0.2.9; **there is still no service to join.** Until a pilot
+asks, the rows go nowhere:
 
 ```bash
 conbus usage --shareable                       # print those rows locally
 conbus usage --otlp http://127.0.0.1:4318      # counts only, to a collector on this Mac
+conbus sync --join INVITE                      # preview an invite; writes nothing
 ```
 
 ## Architecture
@@ -67,7 +69,7 @@ vendor, never the one whose conversation it is digesting.
 
 `CONBUS_RETENTION=encrypted_tools` seals tool bodies with a key in the login
 Keychain. That is the retention key. The device signing key in RFD 0003 is a
-different key, and it is not implemented.
+different key, minted only by `conbus sync --join INVITE --apply`.
 
 ## Install
 
@@ -144,6 +146,11 @@ is treated like `conbus go cursor`.
   `conbus usage --otlp URL` sends counts, never text, to an OpenTelemetry
   collector on this Mac that you name — only when you run it.
 
+  `conbus sync` sends the closed days' counts, never prompts, to the origin a
+  joined invite names — and nothing until `conbus sync --join INVITE --apply`
+  joins this machine. `conbus sync --off` forgets the credential and leaves
+  the log where it is.
+
   To read quota, conbus asks the vendor CLIs you already use (`codex
   app-server`, `agy`); deciding a hop asks `gh` for the checkout's pull request.
 - **What conbus never reads.** Vendor auth tokens and credentials. Vendor
@@ -193,6 +200,7 @@ and `rm -rf ~/.conbus` removes it if you want it gone.
 | `conbus backfill [--apply]` | Recover history from before conbus was installed |
 | `conbus summary --bus-id ID` | A model digest from the other vendor |
 | `conbus verdict` | Score a four-week trial; an open window is not a verdict |
+| `conbus sync [--join INVITE [--apply]] [--off]` | Send closed days' counts to the origin a joined invite names; no host exists yet |
 | `conbus arena fact \| link` | Accept a fact, or link two checkouts |
 | `conbus daemon` · `conbus hook` | The recorder, and the hook it registers |
 | `conbus --version` | Version and the commit it was built from |
@@ -206,8 +214,8 @@ Operational guides and the decisions behind them:
 - [Manual](docs/manual.md) — install, the recorder, hop, upgrade, uninstall.
 - [매뉴얼 (한국어)](docs/manual.ko.md) · [운영자 매뉴얼 (한국어)](docs/beginner-manual.md)
 - [RFD 0001](docs/rfd/0001-hook-contract.md) — the hook contract the binary registers. Field names come from `crates/conbus/tests/fixtures/`.
-- [RFD 0002](docs/rfd/0002-metadata-sync.md) — draft. Which usage rows a sync may send. No sync code yet.
-- [RFD 0003](docs/rfd/0003-security-design.md) — draft. Device keys and `conbus sync --off`. It is accepted only together with RFD 0002, and neither has been accepted. Nothing in it ships in 0.2.8.
+- [RFD 0002](docs/rfd/0002-metadata-sync.md) — draft. Which usage rows a sync may send. The client ships in 0.2.9; there is no service.
+- [RFD 0003](docs/rfd/0003-security-design.md) — draft. Device keys and `conbus sync --off`. It is accepted only together with RFD 0002, and neither has been accepted. The client side ships in 0.2.9.
 - [Changelog](CHANGELOG.md) · [Security](SECURITY.md) · [Releasing](docs/release.md) · [Managed Macs](docs/fleet.md) · [Hop walkthrough](docs/hop-demo.md) · [Fact schema](docs/fact-schema.md) · [License](LICENSE)
 
 conbus is a local tool. There is no hosted bus, account or price
@@ -215,11 +223,11 @@ conbus is a local tool. There is no hosted bus, account or price
 
 ## 한국어
 
-0.2.8은 한 대의 Mac에서 Claude Code, Codex, Cursor, grok, opencode의 대화를
+0.2.9는 한 대의 Mac에서 Claude Code, Codex, Cursor, grok, opencode의 대화를
 로컬 JSONL 세그먼트로 남기고, 쿼터로 멈추거나 직접 말했을 때 다음 하네스로
 넘기는 도구입니다. 호스티드 동기화 서비스는 없습니다.
 
 설치는 위의 `install.sh`와 `conbus install --apply`가 전부입니다.
-`conbus sync`와 `conbus --off`는 [RFD 0003](docs/rfd/0003-security-design.md)에
-적힌 초안이고, 이 릴리스의 명령이 아닙니다. 운영 절차는
-[한국어 매뉴얼](docs/manual.ko.md)에 있습니다.
+`conbus sync`는 0.2.9에 있지만 join할 서비스가 아직 없습니다. 참여한 뒤에는
+닫힌 날의 횟수만 초대에 적힌 origin으로 나가고, 프롬프트는 로그에 남습니다.
+운영 절차는 [한국어 매뉴얼](docs/manual.ko.md)에 있습니다.
