@@ -1,4 +1,5 @@
 /target
+.DS_Store
 /index.js
 /mainView.js
 /mainWindow.js

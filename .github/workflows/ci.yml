@@ -33,6 +33,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: public-safe
+        run: sh scripts/check-public-safe.sh
+
       - name: Toolchain
         run: |
           rustup toolchain install
