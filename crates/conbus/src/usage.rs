@@ -9,7 +9,7 @@ use std::io;
 use conbus_core::clock::{Timestamp, ago};
 use conbus_core::paths::Paths;
 use conbus_core::segment::SegmentLog;
-use conbus_core::usage::{HarnessTotal, Ledger, first_day, next_day};
+use conbus_core::usage::{HarnessTotal, Ledger, SharedRow, first_day, next_day};
 
 use crate::otlp;
 
@@ -78,6 +78,12 @@ pub fn window(
         since,
         until: None,
     })
+}
+
+/// Rows a sync may send. The log stays in this module; `sync` never opens it.
+pub fn shareable_rows(paths: &Paths) -> io::Result<Vec<SharedRow>> {
+    let scan = SegmentLog::scan(paths.log_dir())?;
+    Ok(Ledger::fold(&scan.records, "").shareable())
 }
 
 /// Print the report; with a collector, send it the shareable rows after.

@@ -20,6 +20,12 @@ serde.workspace = true
 # person — Claude's settings.json, Codex's and Cursor's hooks.json — and a
 # rewrite that sorts their keys is not leaving their file alone.
 serde_json = { workspace = true, features = ["preserve_order"] }
+ed25519-dalek = { version = "2.1", default-features = false, features = ["alloc", "zeroize"] }
+getrandom = "0.2"
+sha2 = "0.10"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "2.11"
 
 [dev-dependencies]
 serde_json.workspace = true
