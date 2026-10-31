@@ -107,12 +107,9 @@ has not been exercised under the hardened runtime.
 
 These are not engineering steps and no agent takes them on its own.
 
-- **Repository visibility.** The repository is private. Until it is public,
-  `install.sh`'s anonymous download returns 404 and only people with access —
-  signed in with `gh auth login` — can install from a release. Making it
-  public is `gh repo edit deximple/conbus --visibility public
-  --accept-visibility-change-consequences`, and it publishes the whole history.
-  Read `docs/publication-review.md` first.
+- **Repository visibility.** The repository is public, so `install.sh`'s
+  anonymous download works for anyone. Making it public published the whole
+  history; what that exposed is in `docs/publication-review.md`.
 - **Notarization.** The workflow's binary is ad-hoc signed. Each release is
   then signed and notarized on the operator's Mac, as in "Signing with a
   Developer ID" above.

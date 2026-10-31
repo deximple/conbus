@@ -438,7 +438,7 @@ briefing  6480 conversation(s) judged
           <h2 id="stop-4">A limit is a transfer, not a dead end. <span class="badge">Experimental</span></h2>
           <p>When a vendor stops a turn for quota, conbus can move the conversation to the next agent under the same id — Claude Code and Codex to each other, the rest to Codex — into a session it has kept warm. Or point it yourself: <code>conbus go cursor</code>, or just type <code>switch to cursor</code>.</p>
           <p>Run your agent under <code>conbus run</code> and the next one starts in the same terminal.</p>
-          <p class="note">In 0.2.7 the hop has fired on one real limit, and its next leg arrived after the limit had lifted. Treat it as experimental.</p>
+          <p class="note">The hop has fired on real limits; on the first, its next leg arrived after the limit had lifted. Treat it as experimental.</p>
         </div>
         <div>
           <pre class="term"><span class="cmd">$ conbus status</span>
@@ -506,10 +506,8 @@ data         ~/.conbus — kept. It is your log; remove it yourself if you want 
       <ul class="notes">
         <li>macOS only, for now.</li>
         <li>Claude's remaining quota is visible only from the terminal <code>claude</code>; its desktop app never reports it.</li>
-        <li>The automatic hop has not met a real limit yet.</li>
         <li>Codex asks you to approve conbus's hooks once.</li>
         <li>Not notarized yet. The installer downloads with <code>curl</code>, which macOS does not quarantine.</li>
-        <li>The repository is private for now, so installing needs GitHub access.</li>
       </ul>
     </section>
 
@@ -529,7 +527,7 @@ data         ~/.conbus — kept. It is your log; remove it yourself if you want 
   </main>
 
   <footer>
-    <span>conbus.sh · 0.2.7 · Apache-2.0</span>
+    <span>conbus.sh · 0.2.9 · Apache-2.0</span>
     <nav aria-label="Footer">
       <a href="https://github.com/deximple/conbus">GitHub</a>
       <a href="https://github.com/deximple/conbus/blob/main/README.md">README</a>

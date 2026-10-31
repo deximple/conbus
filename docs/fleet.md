@@ -19,8 +19,7 @@ Mac says so.
 
 Install the release package on every Mac, the same one `install.sh` fetches:
 `conbus-macos-universal.tar.gz` and `conbus-macos-universal.tar.gz.sha256` from
-the release (while the repository is private, `gh release download` with an
-account that has access).
+the release.
 
 ```bash
 # as root, from your device tooling's install script

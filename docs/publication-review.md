@@ -1,5 +1,10 @@
 # Publication review
 
+2026-11-01: the repository is now public, and the history was not rewritten —
+`ca4474f`…`ac42cca` remain reachable on GitHub. Rewriting is still the
+operator's call; it changes every SHA and tag. The rest of this file is the
+record of the review before the flip.
+
 What making `deximple/conbus` public would expose, as of 2026-09-23. Making it
 public publishes **every commit**, not just the current tree, so both were
 read: the working tree and all 106 commits reachable from every ref.
