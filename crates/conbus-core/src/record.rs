@@ -25,6 +25,13 @@ use crate::ids::BusId;
 /// `no_event_body_shadows_an_envelope_key` below. A vendor field whose name
 /// matches one of ours is renamed at the adapter, the way `SessionStart.source`
 /// becomes `trigger`.
+///
+/// **What a reader owes older lines.** A 1.x build reads every record any
+/// earlier build wrote. An older `v` is read as the current record — a field
+/// the older build did not write deserializes to its default, a field it
+/// wrote that no longer exists is ignored. A newer `v` is a defect, not a
+/// guess: a newer writer may have changed what a field means, so the line is
+/// reported rather than read.
 pub const SCHEMA_VERSION: u32 = 3;
 
 /// One line of the append-only log.
