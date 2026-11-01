@@ -385,7 +385,7 @@ Copilot CLI 어댑터(설치·실 payload 필요), Gemini CLI 어댑터, 프롬�
 | 단계 | 상태 | PR | 측정값 | 메모 |
 | --- | --- | --- | --- | --- |
 | M0 | 완료 | #70 #71 #72 | `main` 테스트 707 통과·0 실패·1 무시(1.94와 1.99.1 같음) | 1.99.1 clippy가 계획의 2건 외에 4건(`needless_late_init` 1, `collapsible_match` 3)을 더 잡아 M0.2에서 함께 고침. M0.5: private vulnerability reporting·Dependabot alerts·secret scanning·push protection 켬, `main` 보호(필수 `gate`, strict 끔, 리뷰 없음, force push·삭제 금지). M0.6: v0.2.9 서명·공증 후 교체, 내려받아 `TeamIdentifier=4UN6WC576K`·`Notarized Developer ID` 확인, `latest`는 v0.2.9. 랜딩의 "공증 안 됨"·"실제 한도를 만난 적 없음" 문구도 사실과 달라 함께 고침 |
-| M1 | | | | |
+| M1 | 완료 | #76 #78 #79 #81 #82 | macOS 746 통과·0 실패·1 무시, Linux x86_64·aarch64 초록 | unlock의 기능 커밋 10개를 다섯 PR로 흡수. `git cherry`와 파일별 대조에서 남은 차이는 `site/`(M6)와 unlock 이후 `main`에 들어온 작업, 의도해 다르게 쓴 문서뿐. M1.2 의미 충돌(`sync.rs` 행 키)은 테스트로 고정. M1.3은 "정책 없음 = 바이트 동일", "못 읽는 정책 = 결정 없음 + doctor 경고"를 새 테스트로 고정. Linux CI가 잡은 결함 2건을 M1.4에서 함께 고침: macOS 전용 상수의 dead code, 스레드 테스트가 스텁을 쓰고 곧바로 실행할 때의 ETXTBSY(스텁을 자식 `sh`가 쓰게 함). `linux`·`linux-arm`을 `main` 필수 체크에 추가 |
 | M2 | | | | |
 | M3 | | | | |
 | M4 | | | | |
@@ -400,3 +400,5 @@ Copilot CLI 어댑터(설치·실 payload 필요), Gemini CLI 어댑터, 프롬�
 
 | 시각 | 변경 | 이유 |
 | --- | --- | --- |
+| 2026-11-01 09:20 | M5.3(`--inference-listen` 루프백 전용)과 M5.1(curl `-q` 등)을 M1과 병렬로 먼저 머지(#75, #80) | 보안 항목이고 M1–M4와 파일이 겹치지 않아 Lead가 기다리는 시간에 처리 |
+| 2026-11-01 09:25 | 계획에 없던 테스트 수정 PR #77 추가 | `real_payloads` Codex 테스트가 소켓 bind만 보고 데몬을 기다려 느린 러너에서 실패(문서만 바꾼 #76이 두 번 연속 실패). 구조적 수정은 M3.2 |
