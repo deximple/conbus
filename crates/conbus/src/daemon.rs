@@ -261,7 +261,11 @@ impl Daemon {
             .spooled_at
             .as_deref()
             .and_then(|s| s.parse::<Timestamp>().ok());
-        let brief = request.brief;
+        // A spooled request's hook has already answered and gone. A briefing
+        // would be recorded as received by a session that never saw it, and an
+        // order would be carried out with nobody told, perhaps hours later.
+        let answered = request.spooled_at.is_none();
+        let brief = request.brief && answered;
         let declared = request.provenance;
         let key = SessionKey::new(request.harness.clone(), request.vendor_session_id);
         let observed = Observed {
@@ -423,12 +427,12 @@ impl Daemon {
                     None => {
                         self.remember(&written);
                         self.follow_through(bus_id, &source, &mut written, &mut seqs, declared);
-                        self.finish_write(
-                            Response::Recorded { bus_id, seqs },
-                            bus_id,
-                            &source,
-                            &written,
-                        )
+                        let recorded = Response::Recorded { bus_id, seqs };
+                        if answered {
+                            self.finish_write(recorded, bus_id, &source, &written)
+                        } else {
+                            recorded
+                        }
                     }
                 }
             }
@@ -506,11 +510,11 @@ impl Daemon {
         seqs: &mut Vec<u64>,
         declared: Option<HopProvenance>,
     ) {
-        let Some(reason) = written.iter().find_map(|record| match &record.event {
+        let Some((reason, waited)) = written.iter().find_map(|record| match &record.event {
             Event::TurnEnded {
                 state: TurnState::InterruptedQuota { reason },
                 ..
-            } => Some(reason.clone()),
+            } => Some((reason.clone(), record.spooled_at.is_some())),
             _ => None,
         }) else {
             return;
@@ -577,7 +581,11 @@ impl Daemon {
             written,
             seqs,
         );
-        if next.as_str() == conbus_core::event::Harness::CODEX {
+        // A stop that waited on its way here starts nothing, as a chat order that
+        // waited does not: a window opening on its own, however long after the
+        // stop, is an order carried out with nobody told. The decision stands in
+        // the log, for `conbus hop` and the next briefing.
+        if next.as_str() == conbus_core::event::Harness::CODEX && !waited {
             self.pending_warm = Some(bus_id);
         }
     }
@@ -2006,6 +2014,127 @@ mod tests {
             .expect("the order must hop after the hook reply");
         assert_eq!(dest, Harness::CURSOR);
         assert!(daemon.take_pending_warm().is_none());
+    }
+
+    fn spooled(event: Event) -> Request {
+        Request {
+            spooled_at: Some("2026-11-01T00:00:00.000Z".into()),
+            ..request(event)
+        }
+    }
+
+    #[test]
+    fn a_chat_order_that_waited_in_the_spool_is_not_carried_out() {
+        // Nobody heard the acknowledgement, and the person may have moved on
+        // since. A window opening on its own, minutes or hours after a restart,
+        // is worse than an order they have to say again.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = SegmentLog::open(dir.path(), Retention::default()).expect("open");
+        let mut daemon = Daemon::new(log, Registry::new(), HashMap::new());
+
+        let response = daemon.handle(spooled(Event::TurnStarted {
+            author: None,
+            prompt: Body::kept("이제 커서로 작업할거야"),
+        }));
+
+        assert!(
+            matches!(response, Response::Recorded { .. }),
+            "the prompt is recorded and nothing is announced: {response:?}"
+        );
+        assert!(daemon.take_pending_directed().is_none());
+        assert!(daemon.take_pending_enter().is_none());
+    }
+
+    #[test]
+    fn a_resume_order_that_waited_in_the_spool_is_not_carried_out() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = SegmentLog::open(dir.path(), Retention::default()).expect("open");
+        let mut daemon = Daemon::new(log, Registry::new(), HashMap::new());
+        let mut order = spooled(Event::TurnStarted {
+            author: None,
+            prompt: Body::kept("커서로 재개"),
+        });
+        order.harness = Harness::new(Harness::CURSOR);
+
+        daemon.handle(order);
+
+        assert!(daemon.take_pending_enter().is_none());
+        assert!(daemon.take_pending_directed().is_none());
+    }
+
+    #[test]
+    fn a_spooled_prompt_that_follows_a_displacement_writes_no_edge_to_a_briefing() {
+        // `maybe_continue` runs only behind a briefing, and there is none here.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = SegmentLog::open(dir.path(), Retention::default()).expect("open");
+        let mut daemon = Daemon::new(log, Registry::new(), HashMap::new());
+        for text in ["work", "more work"] {
+            daemon.handle(request(Event::TurnStarted {
+                author: None,
+                prompt: Body::kept(text),
+            }));
+            daemon.handle(request(Event::TurnEnded {
+                state: TurnState::InterruptedQuota {
+                    reason: "rate_limit".into(),
+                },
+                assistant_message: Some(Body::kept("stopped here")),
+                tokens: None,
+            }));
+        }
+        let _ = daemon.take_pending_warm();
+        let mut next = spooled(Event::TurnStarted {
+            author: None,
+            prompt: Body::kept("a new session while the recorder is down"),
+        });
+        next.vendor_session_id = "another-session".into();
+
+        daemon.handle(next);
+
+        let scan = SegmentLog::scan(dir.path()).expect("scan");
+        assert!(
+            !scan.records.iter().any(|record| matches!(
+                record.event,
+                Event::Briefed { .. } | Event::Continued { .. }
+            )),
+            "{:?}",
+            scan.records
+        );
+    }
+
+    #[test]
+    fn a_quota_stop_that_waited_in_the_spool_starts_no_hop_on_its_own() {
+        // The same rule as a chat order. A window opening on its own however long
+        // after the stop is an order carried out with nobody told. The decision
+        // stays in the log, and `conbus hop` and the next briefing still offer it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = SegmentLog::open(dir.path(), Retention::default()).expect("open");
+        let mut daemon = Daemon::new(log, Registry::new(), HashMap::new());
+        daemon.handle(request(Event::TurnStarted {
+            author: None,
+            prompt: Body::kept("keep going"),
+        }));
+
+        daemon.handle(spooled(Event::TurnEnded {
+            state: TurnState::InterruptedQuota {
+                reason: "rate_limit".into(),
+            },
+            assistant_message: None,
+            tokens: None,
+        }));
+
+        assert_eq!(
+            daemon.take_pending_warm(),
+            None,
+            "nobody asked for this now"
+        );
+        let scan = SegmentLog::scan(dir.path()).expect("scan");
+        assert!(
+            scan.records
+                .iter()
+                .any(|record| matches!(record.event, Event::Routed { .. })),
+            "the decision is still recorded: {:?}",
+            scan.records
+        );
     }
 
     #[test]
