@@ -10,6 +10,7 @@
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 
+use crate::clock::Timestamp;
 use crate::event::{Event, Harness, VendorAgentId, VendorTurnId};
 use crate::ids::BusId;
 use crate::record::Record;
@@ -88,6 +89,24 @@ enum Seat {
     Contested,
 }
 
+/// How long a seat waits for its prompt, from the hop that reserved it: the limit
+/// a spooled event gets while it waits for the same thing. A hop nobody follows up
+/// must not bind an unrelated prompt days later, and that binding would be for good.
+const SEAT_LIFE_SECS: i64 = 24 * 60 * 60;
+
+/// A seat, and when the hop that reserved it happened.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Waiting {
+    seat: Seat,
+    since: Timestamp,
+}
+
+impl Waiting {
+    fn is_over(&self, at: Timestamp) -> bool {
+        at.seconds_since(self.since) >= SEAT_LIFE_SECS
+    }
+}
+
 /// The vendor-session-to-conversation map. Lives in the daemon's memory.
 #[derive(Default)]
 pub struct Registry {
@@ -109,7 +128,7 @@ pub struct Registry {
     remembered: u64,
     /// A hop to a catalog leg that cannot keep a warm session. The next
     /// unbound prompt in that checkout claims this conversation.
-    pending: HashMap<(String, String), Seat>,
+    pending: HashMap<(String, String), Waiting>,
 }
 
 /// A registry being rebuilt from the log, one record at a time.
@@ -243,10 +262,12 @@ impl Registry {
 
     fn clear_pending_bus(&mut self, bus_id: BusId) {
         self.pending
-            .retain(|_, seat| !matches!(seat, Seat::Claimed(id) if *id == bus_id));
+            .retain(|_, waiting| !matches!(waiting.seat, Seat::Claimed(id) if id == bus_id));
     }
 
-    fn note_route(&mut self, bus_id: BusId, observed: &Observed) {
+    /// `at` is when the hop happened: now on the live path, the log's `ts` on a
+    /// restore, so a restart does not give a seat a new day.
+    fn note_route(&mut self, bus_id: BusId, observed: &Observed, at: Timestamp) {
         let Event::Routed { next, .. } = &observed.event else {
             return;
         };
@@ -269,13 +290,24 @@ impl Registry {
         // the first was split a second time. A seat two conversations claim
         // belongs to neither: minting a fresh id is a recoverable
         // disappointment, and binding to the wrong one is not.
+        let claimed = Waiting {
+            seat: Seat::Claimed(bus_id),
+            since: at,
+        };
         match self.pending.entry((next.clone(), workspace)) {
             Entry::Vacant(seat) => {
-                seat.insert(Seat::Claimed(bus_id));
+                seat.insert(claimed);
+            }
+            // A seat whose day is over holds nobody, and contests nothing.
+            Entry::Occupied(mut seat) if seat.get().is_over(at) => {
+                seat.insert(claimed);
             }
             Entry::Occupied(mut seat) => {
-                if !matches!(seat.get(), Seat::Claimed(id) if *id == bus_id) {
-                    seat.insert(Seat::Contested);
+                if !matches!(seat.get().seat, Seat::Claimed(id) if id == bus_id) {
+                    seat.insert(Waiting {
+                        seat: Seat::Contested,
+                        since: at,
+                    });
                 }
             }
         }
@@ -290,13 +322,14 @@ impl Registry {
                 workspace: record.source.workspace.clone(),
                 event: record.event.clone(),
             },
+            record.ts,
         );
         if matches!(
             record.event,
             Event::TurnStarted { .. } | Event::TurnEnded { .. }
         ) {
-            self.pending.retain(|(harness, _), seat| {
-                !(matches!(seat, Seat::Claimed(id) if *id == record.bus_id)
+            self.pending.retain(|(harness, _), waiting| {
+                !(matches!(waiting.seat, Seat::Claimed(id) if id == record.bus_id)
                     && harness == record.source.harness.as_str())
             });
         }
@@ -318,12 +351,12 @@ impl Registry {
 
     fn take_seat(&mut self, harness: &Harness, workspace: Option<&str>) -> Option<BusId> {
         let workspace = Self::normalize_workspace(workspace?)?;
-        match self
+        let waiting = self
             .pending
-            .remove(&(harness.as_str().to_string(), workspace))
-        {
-            Some(Seat::Claimed(bus_id)) => Some(bus_id),
-            Some(Seat::Contested) | None => None,
+            .remove(&(harness.as_str().to_string(), workspace))?;
+        match waiting.seat {
+            Seat::Claimed(bus_id) if !waiting.is_over(Timestamp::now()) => Some(bus_id),
+            Seat::Claimed(_) | Seat::Contested => None,
         }
     }
 
@@ -364,7 +397,7 @@ impl Registry {
         // compact, and fork.
         if let Some(bus_id) = self.bound.get(key).copied() {
             self.alias_warm_leg(bus_id, &observed.event);
-            self.note_route(bus_id, &observed);
+            self.note_route(bus_id, &observed, Timestamp::now());
             return Disposition::Write {
                 bus_id,
                 observed: vec![observed],
@@ -427,7 +460,6 @@ impl Registry {
 mod tests {
     use super::*;
     use crate::backfill::CLAUDE_TRANSCRIPT;
-    use crate::clock::Timestamp;
     use crate::event::{Body, Source, TurnState};
     use crate::record::SCHEMA_VERSION;
 
@@ -1411,6 +1443,88 @@ mod tests {
         assert_ne!(
             the_next_prompt_in_the_checkout(&mut live, "a-stranger"),
             handed_off
+        );
+    }
+
+    fn hours_ago(hours: i64) -> Timestamp {
+        let epoch = Timestamp::from_unix_seconds(0).expect("the epoch");
+        Timestamp::from_unix_seconds(Timestamp::now().seconds_since(epoch) - hours * 3600)
+            .expect("a time")
+    }
+
+    #[test]
+    fn a_seat_nobody_takes_within_a_day_is_gone() {
+        // On `main` a hop nobody follows up held its seat for ever, and an unrelated
+        // prompt days later bound to it for good.
+        let mut registry = Registry::new();
+        let (handed_off, _) = a_seat_waiting_in_the_checkout(&mut registry);
+        for waiting in registry.pending.values_mut() {
+            waiting.since = hours_ago(25);
+        }
+
+        assert_ne!(
+            the_next_prompt_in_the_checkout(&mut registry, "a-stranger-days-later"),
+            handed_off
+        );
+    }
+
+    #[test]
+    fn a_seat_inside_its_day_is_still_there_for_the_prompt() {
+        let mut registry = Registry::new();
+        let (handed_off, _) = a_seat_waiting_in_the_checkout(&mut registry);
+        for waiting in registry.pending.values_mut() {
+            waiting.since = hours_ago(23);
+        }
+
+        assert_eq!(
+            the_next_prompt_in_the_checkout(&mut registry, "the-handed-off-one"),
+            handed_off
+        );
+    }
+
+    #[test]
+    fn a_restart_does_not_give_a_seat_a_new_day() {
+        // Its life runs from the `routed` record, not from when the log was read.
+        let handed_off = BusId::mint();
+        let mut routed = a_routed_record(handed_off);
+        routed.ts = hours_ago(25);
+
+        let mut registry = Registry::restore(std::slice::from_ref(&routed));
+
+        assert_ne!(
+            the_next_prompt_in_the_checkout(&mut registry, "a-stranger-days-later"),
+            handed_off
+        );
+    }
+
+    #[test]
+    fn a_restart_keeps_what_is_left_of_a_seats_day() {
+        let handed_off = BusId::mint();
+        let mut routed = a_routed_record(handed_off);
+        routed.ts = hours_ago(23);
+
+        let mut registry = Registry::restore(std::slice::from_ref(&routed));
+
+        assert_eq!(
+            the_next_prompt_in_the_checkout(&mut registry, "the-handed-off-one"),
+            handed_off
+        );
+    }
+
+    #[test]
+    fn a_seat_whose_day_is_over_does_not_contest_the_next_hop() {
+        // Left there it would turn the new hop's seat into one nobody can take.
+        let old = BusId::mint();
+        let new = BusId::mint();
+        let mut abandoned = a_routed_record(old);
+        abandoned.ts = hours_ago(25);
+        let records = [abandoned, a_routed_record(new)];
+
+        let mut registry = Registry::restore(&records);
+
+        assert_eq!(
+            the_next_prompt_in_the_checkout(&mut registry, "the-handed-off-one"),
+            new
         );
     }
 

@@ -13,6 +13,10 @@ the entry says so when it does.
   hop's own comment always said. Such a call also gives the seat up, including
   across a restart, so a stranger's later prompt cannot take it instead: both
   sessions hold fresh ids.
+- A seat reserved for a directed hop now lasts a day, counted from the `routed`
+  record. A hop nobody followed up used to hold it for ever, and an unrelated prompt
+  days later bound to the conversation for good. A hop followed up after a day gets
+  a fresh id.
 
 ## [1.0.0-rc.3] — 2026-11-01
 
