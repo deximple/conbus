@@ -25,10 +25,24 @@ steps that stay with the operator.
 
    The workflow refuses a tag that does not match the workspace version, tests
    the tagged commit again, builds `aarch64-apple-darwin` and
-   `x86_64-apple-darwin`, joins them with `lipo`, builds
-   `x86_64-unknown-linux-gnu` on a Linux runner, and publishes
-   `conbus-macos-universal.tar.gz`, `conbus-linux-x86_64.tar.gz`, their
-   `.sha256`s, and `install.sh`.
+   `x86_64-apple-darwin`, joins them with `lipo`, builds static musl binaries
+   for x86_64 and aarch64 Linux (testing the musl target that ships), and
+   attaches `conbus-macos-universal.tar.gz`, `conbus-linux-x86_64.tar.gz`,
+   `conbus-linux-aarch64.tar.gz`, their `.sha256`s, `install.sh`, and a
+   CycloneDX bill of materials (`conbus.cdx.json`), with build provenance
+   attested for each package (`gh attestation verify <file> --repo
+   deximple/conbus`).
+
+   **`latest` never points at an unsigned package.** A tag with a hyphen
+   (`v1.0.0-rc.1`) is published as a **prerelease**, which is never `latest`.
+   Any other tag is created as a **draft**; `scripts/sign-release.sh vX.Y.Z
+   --upload` replaces the package with the signed, notarized one and only
+   then publishes the release as `latest` (`gh release edit --draft=false
+   --latest`). A release candidate is signed the same way and stays a
+   prerelease.
+6. **Supply chain**: `supply-chain.yml` runs `cargo deny check` (advisories,
+   licences, sources; `deny.toml`) on every release tag, by hand, and weekly —
+   not on pull requests.
 
 The asset names carry no version so `install.sh` can fetch
 `releases/latest/download/<name>`. A specific version is

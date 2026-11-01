@@ -386,9 +386,9 @@ Copilot CLI 어댑터(설치·실 payload 필요), Gemini CLI 어댑터, 프롬�
 | --- | --- | --- | --- | --- |
 | M0 | 완료 | #70 #71 #72 | `main` 테스트 707 통과·0 실패·1 무시(1.94와 1.99.1 같음) | 1.99.1 clippy가 계획의 2건 외에 4건(`needless_late_init` 1, `collapsible_match` 3)을 더 잡아 M0.2에서 함께 고침. M0.5: private vulnerability reporting·Dependabot alerts·secret scanning·push protection 켬, `main` 보호(필수 `gate`, strict 끔, 리뷰 없음, force push·삭제 금지). M0.6: v0.2.9 서명·공증 후 교체, 내려받아 `TeamIdentifier=4UN6WC576K`·`Notarized Developer ID` 확인, `latest`는 v0.2.9. 랜딩의 "공증 안 됨"·"실제 한도를 만난 적 없음" 문구도 사실과 달라 함께 고침 |
 | M1 | 완료 | #76 #78 #79 #81 #82 | macOS 746 통과·0 실패·1 무시, Linux x86_64·aarch64 초록 | unlock의 기능 커밋 10개를 다섯 PR로 흡수. `git cherry`와 파일별 대조에서 남은 차이는 `site/`(M6)와 unlock 이후 `main`에 들어온 작업, 의도해 다르게 쓴 문서뿐. M1.2 의미 충돌(`sync.rs` 행 키)은 테스트로 고정. M1.3은 "정책 없음 = 바이트 동일", "못 읽는 정책 = 결정 없음 + doctor 경고"를 새 테스트로 고정. Linux CI가 잡은 결함 2건을 M1.4에서 함께 고침: macOS 전용 상수의 dead code, 스레드 테스트가 스텁을 쓰고 곧바로 실행할 때의 ETXTBSY(스텁을 자식 `sh`가 쓰게 함). `linux`·`linux-arm`을 `main` 필수 체크에 추가 |
-| M2 | | | | |
+| M2 | 완료 | #84 #87 #92 #100 | Claude Code 2.1.316, Codex 0.166.0, OpenCode 2.2.3, Grok 1.0.71, cursor-agent 2026.10.19, agy 1.4.12 실세션 캡처. `real_payloads` 17/17 | OpenCode 2.x가 0.2.x 플러그인을 처음부터 거부하고 있었다(벤더 로그에만 남음). 2.x 플러그인으로 고침(#84). Grok은 세션 종료 뒤 `Stop`을 한 번 더 보내고 `StopCancelled`가 등록돼 있지 않았다(#87). cursor-agent `-p`에는 프롬프트·턴 종료 훅이 없다(지원 표에 기록). 정책 deny는 Claude Code와 Codex 실세션에서 지켜졌다. 세션 사용: Claude 3, Codex 3, OpenCode 3, Grok 2, Cursor 1. Cursor IDE는 이 Mac에 없어 미확인 |
 | M3 | | | | |
-| M4 | | | | |
+| M4 | 완료 | #85 #86 #89 #93 #101 #102 | 종료 코드·키 집합 골든 테스트 초록. 업그레이드 왕복 테스트 초록(macOS) | 안정 계약은 `docs/stability.md`(#85). 알 수 없는 명령·플래그·빠진 값은 exit 2, `hook`은 면제(#101). `usage --json`·`--shareable`·`progress --json`·`log --json` 키 집합 고정(#93). 레코드 봉투·이벤트 종류·프로토콜·롤백 규칙은 `docs/log-format.md`와 매뉴얼에(#86). RFD 0001 accept, 0002·0003 draft 유지(#89). 0.2.x 업그레이드는 설치 멱등·plist 환경 보존·uninstall이 Conbus 소유만 회수함을 테스트로 고정(#102); Linux systemd 업그레이드 경로는 이번에 만들지 않았다 |
 | M5 | | | | |
 | M6 | | | | |
 | M7 | | | | |
@@ -402,3 +402,5 @@ Copilot CLI 어댑터(설치·실 payload 필요), Gemini CLI 어댑터, 프롬�
 | --- | --- | --- |
 | 2026-11-01 09:20 | M5.3(`--inference-listen` 루프백 전용)과 M5.1(curl `-q` 등)을 M1과 병렬로 먼저 머지(#75, #80) | 보안 항목이고 M1–M4와 파일이 겹치지 않아 Lead가 기다리는 시간에 처리 |
 | 2026-11-01 09:25 | 계획에 없던 테스트 수정 PR #77 추가 | `real_payloads` Codex 테스트가 소켓 bind만 보고 데몬을 기다려 느린 러너에서 실패(문서만 바꾼 #76이 두 번 연속 실패). 구조적 수정은 M3.2 |
+| 2026-11-01 09:50 | M2의 F1(OpenCode 2.x)·F2(Grok)·F4(지원 표)를 Lead가 처리(#84 #87 #92) | Sidekick이 M3 임계 경로에 있는 동안 병렬로 처리 |
+| 2026-11-01 11:45 | Linux systemd 업그레이드 왕복 테스트 제외 | 절단 순서표의 선택 항목; macOS 경로만 검증(#102) |

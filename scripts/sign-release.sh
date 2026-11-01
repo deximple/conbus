@@ -28,10 +28,10 @@ die() { echo "sign-release.sh: $*" >&2; exit 1; }
 tag=${1:-}
 upload=${2:-}
 case $tag in
-  "" | *[!v0-9.]*) die "usage: scripts/sign-release.sh vX.Y.Z [--upload]" ;;
+  "" | *[!v0-9.rc-]*) die "usage: scripts/sign-release.sh vX.Y.Z[-rc.N] [--upload]" ;;
 esac
-printf '%s\n' "$tag" | grep -Eqx 'v[0-9]+\.[0-9]+\.[0-9]+' ||
-  die "usage: scripts/sign-release.sh vX.Y.Z [--upload]"
+printf '%s\n' "$tag" | grep -Eqx 'v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?' ||
+  die "usage: scripts/sign-release.sh vX.Y.Z[-rc.N] [--upload]"
 
 case $upload in
   ""|--upload) ;;
@@ -139,6 +139,16 @@ echo "sign-release.sh: $out/$asset ($(cut -d' ' -f1 < "$out/$asset.sha256"))"
 if [ -n "$upload" ]; then
   gh release upload "$tag" "$out/$asset" "$out/$asset.sha256" --clobber
   echo "sign-release.sh: $tag now carries the signed, notarized package"
+  # A release tag was created as a draft so that `latest` never pointed at the
+  # ad-hoc package; only now, signed, does it become the release people get.
+  # A release candidate stays a prerelease and never becomes `latest`.
+  case $tag in
+    *-rc.*) ;;
+    *)
+      gh release edit "$tag" --draft=false --latest
+      echo "sign-release.sh: $tag is published and is now the latest release"
+      ;;
+  esac
 elif ! $rehearsal; then
   echo "sign-release.sh: check it, then run again with --upload"
 fi
