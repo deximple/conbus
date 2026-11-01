@@ -374,14 +374,17 @@ three.
 
 Measured at 1.0 (2026-11-01, a 10 GB real log; `docs/plan-1.0.md`):
 
-- Start to serving is 11 s against a 5 s target: `prepare`'s meta scan is
-  5.3 s of it. Hooks in that window spool and are not lost. The next step is a
-  restore checkpoint under `cache/` (registry, chapters, split and alias
-  summaries, and per-conversation turn ids and prompt digests so gap filling
-  stays exact).
+- Start to serving is about 11–12 s against a 5 s target: `prepare`'s meta
+  scan is 5.3 s of it. Hooks in that window spool and are not lost. The next
+  step is a restore checkpoint under `cache/` (registry, chapters, split and
+  alias summaries, and per-conversation turn ids and prompt digests so gap
+  filling stays exact).
 - `doctor` is 3.35 s with vendors off PATH against 3 s; the serial briefing
   replay is about 2.3 s.
-- The daemon holds about 445 MB at serving.
+- The daemon holds about 445–500 MB at serving. The follow-up investigation
+  found the leading cause: `relock_derived` mlocks every private writable
+  region ≤ 64 MB, which pins the allocator's freed pages grown during the
+  restore fold, not just the live bindings and chapters.
 - Linux: install, the systemd unit and fixture hooks are checked; real vendor
   sessions on Linux are not.
 - cursor-agent in print mode fires no prompt or turn-end hook, so it leaves no
@@ -491,10 +494,12 @@ Measured at 1.0 (2026-11-01, a 10 GB real log; `docs/plan-1.0.md`):
 1.0 is cut from `docs/plan-1.0.md`; its progress table at the end says what
 landed, what was measured and what was cut. What is left needs a person:
 
-1. **Canary.** Run `scripts/canary.sh preflight`, then `start`, on this Mac
-   with the release candidate, outside the blackout hours, and leave it seven
-   days; `status` and `verdict` read it, `rollback` puts 0.2.x back. `v1.0.0`
-   is tagged only on a passing verdict (`docs/plan-1.0.md` §7).
+1. **Canary.** After `rc.2` is cut (the rc.1 shadow pass found defects to
+   ship in it — see the plan table), run `scripts/canary.sh preflight`, then
+   `start`, on this Mac with the release candidate, outside the blackout
+   hours, and leave it seven days; `status` and `verdict` read it, `rollback`
+   puts 0.2.x back. `v1.0.0` is tagged only on a passing verdict
+   (`docs/plan-1.0.md` §7).
 2. **RFD 0002 and 0003** stay drafts until the operator accepts them; no sync
    service exists.
 3. Then back to `docs/self-improve.md`, from live evidence rather than this
