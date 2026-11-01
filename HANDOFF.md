@@ -28,7 +28,7 @@ tracked: it took weeks to learn and a clone should not have to learn it again.
 - Design SSOT: `.cursor/plans/shared_workspace_context_3f7139b8.plan.md`.
   The filename is a generated id and no longer matches the content; leave it
   so the Cursor plan UI keeps its association.
-- Public name: **conbus.sh**. Landing: `docs/www/index.html`.
+- Public name: **conbus.sh**. Landing and waitlist: `site/` (not deployed; `site/README.md`).
 - Hook contract: `docs/rfd/0001-hook-contract.md`, pinned by the fixtures in
   `crates/conbus/tests/fixtures/`.
 - First-time path: `docs/beginner-manual.md`. Hop walkthrough: `docs/hop-demo.md`.
