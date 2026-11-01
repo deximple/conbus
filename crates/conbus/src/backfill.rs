@@ -807,6 +807,9 @@ fn ingest_chat_exports_filtered(
 /// The state of a thread with no rollout on disk to give it one.
 const NO_STATE: i64 = i64::MIN;
 
+/// The state of a thread the app-server stopped answering on. Never current.
+const FAILED: i64 = i64::MIN + 1;
+
 /// What the Codex pass found, whether or not it wrote any of it.
 #[derive(Default, Debug)]
 struct CodexFill {
@@ -855,12 +858,8 @@ fn fill_live_codex_gaps(
     timing.codex_walk_ms = elapsed_ms(walk);
     timing.codex_unknown_files = unknown;
     timing.codex_layout_unknown = recent.is_none() && unknown > 0;
-    // What a cut range has read in this state is done. What it has not read at
-    // all goes first, or the threads a budget reaches are the same ones each
-    // start.
     if let Some(recent) = recent.as_mut() {
-        recent.retain(|(session, state)| !read.is_current(&session.to_string(), *state));
-        recent.sort_by_key(|(session, _)| read.knows(&session.to_string()));
+        unread_first(recent, read);
     }
     if recent.as_ref().is_some_and(|recent| recent.is_empty()) {
         return Ok(fill);
@@ -888,14 +887,12 @@ fn fill_live_codex_gaps(
     // list cannot be read either, every thread is asked.
     if recent.is_none() {
         let list = Instant::now();
-        // These have no rollout to say what state they were read in, so nothing
-        // is noted for them and a later start asks again.
         recent = since
             .and_then(|since| threads_updated_since(&mut server, since, timing))
             .map(|set| set.into_iter().map(|id| (id, NO_STATE)).collect());
         timing.thread_list_ms = elapsed_ms(list);
     }
-    let sessions: Vec<(BusId, i64)> = match recent {
+    let mut sessions: Vec<(BusId, i64)> = match recent {
         Some(asked) => asked,
         None => known
             .live_codex
@@ -903,6 +900,7 @@ fn fill_live_codex_gaps(
             .map(|session| (*session, NO_STATE))
             .collect(),
     };
+    unread_first(&mut sessions, read);
     let names: Vec<(String, BusId, i64)> = sessions
         .iter()
         .filter_map(|(session, state)| {
@@ -938,7 +936,9 @@ fn fill_live_codex_gaps(
                     fill.refused += 1;
                     continue;
                 }
-                // Nothing behind it will answer either.
+                // Nothing behind it will answer either. It goes behind the threads
+                // not yet asked next time, or it stops them being reached at all.
+                read.note(name, FAILED);
                 timing.codex_deferred = Some(why);
                 break;
             }
@@ -965,12 +965,17 @@ fn fill_live_codex_gaps(
                 None => fill.records += 1,
             }
         }
-        if *state != NO_STATE {
-            read.note(name, *state);
-        }
+        read.note(name, *state);
     }
     timing.list_turns_ms = elapsed_ms(turns_at);
     Ok(fill)
+}
+
+/// What a held range has read in this state is done. What it has not read at all
+/// goes first, or the threads a budget reaches are the same ones each start.
+fn unread_first(threads: &mut Vec<(BusId, i64)>, read: &ReadSoFar) {
+    threads.retain(|(thread, state)| !read.is_current(&thread.to_string(), *state));
+    threads.sort_by_key(|(thread, _)| read.knows(&thread.to_string()));
 }
 
 /// Threads `thread/list` says were updated at or after `since`, or `None`
@@ -3197,7 +3202,8 @@ mod tests {
         live_at(&machine, now, last);
         let mut log =
             SegmentLog::open(machine.paths.log_dir(), Retention::default()).expect("open");
-        let budget = std::time::Duration::from_millis(100);
+        // Well under what parsing that file takes, in a release build too.
+        let budget = std::time::Duration::from_millis(30);
         let records = held(&machine);
         let (_, timing) = append_gaps_at_start_in(
             &machine.paths,

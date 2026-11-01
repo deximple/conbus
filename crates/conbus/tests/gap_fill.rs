@@ -1187,10 +1187,13 @@ fn backfill_gaps_says_when_codex_could_not_be_read_and_still_fills_the_rest() {
     assert!(said.contains("codex     history unavailable"), "{said}");
 }
 
-const THREADS: [&str; 3] = [
+const THREADS: [&str; 6] = [
     "01a19463-0000-7000-8000-000000000001",
     "01a19463-0000-7000-8000-000000000002",
     "01a19463-0000-7000-8000-000000000003",
+    "01a19463-0000-7000-8000-000000000004",
+    "01a19463-0000-7000-8000-000000000005",
+    "01a19463-0000-7000-8000-000000000006",
 ];
 
 /// A stand-in that answers one thread per call, slowly, so a budget covers only
@@ -1210,11 +1213,9 @@ for line in sys.stdin:
         print(json.dumps({"jsonrpc":"2.0","id":i,"result":{"data":data,"nextCursor":None}}), flush=True)
 "#;
 
-#[test]
-fn threads_a_budget_cut_off_are_reached_by_later_starts() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let home = dir.path();
-    let (_stub, fake) = stand_in(SLOW_APP_SERVER);
+/// Every thread live, the first of them the most recently touched: the order the
+/// pass asks them in.
+fn live_threads_touched_in_order(home: &Path) {
     let daemon = start(home);
     for thread in THREADS {
         let payload = json!({"session_id": thread, "hook_event_name": "UserPromptSubmit",
@@ -1223,7 +1224,6 @@ fn threads_a_budget_cut_off_are_reached_by_later_starts() {
         hook_as(home, "codex", &payload.to_string());
     }
     stop(daemon);
-    // The most recently touched thread is asked first, and stays first.
     let rollouts = home.join(".codex/sessions/2026/11/01");
     std::fs::create_dir_all(&rollouts).expect("dir");
     for (age, thread) in THREADS.iter().enumerate() {
@@ -1232,6 +1232,14 @@ fn threads_a_budget_cut_off_are_reached_by_later_starts() {
         file.set_modified(std::time::SystemTime::now() - Duration::from_secs(10 + age as u64 * 10))
             .expect("mtime");
     }
+}
+
+#[test]
+fn threads_a_budget_cut_off_are_reached_by_later_starts() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let (_stub, fake) = stand_in(SLOW_APP_SERVER);
+    live_threads_touched_in_order(home);
 
     let reached = |home: &Path, thread: &str| {
         log_lines(home)
@@ -1243,7 +1251,7 @@ fn threads_a_budget_cut_off_are_reached_by_later_starts() {
             home,
             daemon_command(home)
                 .env("CONBUS_CODEX_BIN", &fake)
-                .env("CONBUS_GAP_BUDGET_MS", "1200")
+                .env("CONBUS_GAP_BUDGET_MS", "2000")
                 .spawn()
                 .expect("daemon"),
         );
@@ -1266,4 +1274,46 @@ fn threads_a_budget_cut_off_are_reached_by_later_starts() {
         })
         .count();
     assert_eq!(turns, THREADS.len(), "each thread's turn once");
+}
+
+#[test]
+fn a_thread_that_kills_the_app_server_does_not_starve_the_ones_behind_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let (_stub, fake) = stand_in(&format!(
+        r#"#!/usr/bin/env python3
+import json, sys
+for line in sys.stdin:
+    msg = json.loads(line)
+    m = msg.get("method"); i = msg.get("id")
+    if m == "initialize":
+        print(json.dumps({{"jsonrpc":"2.0","id":i,"result":{{"userAgent":"fake"}}}}), flush=True)
+    elif m == "thread/turns/list":
+        t = msg["params"]["threadId"]
+        if t == {first:?}:
+            sys.exit(1)
+        data = [{{"id":"turn-of-"+t,"items":[{{"type":"userMessage","content":[{{"type":"text","text":"said in "+t}}]}},{{"type":"agentMessage","text":"a"}}],
+                 "status":"completed","startedAt":1788368800,"completedAt":1788368801}}]
+        print(json.dumps({{"jsonrpc":"2.0","id":i,"result":{{"data":data,"nextCursor":None}}}}), flush=True)
+"#,
+        first = THREADS[0]
+    ));
+    live_threads_touched_in_order(home);
+
+    start_with_codex(home, &fake);
+    start_with_codex(home, &fake);
+
+    let all = log_lines(home);
+    for thread in &THREADS[1..] {
+        assert!(
+            all.iter()
+                .any(|record| record["prompt"]["text"] == format!("said in {thread}")),
+            "{thread} never reached behind the thread that dies:\n{}",
+            show(&all)
+        );
+    }
+    assert!(
+        home.join("cache/gap-since-codex").exists(),
+        "the thread that dies is still unread"
+    );
 }
