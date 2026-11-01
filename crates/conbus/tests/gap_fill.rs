@@ -1757,3 +1757,50 @@ fn a_filled_codex_thread_is_written_oldest_first_across_pages() {
         ["t1", "t2", "t3", "t4", "t5"]
     );
 }
+
+#[test]
+fn a_missed_turn_the_vendor_says_a_tool_ended_gets_its_ending() {
+    // The next start finds the prompt held and skips the ending for good, so a turn
+    // that gets none here reads as still running for ever.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let daemon = start(home);
+    hook(home, &prompt(S, "p0", "before"));
+    hook(home, &ended(S, "p0", "a0"));
+    stop(daemon);
+    let tool_use = json!({"type": "assistant", "sessionId": S, "timestamp": now(), "version": "2.1.316",
+        "message": {"role": "assistant", "stop_reason": "tool_use",
+                    "content": [{"type": "text", "text": "the closing words"},
+                                {"type": "tool_use", "id": "tu", "name": "StructuredOutput", "input": {}}]}})
+    .to_string();
+    let result = json!({"type": "user", "sessionId": S, "timestamp": now(), "version": "2.1.316",
+        "promptId": "p1", "toolEndsTurn": true, "toolUseResult": "ok",
+        "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "tu", "content": "ok"}]}})
+    .to_string();
+    transcript(
+        home,
+        S,
+        &[
+            user(S, "p0", "before"),
+            reply(S, "a0"),
+            sdk_user(S, "p1", "missed"),
+            tool_use,
+            result,
+        ],
+    );
+
+    stop(start(home));
+
+    let all = log_lines(home);
+    assert!(
+        all.iter().any(|record| record["vendor_turn_id"] == "p1"),
+        "the prompt is filled:\n{}",
+        show(&all)
+    );
+    assert!(
+        all.iter()
+            .any(|record| record["assistant_message"]["text"] == "the closing words"),
+        "no ending:\n{}",
+        show(&all)
+    );
+}

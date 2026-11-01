@@ -76,6 +76,8 @@ struct Line {
     is_visible_in_transcript_only: Option<bool>,
     #[serde(rename = "queueTranscriptOnly", default)]
     queue_transcript_only: Option<bool>,
+    #[serde(rename = "toolEndsTurn", default)]
+    tool_ends_turn: Option<bool>,
     #[serde(default)]
     cwd: Option<String>,
     #[serde(default)]
@@ -100,6 +102,11 @@ struct Message {
 /// but 89 of 242,992, and every line of a tool call says `tool_use`. It is the
 /// only thing in a transcript that tells a finished turn from one still running
 /// or cut off, which matters because an ending cannot be taken back.
+///
+/// One thing overrides it. A turn can end on the model's tool call, and the result
+/// line says so with `toolEndsTurn`: all 313 real turns that end that way have a
+/// live `Stop`. Without the flag a last `tool_use` stays unfinished, because of the
+/// 403 real turns that end so, 286 have no live `Stop` at all.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ModelStop {
     /// It finished what it had to say.
@@ -361,6 +368,11 @@ pub fn parse_claude_transcript_born(
 
         match kind {
             "user" => {
+                if line.tool_ends_turn == Some(true)
+                    && let Some(turn) = open.as_mut()
+                {
+                    turn.stop = ModelStop::Stopped;
+                }
                 let content = line.message.as_ref().and_then(|m| m.content.as_ref());
                 let Some(text) = content.and_then(text_of).or_else(|| {
                     // No words, and still somebody's prompt: the hook sees it
@@ -1627,6 +1639,57 @@ mod tests {
             stopped_without_text.to_string(),
         ]);
         assert_eq!(endings(&finished), vec!["the answer"]);
+    }
+
+    /// The result line of a tool call, with the vendor's flag or without it.
+    fn tool_result(flag: Option<bool>) -> String {
+        let mut line = serde_json::json!({
+            "type": "user", "sessionId": "S1", "timestamp": "2026-11-01T00:00:02.000Z",
+            "promptId": "P1", "toolUseResult": "ok",
+            "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]}
+        });
+        if let Some(flag) = flag {
+            line["toolEndsTurn"] = serde_json::json!(flag);
+        }
+        line.to_string()
+    }
+
+    #[test]
+    fn a_turn_the_vendor_says_a_tool_ended_has_an_ending() {
+        let out = parse(&[
+            user("", "P1", "a prompt"),
+            said("the closing words", serde_json::json!("tool_use")),
+            tool_result(Some(true)),
+        ]);
+
+        assert_eq!(endings(&out), vec!["the closing words"]);
+    }
+
+    #[test]
+    fn a_tool_result_without_the_flag_does_not_end_the_turn() {
+        // Of the real turns that end on a tool call with no flag, most never got a
+        // `Stop`. A false `Complete` cannot be taken back.
+        for flag in [None, Some(false)] {
+            let out = parse(&[
+                user("", "P1", "a prompt"),
+                said("working on it", serde_json::json!("tool_use")),
+                tool_result(flag),
+            ]);
+
+            assert_eq!(endings(&out), Vec::<String>::new(), "{flag:?}");
+        }
+    }
+
+    #[test]
+    fn the_model_going_on_after_a_flagged_result_keeps_the_turn_open() {
+        let out = parse(&[
+            user("", "P1", "a prompt"),
+            said("first", serde_json::json!("tool_use")),
+            tool_result(Some(true)),
+            said("still going", serde_json::json!("tool_use")),
+        ]);
+
+        assert_eq!(endings(&out), Vec::<String>::new());
     }
 
     #[test]
