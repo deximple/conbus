@@ -390,7 +390,7 @@ Copilot CLI 어댑터(설치·실 payload 필요), Gemini CLI 어댑터, 프롬�
 | M3 | 완료 | #73 #74 #83 #88 #91 #94 #95 #97 #99 #104 #105 | 캐시 첫 빌드 32.4 s·778 MB(로그 10.3 GB), 이후 `log --tail 1` 13 ms·`usage --days 7` 1.31 s, 캐시 유무 결과 행 단위 동일. 시작→서빙 11.0 s·RSS 445.5 MB. doctor 3.35 s(벤더 오프)·4.1 s(실제 PATH). 1,000-hook 스톰 무손실 | 목표 미달 2건을 측정으로 기록: 시작→서빙 11.0 s > 5 s(prepare의 메타 스캔이 5.3 s를 씀; 체크포인트는 설계만), doctor 3.35 s > 3 s(실제 PATH 병렬 프로브로 64.1→4.1 s). M3.4 RSS 개선·M3.6 drops 표시는 절단 순서표에 따라 제외. 스풀은 정확히 한 번을 약속하지 않고 중복 계산 의미를 지킨다 |
 | M4 | 완료 | #85 #86 #89 #93 #101 #102 | 종료 코드·키 집합 골든 테스트 초록. 업그레이드 왕복 테스트 초록(macOS) | 안정 계약은 `docs/stability.md`(#85). 알 수 없는 명령·플래그·빠진 값은 exit 2, `hook`은 면제(#101). `usage --json`·`--shareable`·`progress --json`·`log --json` 키 집합 고정(#93). 레코드 봉투·이벤트 종류·프로토콜·롤백 규칙은 `docs/log-format.md`와 매뉴얼에(#86). RFD 0001 accept, 0002·0003 draft 유지(#89). 0.2.x 업그레이드는 설치 멱등·plist 환경 보존·uninstall이 Conbus 소유만 회수함을 테스트로 고정(#102); Linux systemd 업그레이드 경로는 이번에 만들지 않았다 |
 | M5 | 완료 | #75 #80 #90 #96 #106 | sync reference 왕복 테스트 초록. M5.6 리뷰 CRITICAL·HIGH 0 | curl `-q` 첫 인자·TLS 고정·리다이렉트 거절·본문은 `--config -`와 stdin으로(#80). 추론 리스너 루프백 전용·읽기쓰기 타임아웃(#75). `-` 있는 태그는 prerelease, 안정 태그는 서명 전 draft(#90). reference 서버가 조각난 TCP 본문 결함 1건을 잡았고, TLS는 `CURL_CA_BUNDLE` 경로만 문서화(#106). M5.4 관리형 설치는 절단 순서표에 따라 제외 |
-| M6 | | | | |
+| M6 | 완료 | #98 #103 | `check-docs.sh` 초록(0.2.9, 명령 19개). site 테스트 6/6(vitest) | `check-docs.sh`가 첫 실행에서 실제 누락 4건을 잡았다(README·한국어 매뉴얼에 `policy`, 두 매뉴얼에 `sync`). 한국어 매뉴얼은 Linux 미지원이라고 적혀 있던 것을 고치고 정책·프로필·sync 절을 넣었다. 랜딩은 `site/` 하나로 합치고 `docs/www/`를 지웠다. site는 `site/**` 경로 필터 CI로만 돌고 배포하지 않았다 |
 | M7 | | | | |
 | S1–S5 | | | | |
 | Canary | | | | |
