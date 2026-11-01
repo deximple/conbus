@@ -50,12 +50,24 @@ fn stamp(home: &Path) -> Value {
         .unwrap_or(Value::Null)
 }
 
+/// A daemon this test owns, stopped when the test ends however it ends. A failing
+/// test that only stopped it on the way out left one serving a deleted root.
+struct Daemon(Child);
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 /// Wait until the stamp says this daemon serves: its start-up fill is done.
-fn wait_serving(home: &Path, daemon: Child) -> Child {
+fn wait_serving(home: &Path, daemon: Child) -> Daemon {
+    let daemon = Daemon(daemon);
     let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
         let stamped = stamp(home);
-        if stamped["pid"].as_u64() == Some(u64::from(daemon.id()))
+        if stamped["pid"].as_u64() == Some(u64::from(daemon.0.id()))
             && stamped.get("serving").is_some()
         {
             return daemon;
@@ -65,13 +77,12 @@ fn wait_serving(home: &Path, daemon: Child) -> Child {
     panic!("the daemon never served");
 }
 
-fn start(home: &Path) -> Child {
+fn start(home: &Path) -> Daemon {
     wait_serving(home, daemon_command(home).spawn().expect("daemon"))
 }
 
-fn stop(mut daemon: Child) {
-    let _ = daemon.kill();
-    let _ = daemon.wait();
+fn stop(daemon: Daemon) {
+    drop(daemon);
 }
 
 fn hook(home: &Path, payload: &str) {
