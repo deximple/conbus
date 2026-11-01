@@ -55,11 +55,9 @@ pub fn start() -> Running {
     let state = Arc::new(Mutex::new(RefServer::default()));
     let shared = Arc::clone(&state);
     std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            if let Ok(stream) = stream {
-                let shared = Arc::clone(&shared);
-                std::thread::spawn(move || handle(stream, shared));
-            }
+        for stream in listener.incoming().flatten() {
+            let shared = Arc::clone(&shared);
+            std::thread::spawn(move || handle(stream, shared));
         }
     });
     Running { url, state }
