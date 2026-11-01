@@ -86,6 +86,7 @@ usage_rows() { # usage_rows <first-iso> <harness>...
 #   nohooks   — no vendor installed here, so nothing registered
 #   rotating  — like live, and it names drops.1.jsonl the way a build that
 #               rotates its drop log does
+#   lostlines — its `install --apply` writes the two lines that lost records
 #   elided    — its `install --apply` writes `tool bodies elided, not sealed` and
 #               `the log refused writes for a while`, like a spool drained at boot
 #   flap      — doctor sleeps on its first call, then answers fast: a
@@ -121,6 +122,8 @@ write_fake() {
         rotating) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "disk      log 1.0 MB — 1.0 GB free of 2.0 GB (50.0%)"; echo "log       5 record(s), 1 conversation(s), 0 unreadable line(s)"; echo "hooks     claude_code  runs — x"' ;;
         elided) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "hooks     claude_code  runs — x"'
             install_body='touch "$HOME/.install-called"; now=$(perl -MTime::HiRes=gettimeofday -MPOSIX=strftime -e "(\$s,\$u)=gettimeofday; printf \"%s.%03dZ\", strftime(\"%Y-%m-%dT%H:%M:%S\", gmtime(\$s)), int(\$u/1000)"); printf "{\"detail\":\"7 tool event(s)\",\"reason\":\"tool bodies elided, not sealed\",\"ts\":\"%s\"}\n{\"reason\":\"the log refused writes for a while\",\"ts\":\"%s\"}\n" "$now" "$now" >> "$HOME/.conbus/drops.jsonl"' ;;
+        lostlines) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "hooks     claude_code  runs — x"'
+            install_body='touch "$HOME/.install-called"; now=$(perl -MTime::HiRes=gettimeofday -MPOSIX=strftime -e "(\$s,\$u)=gettimeofday; printf \"%s.%03dZ\", strftime(\"%Y-%m-%dT%H:%M:%S\", gmtime(\$s)), int(\$u/1000)"); printf "{\"detail\":\"2 record(s) lost\",\"reason\":\"the recorder stopped with records it could not land\",\"ts\":\"%s\"}\n{\"reason\":\"the log refused writes for a while and records may be lost\",\"ts\":\"%s\"}\n" "$now" "$now" >> "$HOME/.conbus/drops.jsonl"' ;;
         knowndrop) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "hooks     claude_code  runs — x"'
             install_body='touch "$HOME/.install-called"; printf "{\"ts\":\"%s\",\"reason\":\"socket closed early\"}\n" "$(perl -MTime::HiRes=gettimeofday -MPOSIX=strftime -e "(\$s,\$u)=gettimeofday; printf \"%s.%03dZ\", strftime(\"%Y-%m-%dT%H:%M:%S\", gmtime(\$s)), int(\$u/1000)")" >> "$HOME/.conbus/drops.jsonl"' ;;
         notokens) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "hooks     claude_code  runs — x"' ;;
@@ -919,7 +922,7 @@ code=0
 run verdict >"$tmp/verdict.out" 2>&1 || code=$?
 if [ "$code" != 0 ]; then cat "$tmp/verdict.out" >&2; fi
 expect 0 "$code" "verdict exits 0 on a completed clean window"
-for name in build hooks recorder-serving restarts unreadable disk drops tool-bodies harness-activity twins-repeated \
+for name in build hooks recorder-serving restarts unreadable disk drops log-outages tool-bodies harness-activity twins-repeated \
     usage-parity rss-budget time-budget serving-budget policy sync operator-feel; do
     grep -qE "^(PASS|FAIL|UNCHECKED) $name " "$tmp/verdict.out"
     expect 0 $? "verdict prints a $name line"
@@ -1164,14 +1167,57 @@ drop_line 3600 'the log refused writes for a while' '3 record(s) waited in memor
 code=0
 run verdict >"$tmp/verdict-held.out" 2>&1 || code=$?
 expect 0 "$code" "an outage in which every record landed is not a loss"
-expect_grep '^PASS drops.*1 not lost' "$tmp/verdict-held.out" "it is counted as not lost"
-expect_grep 'every record waited and landed' "$tmp/verdict-held.out" "and shown"
+expect_grep '^PASS drops — 0 lost records (1 line(s) since' "$tmp/verdict-held.out" "drops passes: it is not a drop"
+expect_no_grep 'not seen before\|no rule covers need' "$tmp/verdict-held.out" "and not a new reason"
+expect_grep '^PASS log-outages — 1 time(s) the log refused writes' "$tmp/verdict-held.out" "the outage has its own line"
+expect_grep '^  1× 3 record(s) waited in memory and landed' "$tmp/verdict-held.out" "with what it said"
+drop_line 1800 'the log refused writes for a while' '1 record(s) waited in memory and landed, 0 could not be kept there, since 2026-11-01T01:00:00.000Z: No space left on device (os error 28)'
+code=0
+run verdict >"$tmp/verdict-held-two.out" 2>&1 || code=$?
+expect 0 "$code" "two outages are still no loss"
+expect_grep '^PASS log-outages — 2 time(s)' "$tmp/verdict-held-two.out" "they are counted"
+expect_grep '^PASS log-outages — 0 time(s)' "$tmp/verdict.out" "and a window with none says so"
 verdict_fixture
 drop_line 3600 'the log refused writes for a while and records may be lost' '3 record(s) waited in memory and landed, 2 could not be kept there, since 2026-11-01T00:00:00.000Z: No space left on device (os error 28)'
 code=0
 run verdict >"$tmp/verdict-held-lost.out" 2>&1 || code=$?
 expect 1 "$code" "an outage that could not keep its records fails"
 expect_grep '^FAIL drops — 1 lost record' "$tmp/verdict-held-lost.out" "as a lost record"
+expect_grep '^PASS log-outages — 0 time(s)' "$tmp/verdict-held-lost.out" "and is no outage that lost nothing"
+# Inside the swap window it is no less lost, and known words do not excuse it.
+verdict_fixture "$(iso_ago 120)"
+drop_line $((3 * DAY)) 'the log refused writes for a while and records may be lost' 'seen before the swap'
+drop_line 100 'the log refused writes for a while and records may be lost' '3 record(s) waited in memory and landed, 2 could not be kept there, since 2026-11-01T00:00:00.000Z: No space left on device (os error 28)'
+code=0
+run verdict >"$tmp/verdict-held-lost-swap.out" 2>&1 || code=$?
+expect 1 "$code" "records may be lost has no exemption, not even in the swap window"
+
+# The recorder went down holding records it could not land (#158). The count in
+# its detail is how many, and whether its words are known changes nothing.
+verdict_fixture
+drop_line 3600 'the recorder stopped with records it could not land' '3 record(s) lost'
+code=0
+run verdict >"$tmp/verdict-stopped-lost.out" 2>&1 || code=$?
+expect 1 "$code" "a recorder that stopped with records it could not land fails"
+expect_grep '^FAIL drops — 3 lost record' "$tmp/verdict-stopped-lost.out" "and the line counts what it stands for"
+expect_grep 'the recorder stopped with records it could not land (3 record(s) lost)' "$tmp/verdict-stopped-lost.out" "with its detail"
+verdict_fixture
+drop_line $((8 * DAY)) 'the recorder stopped with records it could not land' '1 record(s) lost'
+drop_line 3600 'the recorder stopped with records it could not land' '2 record(s) lost'
+code=0
+run verdict >"$tmp/verdict-stopped-known.out" 2>&1 || code=$?
+expect 1 "$code" "seen before the swap, it still fails: not a question for a person"
+expect_grep '^FAIL drops — 2 lost record' "$tmp/verdict-stopped-known.out" "only the window's lines are counted"
+verdict_fixture "$(iso_ago 120)"
+drop_line 100 'the recorder stopped with records it could not land' '1 record(s) lost'
+code=0
+run verdict >"$tmp/verdict-stopped-swap.out" 2>&1 || code=$?
+expect 1 "$code" "it has no swap-window exemption"
+verdict_fixture
+drop_line 3600 'the recorder stopped with records it could not land' '0 record(s) lost'
+code=0
+run verdict >"$tmp/verdict-stopped-zero.out" 2>&1 || code=$?
+expect 1 "$code" "a count of zero does not clear the line"
 
 # The same words, seen before and covered by no rule, need a person.
 verdict_fixture
@@ -1274,6 +1320,7 @@ run verdict >"$tmp/verdict-two-rotations.out" 2>&1 || code=$?
 expect 4 "$code" "two rotations leave a hole, not a pass and not a fail"
 expect_grep '^UNCHECKED drops.*anything dropped before it was rotated away' "$tmp/verdict-two-rotations.out" "the hole is named"
 expect_no_grep '^FAIL drops' "$tmp/verdict-two-rotations.out" "a known kind does not read as new"
+expect_grep '^PASS log-outages — at least 0 time(s)' "$tmp/verdict-two-rotations.out" "and a count over a hole says it is a floor"
 printf '{"reason":"a reason no rule covers","ts":"%s"}\n' "$(iso_ago $((3 * DAY)))" >"$home/.conbus/drops.1.jsonl"
 code=0
 run verdict >"$tmp/verdict-two-rotations-other.out" 2>&1 || code=$?
@@ -1618,6 +1665,15 @@ if [ "$(id -u)" != 0 ]; then
     chmod 600 "$home/.conbus/canary.json"
     expect 4 "$code" "an unreadable canary.json ends in exit 4"
     expect_grep 'canary.json cannot be read' "$tmp/verdict-chmod-state.out" "and says so, not that no swap was recorded"
+fi
+
+if [ "$(id -u)" != 0 ]; then
+    verdict_fixture
+    chmod 000 "$home/.conbus/drops.jsonl"
+    code=0
+    run verdict >"$tmp/verdict-chmod-outages.out" 2>&1 || code=$?
+    chmod 600 "$home/.conbus/drops.jsonl"
+    expect_grep '^UNCHECKED log-outages.*could not be read' "$tmp/verdict-chmod-outages.out" "an unreadable drop log cannot report outages"
 fi
 
 # A dead recorder pid is this item's whole point, and `ps` failing inside a
@@ -2085,6 +2141,17 @@ run_real restart >"$tmp/restart-sessions.out" 2>&1 || code=$?
 expect 0 "${code:-0}" "planned restart with a sessionless refusal"
 expect_grep 'sessionless' "$tmp/restart-sessions.out" "the sessionless refusal is shown aside"
 expect_grep '"new_drops":0' "$home/.conbus/canary.json" "it is not counted as a loss"
+
+# Lost is lost on a planned restart too, whichever of the two lines says so.
+cat >"$home/.conbus/canary.json" <<EOF
+{"swapped":"$past","prev_build":"01d","candidate_build":"beef","candidate_sha256":"x","restarts":[]}
+EOF
+write_fake beef lostlines "$install_dir/conbus"
+daemon_boot beef 5013
+code=0
+run_real restart >"$tmp/restart-lostlines.out" 2>&1 || code=$?
+expect 0 "${code:-0}" "planned restart with lines that lost records"
+expect_grep '"new_drops":2' "$home/.conbus/canary.json" "both are counted in new_drops"
 
 # Tool bodies elided on a planned restart: the records landed, so new_drops
 # stays 0 however many tool calls were in flight.

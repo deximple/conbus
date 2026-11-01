@@ -566,7 +566,8 @@ say_spool() {
 #   lost        a record that did not land. A build that spools only writes these
 #               when the spool refused too. Fails at any count, known or not.
 #               Includes an orphaned tool or prompt event: real content with no
-#               conversation to go in.
+#               conversation to go in, and `the recorder stopped with records it
+#               could not land` (#158), whose detail says how many.
 #   gap         the adapter has no mapping for an event (`no mapping`, `no
 #               adapter`): the vendor moved. Fails at any count, named by event.
 #   ghost       the end of a session or a turn, or a notification, for a session
@@ -580,7 +581,9 @@ say_spool() {
 #               that was a record. 64 lines in eight weeks.
 #   held        `the log refused writes for a while` (#155): an outage's one line,
 #               written once a write worked, when every record waited and landed.
-#               The same line with `and records may be lost` is lost.
+#               Delayed, not lost, and counted on its own line because a person
+#               should know the disk refused writes. The same line with `and records
+#               may be lost` is lost.
 #   elided      `tool bodies elided, not sealed` (#158): the record landed, its
 #               tool body did not. Judged on its own, as a share of tool calls.
 #   other       none of the above: new since the swap fails, known needs a person.
@@ -602,6 +605,7 @@ function drop_class(r, d) {
     if (r == "tool bodies elided, not sealed") return "elided"
     if (r == "the log refused writes for a while") return "held"
     if (starts(r, "the log refused writes for a while")) return "lost"
+    if (starts(r, "the recorder stopped with records it could not land")) return "lost"
     if (starts(r, "no mapping for hook event") || starts(r, "no adapter for harness")) return "gap"
     if (index(r, "names no session")) return "sessionless"
     if (starts(r, "no conversation for this session") || starts(r, "spooled hook still has no conversation")) {
@@ -727,6 +731,7 @@ drop_table() { # drop_table <since> <end of the swap window> <file>...
             if (c == "gap") key = drop_gap_name(d_reason)
             else if (c == "ghost" || c == "sessionless" || c == "held") { key = d_detail; sub(/ \(fields:.*/, "", key); sub(/ for session .*/, "", key) }
             else if (c == "lost" && index(d_detail, " for session ")) key = drop_event(d_detail) ": " d_reason
+            else if (c == "lost" && d_detail != "") key = d_reason " (" d_detail ")"
             else key = d_reason
             if (key == "") key = "(no detail)"
             if (c == "other") {
@@ -734,7 +739,11 @@ drop_table() { # drop_table <since> <end of the swap window> <file>...
                 n_other[key]++
                 next
             }
-            total[c]++
+            # One line can stand for many records. Zero or no count still counts
+            # as one: the line says records were lost, so it fails either way.
+            weight = 1
+            if (c == "lost" && d_detail ~ /^[1-9][0-9]* record\(s\) lost$/) weight = d_detail + 0
+            total[c] += weight
             n[c SUBSEP key]++
         }
         END {
@@ -801,7 +810,9 @@ verdict_drops() {
     if [ "${n_bad:-0}" -gt 0 ]; then
         open="$open; ${n_bad} line(s) have no readable time or reason"
     fi
+    held_floor=""
     if drops_blind "$bin"; then
+        held_floor="at least "
         open="$open; $drops_log reached the cap on a build that does not rotate: nothing after ${last_drop:-its last line} was recorded"
     fi
     # The rotated generation keeps the file as it was, so its first line predates
@@ -809,6 +820,7 @@ verdict_drops() {
     discarded=0
     if [ -n "$first_rotated" ] && [ "$first_rotated" \> "$since" ]; then
         discarded=1
+        held_floor="at least "
         open="$open; the oldest drop line left is at $first_rotated, after the swap: anything dropped before it was rotated away"
     fi
     if [ "${n_known:-0}" -gt 0 ]; then
@@ -834,7 +846,7 @@ verdict_drops() {
     [ "$n_unseen" -eq 0 ] || faults="$faults, $n_unseen line(s) with a reason not seen before the swap"
     [ "$restart_drops" -eq 0 ] || faults="$faults, $restart_drops drop(s) during planned restarts"
 
-    shown=$((${n_ghost:-0} + ${n_sessionless:-0} + ${n_payload:-0} + ${n_held:-0}))
+    shown=$((${n_ghost:-0} + ${n_sessionless:-0} + ${n_payload:-0}))
     tally="${n_lines:-0} line(s) since $since: $swap_exempted expected swap-window, $shown not lost, $restart_drops on planned restarts"
     if [ -n "$faults" ]; then
         line FAIL drops "${faults#, } ($tally)${open:+$open}"
@@ -858,7 +870,6 @@ verdict_drops() {
     group ghost "end of a session or turn with no binding — not lost, shown only:"
     group sessionless "payload named no session — the vendor's, not lost, shown only:"
     group payload "payload the hook could not parse — cannot prove a loss, shown only:"
-    group held "the log refused writes and every record waited and landed — not lost, shown only:"
     printf '  rule: a lost record or adapter gap fails at any count; a reason new since the swap fails; the three shown kinds stop a pass only above %s lines each; the swap window exempts its two reasons for 60 s\n' "$noise_limit"
     if [ -r "$daemon_log" ]; then
         refused_hooks=$(awk -v s="$since" '$1 ~ /^[0-9]/ && $1 > s && /refusing a hook speaking protocol/ { n++ } END { print n + 0 }' "$daemon_log")
@@ -866,6 +877,17 @@ verdict_drops() {
             printf '  note: daemon.log names %s refused hook(s) since the window began, and %s expected swap-window drop line(s) exist here; a refusal with no line was spooled, or its line never landed\n' "$refused_hooks" "$swap_exempted"
         fi
     fi
+}
+
+# Outages the log came back from. Nothing was lost, only delayed, so it is no drop;
+# it is on its own line because a person should know the disk refused writes.
+verdict_log_outages() {
+    if [ -n "$dt_problem" ]; then
+        line UNCHECKED log-outages "the drop log could not be read:$dt_problem"
+        return
+    fi
+    line PASS log-outages "${held_floor}${n_held:-0} time(s) the log refused writes since $since and every record waited and landed"
+    row_value "$dt_rows" "item held" | sort | sed 's/^/  /'
 }
 
 # 4. Activity. Only what the log holds can be read here, so the questions are:
@@ -1812,6 +1834,7 @@ case $sub in
         # 3. Drops, then what the same lines say about tool bodies. Both read the
         #    usage rows taken above.
         verdict_drops
+        verdict_log_outages
 
         if [ -n "$window_problem" ]; then
             line UNCHECKED tool-bodies \
