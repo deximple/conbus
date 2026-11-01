@@ -957,10 +957,12 @@ fn missing_from<'a>(
                 let Some(text) = prompt_text(prompt) else {
                     continue;
                 };
-                let answers_by_words = id.is_none_or(|id| {
-                    !listed.contains(id)
-                        && record.source.vendor_session_id.as_deref() == Some(session)
-                });
+                let answers_by_words = id.is_none_or(|id| !listed.contains(id))
+                    && record
+                        .source
+                        .vendor_session_id
+                        .as_deref()
+                        .is_none_or(|name| name == session);
                 if answers_by_words {
                     *unexplained.entry(text.clone()).or_default() += 1;
                 }
@@ -1125,7 +1127,7 @@ fn append_gaps_files(
             known.unreadable_live.len() as u64,
         );
     }
-    let to_read: Vec<(&PathBuf, &str, BusId)> = files
+    let mut to_read: Vec<(&PathBuf, &str, BusId)> = files
         .iter()
         .filter_map(|file| {
             let (stem, session) = session_of(file)?;
@@ -1133,6 +1135,12 @@ fn append_gaps_files(
             (!untouched_since(file, since)).then_some((file, stem, live_bus))
         })
         .collect();
+    // One file per session, the most recently written. What this pass writes is
+    // not in `held`, so a second copy would write the same turns again.
+    to_read.sort_by_key(|(file, ..)| std::cmp::Reverse(modified_unix(file)));
+    let mut sessions = HashSet::new();
+    to_read.retain(|(_, stem, _)| sessions.insert(*stem));
+    to_read.sort_by_key(|(file, ..)| *file);
     let targets: Vec<(&str, BusId)> = to_read.iter().map(|&(_, stem, bus)| (stem, bus)).collect();
     let grouped = records_of(held, &targets);
     for (file, stem, live_bus) in to_read {
@@ -2122,6 +2130,57 @@ mod tests {
         let missing = missing_from(&records, SESSION, bus, transcript_of(&[("p1", "continue")]));
 
         assert_eq!(turns_in(&missing), vec!["p1"]);
+    }
+
+    #[test]
+    fn a_prompt_with_no_id_on_another_leg_does_not_hide_a_missed_turn_either() {
+        // Grok's adapter sets no turn id at all, and neither did old hooks.
+        let machine = machine();
+        let bus = BusId::mint();
+        let records = logged(
+            &machine,
+            vec![live_prompt(
+                "another-leg",
+                Harness::GROK,
+                bus,
+                None,
+                "continue",
+            )],
+        );
+
+        let missing = missing_from(&records, SESSION, bus, transcript_of(&[("p1", "continue")]));
+
+        assert_eq!(turns_in(&missing), vec!["p1"]);
+    }
+
+    #[test]
+    fn two_copies_of_one_sessions_transcript_fill_it_once() {
+        // Nothing on this machine has two today, and `relocated` lines say a
+        // session can move. The newer copy is the one that holds everything.
+        let machine = machine();
+        recorded_live(&machine, SESSION);
+        let copy = machine.transcripts.join("-Applications-conbus-moved");
+        fs::create_dir_all(&copy).expect("dir");
+        transcript_two_turns(&machine, SESSION);
+        let original = machine
+            .transcripts
+            .join("-Applications-conbus")
+            .join(format!("{SESSION}.jsonl"));
+        let moved = copy.join(format!("{SESSION}.jsonl"));
+        fs::copy(&original, &moved).expect("copy");
+        let hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3_600);
+        fs::File::options()
+            .write(true)
+            .open(&original)
+            .expect("open")
+            .set_modified(hour_ago)
+            .expect("backdate");
+
+        let outcome = fill_gaps(&machine.paths, &machine.transcripts, true).expect("fill");
+
+        assert_eq!(outcome.gap_turns, 1, "not once per copy");
+        assert_eq!(outcome.gap_records, 2);
+        assert_eq!(records_on_disk(&machine), 3);
     }
 
     #[test]
