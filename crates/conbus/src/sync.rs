@@ -1388,9 +1388,24 @@ mod tests {
         }
         let proxy = TcpListener::bind("127.0.0.1:0").expect("bind proxy");
         proxy.set_nonblocking(true).expect("nonblocking");
-        let closed = TcpListener::bind("127.0.0.1:0").expect("bind closed");
-        let closed_port = closed.local_addr().expect("addr").port();
-        drop(closed);
+        // A privileged port is refused AND unbindable without privilege, so
+        // nothing can take it between a probe and curl's connect — a dropped
+        // listener's port can come back owned by a different server.
+        let closed_port = (|| {
+            for port in [
+                1u16, 9, 13, 17, 19, 23, 25, 37, 42, 87, 95, 98, 110, 119, 123, 135, 139, 143,
+            ] {
+                let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+                let refused = matches!(
+                    std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(200)),
+                    Err(err) if err.kind() == io::ErrorKind::ConnectionRefused
+                );
+                if refused && TcpListener::bind(addr).is_err() {
+                    return port;
+                }
+            }
+            panic!("no privileged port is both refused and unbindable here")
+        })();
         let home = home();
         let rc = format!(
             "proxy = \"http://127.0.0.1:{}\"\ninsecure\nlocation\n",
