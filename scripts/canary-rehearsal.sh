@@ -140,6 +140,20 @@ run preflight >/dev/null 2>&1 || code=$?
 expect 1 "$code" "preflight fails on DIFFERS"
 write_fake old "$install_dir/conbus"
 
+# A candidate that is not a signed binary fails preflight; a matching hash
+# sidecar passes its own line either way.
+code=0
+run preflight --from "$tmp/stage/conbus-new" >"$tmp/preflight-sig.out" 2>&1 || code=$?
+expect 1 "$code" "preflight fails on an unsigned candidate"
+grep -q '^FAIL signature' "$tmp/preflight-sig.out"
+expect 0 $? "the unsigned candidate is named signature"
+grep -q '^WARN artifact-hash' "$tmp/preflight-sig.out"
+expect 0 $? "no sidecar warns, does not fail"
+shasum -a 256 "$tmp/stage/conbus-new" | awk '{print $1}' >"$tmp/stage/conbus-new.sha256"
+run preflight --from "$tmp/stage/conbus-new" >"$tmp/preflight-hash.out" 2>&1 || true
+grep -q '^PASS artifact-hash' "$tmp/preflight-hash.out"
+expect 0 $? "a matching .sha256 sidecar passes"
+
 # The guard: without real HOME and with launchctl skipped, the swap needs
 # the rehearsal declaration — or --live.
 code=0

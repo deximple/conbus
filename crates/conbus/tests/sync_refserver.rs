@@ -65,11 +65,12 @@ fn join_batch_replay_revoke_leave_round_trip() {
 
     // batch: accepted with its own revision.
     let batch = serde_json::to_vec(&serde_json::json!({
-        "device": device, "day": "2026-11-01", "revision": 1, "rows": []
+        "device": device, "day_closed": "2026-11-01", "revision": 1, "rows": []
     }))
     .expect("batch");
     let reply = post(&url, &sign(&seed, &batch), &batch);
-    assert_eq!(reply["accepted"], 1, "the batch landed: {reply}");
+    assert_eq!(reply["accepted"], true, "the batch landed: {reply}");
+    assert_eq!(reply["revision"], 1, "the batch landed: {reply}");
 
     // replay: the same revision is refused.
     let reply = post(&url, &sign(&seed, &batch), &batch);
@@ -117,6 +118,11 @@ fn standalone() {
         .state()
         .invites
         .insert("SHADOW-INVITE".into(), "shadow".into());
+    // The real CLI posts the invite document it was given verbatim, so a
+    // shadow join needs the document itself registered, not a token naming it.
+    if let Ok(doc) = std::env::var("CONBUS_SHADOW_INVITE") {
+        server.state().invites.insert(doc, "shadow".into());
+    }
     println!("reference sync server on {}", server.url());
     println!("invite: SHADOW-INVITE — kill to stop");
     loop {

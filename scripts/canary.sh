@@ -291,18 +291,65 @@ case $sub in
             check 0 plist-backup "no service file present — nothing to back up"
         fi
 
+        # The candidate binary: Developer ID signature, hardened runtime on
+        # every slice, and a matching published hash when a .sha256 sidecar
+        # sits beside it (the release asset naming). macOS only — on Linux
+        # the check degrades to the hash.
+        if [ -n "$from" ]; then
+            [ -f "$from" ] || die "no candidate at $from"
+            if [ "$(uname -s)" = Darwin ]; then
+                if codesign --verify --strict "$from" 2>/dev/null; then
+                    team=$(codesign -dv "$from" 2>&1 | sed -n 's/^TeamIdentifier=//p')
+                    if [ -n "$team" ] && [ "$team" != "not set" ]; then
+                        check 0 signature "Developer ID team $team"
+                    else
+                        check 1 signature "verifies but names no team — not a Developer ID build"
+                    fi
+                else
+                    check 1 signature "codesign --verify --strict failed on $from"
+                fi
+                slices=$(lipo -archs "$from" 2>/dev/null || uname -m)
+                runtime_fail=""
+                for arch in $slices; do
+                    codesign -dv --arch "$arch" "$from" 2>&1 | grep -q 'runtime' ||
+                        runtime_fail="$runtime_fail $arch"
+                done
+                if [ -z "$runtime_fail" ]; then
+                    check 0 hardened-runtime "all slices ($slices)"
+                else
+                    check 1 hardened-runtime "missing on:$runtime_fail"
+                fi
+            fi
+            if [ -f "$from.sha256" ]; then
+                want=$(awk '{print $1}' "$from.sha256")
+                got=$(shasum -a 256 "$from" | awk '{print $1}')
+                if [ "$want" = "$got" ]; then
+                    check 0 artifact-hash "matches $from.sha256"
+                else
+                    check 1 artifact-hash "sha256 mismatch: want $want got $got"
+                fi
+            else
+                check 2 artifact-hash "no $from.sha256 beside the candidate"
+            fi
+        fi
+
         if blackout_active; then
             check 1 blackout "CONBUS_CANARY_BLACKOUT is active (${CONBUS_CANARY_BLACKOUT:-})"
         else
             check 0 blackout "no active blackout"
         fi
 
-        # The derived cache, built now by the installed binary, so the
-        # candidate's first reads do not pay first-build cost at cutover.
-        if index_out=$("$bin" log index 2>&1); then
-            check 0 cache "$index_out"
+        # The derived cache, built now by the candidate on the live root, so
+        # its first reads do not pay first-build cost at cutover. `log index`
+        # only writes cache/ — a rebuildable sidecar — next to the log.
+        if [ -n "$from" ]; then
+            if index_out=$("$from" log index 2>&1); then
+                check 0 cache "$index_out"
+            else
+                check 1 cache "candidate log index failed: $index_out"
+            fi
         else
-            check 1 cache "conbus log index failed: $index_out"
+            check 2 cache "no --from — the live cache is not prebuilt"
         fi
         exit "$fail"
         ;;
