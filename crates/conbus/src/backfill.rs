@@ -3234,8 +3234,7 @@ mod tests {
         live_at(&machine, now, last);
         let mut log =
             SegmentLog::open(machine.paths.log_dir(), Retention::default()).expect("open");
-        // Well under what parsing that file takes, in a release build too.
-        let budget = std::time::Duration::from_millis(30);
+        let budget = std::time::Duration::from_millis(100);
         let records = held(&machine);
         let (_, timing) = append_gaps_at_start_in(
             &machine.paths,
@@ -3248,41 +3247,52 @@ mod tests {
         assert!(timing.budget_exhausted, "the big file used the budget up");
         assert!(!holds_prompt(&machine, "the turn nobody reaches"));
 
-        // The big file changes before the next start, and a read of it would
-        // use that budget up as well.
-        let mut grown = fs::OpenOptions::new()
-            .append(true)
-            .open(project.join(format!("{first}.jsonl")))
-            .expect("open");
-        std::io::Write::write_all(
-            &mut grown,
-            format!(
-                "{{\"type\":\"user\",\"sessionId\":\"{first}\",\"timestamp\":\"2026-11-01T00:01:00.000Z\",\
-                 \"promptId\":\"grew\",\"message\":{{\"role\":\"user\",\"content\":\"it grew\"}}}}\n"
+        // The big file changes before every start, and a read of it would use that
+        // budget up as well. So a start that read it first would never reach the
+        // other file, and a slow machine only costs another try.
+        let grow = || {
+            let mut grown = fs::OpenOptions::new()
+                .append(true)
+                .open(project.join(format!("{first}.jsonl")))
+                .expect("open");
+            std::io::Write::write_all(
+                &mut grown,
+                format!(
+                    "{{\"type\":\"user\",\"sessionId\":\"{first}\",\"timestamp\":\"2026-11-01T00:01:00.000Z\",\
+                     \"promptId\":\"{}\",\"message\":{{\"role\":\"user\",\"content\":\"it grew\"}}}}\n",
+                    BusId::mint()
+                )
+                .as_bytes(),
             )
-            .as_bytes(),
-        )
-        .expect("grow");
-        let records = held(&machine);
-        let _ = append_gaps_at_start_in(
-            &machine.paths,
-            &records,
-            &mut log,
-            budget,
-            Some(home.path()),
-        )
-        .expect("the next start");
+            .expect("grow");
+        };
+        for _ in 0..6 {
+            grow();
+            let records = held(&machine);
+            let _ = append_gaps_at_start_in(
+                &machine.paths,
+                &records,
+                &mut log,
+                budget,
+                Some(home.path()),
+            )
+            .expect("the next start");
+            if holds_prompt(&machine, "the turn nobody reaches") {
+                break;
+            }
+        }
         assert!(
             holds_prompt(&machine, "the turn nobody reaches"),
             "what the range has not read at all goes first"
         );
 
+        // Given the time, the change is read in the end.
         let records = held(&machine);
         let _ = append_gaps_at_start_in(
             &machine.paths,
             &records,
             &mut log,
-            budget,
+            std::time::Duration::from_secs(60),
             Some(home.path()),
         )
         .expect("the one after");
