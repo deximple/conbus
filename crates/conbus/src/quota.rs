@@ -49,7 +49,13 @@ pub const DEADLINE: Duration = Duration::from_secs(15);
 
 /// Ask a fresh app-server for the account's limits.
 pub fn read() -> io::Result<Quota> {
-    let mut server = AppServer::start(DEADLINE)?;
+    read_with(DEADLINE)
+}
+
+/// [`read`] with the caller's deadline — `doctor` gives every probe two
+/// seconds rather than a hang's fifteen.
+pub fn read_with(deadline: Duration) -> io::Result<Quota> {
+    let mut server = AppServer::start(deadline)?;
     let result = server.call("account/rateLimits/read", serde_json::json!({}))?;
     parse(&result)
 }
@@ -166,26 +172,28 @@ pub fn run(paths: &Paths) -> io::Result<()> {
 /// Official print-mode JSON. Not a TUI scrape: the unmodified binary
 /// already fetched remaining quota and emits `command.data.groups`.
 pub fn read_agy() -> io::Result<Quota> {
+    read_agy_with(Duration::from_secs(15))
+}
+
+/// [`read_agy`] with the caller's deadline — the same two seconds `doctor`
+/// gives every probe.
+pub fn read_agy_with(deadline: Duration) -> io::Result<Quota> {
     let binary = agy_binary();
-    let output = Command::new(&binary)
+    let mut command = Command::new(&binary);
+    command
         .args([
             "-p",
             "/usage",
             "--output-format",
             "json",
             "--print-timeout",
-            "15s",
+            &format!("{}s", deadline.as_secs().max(1)),
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .map_err(|err| {
-            io::Error::other(format!(
-                "could not run `{} -p /usage`: {err}",
-                binary.to_string_lossy()
-            ))
-        })?;
+        .stderr(Stdio::null());
+    let output = crate::code::output_within(command, deadline)
+        .map_err(|err| io::Error::other(format!("agy -p /usage: {err}")))?;
     if !output.status.success() {
         return Err(io::Error::other(format!(
             "`{} -p /usage` exited {}",

@@ -1325,31 +1325,66 @@ pub fn doctor(paths: &Paths) -> io::Result<()> {
     // than the sum of them. Output order is the println!s below, not the
     // order the threads finish in.
     let home = std::env::var("HOME").ok();
-    let (replay, meter, twins_summary, nameless_sessions, warm, claude, route) =
-        std::thread::scope(|scope| {
-            let replay_t =
-                scope.spawn(|| conbus_core::continuation::replay(&scan.records, home.as_deref()));
-            let meter_t = scope.spawn(|| conbus_core::meter::Meter::fold(&scan.records));
-            let twin_t = scope.spawn(|| (twins(&scan.records), nameless(&scan.records)));
-            let warm_t = scope.spawn(|| {
-                (
-                    crate::hop::live_warm_threads(&scan.records),
-                    crate::hop::live_claude_sessions(&scan.records),
-                    crate::hop::decide_from(paths, &scan.records, None),
-                )
-            });
-            let (twins_summary, nameless_sessions) = twin_t.join().expect("twins");
-            let (warm, claude, route) = warm_t.join().expect("warm");
+    let now_probe = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let (
+        replay,
+        meter,
+        twins_summary,
+        nameless_sessions,
+        warm,
+        claude,
+        route,
+        codex_quota,
+        agy_quota,
+    ) = std::thread::scope(|scope| {
+        let probe_t = scope.spawn(|| {
+            let probe = |read: &dyn Fn() -> std::io::Result<crate::quota::Quota>| {
+                let started = std::time::Instant::now();
+                match read() {
+                    Ok(quota) => crate::quota::describe(&quota, now_probe),
+                    // A probe that ran its whole deadline out says so;
+                    // one that failed fast names why.
+                    Err(err) if started.elapsed() >= std::time::Duration::from_secs(2) => {
+                        let _ = err;
+                        "did not answer within 2s".to_string()
+                    }
+                    Err(err) => format!("unavailable — {err}"),
+                }
+            };
             (
-                replay_t.join().expect("replay"),
-                meter_t.join().expect("meter"),
-                twins_summary,
-                nameless_sessions,
-                warm,
-                claude,
-                route,
+                probe(&|| crate::quota::read_with(std::time::Duration::from_secs(2))),
+                probe(&|| crate::quota::read_agy_with(std::time::Duration::from_secs(2))),
             )
         });
+        let replay_t =
+            scope.spawn(|| conbus_core::continuation::replay(&scan.records, home.as_deref()));
+        let meter_t = scope.spawn(|| conbus_core::meter::Meter::fold(&scan.records));
+        let twin_t = scope.spawn(|| (twins(&scan.records), nameless(&scan.records)));
+        let warm_t = scope.spawn(|| {
+            (
+                crate::hop::live_warm_threads(&scan.records),
+                crate::hop::live_claude_sessions(&scan.records),
+                crate::hop::decide_from(paths, &scan.records, None),
+            )
+        });
+        let (twins_summary, nameless_sessions) = twin_t.join().expect("twins");
+        let (warm, claude, route) = warm_t.join().expect("warm");
+        let (codex_quota, agy_quota) = probe_t.join().expect("probes");
+        (
+            replay_t.join().expect("replay"),
+            meter_t.join().expect("meter"),
+            twins_summary,
+            nameless_sessions,
+            warm,
+            claude,
+            route,
+            codex_quota,
+            agy_quota,
+        )
+    });
     report_twins(twins_summary);
     report_nameless(nameless_sessions);
     println!("briefing  {} conversation(s) judged", replay.total());
@@ -1366,19 +1401,15 @@ pub fn doctor(paths: &Paths) -> io::Result<()> {
     }
 
     // The router's signal, where every other health fact is. Read from a
-    // fresh app-server; "unavailable" is a fact too, not an omission.
+    // fresh app-server; "unavailable" is a fact too, not an omission — and
+    // neither probe may hold the report: a vendor that does not answer
+    // inside two seconds says so on its own line.
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    match crate::quota::read() {
-        Ok(quota) => println!("quota     codex {}", crate::quota::describe(&quota, now)),
-        Err(err) => println!("quota     codex unavailable — {err}"),
-    }
-    match crate::quota::read_agy() {
-        Ok(quota) => println!("quota     agy {}", crate::quota::describe(&quota, now)),
-        Err(err) => println!("quota     agy unavailable — {err}"),
-    }
+    println!("quota     codex {codex_quota}");
+    println!("quota     agy {agy_quota}");
     println!(
         "quota     claude {}",
         crate::quota::describe_claude(paths, now)
