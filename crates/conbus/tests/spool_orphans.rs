@@ -54,7 +54,7 @@ fn start_with(home: &Path, retention: &str) -> Daemon {
     panic!("the daemon never served");
 }
 
-fn start(home: &Path) -> Child {
+fn start(home: &Path) -> Daemon {
     start_with(home, "conversation_only")
 }
 
@@ -244,6 +244,8 @@ fn an_event_no_prompt_ever_claims_goes_with_a_drop_line_after_a_day() {
 
     let daemon = start(home.path());
     until("it goes", || spooled(home.path()).is_empty());
+    // The file goes first and the line follows it, so wait for the line.
+    until("it says so", || !drops(home.path()).is_empty());
     stop(daemon);
 
     let said = drops(home.path());
@@ -321,6 +323,7 @@ fn an_orphan_that_cannot_be_removed_has_not_gone_and_says_nothing_yet() {
     let said_early = drops(home.path());
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("open");
     until("it goes", || spooled(home.path()).is_empty());
+    until("it says so", || !drops(home.path()).is_empty());
     stop(daemon);
 
     assert!(still_there);
