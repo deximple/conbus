@@ -44,6 +44,8 @@ the entry says so when it does.
 - A budget cut can no longer starve the transcripts or threads behind it. What a
   held range has read is kept in `cache/gap-read`, so the next start goes on from
   there instead of repeating the same prefix.
+- Two chat exports in one pass no longer write a conversation twice. Each export
+  now sees what the one before it appended.
 - Gap fill and `backfill` no longer copy a parent Codex thread into its fork. A
   forked thread lists its parent's turns as its own, under the parent's turn ids.
   A turn older than its thread is now counted as not read.
