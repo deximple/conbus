@@ -410,9 +410,16 @@ fn a_rerun_copies_only_what_is_new() {
     ok(&world.backup(&folder));
     let first = inodes(&backup_log(&folder));
 
+    let manifest = folder.join("conbus-backup/manifest.json");
+    let manifest_ino = fs::metadata(&manifest).expect("manifest").ino();
     let said = ok(&world.backup(&folder));
     assert!(said.contains("copied 0 segment(s)"), "{said}");
     assert_eq!(inodes(&backup_log(&folder)), first, "nothing was rewritten");
+    assert_eq!(
+        fs::metadata(&manifest).expect("manifest").ino(),
+        manifest_ino,
+        "a run with nothing new writes nothing at the destination"
+    );
 
     world.write_turns(9, SMALL_SEGMENT);
     let (closed, _) = split_open(&world);
@@ -439,6 +446,7 @@ fn a_log_with_nothing_closed_yet_says_so_and_still_has_one_copy() {
     let said = ok(&world.backup(&folder));
 
     assert!(said.contains("copied 0 segment(s)"), "{said}");
+    assert!(said.contains("this log still has one copy"), "{said}");
     assert!(
         said.contains("newer than the backup: 6 record(s)"),
         "{said}"

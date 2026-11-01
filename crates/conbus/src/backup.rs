@@ -44,9 +44,9 @@ const ONE_COPY: &str = "backup    none: this log has one copy";
 const FIRST_RUN_NOTES: &[&str] = &[
     "note      prompts and replies are plain text in this backup: an unencrypted \
      external disk exposes them to whoever holds it",
-    "note      tool bodies sealed under encrypted_tools need the log-kek key in this \
-     Mac's login Keychain, which a backup does not copy: on another machine they \
-     stay unreadable",
+    "note      tool bodies sealed under encrypted_tools need the log-kek key in the login \
+     Keychain of the Mac that wrote them, which a backup does not copy: on another machine \
+     they stay unreadable",
     "note      a backup does not stop a full disk from losing new records",
 ];
 
@@ -185,10 +185,14 @@ fn copy_to(paths: &Paths, to: &Path, home: Option<&Path>) -> io::Result<()> {
         .collect::<io::Result<Vec<_>>>()?;
     copy::sync_dir(&layout.log);
 
-    let written = copies.iter().map(|(row, _)| row.clone());
-    rows.extend(planned.adopted.into_iter().chain(written).map(keyed));
-    write_manifest(&layout.manifest, &rows)?;
-    copy::sync_dir(&layout.dir);
+    // Nothing new, nothing written: a rerun must not wear a backup disk, or fail
+    // on a full or read-only one with nothing left to do.
+    if first_here || !copies.is_empty() || !planned.adopted.is_empty() {
+        let written = copies.iter().map(|(row, _)| row.clone());
+        rows.extend(planned.adopted.into_iter().chain(written).map(keyed));
+        write_manifest(&layout.manifest, &rows)?;
+        copy::sync_dir(&layout.dir);
+    }
     let bytes = rows.values().map(|row| row.size).sum();
     write_record(paths, &folder, &rows, bytes, same_volume)?;
 
@@ -503,6 +507,9 @@ fn print_report(report: &Report) {
             gone => format!("; {gone} no longer in the log"),
         }
     );
+    if report.held == 0 {
+        println!("backup    nothing has closed yet: this log still has one copy");
+    }
     println!(
         "backup    newer than the backup: {} record(s); the open segment is copied once it \
          rolls over",

@@ -184,6 +184,7 @@ The rest of `doctor`:
 | Line | What it tells you |
 | --- | --- |
 | `hardening` | whether the recorder disabled core dumps and locked its memory |
+| `backup` | when the last backup ran and where to, or that this log has one copy (section 11) |
 | `chat` | how Claude.ai conversations can reach the log (section 9) |
 | `log` | records, conversations, and lines the recorder could not read (should be 0) |
 | `twins` | sessions recorded both live and by backfill, and which copy they continue under |
