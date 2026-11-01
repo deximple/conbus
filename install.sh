@@ -72,6 +72,21 @@ fetch "$asset.sha256" || die "could not download $asset.sha256"
 tar -xzf "$tmp/$asset" -C "$tmp"
 "$tmp/conbus" --version >/dev/null 2>&1 || die "the downloaded binary does not run on this machine"
 
+# Releases from the project's own repository are signed with its Developer ID
+# from v0.2.6 on. A checksum only says the download is what the release holds;
+# the signature says who built it. A mirror or a local build (CONBUS_BASE_URL)
+# is the person's own choice and is not checked.
+if [ "$(uname -s)" = Darwin ] && [ -z "${CONBUS_BASE_URL:-}" ] &&
+  [ "$repo" = deximple/conbus ]; then
+  case $version in
+    latest | v0.2.[6-9] | v0.2.[1-9][0-9] | v0.[3-9].* | v[1-9]*)
+      team=$(codesign -dv "$tmp/conbus" 2>&1 | sed -n 's/^TeamIdentifier=//p')
+      [ "$team" = 4UN6WC576K ] ||
+        die "the downloaded binary is not signed by conbus's Developer ID (TeamIdentifier ${team:-none}); nothing was installed"
+      ;;
+  esac
+fi
+
 dest="$HOME/.local/bin"
 mkdir -p "$dest"
 cp "$tmp/conbus" "$dest/conbus.next"

@@ -204,9 +204,10 @@ and `rm -rf ~/.conbus` removes it if you want it gone.
 | `conbus go [HARNESS]` | Hop the current conversation |
 | `conbus run [HARNESS]` | Start a leg in this terminal; hops exec the next one |
 | `conbus backfill [--apply]` | Recover history from before conbus was installed |
-| `conbus summary --bus-id ID` | A model digest from the other vendor |
-| `conbus verdict` | Score a four-week trial; an open window is not a verdict |
+| `conbus summary --bus-id ID` | A model digest from the other vendor (experimental) |
+| `conbus verdict` | Score a four-week trial; an open window is not a verdict (experimental) |
 | `conbus sync [--join INVITE [--apply]] [--off]` | Send closed days' counts to the origin a joined invite names; no host exists yet |
+| `conbus policy check` · `conbus policy test` | The local `PreToolUse` rules in `policy.json` (experimental, off without the file) |
 | `conbus arena fact \| link` | Accept a fact, or link two checkouts |
 | `conbus daemon` · `conbus hook` | The recorder, and the hook it registers |
 | `conbus --version` | Version and the commit it was built from |
@@ -220,6 +221,7 @@ Operational guides and the decisions behind them:
 - [Manual](docs/manual.md) — install, the recorder, hop, upgrade, uninstall.
 - [매뉴얼 (한국어)](docs/manual.ko.md) · [운영자 매뉴얼 (한국어)](docs/beginner-manual.md)
 - [RFD 0001](docs/rfd/0001-hook-contract.md) — the hook contract the binary registers. Field names come from `crates/conbus/tests/fixtures/`.
+- [Support matrix](docs/support-matrix.md) — which vendor versions were checked live, and what each one sends. [Stability](docs/stability.md) — what 1.x keeps. [Log format](docs/log-format.md).
 - [RFD 0002](docs/rfd/0002-metadata-sync.md) — draft. Which usage rows a sync may send. The client ships in 0.2.9; there is no service.
 - [RFD 0003](docs/rfd/0003-security-design.md) — draft. Device keys and `conbus sync --off`. It is accepted only together with RFD 0002, and neither has been accepted. The client side ships in 0.2.9.
 - [Changelog](CHANGELOG.md) · [Security](SECURITY.md) · [Releasing](docs/release.md) · [Managed Macs](docs/fleet.md) · [Hop walkthrough](docs/hop-demo.md) · [Fact schema](docs/fact-schema.md) · [License](LICENSE)
