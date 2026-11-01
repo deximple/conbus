@@ -8,6 +8,10 @@
 //! `conbus`'s real transport pins `https://`, which needs rustls+rcgen wired
 //! to `CURL_CA_BUNDLE`; that piece is not landed.
 
+// Only the sync tests use this module; it is dead code in every other
+// integration test that shares `tests/support`.
+#![allow(dead_code)]
+
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpListener;
