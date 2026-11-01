@@ -71,8 +71,9 @@ fn start_daemon_with(home: &Path, env: &[(&str, &std::ffi::OsStr)]) -> Daemon {
     panic!("daemon never started listening on {}", socket.display());
 }
 
-/// The first stamp lands at bind. Hardening rewrites it after restore.
-/// Tests that overwrite the stamp must wait until that rewrite is done.
+/// The stamp is written three times — at bind, after hardening, and once
+/// serving is marked. Tests that overwrite the stamp must wait until the last
+/// rewrite is done, or the daemon's next write lands over theirs.
 fn daemon_stamp_is_settled(home: &Path) -> bool {
     let Ok(text) = std::fs::read_to_string(home.join("daemon.build")) else {
         return false;
@@ -80,7 +81,7 @@ fn daemon_stamp_is_settled(home: &Path) -> bool {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(text.trim()) else {
         return false;
     };
-    value.get("memory_locked").is_some()
+    value.get("serving").is_some()
 }
 
 /// Run `conbus hook` with a payload on stdin. Returns (exit code, stderr).
