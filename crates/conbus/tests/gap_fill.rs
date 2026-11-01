@@ -1239,6 +1239,13 @@ fn threads_a_budget_cut_off_are_reached_by_later_starts() {
     let dir = tempfile::tempdir().expect("tempdir");
     let home = dir.path();
     let (_stub, fake) = stand_in(SLOW_APP_SERVER);
+    // Its first exec can take seconds on a loaded machine. Charged to a start, that
+    // would read as an app-server that stalled.
+    let warmed = Command::new(&fake)
+        .stdin(Stdio::null())
+        .status()
+        .expect("warm the stand-in");
+    assert!(warmed.success());
     live_threads_touched_in_order(home);
 
     let reached = |home: &Path, thread: &str| {
@@ -1354,31 +1361,45 @@ for line in sys.stdin:
     assert_eq!(filled.len(), 1, "\n{}", show(&filled));
     assert_eq!(filled[0]["prompt"]["text"], "the fork's own prompt");
 }
-/// A stand-in that notes each launch and then never answers `initialize`: the
-/// stall `AppServer` documents, from an MCP server it is trying to start.
-fn a_stalled_app_server(home: &Path) -> (tempfile::TempDir, PathBuf, PathBuf) {
-    let launches = home.join("app-server-launches");
-    let script = format!(
-        r#"#!/bin/sh
-echo launched >> {launches:?}
-exec sleep 60
-"#
-    );
-    let (stub, fake) = stand_in(&script);
-    (stub, fake, launches)
+/// A stand-in that never answers `initialize`: the stall `AppServer` documents,
+/// from an MCP server it is trying to start.
+fn a_stalled_app_server() -> (tempfile::TempDir, PathBuf) {
+    stand_in("#!/bin/sh\nexec sleep 60\n")
 }
 
+/// One start, keeping what the daemon said in `daemon-notes` under the root.
 fn start_with_stalled_codex(home: &Path, codex: &Path) {
+    let notes = std::fs::File::options()
+        .create(true)
+        .append(true)
+        .open(home.join("daemon-notes"))
+        .expect("notes");
     let daemon = wait_serving(
         home,
         daemon_command(home)
             .env("CONBUS_CODEX_BIN", codex)
-            // Long enough for a stand-in's first exec, which can take 300 ms.
-            .env("CONBUS_GAP_BUDGET_MS", "1500")
+            .env("CONBUS_GAP_BUDGET_MS", "1000")
+            .stderr(Stdio::from(notes))
             .spawn()
             .expect("daemon"),
     );
     stop(daemon);
+}
+
+/// How many starts asked the app-server, and how many left it alone. Read from
+/// what the daemon says rather than from the stand-in, whose first exec can
+/// outlast its limit on a loaded machine.
+fn asked_and_left_alone(home: &Path) -> (usize, usize) {
+    let notes = std::fs::read_to_string(home.join("daemon-notes")).unwrap_or_default();
+    let deferred: Vec<&str> = notes
+        .lines()
+        .filter(|line| line.contains("codex gap fill deferred ("))
+        .collect();
+    let left_alone = deferred
+        .iter()
+        .filter(|line| line.contains("it stalled at an earlier start"))
+        .count();
+    (deferred.len() - left_alone, left_alone)
 }
 
 #[test]
@@ -1387,15 +1408,18 @@ fn a_stalled_app_server_costs_one_start_not_every_start() {
     // must not mean paying that on every restart for as long as Codex is wedged.
     let dir = tempfile::tempdir().expect("tempdir");
     let home = dir.path();
-    let (_stub, fake, launches) = a_stalled_app_server(home);
+    let (_stub, fake) = a_stalled_app_server();
     a_live_codex_thread(home);
 
     start_with_stalled_codex(home, &fake);
     start_with_stalled_codex(home, &fake);
     start_with_stalled_codex(home, &fake);
 
-    let launched = std::fs::read_to_string(&launches).unwrap_or_default();
-    assert_eq!(launched.lines().count(), 1, "asked again within the hour");
+    assert_eq!(
+        asked_and_left_alone(home),
+        (1, 2),
+        "asked again within the hour"
+    );
     assert!(
         home.join("cache/gap-since-codex").exists(),
         "and the range is still held"
@@ -1406,7 +1430,7 @@ fn a_stalled_app_server_costs_one_start_not_every_start() {
 fn a_stalled_app_server_is_asked_again_once_the_back_off_has_passed() {
     let dir = tempfile::tempdir().expect("tempdir");
     let home = dir.path();
-    let (_stub, fake, launches) = a_stalled_app_server(home);
+    let (_stub, fake) = a_stalled_app_server();
     a_live_codex_thread(home);
     start_with_stalled_codex(home, &fake);
 
@@ -1424,12 +1448,15 @@ fn a_stalled_app_server_is_asked_again_once_the_back_off_has_passed() {
             _ => line.to_string(),
         })
         .collect();
+    assert!(
+        rewound.iter().any(|line| line.ends_with("stalled")),
+        "the stall was noted: {held}"
+    );
     std::fs::write(&read, rewound.join("\n") + "\n").expect("rewind");
 
     start_with_stalled_codex(home, &fake);
 
-    let launched = std::fs::read_to_string(&launches).unwrap_or_default();
-    assert_eq!(launched.lines().count(), 2);
+    assert_eq!(asked_and_left_alone(home), (2, 0));
 }
 
 #[test]
@@ -1455,7 +1482,7 @@ fn an_app_server_that_is_only_missing_is_tried_every_start() {
 fn backfill_gaps_by_hand_asks_a_stalled_app_server_regardless() {
     let dir = tempfile::tempdir().expect("tempdir");
     let home = dir.path();
-    let (_stub, fake, _launches) = a_stalled_app_server(home);
+    let (_stub, fake) = a_stalled_app_server();
     a_live_codex_thread(home);
     start_with_stalled_codex(home, &fake);
     let (_stub2, working) = stand_in(FAKE_APP_SERVER);
