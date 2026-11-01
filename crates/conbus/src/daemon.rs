@@ -1040,14 +1040,16 @@ fn claim_recorder(paths: &Paths) -> io::Result<Option<fs::File>> {
             return Err(io::Error::new(
                 io::ErrorKind::AddrInUse,
                 format!(
-                    "another conbus daemon is the recorder of {}; nothing was written",
+                    "another conbus daemon is the recorder of {}, or its start-up repair is \
+                     still running; nothing was written",
                     paths.root().display()
                 ),
             ));
         }
         if !said {
             note!(
-                "another daemon is the recorder of {}; waiting up to {CLAIM_WAIT:?} for it to go",
+                "another daemon is the recorder of {}, or its start-up repair is still running; \
+                 waiting up to {CLAIM_WAIT:?} for it to go",
                 paths.root().display()
             );
             said = true;
@@ -1056,8 +1058,9 @@ fn claim_recorder(paths: &Paths) -> io::Result<Option<fs::File>> {
     }
 }
 
-/// `conbus daemon --prepare`. A daemon's own child writes under its parent's
-/// claim; anything else has to take the claim itself first.
+/// `conbus daemon --prepare`. A daemon's own child is handed the claim, so it
+/// outlives that daemon if it has to (`prepare_in_child`); anything else has to
+/// take the claim itself first.
 pub fn prepare_command(paths: &Paths, retention: Retention) -> io::Result<()> {
     let under_parent = std::env::var(PREPARE_FOR)
         .is_ok_and(|pid| pid == std::os::unix::process::parent_id().to_string());
@@ -1251,13 +1254,27 @@ pub fn prepare(paths: &Paths, retention: Retention) -> io::Result<()> {
 
 /// Run [`prepare`] in a child process, and in this one only if the child could
 /// not run.
-fn prepare_in_child(paths: &Paths, retention: Retention) {
+///
+/// The child holds the claim as well, on its stdin, which it never reads. `flock`
+/// belongs to the open file and not to a process, so if this daemon dies alone the
+/// child goes on holding it. The next daemon then waits for the child rather than
+/// writing beside it, and comes back under its service manager if that takes longer
+/// than [`CLAIM_WAIT`]. Everything the child starts gets a stdin of its own, so the
+/// claim ends with the child.
+fn prepare_in_child(paths: &Paths, retention: Retention, claim: Option<&fs::File>) {
     let started = std::time::Instant::now();
+    let stdin = claim
+        .and_then(|lock| {
+            lock.try_clone()
+                .map_err(|err| note!("could not hand the claim to the repair ({err})"))
+                .ok()
+        })
+        .map_or_else(Stdio::null, Stdio::from);
     let status = std::env::current_exe().and_then(|bin| {
         Command::new(bin)
             .args(["daemon", "--prepare"])
             .env(PREPARE_FOR, std::process::id().to_string())
-            .stdin(Stdio::null())
+            .stdin(stdin)
             .stdout(Stdio::null())
             // The child's notes belong in the same place as the daemon's.
             .stderr(Stdio::inherit())
@@ -1338,7 +1355,7 @@ pub fn serve(paths: &Paths, retention: Retention) -> io::Result<()> {
     }
     // Nothing below is written until this process knows it is the recorder.
     // Held until the process ends, so it is never dropped: `serve` only loops.
-    let _claim = claim_recorder(paths)?;
+    let claim = claim_recorder(paths)?;
     // The first stamp, before anything long: a daemon that takes a minute to
     // prepare shows "starting" to a doctor, never a dead process — and a hook
     // that arrives early meets a refused socket at once rather than waiting
@@ -1351,7 +1368,7 @@ pub fn serve(paths: &Paths, retention: Retention) -> io::Result<()> {
     // But a log we cannot read must not stop us recording: an empty registry
     // costs a forked conversation, which the vendor session id on every record
     // still makes recoverable, while refusing to start costs every future turn.
-    prepare_in_child(paths, retention);
+    prepare_in_child(paths, retention, claim.as_ref());
     let (log, restored) = restore(paths, retention)?;
     let mut daemon = Daemon::new(log, restored.registry, restored.chapters)
         .with_arena(paths.root().to_path_buf())

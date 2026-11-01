@@ -337,3 +337,130 @@ fn the_claim_goes_with_the_daemon_however_it_dies() {
         "a dead daemon's claim held the next one up for {waited:?}"
     );
 }
+
+/// A transcript that takes a start seconds to read, with turns only it holds at
+/// the end of it: long enough to kill a daemon while its child is still reading.
+fn a_long_transcript_with_three_gaps(home: &std::path::Path) {
+    let dir = home.join(".claude/projects/-repo");
+    std::fs::create_dir_all(&dir).expect("dir");
+    let ts = String::from_utf8(
+        Command::new("/bin/date")
+            .args(["-u", "+%Y-%m-%dT%H:%M:%S.000Z"])
+            .output()
+            .expect("date")
+            .stdout,
+    )
+    .expect("utf8");
+    let ts = ts.trim();
+    let user = |id: &str, text: &str| {
+        serde_json::json!({"type":"user","sessionId":SESSION,"timestamp":ts,"version":"2.1.316",
+            "cwd":"/repo","entrypoint":"cli","promptId":id,"message":{"role":"user","content":text}})
+        .to_string()
+    };
+    let filler = serde_json::json!({"type":"assistant","sessionId":SESSION,"timestamp":ts,
+        "version":"2.1.316","message":{"role":"assistant","content":[{"type":"text","text":"x".repeat(2048)}]}})
+    .to_string();
+    let mut body = vec![user("p0", "first")];
+    body.extend(std::iter::repeat_n(filler, 40_000));
+    body.extend((0..3).map(|n| {
+        user(
+            &format!("gap{n}"),
+            &format!("only the transcript holds this {n}"),
+        )
+    }));
+    std::fs::write(dir.join(format!("{SESSION}.jsonl")), body.join("\n") + "\n")
+        .expect("transcript");
+}
+
+/// Until this daemon has started its `--prepare` child. The child has the claim
+/// from the moment it exists: it is handed over before the child runs a line.
+fn until_it_has_a_child(pid: u32) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        let children = Command::new("/usr/bin/pgrep")
+            .args(["-P", &pid.to_string()])
+            .output()
+            .expect("pgrep");
+        if !children.stdout.is_empty() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    panic!("pid {pid} never started its repair");
+}
+
+/// What launchd or systemd does: start a daemon, and start it again a moment after
+/// it gives up, until one serves.
+fn a_daemon_under_a_service_manager(home: &std::path::Path) -> Daemon {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let mut daemon = Daemon(daemon_in(home).spawn().expect("daemon"));
+        while Instant::now() < deadline {
+            if stamped_pid(home) == Some(u64::from(daemon.0.id())) && serving(home).is_some() {
+                return daemon;
+            }
+            if daemon.0.try_wait().expect("try_wait").is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(Instant::now() < deadline, "no daemon ever served");
+        std::thread::sleep(Duration::from_secs(2));
+    }
+}
+
+#[test]
+fn a_prepare_child_that_outlives_its_daemon_does_not_write_beside_the_next_one() {
+    // A daemon dies alone, as one started by hand can, and the kernel frees its
+    // lock. Its child went on filling gaps with no lock of its own, and the next
+    // daemon's child filled the same gaps: duplicate sequence numbers and every
+    // turn twice, for good.
+    let home = tempfile::tempdir().expect("tempdir");
+    let first = Daemon(daemon_in(home.path()).spawn().expect("first"));
+    wait_serving(home.path(), first.0.id());
+    hook(home.path(), &prompt("p0", "first"));
+    drop(first);
+    a_long_transcript_with_three_gaps(home.path());
+
+    let mut a = daemon_in(home.path()).spawn().expect("a");
+    let a_pid = a.id();
+    until_it_has_a_child(a_pid);
+    Command::new("/bin/kill")
+        .args(["-TERM", &a_pid.to_string()])
+        .status()
+        .expect("kill");
+    a.wait().expect("reap");
+
+    // The daemon has gone and the claim has not, as a lock taken from outside shows.
+    let lock = std::fs::File::open(home.path().join("daemon.lock")).expect("lock");
+    let claimed = matches!(lock.try_lock(), Err(std::fs::TryLockError::WouldBlock));
+    drop(lock);
+
+    let b = a_daemon_under_a_service_manager(home.path());
+    // Anything still writing beside it has time to show here.
+    std::thread::sleep(Duration::from_secs(8));
+    drop(b);
+
+    assert!(
+        claimed,
+        "the claim went with the daemon, not with the child"
+    );
+    let all = records(home.path());
+    let mut seqs: Vec<u64> = all.iter().filter_map(|r| r["seq"].as_u64()).collect();
+    let total = seqs.len();
+    seqs.sort_unstable();
+    seqs.dedup();
+    let gaps = all
+        .iter()
+        .filter(|r| {
+            r["vendor_turn_id"]
+                .as_str()
+                .is_some_and(|t| t.starts_with("gap"))
+        })
+        .count();
+    assert_eq!(
+        (total - seqs.len(), gaps),
+        (0, 3),
+        "(duplicate seq, gap turn records)"
+    );
+}

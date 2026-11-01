@@ -12,7 +12,9 @@ the entry says so when it does.
   to overwrite the live daemon's stamp, fill gaps and drain the spool, and only
   then lose the socket, which could leave a duplicate `seq` on disk. A daemon now
   takes a lock on `daemon.lock` first, waits up to five seconds for the recorder
-  already there to go, and otherwise exits having written nothing.
+  already there to go, and otherwise exits having written nothing. A start-up repair
+  that outlives its daemon holds that lock until it ends, so the next daemon waits
+  for it rather than writing beside it.
 
 ## [1.0.0-rc.3] — 2026-11-01
 
