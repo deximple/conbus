@@ -40,6 +40,9 @@ write_fake() {
     path=$3
     install_body='touch "$HOME/.install-called"'
     case $persona in
+        old) install_body='touch "$HOME/.install-called"; printf "{\"build\":\"'"$tag"'\",\"pid\":$$,\"started\":\"2026-11-01T10:00:00.000Z\",\"serving\":\"2026-11-01T10:00:04.000Z\"}\n" > "$HOME/.conbus/daemon.build"'
+            doctor='printf "{\"build\":\"'"$tag"'\",\"pid\":$$,\"started\":\"2026-11-01T10:00:00.000Z\",\"serving\":\"2026-11-01T10:00:04.000Z\"}\n" > "$HOME/.conbus/daemon.build"; echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid $$ since 2026-11-01T10:00:00.000Z"; echo "disk      log 1.0 MB — 1.0 GB free of 2.0 GB (50.0%)"; echo "log       5 record(s), 1 conversation(s), 0 unreadable line(s)"; echo "hooks     claude_code  runs — x"; echo "events    claude_code  13/13 registered"' ;;
+        diskwarn) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "disk      log 1.0 MB — 0.1 GB free of 2.0 GB (5.0%) — WARNING: under 10% free"; echo "log       5 record(s), 1 conversation(s), 0 unreadable line(s)"' ;;
         silent) doctor='echo "socket    $HOME/.conbus/conbus.sock — not answering"; echo "disk      log 1.0 MB — 1.0 GB free of 2.0 GB (50.0%)"; echo "log       5 record(s), 1 conversation(s), 0 unreadable line(s)"' ;;
         live) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "disk      log 1.0 MB — 1.0 GB free of 2.0 GB (50.0%)"; echo "log       5 record(s), 1 conversation(s), 0 unreadable line(s)"; echo "hooks     claude_code  runs — $HOME/.local/bin/conbus hook"; echo "events    claude_code  13/13 registered"' ;;
         differs) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build aaaa pid 9999 since 2026-11-01T10:00:00.000Z — DIFFERS from this binary ('"$tag"'); restart the daemon"' ;;
@@ -77,7 +80,7 @@ EOF
 
 # --- fixtures ---------------------------------------------------------------
 
-write_fake 01d silent "$install_dir/conbus"          # the installed "0.2.8"
+write_fake 01d old "$install_dir/conbus"          # the installed "0.2.8"
 write_fake beef live "$tmp/stage/conbus-good"        # a healthy candidate
 write_fake beef differs "$tmp/stage/conbus-differs"
 write_fake beef hookfail "$tmp/stage/conbus-hookfail"
@@ -185,7 +188,17 @@ write_fake bad differs "$install_dir/conbus"
 code=0
 run preflight >/dev/null 2>&1 || code=$?
 expect 1 "$code" "preflight fails on DIFFERS"
-write_fake 01d silent "$install_dir/conbus"
+write_fake bad diskwarn "$install_dir/conbus"
+code=0
+run preflight >"$tmp/preflight-disk.out" 2>&1 || code=$?
+expect 1 "$code" "a disk WARNING fails preflight"
+expect_grep '^FAIL disk' "$tmp/preflight-disk.out" "the disk line is named"
+code=0
+CONBUS_CANARY_DISK_WARN_OK=1 run preflight >"$tmp/preflight-disk-ok.out" 2>&1 || code=$?
+expect 0 "$code" "CONBUS_CANARY_DISK_WARN_OK=1 accepts the warning"
+expect_grep '^WARN disk' "$tmp/preflight-disk-ok.out" "the disk line downgrades to WARN"
+expect_grep 'CONBUS_CANARY_DISK_WARN_OK' "$tmp/preflight-disk-ok.out" "the acceptance is named"
+write_fake 01d old "$install_dir/conbus"
 
 # Under a rehearsal HOME the signature check warns, does not fail — the fake
 # candidate is a shell script and can never carry a signature.
@@ -347,7 +360,7 @@ expect_grep '"candidate_build":"beef"' "$home/.conbus/canary.json" "canary.json 
 
 # The same swap through the real code path: install --apply runs (the fake
 # answers for it) and its marker proves the branch was real.
-write_fake 01d silent "$install_dir/conbus"
+write_fake 01d old "$install_dir/conbus"
 rm -f "$rollback_bin" "$home/.conbus/canary.json" "$home/.install-called"
 daemon_boot beef 4244
 code=0
@@ -359,7 +372,7 @@ expect "conbus 0.0.0-beef (beef)" "$("$install_dir/conbus" --version)" "the cand
 # F1 — the swap-window drop a normal cutover produces: the new hook (v6)
 # reaches the old daemon (v5), is refused, and cannot spool because the old
 # stamp names no retention. Counted, recorded, NOT rolled back.
-write_fake 01d silent "$install_dir/conbus"
+write_fake 01d old "$install_dir/conbus"
 rm -f "$home/.install-called" "$home/.conbus/canary.json"
 cat >"$home/.conbus/drops.jsonl" <<'EOF'
 {"ts":"2026-10-30T09:00:00.000Z","reason":"socket closed early"}
@@ -374,7 +387,7 @@ expect_grep '"swap_window_drops":1' "$home/.conbus/canary.json" \
 
 # A drop reason that is NOT a swap artifact still rolls back under the
 # real path — the tolerance is narrow by design.
-write_fake 01d silent "$install_dir/conbus"
+write_fake 01d old "$install_dir/conbus"
 rm -f "$rollback_bin" "$home/.install-called" "$home/.conbus/canary.json"
 cat >"$home/.conbus/drops.jsonl" <<'EOF'
 {"ts":"2026-10-30T09:00:00.000Z","reason":"socket closed early"}
@@ -405,6 +418,7 @@ expect 1 "$code" "no serving stamp -> start exits 1"
 expect_live 01d "no serving stamp -> rolled back automatically"
 expect_grep "rolling back" "$tmp/noserve.out" "the rollback is announced"
 expect_grep "serving" "$tmp/noserve.out" "the reason names serving"
+expect_grep "rollback verified" "$tmp/noserve.out" "the old build came back and is verified"
 
 # DIFFERS: the answering daemon is another build -> auto rollback.
 daemon_boot beef 4301
@@ -413,6 +427,7 @@ SERVING_LIMIT=2 run start --from "$tmp/stage/conbus-differs" >"$tmp/diff.out" 2>
 expect 1 "$code" "DIFFERS -> start exits 1"
 expect_live 01d "DIFFERS -> rolled back automatically"
 expect_grep "different build" "$tmp/diff.out" "the reason names the build"
+expect_grep "rollback verified" "$tmp/diff.out" "the old build came back and is verified"
 
 # a hook is not `runs` -> auto rollback.
 daemon_boot beef 4302
@@ -421,6 +436,7 @@ SERVING_LIMIT=2 run start --from "$tmp/stage/conbus-hookfail" >"$tmp/hook.out" 2
 expect 1 "$code" "a hook not runs -> start exits 1"
 expect_live 01d "a hook not runs -> rolled back automatically"
 expect_grep "hook" "$tmp/hook.out" "the reason names the hook"
+expect_grep "rollback verified" "$tmp/hook.out" "the old build came back and is verified"
 
 # a new drop reason after the swap -> auto rollback. (drops reset to a clean
 # baseline — a reason already in the log is 'known' and tolerated, so the
@@ -434,6 +450,34 @@ SERVING_LIMIT=2 run start --from "$tmp/stage/conbus-dropper" >"$tmp/drop.out" 2>
 expect 1 "$code" "a new drop reason -> start exits 1"
 expect_live 01d "a new drop reason -> rolled back automatically"
 expect_grep "drop" "$tmp/drop.out" "the reason names drops"
+expect_grep "rollback verified" "$tmp/drop.out" "the old build came back and is verified"
+
+# (b) a post-swap failure whose rollback never comes back: the restored
+# binary cannot boot a daemon, so the stamp keeps the candidate's pid and
+# build. exit 3, not the ordinary 1.
+write_fake 01d silent "$rollback_bin"
+restore_candidate
+code=0
+SERVING_LIMIT=1 run start --from "$tmp/stage/conbus-dropper" >"$tmp/norb.out" 2>&1 || code=$?
+expect 3 "$code" "unverified rollback -> start exits 3"
+expect_grep "ROLLBACK NOT VERIFIED" "$tmp/norb.out" "the script says the rollback was not verified"
+expect_live 01d "the rollback binary was still moved back"
+rm -f "$rollback_bin"
+
+# (c) the rollback subcommand, verified and not.
+write_fake 01d old "$rollback_bin"
+daemon_boot beef 4401
+code=0
+run rollback >"$tmp/rb-ok.out" 2>&1 || code=$?
+expect 0 "$code" "rollback exits 0 when the old build is verified"
+expect_grep "rollback verified" "$tmp/rb-ok.out" "the verification is announced"
+write_fake 01d silent "$rollback_bin"
+daemon_boot beef 4402
+code=0
+SERVING_LIMIT=1 run rollback >"$tmp/rb-bad.out" 2>&1 || code=$?
+expect 3 "$code" "rollback exits 3 when the old build never serves a stamp"
+expect_grep "ROLLBACK NOT VERIFIED" "$tmp/rb-bad.out" "the failure is announced"
+rm -f "$rollback_bin"
 
 # --- restart + verdict -------------------------------------------------------
 
@@ -643,7 +687,7 @@ expect_grep '"new_drops":0' "$home/.conbus/canary.json" "it is not counted as a 
 # rollback reports the spool it leaves behind.
 mkdir -p "$home/.conbus/spool"
 touch "$home/.conbus/spool/req-1" "$home/.conbus/spool/req-2"
-write_fake 01d silent "$rollback_bin"
+write_fake 01d old "$rollback_bin"
 run rollback >"$tmp/rollback.out" 2>&1
 expect 0 $? "rollback"
 expect "conbus 0.0.0-01d (01d)" "$("$install_dir/conbus" --version 2>&1 || echo x)" "rollback restored the original"
