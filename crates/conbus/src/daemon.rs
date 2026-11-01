@@ -1080,6 +1080,7 @@ struct Restored {
 pub fn prepare(paths: &Paths, retention: Retention) -> io::Result<()> {
     // No core dump of a process holding every prompt on the machine.
     let _ = harden::harden();
+    let t0 = std::time::Instant::now();
     let mut scan =
         SegmentLog::scan_meta(paths.log_dir(), Some(&paths.cache_dir())).unwrap_or_else(|err| {
             note!(
@@ -1088,6 +1089,7 @@ pub fn prepare(paths: &Paths, retention: Retention) -> io::Result<()> {
             );
             Scan::default()
         });
+    let t_scan = t0.elapsed();
     let mut log = SegmentLog::open(paths.log_dir(), retention)?;
     // Official transcripts only, same parser as `backfill --gaps`. Turns
     // that happened while no recorder was running join the live `bus_id`
@@ -1105,11 +1107,18 @@ pub fn prepare(paths: &Paths, retention: Retention) -> io::Result<()> {
         }
         Err(err) => note!("gap fill skipped ({err})"),
     }
+    let t_gaps = t0.elapsed() - t_scan;
     match repair_splits(&scan.records, &mut log) {
         Ok(0) => {}
         Ok(n) => note!("aliased {n} split conversation pair(s)"),
         Err(err) => note!("split alias skipped ({err})"),
     }
+    note!(
+        "prepare breakdown: meta scan {} ms, gap fill {} ms, split repair {} ms",
+        t_scan.as_millis(),
+        t_gaps.as_millis(),
+        (t0.elapsed() - t_scan - t_gaps).as_millis()
+    );
     Ok(())
 }
 
