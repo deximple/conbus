@@ -1885,12 +1885,18 @@ fn recover_codex(
     Ok(())
 }
 
-/// Every turn of one thread, page by page.
+/// Every turn of one thread, oldest first, page by page.
+///
+/// The order has to be asked for: `sortDirection` "defaults to descending", in the
+/// schema of codex-cli 0.166.0. Read newest first, an older turn's reply lands on a
+/// newer prompt, a running turn gets an ending that is not its own, and a filled
+/// batch ends on its oldest turn.
 fn list_turns(server: &mut AppServer, thread_id: &str) -> io::Result<Vec<serde_json::Value>> {
     let mut turns = Vec::new();
     let mut cursor: Option<String> = None;
     loop {
-        let mut params = serde_json::json!({"threadId": thread_id, "limit": 100});
+        let mut params =
+            serde_json::json!({"threadId": thread_id, "limit": 100, "sortDirection": "asc"});
         if let Some(cursor) = &cursor {
             params["cursor"] = serde_json::json!(cursor);
         }

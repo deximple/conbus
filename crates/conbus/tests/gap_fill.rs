@@ -841,9 +841,24 @@ fn a_spool_file_nobody_can_read_does_not_stop_the_fill() {
 
 const THREAD: &str = "01a19463-cbd4-7b50-b819-000000000abc";
 
+/// What every stand-in `codex app-server` starts with: `thread/turns/list` as the
+/// real one answers it. The schema of codex-cli 0.166.0 says of `sortDirection`
+/// "defaults to descending", and the cursor goes on in the direction asked for.
+/// `turns` is given oldest first. A stand-in that listed oldest first whatever it
+/// was asked hid that the fill never asked.
+const TURNS_ANSWER: &str = r#"#!/usr/bin/env python3
+import json, os, sys, time
+def turns_page(msg, turns, page_size=100):
+    params = msg["params"]
+    listed = list(turns) if params.get("sortDirection") == "asc" else list(reversed(turns))
+    at = int(params.get("cursor") or 0)
+    size = min(params.get("limit") or page_size, page_size)
+    more = at + size < len(listed)
+    return {"jsonrpc":"2.0","id":msg.get("id"),"result":{"data":listed[at:at + size],"nextCursor":str(at + size) if more else None}}
+"#;
+
 /// A stand-in `codex app-server` that lists one completed turn, `t1`.
-const FAKE_APP_SERVER: &str = r#"#!/usr/bin/env python3
-import json, sys
+const FAKE_APP_SERVER: &str = r#"
 for line in sys.stdin:
     try: msg = json.loads(line)
     except Exception: continue
@@ -852,7 +867,7 @@ for line in sys.stdin:
     elif m == "thread/turns/list":
         data = [{"id":"t1","items":[{"type":"userMessage","content":[{"type":"text","text":"during"}]},{"type":"agentMessage","text":"a1"}],
                  "status":"completed","startedAt":1788368800,"completedAt":1788368801}]
-        print(json.dumps({"jsonrpc":"2.0","id":i,"result":{"data":data,"nextCursor":None}}), flush=True)
+        print(json.dumps(turns_page(msg, data)), flush=True)
 "#;
 
 fn codex_prompt(turn: &str, text: &str) -> String {
@@ -877,8 +892,7 @@ fn codex_rollout(home: &Path) {
 fn the_codex_pass_does_not_write_a_spooled_turn_twice() {
     // It also lists t2, which nothing spooled: filling it shows the pass ran, and
     // a Codex that could not start would pass this for the wrong reason.
-    const LISTS_TWO_TURNS: &str = r#"#!/usr/bin/env python3
-import json, sys
+    const LISTS_TWO_TURNS: &str = r#"
 def turn(i, said, reply):
     return {"id":i,"items":[{"type":"userMessage","content":[{"type":"text","text":said}]},{"type":"agentMessage","text":reply}],
             "status":"completed","startedAt":1788368800,"completedAt":1788368801}
@@ -889,13 +903,11 @@ for line in sys.stdin:
     if m == "initialize": print(json.dumps({"jsonrpc":"2.0","id":i,"result":{"userAgent":"fake"}}), flush=True)
     elif m == "thread/turns/list":
         data = [turn("t1", "during", "a1"), turn("t2", "only the thread holds this", "a2")]
-        print(json.dumps({"jsonrpc":"2.0","id":i,"result":{"data":data,"nextCursor":None}}), flush=True)
+        print(json.dumps(turns_page(msg, data)), flush=True)
 "#;
     let dir = tempfile::tempdir().expect("tempdir");
     let home = dir.path();
-    let stub = tempfile::tempdir().expect("stub");
-    let fake = stub.path().join("codex");
-    support::write_executable(&fake, LISTS_TWO_TURNS);
+    let (_stub, fake) = codex_stand_in(LISTS_TWO_TURNS);
     let daemon = start(home);
     hook_as(home, "codex", &codex_prompt("t0", "before"));
     stop(daemon);
@@ -1144,6 +1156,11 @@ fn stand_in(script: &str) -> (tempfile::TempDir, PathBuf) {
     (dir, path)
 }
 
+/// A stand-in `codex app-server`: `body` is its loop, after [`TURNS_ANSWER`].
+fn codex_stand_in(body: &str) -> (tempfile::TempDir, PathBuf) {
+    stand_in(&format!("{TURNS_ANSWER}{body}"))
+}
+
 /// One start with this binary answering for Codex.
 fn start_with_codex(home: &Path, codex: &Path) {
     let daemon = wait_serving(
@@ -1232,7 +1249,7 @@ fn newer_records_arrive(home: &Path) {
 fn a_range_the_codex_pass_could_not_read_is_read_by_the_next_start_that_can() {
     let dir = tempfile::tempdir().expect("tempdir");
     let home = dir.path();
-    let (_stub, fake) = stand_in(FAKE_APP_SERVER);
+    let (_stub, fake) = codex_stand_in(FAKE_APP_SERVER);
     a_live_codex_thread(home);
     stop(start(home)); // the app-server cannot start
     newer_records_arrive(home);
@@ -1257,8 +1274,7 @@ fn an_app_server_that_dies_part_way_keeps_the_range() {
     let home = dir.path();
     let witness = home.join("the-stand-in-was-asked");
     let dies = format!(
-        r#"#!/usr/bin/env python3
-import json, sys
+        r#"
 for line in sys.stdin:
     msg = json.loads(line)
     if msg.get("method") == "initialize":
@@ -1269,7 +1285,7 @@ for line in sys.stdin:
 "#,
         witness.to_str().expect("utf-8")
     );
-    let (_stub, fake) = stand_in(&dies);
+    let (_stub, fake) = codex_stand_in(&dies);
     a_live_codex_thread(home);
 
     start_with_codex(home, &fake);
@@ -1282,8 +1298,7 @@ for line in sys.stdin:
 fn a_thread_the_app_server_refuses_does_not_hold_the_range_for_ever() {
     // Asking again gets the same answer, and a range that never clears has every
     // later start bring up the app-server again.
-    const REFUSES: &str = r#"#!/usr/bin/env python3
-import json, sys
+    const REFUSES: &str = r#"
 for line in sys.stdin:
     msg = json.loads(line)
     if msg.get("method") == "initialize":
@@ -1293,7 +1308,7 @@ for line in sys.stdin:
 "#;
     let dir = tempfile::tempdir().expect("tempdir");
     let home = dir.path();
-    let (_stub, fake) = stand_in(REFUSES);
+    let (_stub, fake) = codex_stand_in(REFUSES);
     a_live_codex_thread(home);
 
     start_with_codex(home, &fake);
@@ -1322,7 +1337,7 @@ fn backfill_gaps(home: &Path, codex: &Path, apply: bool) -> (bool, String) {
 fn backfill_gaps_fills_a_live_codex_thread() {
     let dir = tempfile::tempdir().expect("tempdir");
     let home = dir.path();
-    let (_stub, fake) = stand_in(FAKE_APP_SERVER);
+    let (_stub, fake) = codex_stand_in(FAKE_APP_SERVER);
     a_live_codex_thread(home);
     let bus = log_lines(home)
         .iter()
@@ -1373,8 +1388,7 @@ const THREADS: [&str; 6] = [
 
 /// A stand-in that answers one thread per call, slowly, so a budget covers only
 /// some of them.
-const SLOW_APP_SERVER: &str = r#"#!/usr/bin/env python3
-import json, sys, time
+const SLOW_APP_SERVER: &str = r#"
 for line in sys.stdin:
     msg = json.loads(line)
     m = msg.get("method"); i = msg.get("id")
@@ -1385,7 +1399,7 @@ for line in sys.stdin:
         t = msg["params"]["threadId"]
         data = [{"id":"turn-of-"+t,"items":[{"type":"userMessage","content":[{"type":"text","text":"said in "+t}]},{"type":"agentMessage","text":"a"}],
                  "status":"completed","startedAt":1788368800,"completedAt":1788368801}]
-        print(json.dumps({"jsonrpc":"2.0","id":i,"result":{"data":data,"nextCursor":None}}), flush=True)
+        print(json.dumps(turns_page(msg, data)), flush=True)
 "#;
 
 /// Every thread live, the first of them the most recently touched: the order the
@@ -1413,7 +1427,7 @@ fn live_threads_touched_in_order(home: &Path) {
 fn threads_a_budget_cut_off_are_reached_by_later_starts() {
     let dir = tempfile::tempdir().expect("tempdir");
     let home = dir.path();
-    let (_stub, fake) = stand_in(SLOW_APP_SERVER);
+    let (_stub, fake) = codex_stand_in(SLOW_APP_SERVER);
     // Its first exec can take seconds on a loaded machine. Charged to a start, that
     // would read as an app-server that stalled.
     let warmed = Command::new(&fake)
@@ -1464,9 +1478,8 @@ fn threads_a_budget_cut_off_are_reached_by_later_starts() {
 fn a_thread_that_kills_the_app_server_does_not_starve_the_ones_behind_it() {
     let dir = tempfile::tempdir().expect("tempdir");
     let home = dir.path();
-    let (_stub, fake) = stand_in(&format!(
-        r#"#!/usr/bin/env python3
-import json, sys
+    let (_stub, fake) = codex_stand_in(&format!(
+        r#"
 for line in sys.stdin:
     msg = json.loads(line)
     m = msg.get("method"); i = msg.get("id")
@@ -1478,7 +1491,7 @@ for line in sys.stdin:
             sys.exit(1)
         data = [{{"id":"turn-of-"+t,"items":[{{"type":"userMessage","content":[{{"type":"text","text":"said in "+t}}]}},{{"type":"agentMessage","text":"a"}}],
                  "status":"completed","startedAt":1788368800,"completedAt":1788368801}}]
-        print(json.dumps({{"jsonrpc":"2.0","id":i,"result":{{"data":data,"nextCursor":None}}}}), flush=True)
+        print(json.dumps(turns_page(msg, data)), flush=True)
 "#,
         first = THREADS[0]
     ));
@@ -1505,8 +1518,7 @@ for line in sys.stdin:
 #[test]
 fn the_codex_pass_does_not_copy_a_parent_thread_into_its_fork() {
     // Older than THREAD, so older than the thread that lists it.
-    const LISTS_THE_PARENTS_TURN: &str = r#"#!/usr/bin/env python3
-import json, sys
+    const LISTS_THE_PARENTS_TURN: &str = r#"
 def turn(i, said):
     return {"id":i,"items":[{"type":"userMessage","content":[{"type":"text","text":said}]},{"type":"agentMessage","text":"a"}],
             "status":"completed","startedAt":1788368800,"completedAt":1788368801}
@@ -1518,11 +1530,11 @@ for line in sys.stdin:
     elif m == "thread/turns/list":
         data = [turn("01a00000-0000-7000-8000-000000000001", "the parent's prompt"),
                 turn("01a19463-ffff-7000-8000-000000000002", "the fork's own prompt")]
-        print(json.dumps({"jsonrpc":"2.0","id":i,"result":{"data":data,"nextCursor":None}}), flush=True)
+        print(json.dumps(turns_page(msg, data)), flush=True)
 "#;
     let dir = tempfile::tempdir().expect("tempdir");
     let home = dir.path();
-    let (_stub, fake) = stand_in(LISTS_THE_PARENTS_TURN);
+    let (_stub, fake) = codex_stand_in(LISTS_THE_PARENTS_TURN);
     a_live_codex_thread(home);
 
     start_with_codex(home, &fake);
@@ -1639,7 +1651,7 @@ fn an_app_server_that_is_only_missing_is_tried_every_start() {
     // It costs nothing, and installing Codex should fill the range at the next one.
     let dir = tempfile::tempdir().expect("tempdir");
     let home = dir.path();
-    let (_stub, fake) = stand_in(FAKE_APP_SERVER);
+    let (_stub, fake) = codex_stand_in(FAKE_APP_SERVER);
     a_live_codex_thread(home);
     stop(start(home)); // the app-server cannot start
 
@@ -1660,7 +1672,7 @@ fn backfill_gaps_by_hand_asks_a_stalled_app_server_regardless() {
     let (_stub, fake) = a_stalled_app_server();
     a_live_codex_thread(home);
     start_with_stalled_codex(home, &fake);
-    let (_stub2, working) = stand_in(FAKE_APP_SERVER);
+    let (_stub2, working) = codex_stand_in(FAKE_APP_SERVER);
 
     let (ok, said) = backfill_gaps(home, &working, true);
 
@@ -1668,5 +1680,80 @@ fn backfill_gaps_by_hand_asks_a_stalled_app_server_regardless() {
     assert!(
         said.contains("1 thread(s), 1 turn(s), 2 record(s)"),
         "{said}"
+    );
+}
+
+/// A thread's turns, given oldest first, listed the way the real server lists them.
+/// `page_size` is what the server keeps a page to.
+fn turns_of_a_thread(turns: &str, page_size: u32) -> String {
+    format!(
+        r#"
+def prompt(i, said, reply=None, status="completed"):
+    items=[{{"type":"userMessage","content":[{{"type":"text","text":said}}]}}]
+    if reply: items.append({{"type":"agentMessage","text":reply}})
+    return {{"id":i,"items":items,"status":status,"startedAt":1788368800,"completedAt":1788368801 if status=="completed" else None}}
+def only_reply(i, reply):
+    return {{"id":i,"items":[{{"type":"agentMessage","text":reply}}],"status":"completed","startedAt":1788368800,"completedAt":1788368801}}
+for line in sys.stdin:
+    msg = json.loads(line)
+    m = msg.get("method"); i = msg.get("id")
+    if m == "initialize":
+        print(json.dumps({{"jsonrpc":"2.0","id":i,"result":{{"userAgent":"fake"}}}}), flush=True)
+    elif m == "thread/turns/list":
+        print(json.dumps(turns_page(msg, {turns}, {page_size})), flush=True)
+"#
+    )
+}
+
+fn turns_filled(all: &[Value]) -> Vec<String> {
+    all.iter()
+        .filter(|record| {
+            record["event"] == "turn_started" && record.get("backfilled_from").is_some()
+        })
+        .map(|record| record["vendor_turn_id"].as_str().unwrap_or("-").to_string())
+        .collect()
+}
+
+#[test]
+fn a_running_codex_turn_gets_no_ending_from_an_older_turns_reply() {
+    // Listed newest first, the reply-only turn came straight after the running
+    // prompt, and its reply and `completed` landed on it for good.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let (_stub, fake) = codex_stand_in(&turns_of_a_thread(
+        r#"[prompt("t1","older prompt","older first reply"), only_reply("t2","an older reply"), prompt("t3","still running",None,"inProgress")]"#,
+        100,
+    ));
+    a_live_codex_thread(home);
+
+    start_with_codex(home, &fake);
+
+    let all = log_lines(home);
+    assert_eq!(turns_filled(&all), ["t1", "t3"], "\n{}", show(&all));
+    let endings: Vec<&Value> = all
+        .iter()
+        .filter(|record| record["event"] == "turn_ended")
+        .collect();
+    assert_eq!(endings.len(), 1, "\n{}", show(&all));
+    assert_eq!(endings[0]["vendor_turn_id"], "t1");
+    assert_eq!(endings[0]["assistant_message"]["text"], "an older reply");
+}
+
+#[test]
+fn a_filled_codex_thread_is_written_oldest_first_across_pages() {
+    // The log's newest record decides what a reader takes as the last turn.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let (_stub, fake) = codex_stand_in(&turns_of_a_thread(
+        r#"[prompt("t1","oldest","a1"), prompt("t2","middle","a2"), prompt("t3","next","a3"), prompt("t4","newest","a4"), prompt("t5","latest","a5")]"#,
+        2,
+    ));
+    a_live_codex_thread(home);
+
+    start_with_codex(home, &fake);
+
+    assert_eq!(
+        turns_filled(&log_lines(home)),
+        ["t1", "t2", "t3", "t4", "t5"]
     );
 }

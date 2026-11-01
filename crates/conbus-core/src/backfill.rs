@@ -504,6 +504,9 @@ pub const CODEX_THREAD: &str = "codex_thread";
 /// back to 0.107.0 on the same machine, so the version skew the plan feared
 /// belongs to rollout files, not to this surface. Read tolerantly, like the
 /// transcript parser: what it does not understand is counted, not fatal.
+///
+/// `turns` are oldest first, which the server gives only when asked. A reply is
+/// paired with the prompt before it, so this order is what makes the pairing true.
 pub fn parse_codex_thread(thread: &serde_json::Value, turns: &[serde_json::Value]) -> Recovered {
     let mut out = Recovered::default();
     let Some(bus_id) = thread
