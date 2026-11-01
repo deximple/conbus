@@ -1148,8 +1148,8 @@ fn nameless(records: &[Record]) -> Vec<(BusId, String, usize)> {
     found
 }
 
-fn report_nameless(records: &[Record]) {
-    for (bus, harness, n) in nameless(records) {
+fn report_nameless(sessions: Vec<(BusId, String, usize)>) {
+    for (bus, harness, n) in sessions {
         println!(
             "nameless  {bus} — {n} {harness} record(s) keyed on an empty session id by an older \
              build; they came from sessions that named none and may belong to several"
@@ -1157,8 +1157,7 @@ fn report_nameless(records: &[Record]) {
     }
 }
 
-fn report_twins(records: &[Record]) {
-    let summary = twins(records);
+fn report_twins(summary: Twins) {
     if summary.total == 0 {
         println!("twins     none");
         return;
@@ -1321,17 +1320,38 @@ pub fn doctor(paths: &Paths) -> io::Result<()> {
     // Sessions the log holds twice, and which copy a restart would continue.
     // The binding is the daemon's decision, so this asks the same code the
     // daemon runs at start rather than guessing at it.
-    report_twins(&scan.records);
-    report_nameless(&scan.records);
-
-    // What a session opening in each checkout would have been told, replayed
-    // over the whole log. The briefing is live since 2026-09-01; this replay is
-    // the offline measurement of the same decision, the one that
-    // has to come first, because how often it speaks and how wide it speaks is
-    // the only way to know whether it is chrome before it is chrome in front of
-    // a person.
+    // Every one of these is an independent fold over the same immutable
+    // scan — run them at once so their wall time is the longest fold rather
+    // than the sum of them. Output order is the println!s below, not the
+    // order the threads finish in.
     let home = std::env::var("HOME").ok();
-    let replay = conbus_core::continuation::replay(&scan.records, home.as_deref());
+    let (replay, meter, twins_summary, nameless_sessions, warm, claude, route) =
+        std::thread::scope(|scope| {
+            let replay_t =
+                scope.spawn(|| conbus_core::continuation::replay(&scan.records, home.as_deref()));
+            let meter_t = scope.spawn(|| conbus_core::meter::Meter::fold(&scan.records));
+            let twin_t = scope.spawn(|| (twins(&scan.records), nameless(&scan.records)));
+            let warm_t = scope.spawn(|| {
+                (
+                    crate::hop::live_warm_threads(&scan.records),
+                    crate::hop::live_claude_sessions(&scan.records),
+                    crate::hop::decide_from(paths, &scan.records, None),
+                )
+            });
+            let (twins_summary, nameless_sessions) = twin_t.join().expect("twins");
+            let (warm, claude, route) = warm_t.join().expect("warm");
+            (
+                replay_t.join().expect("replay"),
+                meter_t.join().expect("meter"),
+                twins_summary,
+                nameless_sessions,
+                warm,
+                claude,
+                route,
+            )
+        });
+    report_twins(twins_summary);
+    report_nameless(nameless_sessions);
     println!("briefing  {} conversation(s) judged", replay.total());
     for (verdict, count) in &replay.verdicts {
         println!("          {count:>6}  {verdict}");
@@ -1364,22 +1384,19 @@ pub fn doctor(paths: &Paths) -> io::Result<()> {
         crate::quota::describe_claude(paths, now)
     );
 
-    let meter = conbus_core::meter::Meter::fold(&scan.records);
     println!("{}", meter.describe());
     println!("{}", meter.describe_provenance());
     println!("{}", meter.describe_cost());
     println!("{}", meter.describe_turns());
     println!("verdict   conbus verdict — 4-week dogfood score; open window is not a kill");
     println!("{}", cursor_line(&scan.records));
-    match crate::hop::decide_from(paths, &scan.records, None) {
+    match route {
         Ok(line) => println!("route     {line}"),
         Err(err) => println!("route     unavailable — {err}"),
     }
     if let Some(line) = crate::takeover::describe(paths) {
         println!("takeover  {line}");
     }
-    let warm = crate::hop::live_warm_threads(&scan.records);
-    let claude = crate::hop::live_claude_sessions(&scan.records);
     if warm.is_empty() && claude.is_empty() {
         println!("warm      none");
     } else {

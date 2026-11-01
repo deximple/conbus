@@ -315,7 +315,7 @@ impl Replay {
 /// marked — so the measurement is now informative on its own.
 pub fn replay(records: &[Record], home: Option<&str>) -> Replay {
     let mut by_time: Vec<&Record> = records.iter().collect();
-    by_time.sort_by_key(|record| (record.ts, record.seq));
+    by_time.sort_unstable_by_key(|record| (record.ts, record.seq));
 
     // Which checkout each conversation happened in, read from the whole log
     // rather than incrementally.
