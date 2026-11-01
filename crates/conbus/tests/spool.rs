@@ -324,10 +324,10 @@ fn a_thousand_hooks_survive_a_daemon_restart() {
     let mut dup_hook_ids = 0u64;
     for line in String::from_utf8_lossy(&output.stdout).lines() {
         let record: serde_json::Value = serde_json::from_str(line).expect("record");
-        if let Some(h) = record.get("hook_id").and_then(|h| h.as_str()) {
-            if !hook_ids.insert(h.to_string()) {
-                dup_hook_ids += 1;
-            }
+        if let Some(h) = record.get("hook_id").and_then(|h| h.as_str())
+            && !hook_ids.insert(h.to_string())
+        {
+            dup_hook_ids += 1;
         }
         if let Some(id) = record
             .get("tool_use_id")
