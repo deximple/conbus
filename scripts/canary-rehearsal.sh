@@ -34,6 +34,11 @@ mkdir -p "$install_dir" "$tmp/stage" "$home/.conbus" \
 #               protocol refusal, like a hook firing mid-restart
 #   sessions  — its `install --apply` drops a sessionless refusal
 #   notokens  — usage rows without the tokens_* keys (the 0.2.8 shape)
+#   stuck     — doctor never answers: a wedged vendor probe, like the
+#               unbounded ones a 0.2.x doctor runs
+#   stuckboot — doctor stamps the daemon build, then never answers: the
+#               rollback-verify path can pass the stamp check and still
+#               hang on the agreeing-doctor check
 write_fake() {
     tag=$1
     persona=${2:-silent}
@@ -55,6 +60,8 @@ write_fake() {
         knowndrop) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "hooks     claude_code  runs — x"'
             install_body='touch "$HOME/.install-called"; printf "{\"ts\":\"%s\",\"reason\":\"socket closed early\"}\n" "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)" >> "$HOME/.conbus/drops.jsonl"' ;;
         notokens) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "hooks     claude_code  runs — x"' ;;
+        stuck) doctor='sleep 3600' ;;
+        stuckboot) doctor='printf "{\"build\":\"'"$tag"'\",\"pid\":$$,\"started\":\"2026-11-01T10:00:00.000Z\",\"serving\":\"2026-11-01T10:00:04.000Z\"}\n" > "$HOME/.conbus/daemon.build"; sleep 3600' ;;
     esac
     usage_rows='        echo "{\"day\":\"2026-10-30\",\"harness\":\"claude_code\",\"tool_denials\":0,\"repeated\":0,\"tokens_input\":1}"
         echo "{\"day\":\"2026-10-31\",\"harness\":\"codex\",\"tool_denials\":0,\"repeated\":0,\"tokens_output\":2}"
@@ -88,6 +95,7 @@ write_fake beef dropper "$tmp/stage/conbus-dropper"
 write_fake beef silent "$tmp/stage/conbus-noserve"   # daemon never serves
 write_fake beef swapdrop "$tmp/stage/conbus-swapdrop" # swap-window drop at install
 write_fake beef sessions "$tmp/stage/conbus-sessions" # sessionless drop at install
+write_fake beef stuck "$tmp/stage/conbus-stuck"       # doctor never answers
 
 cat >"$home/.conbus/daemon.build" <<'EOF'
 {"build":"01d","pid":4242,"started":"2026-10-31T10:00:00.000Z","serving":"2026-10-31T10:00:04.000Z"}
@@ -198,6 +206,14 @@ CONBUS_CANARY_DISK_WARN_OK=1 run preflight >"$tmp/preflight-disk-ok.out" 2>&1 ||
 expect 0 "$code" "CONBUS_CANARY_DISK_WARN_OK=1 accepts the warning"
 expect_grep '^WARN disk' "$tmp/preflight-disk-ok.out" "the disk line downgrades to WARN"
 expect_grep 'CONBUS_CANARY_DISK_WARN_OK' "$tmp/preflight-disk-ok.out" "the acceptance is named"
+
+# A wedged doctor — a vendor probe that never answers — must fail the
+# preflight inside CONBUS_CANARY_DOCTOR_LIMIT, not hang it.
+write_fake bad stuck "$install_dir/conbus"
+code=0
+CONBUS_CANARY_DOCTOR_LIMIT=2 run preflight >"$tmp/preflight-stuck.out" 2>&1 || code=$?
+expect 1 "$code" "a wedged doctor fails preflight instead of hanging it"
+expect_grep 'doctor' "$tmp/preflight-stuck.out" "the wedged doctor is named"
 write_fake 01d old "$install_dir/conbus"
 
 # Under a rehearsal HOME the signature check warns, does not fail — the fake
@@ -478,6 +494,36 @@ code=0
 SERVING_LIMIT=1 run rollback >"$tmp/rb-bad.out" 2>&1 || code=$?
 expect 3 "$code" "rollback exits 3 when the old build never serves a stamp"
 expect_grep "ROLLBACK NOT VERIFIED" "$tmp/rb-bad.out" "the failure is announced"
+rm -f "$rollback_bin"
+
+# A wedged doctor after the swap: the candidate's doctor never answers, so
+# the post-swap check hits CONBUS_CANARY_DOCTOR_LIMIT, fails, and rolls
+# back — the swap cannot hang on a vendor probe.
+write_fake 01d old "$install_dir/conbus"
+rm -f "$home/.install-called" "$home/.conbus/canary.json"
+daemon_boot beef 4403
+code=0
+CONBUS_CANARY_DOCTOR_LIMIT=2 SERVING_LIMIT=2 run_real start \
+    --from "$tmp/stage/conbus-stuck" >"$tmp/stuck.out" 2>&1 || code=$?
+expect 1 "$code" "a wedged doctor -> start exits 1 (rolled back, not a hang)"
+expect_live 01d "a wedged doctor -> rolled back automatically"
+expect_grep "did not answer" "$tmp/stuck.out" "the doctor cap is named"
+expect_grep "rollback verified" "$tmp/stuck.out" "the old build came back and is verified"
+
+# The same wedge on the rollback path: the rehearsal kick writes the old
+# build's stamp before the doctor hangs, so the stamp check passes and the
+# verifying call is the one that hits the cap -> ROLLBACK NOT VERIFIED.
+cat >"$home/.conbus/drops.jsonl" <<'EOF'
+{"ts":"2026-10-30T09:00:00.000Z","reason":"socket closed early"}
+EOF
+write_fake 01d stuckboot "$rollback_bin"
+restore_candidate
+daemon_boot beef 4404
+code=0
+CONBUS_CANARY_DOCTOR_LIMIT=2 SERVING_LIMIT=2 run start \
+    --from "$tmp/stage/conbus-dropper" >"$tmp/stuckrb.out" 2>&1 || code=$?
+expect 3 "$code" "a capped rollback-verify doctor -> exit 3"
+expect_grep "ROLLBACK NOT VERIFIED" "$tmp/stuckrb.out" "the cap-hit verification says NOT VERIFIED"
 rm -f "$rollback_bin"
 
 # --- restart + verdict -------------------------------------------------------

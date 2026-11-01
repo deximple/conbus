@@ -51,6 +51,10 @@
 #     `rollback` subcommand — is verified: the restored build must write a
 #     daemon.build stamp with a new pid and doctor must listen with no
 #     DIFFERS, else the script exits 3.
+#   - every doctor call is capped at CONBUS_CANARY_DOCTOR_LIMIT seconds
+#     (default 120): an old build's vendor probes are unbounded, and a
+#     wedged one must fail the check it is in — not hang it. A cap hit in
+#     verify_rollback exits 3 like any unverified rollback.
 #
 # The install dir is detected exactly the way install.sh places it:
 # $HOME/.local/bin. Swaps write beside the target and rename — never a copy
@@ -85,8 +89,45 @@ tail_ms_budget=${CONBUS_CANARY_TAIL_MS:-200}
 usage_ms_budget=${CONBUS_CANARY_USAGE_MS:-2000}
 doctor_ms_budget=${CONBUS_CANARY_DOCTOR_MS:-3000}
 serving_ms_budget=${CONBUS_CANARY_SERVING_MS:-5000}
+doctor_limit_s=${CONBUS_CANARY_DOCTOR_LIMIT:-120}
 
 is_uint() { case $1 in '' | *[!0-9]*) return 1 ;; *) return 0 ;; esac }
+
+# doctor under a wall-clock cap — CONBUS_CANARY_DOCTOR_LIMIT seconds
+# (default 120). 0.2.x's vendor probes have no bound and a wedged probe has
+# hung this script outright. The call runs detached with its output in a
+# file: a probe can outlive the doctor that spawned it, and a surviving
+# probe holding the command-substitution pipe would hang the caller anyway.
+# Exit 142 means the cap fired — callers treat it as "no answer", never as
+# a verdict on the daemon's health.
+run_doctor() {
+    df=$(mktemp "${TMPDIR:-/tmp}/canary-doctor.XXXXXX") || return 1
+    "$bin" doctor >"$df" 2>&1 &
+    dpid=$!
+    n=0
+    while kill -0 "$dpid" 2>/dev/null && [ $n -lt $((doctor_limit_s * 2)) ]; do
+        sleep 0.5
+        n=$((n + 1))
+    done
+    if kill -0 "$dpid" 2>/dev/null; then
+        # A probe the doctor spawned is a direct child — name it before the
+        # kill, since a dead doctor orphans it under launchd. Deeper
+        # descendants still escape, same as any killed tree.
+        kids=$(pgrep -P "$dpid" 2>/dev/null || true)
+        kill $kids "$dpid" 2>/dev/null || true
+        m=0
+        while kill -0 "$dpid" 2>/dev/null && [ $m -lt 10 ]; do
+            sleep 0.2
+            m=$((m + 1))
+        done
+        cat "$df"
+        rm -f "$df"
+        return 142
+    fi
+    wait "$dpid" 2>/dev/null || true
+    cat "$df"
+    rm -f "$df"
+}
 
 # HOME resolves to this user's passwd home — independent of SKIP or
 # REHEARSAL, so a rehearsal under it can be refused outright. `cd` with
@@ -348,13 +389,18 @@ verify_rollback() {
     if [ "$mode" = rehearsal ]; then
         # The reload is skipped under rehearsal; let the fake boot the old
         # build's daemon the way install --apply would have.
-        "$bin" doctor >/dev/null 2>&1 || true
+        run_doctor >/dev/null 2>&1 || true
     fi
     rb_pid=$(wait_for_build "$prev_build" "$cand_pid") || {
         say "ROLLBACK NOT VERIFIED — no $prev_build stamp inside ${serving_limit}s; run 'canary.sh status'"
         exit 3
     }
-    doctor_out=$("$bin" doctor 2>&1 || true)
+    doctor_rc=0
+    doctor_out=$(run_doctor) || doctor_rc=$?
+    if [ "$doctor_rc" -eq 142 ]; then
+        say "ROLLBACK NOT VERIFIED — doctor did not answer inside ${doctor_limit_s}s; run 'canary.sh status'"
+        exit 3
+    fi
     if echo "$doctor_out" | grep -q 'DIFFERS'; then
         say "ROLLBACK NOT VERIFIED — doctor reports a different build; run 'canary.sh status'"
         exit 3
@@ -370,7 +416,10 @@ verify_rollback() {
 # up; in rehearsal, not-listening is expected.
 check_doctor() {
     mode=$1
-    doctor_out=$("$bin" doctor 2>&1 || true)
+    doctor_rc=0
+    doctor_out=$(run_doctor) || doctor_rc=$?
+    [ "$doctor_rc" -eq 142 ] &&
+        say "doctor: no answer inside ${doctor_limit_s}s (cap)"
     echo "$doctor_out" | grep -E '^(socket|daemon|recorder|hardening)' || true
     if echo "$doctor_out" | grep -q 'DIFFERS'; then
         say "doctor: the answering daemon is a different build —"
@@ -523,31 +572,39 @@ do_preflight() {
         check 1 version "no output"
     fi
 
-    doctor_out=$("$bin" doctor 2>&1 || true)
-    socket_line=$(echo "$doctor_out" | grep '^socket' || true)
-    case $socket_line in
-        *listening* | *"not answering"*)
-            check 0 socket "${socket_line#socket    }"
-            ;;
-        *)
-            check 1 socket "${socket_line:-no socket line}"
-            ;;
-    esac
-    disk_line=$(echo "$doctor_out" | grep '^disk' || true)
-    case $disk_line in
-        *WARNING*)
-            if [ "${CONBUS_CANARY_DISK_WARN_OK:-}" = 1 ]; then
-                check 2 disk "$disk_line (accepted by CONBUS_CANARY_DISK_WARN_OK)"
-            else
-                check 1 disk "$disk_line"
-            fi
-            ;;
-        *) check 0 disk "${disk_line:-no disk line}" ;;
-    esac
-    if echo "$doctor_out" | grep -q 'DIFFERS'; then
-        check 1 daemon-build "$(echo "$doctor_out" | grep 'DIFFERS' | head -1)"
+    doctor_rc=0
+    doctor_out=$(run_doctor) || doctor_rc=$?
+    if [ "$doctor_rc" -eq 142 ]; then
+        check 1 doctor "no answer inside ${doctor_limit_s}s — a vendor probe is wedged"
+        check 2 socket "unknown — doctor did not answer"
+        check 2 disk "unknown — doctor did not answer"
+        check 2 daemon-build "unknown — doctor did not answer"
     else
-        check 0 daemon-build "no DIFFERS"
+        socket_line=$(echo "$doctor_out" | grep '^socket' || true)
+        case $socket_line in
+            *listening* | *"not answering"*)
+                check 0 socket "${socket_line#socket    }"
+                ;;
+            *)
+                check 1 socket "${socket_line:-no socket line}"
+                ;;
+        esac
+        disk_line=$(echo "$doctor_out" | grep '^disk' || true)
+        case $disk_line in
+            *WARNING*)
+                if [ "${CONBUS_CANARY_DISK_WARN_OK:-}" = 1 ]; then
+                    check 2 disk "$disk_line (accepted by CONBUS_CANARY_DISK_WARN_OK)"
+                else
+                    check 1 disk "$disk_line"
+                fi
+                ;;
+            *) check 0 disk "${disk_line:-no disk line}" ;;
+        esac
+        if echo "$doctor_out" | grep -q 'DIFFERS'; then
+            check 1 daemon-build "$(echo "$doctor_out" | grep 'DIFFERS' | head -1)"
+        else
+            check 0 daemon-build "no DIFFERS"
+        fi
     fi
 
     # S1–S5 evidence, kept outside the repo per the plan. With no
@@ -695,6 +752,9 @@ while [ $# -gt 0 ]; do
     shift
 done
 
+is_uint "$doctor_limit_s" && [ "$doctor_limit_s" -ge 1 ] ||
+    refuse "CONBUS_CANARY_DOCTOR_LIMIT='$doctor_limit_s' is not a positive integer"
+
 case $sub in
     preflight)
         do_preflight
@@ -718,8 +778,14 @@ case $sub in
             say "daemon stamp: none"
         fi
         if [ -x "$bin" ]; then
-            socket_line=$("$bin" doctor 2>/dev/null | grep '^socket' || true)
-            say "socket: ${socket_line:-doctor gave no socket line}"
+            doctor_rc=0
+            doctor_out=$(run_doctor 2>/dev/null) || doctor_rc=$?
+            if [ "$doctor_rc" -eq 142 ]; then
+                say "socket: doctor did not answer inside ${doctor_limit_s}s"
+            else
+                socket_line=$(echo "$doctor_out" | grep '^socket' || true)
+                say "socket: ${socket_line:-doctor gave no socket line}"
+            fi
         elif [ -S "$root/conbus.sock" ]; then
             say "socket: $root/conbus.sock exists"
         else
@@ -792,7 +858,7 @@ case $sub in
                 "$daemon_log" | tail -1)
         fi
         if [ -z "$unreadable" ]; then
-            unreadable=$("$bin" doctor 2>/dev/null |
+            unreadable=$(run_doctor 2>/dev/null |
                 sed -n 's/^log.* \([0-9][0-9]*\) unreadable line(s)/\1/p' | tail -1)
         fi
         case ${unreadable:-x} in
@@ -983,7 +1049,7 @@ case $sub in
         }
         t_tail=$(measure "$bin" log --tail 1)
         t_usage=$(measure "$bin" usage --days 7)
-        t_doctor=$(measure "$bin" doctor)
+        t_doctor=$(measure run_doctor)
         tb_bad=""
         [ "$t_tail" -gt "$tail_ms_budget" ] && tb_bad="$tb_bad tail(${t_tail}>${tail_ms_budget})"
         [ "$t_usage" -gt "$usage_ms_budget" ] && tb_bad="$tb_bad usage(${t_usage}>${usage_ms_budget})"
@@ -1175,8 +1241,11 @@ case $sub in
         fi
 
         if [ -z "$fail_reason" ]; then
-            doctor_out=$("$bin" doctor 2>&1 || true)
-            if echo "$doctor_out" | grep -q 'DIFFERS'; then
+            doctor_rc=0
+            doctor_out=$(run_doctor) || doctor_rc=$?
+            if [ "$doctor_rc" -eq 142 ]; then
+                fail_reason="doctor did not answer inside ${doctor_limit_s}s"
+            elif echo "$doctor_out" | grep -q 'DIFFERS'; then
                 fail_reason="the answering daemon is a different build than $cand_build"
             elif ! echo "$doctor_out" | grep -q 'listening'; then
                 fail_reason="the daemon is not answering after the swap"
