@@ -84,10 +84,10 @@ is_uint() { case $1 in '' | *[!0-9]*) return 1 ;; *) return 0 ;; esac }
 
 # HOME resolves to this user's passwd home — independent of SKIP or
 # REHEARSAL, so a rehearsal under it can be refused outright. `cd` with
-# HOME unset fails in bash, and `~user` expansion reads the passwd
-# database directly — no dscl/getent dependency.
+# HOME unset fails in bash, but `cd ~` resolves the login entry via
+# getpwuid — no dscl/getent/getpwnam dependency.
 passwd_home() {
-    env -u HOME bash -c "cd ~$(id -un) 2>/dev/null && pwd -P" 2>/dev/null
+    env -u HOME bash -c 'cd ~ && pwd -P' 2>/dev/null
 }
 
 is_passwd_home() {

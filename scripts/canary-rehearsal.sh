@@ -150,10 +150,16 @@ expect_grep() { # expect_grep <pattern> <file> <what>
     echo "rehearsal: ok: $3"
 }
 
-# Simulate the daemon coming up after install --apply: writes a new stamp
-# with a new pid and a `serving` field, like the real boot does.
+# Simulate the daemon coming up after install --apply. First writes the
+# OLD daemon's stamp synchronously (pid-1) so `start` reads a stable
+# old_stamp_pid no matter when its preflight finishes — without it, a slow
+# preflight could read the new stamp and wait_for_serving would wait for a
+# change that already happened. Then the new stamp lands after a delay.
 daemon_boot() { # daemon_boot <build> <pid> [delay]
-    (sleep "${3:-0.4}"
+    printf '{"build":"01d","pid":%s,"started":"%s","serving":"%s","core_dumps_disabled":true,"memory_locked":true}\n' \
+        "$(($2 - 1))" "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)" "$(date -u +%Y-%m-%dT%H:%M:%S.002Z)" \
+        >"$home/.conbus/daemon.build"
+    (sleep "${3:-1.0}"
      [ -d "$home/.conbus" ] || exit 0
      printf '{"build":"%s","pid":%s,"started":"%s","serving":"%s","core_dumps_disabled":true,"memory_locked":true}\n' \
          "$1" "$2" "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)" "$(date -u +%Y-%m-%dT%H:%M:%S.002Z)" \
@@ -213,9 +219,9 @@ expect 2 "$code" "--live is refused (exit 2)"
 # A rehearsal under the real passwd HOME is refused BEFORE anything moves —
 # this is the guard that makes a stray REHEARSAL flag safe. The refusal must
 # come before preflight or the file swap, and the live binary must not move.
-# Resolve the passwd home the same way canary.sh does — `~user` expansion
-# reads the passwd database, `cd` without HOME fails in bash.
-real_home=$(env -u HOME bash -c "cd ~$(id -un) 2>/dev/null && pwd -P" 2>/dev/null)
+# Resolve the passwd home the same way canary.sh does — `cd ~` with HOME
+# unset answers from getpwuid; plain `cd` needs HOME itself.
+real_home=$(env -u HOME bash -c 'cd ~ && pwd -P' 2>/dev/null)
 live_bin=$real_home/.local/bin/conbus
 live_sha=""
 [ -f "$live_bin" ] && live_sha=$(shasum -a 256 "$live_bin" | awk '{print $1}')
