@@ -250,9 +250,7 @@ for line in sys.stdin:
     fn fake() -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("codex");
-        std::fs::write(&path, FAKE).expect("write");
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        crate::test_support::write_executable(&path, FAKE);
         (dir, path)
     }
 
