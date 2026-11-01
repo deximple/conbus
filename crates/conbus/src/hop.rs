@@ -486,7 +486,9 @@ fn observed_quota(paths: &Paths, harness: &str, profile: Option<&str>) -> Option
             paths,
             &profile.map_or_else(|| harness.to_string(), |p| format!("{harness}@{p}")),
         ),
-        Harness::AGY => quota::read_agy().ok(),
+        // The cache only — a hop the daemon starts must never run the
+        // vendor: `agy -p` on a logged-out account opens an OAuth tab.
+        Harness::AGY => quota::read_cached(paths, harness),
         _ => None,
     }
 }

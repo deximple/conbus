@@ -281,15 +281,6 @@ impl AgyStandIn {
     fn opened_a_browser(&self) -> bool {
         self.dir.path().join("opened").exists()
     }
-
-    /// `models` at most: a deadline can kill the stand-in before it writes.
-    fn assert_only_the_check_ran(&self, what: &str) {
-        let calls = self.calls();
-        assert!(
-            calls.iter().all(|call| call == "models"),
-            "{what} went past the check: {calls:?}"
-        );
-    }
 }
 
 fn agy_line(stdout: &str) -> &str {
@@ -301,6 +292,8 @@ fn agy_line(stdout: &str) -> &str {
 
 /// The one thing nobody asked for: a browser tab per probe, from `doctor`, a
 /// canary, or a hop the daemon started, on an account that is not signed in.
+/// doctor/status do not probe at all — only `quota`, a command a person ran,
+/// may check the login, and it stops before `-p`.
 #[test]
 fn an_agy_with_no_login_is_never_asked_for_usage() {
     for sub in ["quota", "doctor", "status"] {
@@ -310,15 +303,21 @@ fn an_agy_with_no_login_is_never_asked_for_usage() {
         let stdout = agy.run(root.path(), sub);
 
         let line = agy_line(&stdout);
-        assert!(
-            line.contains("AUTH_REQUIRED")
-                // `doctor` allows two seconds, which a busy machine can use up
-                // before the stand-in has run. Not knowing is still not asking.
-                || (sub == "doctor" && line.contains("did not answer within 2s")),
-            "`{sub}` says so:\n{stdout}"
-        );
+        if sub == "quota" {
+            assert!(line.contains("AUTH_REQUIRED"), "quota says so:\n{stdout}");
+            assert_eq!(agy.calls(), ["models"], "quota stops at the check");
+        } else {
+            assert!(
+                line.contains("no reading yet"),
+                "`{sub}` reads the cache, not the vendor:\n{stdout}"
+            );
+            assert!(
+                agy.calls().is_empty(),
+                "`{sub}` must not run the vendor at all: {:?}",
+                agy.calls()
+            );
+        }
         assert!(!agy.opened_a_browser(), "`{sub}` opened a browser");
-        agy.assert_only_the_check_ran(sub);
     }
 }
 
@@ -339,7 +338,7 @@ fn a_request_to_sign_in_outranks_a_clean_exit() {
 }
 
 /// `hop` has no line to say it on, and the daemon starts hops with nobody
-/// watching: it goes on without a reading and asks for none.
+/// watching: it goes on without a reading and runs no vendor at all.
 #[test]
 fn a_hop_from_an_agy_with_no_login_asks_for_no_usage() {
     let agy = AgyStandIn::not_signed_in();
@@ -355,11 +354,12 @@ fn a_hop_from_an_agy_with_no_login_asks_for_no_usage() {
 
     let stdout = agy.run(root.path(), "hop");
 
+    assert!(stdout.contains("agy"), "the hop names the leg:\n{stdout}");
     assert!(
-        !agy.calls().is_empty(),
-        "the hop never reached agy:\n{stdout}"
+        agy.calls().is_empty(),
+        "a hop must not run the vendor at all: {:?}",
+        agy.calls()
     );
-    agy.assert_only_the_check_ran("a hop");
     assert!(!agy.opened_a_browser(), "a hop opened a browser");
 }
 
@@ -383,6 +383,54 @@ fn a_signed_in_agy_is_read_once_the_check_says_so() {
     assert_eq!(calls.len(), 2, "{calls:?}");
     assert_eq!(calls[0], "models");
     assert!(calls[1].starts_with("-p /usage"), "{calls:?}");
+
+    // What `quota` read, `doctor` and `status` show — from the cache, with
+    // its age, and without ever running the vendor again.
+    for sub in ["doctor", "status"] {
+        let stdout = agy.run(root.path(), sub);
+        let line = agy_line(&stdout);
+        assert!(
+            line.contains("72%") && line.contains("ago"),
+            "`{sub}` shows the cached reading and its age:\n{stdout}"
+        );
+    }
+    assert_eq!(agy.calls().len(), 2, "reads past quota: {:?}", agy.calls());
+}
+
+/// A cached agy reading past its TTL is shown but not counted.
+#[test]
+fn a_stale_agy_reading_is_shown_but_not_counted() {
+    let agy = AgyStandIn::not_signed_in();
+    let root = tempfile::tempdir().expect("tempdir");
+    let cache = root.path().join("quota");
+    std::fs::create_dir_all(&cache).expect("cache dir");
+    let stale = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs()
+        - 91 * 60;
+    std::fs::write(
+        cache.join("agy.json"),
+        format!(
+            "{{\"schema_version\":1,\"harness\":\"agy\",\"observed_at\":{stale},\
+             \"plan\":\"pro\",\"primary\":{{\"used_percent\":72,\"minutes\":300,\
+             \"resets_at\":4102444800}},\"secondary\":null,\"reached\":null}}"
+        ),
+    )
+    .expect("cache file");
+
+    let stdout = agy.run(root.path(), "doctor");
+
+    let line = agy_line(&stdout);
+    assert!(
+        line.contains("not counted") || line.contains("last read"),
+        "a stale reading says so:\n{stdout}"
+    );
+    assert!(
+        agy.calls().is_empty(),
+        "a stale cache never re-asks the vendor: {:?}",
+        agy.calls()
+    );
 }
 
 /// Failing closed: only a clean answer lets `-p` run. A check that fails for a
@@ -414,8 +462,10 @@ fn an_agy_whose_login_cannot_be_told_is_skipped_not_asked() {
     }
 }
 
+/// doctor's old probe is the reason a hung `agy models` ever mattered; it
+/// does not run the vendor at all now, so a wedged binary cannot hold it.
 #[test]
-fn a_login_check_that_hangs_is_skipped_within_doctors_deadline() {
+fn doctor_never_runs_agy_even_when_it_would_hang() {
     let agy = AgyStandIn::new(
         "exec sleep 60",
         "open https://accounts.example/o/oauth2/auth; exit 1",
@@ -430,9 +480,11 @@ fn a_login_check_that_hangs_is_skipped_within_doctors_deadline() {
         "doctor held for {:?}",
         started.elapsed()
     );
-    let line = agy_line(&stdout);
-    assert!(line.contains("SKIP"), "{stdout}");
-    assert!(line.contains("did not answer within 2s"), "{stdout}");
-    assert!(!agy.opened_a_browser(), "a hung check opened a browser");
-    agy.assert_only_the_check_ran("a hung check");
+    assert!(agy_line(&stdout).contains("no reading yet"), "{stdout}");
+    assert!(
+        agy.calls().is_empty(),
+        "doctor ran the vendor: {:?}",
+        agy.calls()
+    );
+    assert!(!agy.opened_a_browser(), "doctor opened a browser");
 }
