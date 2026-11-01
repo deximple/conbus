@@ -184,65 +184,6 @@ fn auth_url_names_the_page_without_echoing_its_query() {
     assert!(stdout.contains("conbus"), "the conbus verdict: {stdout}");
 }
 
-#[test]
-fn auth_url_finds_the_token_file_and_the_port_holder() {
-    // The Playwright bridge URL is the one that was actually chased down:
-    // its token lives in a vendor config and its port names the asker.
-    let dir = tempfile::tempdir().expect("tempdir");
-    let home = dir.path();
-    let codex = home.join(".codex");
-    std::fs::create_dir_all(&codex).expect("mkdir");
-    std::fs::write(
-        codex.join("config.toml"),
-        "mcp_servers.playwright.token = \"TOK3N-USED-FOR-TEST\"\n",
-    )
-    .expect("config");
-
-    // A port the test itself holds: ancestry must reach this process.
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-    let port = listener.local_addr().expect("addr").port();
-    let url = format!(
-        "chrome-extension://mmlmfjhmonkocbjadbfplnigmagldckm/connect.html?mcpRelayUrl=ws%3A%2F%2F127.0.0.1%3A{port}%2F&token=TOK3N-USED-FOR-TEST&client=%7B%22name%22%3A%22test-client%22%7D"
-    );
-    let output = conbus(dir.path())
-        .args(["auth", "--url", &url])
-        .env("HOME", home)
-        .output()
-        .expect("run auth --url");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    assert!(
-        stdout.contains("Playwright MCP Bridge"),
-        "the page pattern: {stdout}"
-    );
-    assert!(
-        stdout.contains("\"test-client\""),
-        "the client's name is the one query value safe to show: {stdout}"
-    );
-    assert!(
-        !stdout.contains("TOK3N-USED-FOR-TEST"),
-        "the token value must never print: {stdout}"
-    );
-    assert!(
-        stdout.contains(".codex/config.toml") || stdout.contains("came from"),
-        "which file held the token: {stdout}"
-    );
-    if which("lsof") {
-        assert!(
-            stdout.contains("cargo") || stdout.contains("conbus auth") || stdout.contains(" > "),
-            "the holder's ancestry: {stdout}"
-        );
-    }
-}
-
-fn which(name: &str) -> bool {
-    Command::new("sh")
-        .args(["-c", &format!("command -v {name}")])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
 /// `this` as `conbus auth --url` answers it: the label alone.
 fn page_label(root: &std::path::Path, url: &str) -> String {
     let output = conbus(root)
@@ -1063,6 +1004,124 @@ fn a_client_that_names_nothing_says_so() {
         );
     }
     assert!(!ask("https://x.example/").contains("url says"));
+}
+
+/// The vendor files the public docs promise conbus does not read for a token.
+const VENDOR_CONFIGS: &[&str] = &[
+    ".codex/config.toml",
+    ".cursor/mcp.json",
+    ".claude.json",
+    ".config/opencode/opencode.json",
+];
+
+/// A bridge page with a token, and every other value of its query.
+const BRIDGE_WITH_TOKEN: &str = "chrome-extension://mmlmfjhmonkocbjadbfplnigmagldckm/connect.html?mcpRelayUrl=ws%3A%2F%2F127.0.0.1%3A1%2F&token=TOK3N-USED-FOR-TEST";
+
+/// Run to the end or fail: what this guards against is a hang.
+fn finishes(mut command: Command, what: &str) {
+    let mut child = command
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while child.try_wait().expect("wait").is_none() {
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("{what} tried to open a vendor config file");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn no_form_of_the_command_opens_a_vendor_config_file() {
+    // Each file is a FIFO, and opening a FIFO to read it blocks until something
+    // writes. So this catches a read whatever becomes of its result, which no
+    // look at the output could.
+    let home = tempfile::tempdir().expect("tempdir");
+    for config in VENDOR_CONFIGS {
+        let path = home.path().join(config);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        let made = Command::new("mkfifo").arg(&path).status().expect("mkfifo");
+        assert!(made.success(), "mkfifo {config}");
+    }
+    let page = home.path().join("auth.html");
+
+    let mut url = conbus(home.path());
+    url.args(["auth", "--url", BRIDGE_WITH_TOKEN]);
+    finishes(url, "auth --url");
+
+    let mut table = conbus(home.path());
+    table.arg("auth");
+    finishes(table, "auth");
+
+    let mut html = conbus(home.path());
+    html.args(["auth", "--html", page.to_str().expect("utf8")]);
+    finishes(html, "auth --html");
+}
+
+#[test]
+fn a_token_in_the_url_is_not_looked_for_and_not_printed() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let codex = home.path().join(".codex");
+    std::fs::create_dir_all(&codex).expect("mkdir");
+    std::fs::write(
+        codex.join("config.toml"),
+        "mcp_servers.playwright.token = \"TOK3N-USED-FOR-TEST\"\n",
+    )
+    .expect("config");
+
+    let output = conbus(home.path())
+        .args(["auth", "--url", BRIDGE_WITH_TOKEN])
+        .output()
+        .expect("run auth --url");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(!stdout.contains("TOK3N"), "{stdout}");
+    assert!(!stdout.lines().any(|l| l.starts_with("token")), "{stdout}");
+    assert!(!stdout.contains("came from"), "{stdout}");
+    assert!(!stdout.contains("config.toml"), "{stdout}");
+}
+
+#[test]
+fn the_cause_is_a_condition_because_nothing_here_saw_the_page() {
+    // The cause used to be stated for every bridge address, a token or not.
+    for url in [
+        "chrome-extension://mmlmfjhmonkocbjadbfplnigmagldckm/connect.html",
+        BRIDGE_WITH_TOKEN,
+    ] {
+        let stdout = ask(url);
+        let cause = row(&stdout, "cause");
+        assert!(
+            cause.contains("if the page says `Invalid token provided`"),
+            "{stdout}"
+        );
+        assert!(!cause.contains("that file"), "{stdout}");
+        let fix = row(&stdout, "fix");
+        assert!(fix.contains("`PLAYWRIGHT_MCP_EXTENSION_TOKEN`"), "{stdout}");
+        assert!(
+            fix.contains("`PLAYWRIGHT_MCP_PROFILE_DIR_NAME`"),
+            "{stdout}"
+        );
+    }
+}
+
+#[test]
+fn only_the_bridge_gets_a_cause_and_a_fix() {
+    for url in [
+        "https://accounts.google.com/o/oauth2/auth?token=x",
+        "https://evil.example/?x=chrome-extension://mmlmfjhmonkocbjadbfplnigmagldckm/",
+    ] {
+        let stdout = ask(url);
+        assert!(
+            !stdout
+                .lines()
+                .any(|l| l.starts_with("cause") || l.starts_with("fix")),
+            "{url}: {stdout}"
+        );
+    }
 }
 
 #[test]

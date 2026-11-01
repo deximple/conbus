@@ -23,15 +23,6 @@ mod verdict;
 
 use url::{Address, BRIDGE_SCHEME, CALLBACK_PARAMS, PAGES, UNKNOWN_PAGE};
 
-/// Vendor config files a URL's `token=` may have been copied from. Their
-/// contents are never printed — only which file held the value.
-const TOKEN_FILES: &[&str] = &[
-    ".codex/config.toml",
-    ".cursor/mcp.json",
-    ".claude.json",
-    ".config/opencode/opencode.json",
-];
-
 /// What runs with nobody at the keyboard. Automatic overflow lands on Codex or
 /// Claude only (`attach::overflow`); the other legs open on a person's order.
 const BACKGROUND: &str = "the recorder runs `codex app-server` (gap fill at start; quota and \
@@ -45,6 +36,14 @@ const AGY_NEEDED_FOR: &str = "`conbus quota` and `conbus auth` ask it, `auth` wi
 alone; a hop to it or `conbus run` starts it as a session; recording is unaffected";
 const GH_NEEDED_FOR: &str = "for hop's pull request lookup";
 const CANNOT_BE_TOLD: &str = "its sign-in could not be told";
+
+/// A condition, because nothing here saw what the page says or read a token: a
+/// URL's token is not compared with anything, and Chrome's storage and the
+/// vendors' config files are not opened.
+const BRIDGE_CAUSE: &str = "cause     if the page says `Invalid token provided`, the token this \
+client was given differs from the extension's in the Chrome profile it opened in\n";
+const BRIDGE_FIX: &str = "fix       copy the token from the extension's page into the client's \
+`PLAYWRIGHT_MCP_EXTENSION_TOKEN`; `PLAYWRIGHT_MCP_PROFILE_DIR_NAME` pins the Chrome profile\n";
 
 /// One line of the `auth` table.
 struct Row {
@@ -177,24 +176,6 @@ fn printable(c: char) -> bool {
     matches!(c, ' '..='~') || (!c.is_ascii() && c.is_alphanumeric())
 }
 
-/// Whether `token` appears in one of the vendor config files — existence
-/// only, the value is never printed or kept.
-fn token_origin(token: &str) -> String {
-    let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
-        return "cannot tell — no HOME".into();
-    };
-    for rel in TOKEN_FILES {
-        let file = home.join(rel);
-        if std::fs::read_to_string(&file)
-            .map(|text| text.contains(token))
-            .unwrap_or(false)
-        {
-            return format!("came from {}", file.display());
-        }
-    }
-    "present in none of the vendor config files conbus checks".into()
-}
-
 /// `conbus auth --url <URL>`: whose page, who asked, whether conbus did.
 fn describe_url(url: &str) -> String {
     let mut out = String::new();
@@ -212,10 +193,6 @@ fn describe_url(url: &str) -> String {
         out.push_str(&format!("url says  {}\n", url::client_claim(&client)));
     }
 
-    if let Some(token) = value_of("token") {
-        out.push_str(&format!("token     {}\n", token_origin(&token)));
-    }
-
     let callbacks = address.as_ref().map(Address::callbacks).unwrap_or_default();
     for line in verdict::describe(&callbacks) {
         out.push_str(&line);
@@ -223,12 +200,8 @@ fn describe_url(url: &str) -> String {
     }
 
     if page.is_some_and(|page| page.scheme == BRIDGE_SCHEME) {
-        out.push_str(
-            "cause     the token in that file differs from the extension's token in the Chrome profile this opened in\n",
-        );
-        out.push_str(
-            "fix       copy the token from the extension's page into that file; PLAYWRIGHT_MCP_PROFILE_DIR_NAME pins the profile\n",
-        );
+        out.push_str(BRIDGE_CAUSE);
+        out.push_str(BRIDGE_FIX);
     }
     out
 }
