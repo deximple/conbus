@@ -6,6 +6,14 @@ the entry says so when it does.
 
 ## [Unreleased]
 
+### Fixed
+
+- A start-up gap fill the time budget cut short is now remembered in
+  `cache/gap-since` and resumed on the next start, instead of being lost to a
+  newer `newest - margin`; the start budget defaults to fifteen seconds, and a
+  Codex `sessions/` layout the build cannot read falls back to `thread/list`
+  instead of silently stopping.
+
 ## [1.0.0-rc.1] — 2026-11-01
 
 ### Added
