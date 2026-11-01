@@ -37,41 +37,60 @@ pub enum PluginApi {
     V2,
 }
 
+/// How long `install` waits to hear which OpenCode this is. A person is waiting on
+/// this one command, and OpenCode refuses the other major's plugin outright.
+const INSTALL_ASKS_FOR: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// The plugin API of the OpenCode on this machine, from `opencode --version`, or
-/// the binary `CONBUS_OPENCODE_BIN` names. One that cannot be asked, or answers
-/// something unreadable, is taken as the current major.
+/// the binary `CONBUS_OPENCODE_BIN` names, and why not if it could not be read.
 ///
 /// This crate's own tests never ask. `cargo test` must not run a vendor CLI that
 /// happens to be on `PATH`, and they share one process, where `set_var` is unsound
 /// while another thread reads the environment. Tests of the built binary name a
 /// binary instead.
-pub fn opencode_plugin_api() -> PluginApi {
+pub fn opencode_plugin_api_within(limit: std::time::Duration) -> Result<PluginApi, String> {
     if cfg!(test) {
-        return PluginApi::V2;
+        return Ok(PluginApi::V2);
     }
     let binary = std::env::var_os("CONBUS_OPENCODE_BIN")
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "opencode".into());
     let mut command = std::process::Command::new(binary);
     command.arg("--version");
-    crate::code::output_within(command, std::time::Duration::from_secs(2))
-        .map(|out| parse_api(&String::from_utf8_lossy(&out.stdout)))
+    let out = crate::code::output_within(command, limit)?;
+    parse_api(&String::from_utf8_lossy(&out.stdout))
+        .ok_or_else(|| "its answer did not name a version".to_string())
+}
+
+/// What `install` hears: asked once, since it needs the answer several times and a
+/// person is waiting.
+pub fn opencode_version_for_install() -> &'static Result<PluginApi, String> {
+    static ASKED: std::sync::OnceLock<Result<PluginApi, String>> = std::sync::OnceLock::new();
+    ASKED.get_or_init(|| opencode_plugin_api_within(INSTALL_ASKS_FOR))
+}
+
+/// The plugin API `install` writes for. One that could not be read is taken as the
+/// current major, and `install` says so.
+fn opencode_plugin_api() -> PluginApi {
+    opencode_version_for_install()
+        .clone()
         .unwrap_or(PluginApi::V2)
 }
 
 /// `opencode v2.2.3` and `1.18.31` both say their major.
-fn parse_api(version: &str) -> PluginApi {
+fn parse_api(version: &str) -> Option<PluginApi> {
     let major = version.split_whitespace().find_map(|word| {
         word.trim_start_matches('v')
             .split('.')
             .next()?
             .parse::<u32>()
             .ok()
-    });
-    match major {
-        Some(1) => PluginApi::V1,
-        _ => PluginApi::V2,
-    }
+    })?;
+    Some(if major == 1 {
+        PluginApi::V1
+    } else {
+        PluginApi::V2
+    })
 }
 
 /// Plugin that forwards official bus events to `conbus hook --harness opencode`,
@@ -777,14 +796,22 @@ if (typeof dispose === "function") dispose();
     }
 
     #[test]
+    fn these_tests_never_ask_a_real_opencode() {
+        assert_eq!(
+            opencode_plugin_api_within(std::time::Duration::from_secs(2)),
+            Ok(PluginApi::V2)
+        );
+    }
+
+    #[test]
     fn opencode_2_gets_a_plugin_it_loads() {
         // 2.x refuses the 1.x module outright, and each major is told apart
         // by what `opencode --version` prints.
-        assert_eq!(parse_api("opencode v2.2.3\n"), PluginApi::V2);
-        assert_eq!(parse_api("1.18.31"), PluginApi::V1);
-        assert_eq!(parse_api("v1.0.0"), PluginApi::V1);
-        assert_eq!(parse_api(""), PluginApi::V2);
-        assert_eq!(parse_api("something else"), PluginApi::V2);
+        assert_eq!(parse_api("opencode v2.2.3\n"), Some(PluginApi::V2));
+        assert_eq!(parse_api("1.18.31"), Some(PluginApi::V1));
+        assert_eq!(parse_api("v1.0.0"), Some(PluginApi::V1));
+        assert_eq!(parse_api(""), None);
+        assert_eq!(parse_api("something else"), None);
 
         let bin = Path::new("/opt/conbus/bin/conbus");
         let v2 = opencode_plugin_source_for(bin, PluginApi::V2);
