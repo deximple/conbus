@@ -213,13 +213,9 @@ expect 2 "$code" "--live is refused (exit 2)"
 # A rehearsal under the real passwd HOME is refused BEFORE anything moves —
 # this is the guard that makes a stray REHEARSAL flag safe. The refusal must
 # come before preflight or the file swap, and the live binary must not move.
-# Resolve the passwd home the same way canary.sh does (`cd` without HOME
-# fails in bash, so the environment cannot be consulted).
-if [ "$(uname -s)" = Darwin ]; then
-    real_home=$(dscl . -read "/Users/$(id -un)" NFSHomeDirectory 2>/dev/null | awk '{print $2}')
-else
-    real_home=$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f6)
-fi
+# Resolve the passwd home the same way canary.sh does — `~user` expansion
+# reads the passwd database, `cd` without HOME fails in bash.
+real_home=$(env -u HOME bash -c "cd ~$(id -un) 2>/dev/null && pwd -P" 2>/dev/null)
 live_bin=$real_home/.local/bin/conbus
 live_sha=""
 [ -f "$live_bin" ] && live_sha=$(shasum -a 256 "$live_bin" | awk '{print $1}')

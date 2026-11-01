@@ -84,14 +84,10 @@ is_uint() { case $1 in '' | *[!0-9]*) return 1 ;; *) return 0 ;; esac }
 
 # HOME resolves to this user's passwd home — independent of SKIP or
 # REHEARSAL, so a rehearsal under it can be refused outright. `cd` with
-# HOME unset fails in bash, so the passwd entry is the lookup, not the
-# environment.
+# HOME unset fails in bash, and `~user` expansion reads the passwd
+# database directly — no dscl/getent dependency.
 passwd_home() {
-    if [ "$(uname -s)" = Darwin ]; then
-        dscl . -read "/Users/$(id -un)" NFSHomeDirectory 2>/dev/null | awk '{print $2}'
-    else
-        getent passwd "$(id -un)" 2>/dev/null | cut -d: -f6
-    fi
+    env -u HOME bash -c "cd ~$(id -un) 2>/dev/null && pwd -P" 2>/dev/null
 }
 
 is_passwd_home() {
