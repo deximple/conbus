@@ -11,8 +11,18 @@ struct ProcessTable {
 
 impl ProcessTable {
     /// `listeners` hold every port asked about. `processes` is pid, ppid, name;
-    /// a pid not in it is one `ps` no longer finds.
+    /// a pid not in it is one `ps` no longer finds. Each leads its own process
+    /// group, as anything launchd or systemd started does.
     fn new(listeners: &[u32], processes: &[(u32, u32, &str)]) -> Self {
+        Self::with_groups(listeners, processes, &[])
+    }
+
+    /// As [`ProcessTable::new`], with the group of each pid in `groups` named.
+    fn with_groups(
+        listeners: &[u32],
+        processes: &[(u32, u32, &str)],
+        groups: &[(u32, u32)],
+    ) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         let lsof_calls = dir.path().join("lsof.calls");
         let pids: String = listeners.iter().map(|pid| format!("{pid}\n")).collect();
@@ -26,7 +36,13 @@ impl ProcessTable {
         );
         let arms: String = processes
             .iter()
-            .map(|(pid, ppid, name)| format!("  {pid}) echo '{ppid} {name}' ;;\n"))
+            .map(|(pid, ppid, name)| {
+                let group = groups
+                    .iter()
+                    .find(|(member, _)| member == pid)
+                    .map_or(*pid, |(_, group)| *group);
+                format!("  {pid}) echo '{ppid} {group} {name}' ;;\n")
+            })
             .collect();
         support::write_executable(
             &dir.path().join("ps"),
@@ -336,6 +352,72 @@ fn a_walk_that_cannot_reach_the_root_is_not_a_no() {
 }
 
 #[test]
+fn a_listener_that_outlived_what_started_it_is_not_a_no() {
+    // Directly under the root and not the leader of its own process group: what
+    // started it has exited, and with it the ancestry. A read's server left behind
+    // by a conbus that has gone looks exactly like this.
+    let table = ProcessTable::with_groups(
+        &[50],
+        &[(50, 1, "python3"), (1, 0, "/sbin/launchd")],
+        &[(50, 40)],
+    );
+
+    let stdout = table.ask(&bridge_url(55407));
+
+    assert!(
+        verdict_of(&stdout).starts_with("conbus    cannot tell:"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("has exited"), "{stdout}");
+    assert!(
+        stdout.contains("`conbus status`"),
+        "what would tell: {stdout}"
+    );
+    assert!(stdout.contains("`ps -o lstart= -p 50`"), "{stdout}");
+    assert!(stdout.contains("pid 50: python3 > launchd"), "{stdout}");
+}
+
+#[test]
+fn a_helper_of_a_live_parent_needs_no_group_of_its_own() {
+    // Only a process directly under the root says anything by its group.
+    let table = ProcessTable::with_groups(
+        &[50],
+        &[
+            (50, 40, "node"),
+            (40, 30, "npm"),
+            (30, 1, "Codex"),
+            (1, 0, "/sbin/launchd"),
+        ],
+        &[(50, 30), (40, 30)],
+    );
+
+    let stdout = table.ask(&bridge_url(55407));
+
+    assert!(verdict_of(&stdout).starts_with("conbus    no:"), "{stdout}");
+}
+
+#[test]
+fn conbus_above_a_listener_outranks_a_broken_group() {
+    let table = ProcessTable::with_groups(
+        &[50, 60],
+        &[
+            (50, 1, "python3"),
+            (60, 61, "node"),
+            (61, 1, "conbus"),
+            (1, 0, "/sbin/launchd"),
+        ],
+        &[(50, 40)],
+    );
+
+    let stdout = table.ask(&bridge_url(55407));
+
+    assert!(
+        verdict_of(&stdout).starts_with("conbus    yes:"),
+        "{stdout}"
+    );
+}
+
+#[test]
 fn a_port_with_several_callbacks_needs_all_of_them_clear_for_no() {
     let table = ProcessTable::new(&[4242], CODEX_TREE);
     let local = "http%3A%2F%2F127.0.0.1%3A55407%2F";
@@ -440,6 +522,76 @@ fn a_real_listener_under_a_real_conbus_is_yes() {
     assert!(stdout.contains(" > conbus > "), "{stdout}");
 }
 
+/// A stand-in `codex app-server` that starts a server of its own and exits, leaving
+/// it behind: what a read looks like when the vendor's server outlives it.
+const CODEX_LEAVING_A_SERVER: &str = r#"#!/usr/bin/env python3
+import os, socket, subprocess, sys
+here = os.path.dirname(os.path.abspath(__file__))
+server = """
+import os, socket, sys, time
+here = sys.argv[1]
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+s.listen(1)
+with open(os.path.join(here, "port.tmp"), "w") as f:
+    f.write(str(s.getsockname()[1]))
+os.rename(os.path.join(here, "port.tmp"), os.path.join(here, "port"))
+deadline = time.time() + 30
+while time.time() < deadline and not os.path.exists(os.path.join(here, "stop")):
+    time.sleep(0.05)
+"""
+subprocess.Popen([sys.executable, "-c", server, here], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+"#;
+
+#[test]
+fn a_real_server_left_behind_by_a_read_is_not_a_no() {
+    if !have_lsof_and_ps() {
+        return;
+    }
+    let root = tempfile::tempdir().expect("tempdir");
+    let codex_dir = tempfile::tempdir().expect("tempdir");
+    let codex = codex_dir.path().join("codex");
+    support::write_executable(&codex, CODEX_LEAVING_A_SERVER);
+    let quota = conbus(root.path())
+        .arg("quota")
+        .env("CONBUS_CODEX_BIN", &codex)
+        .output()
+        .expect("run quota");
+    assert!(quota.status.code().is_some());
+    let port_file = codex_dir.path().join("port");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let port = loop {
+        if let Ok(text) = std::fs::read_to_string(&port_file) {
+            break text.trim().parse::<u16>().expect("port");
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the stand-in's server never listened"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+
+    let output = conbus(root.path())
+        .args(["auth", "--url", &bridge_url(port)])
+        .output()
+        .expect("run auth --url");
+    std::fs::write(codex_dir.path().join("stop"), "").expect("stop");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let said = verdict_of(&stdout);
+    assert!(!said.starts_with("conbus    yes:"), "{stdout}");
+    // macOS hands an orphan to launchd. Linux can hand it to a subreaper, whose
+    // own parent keeps the chain whole; there the limit line has to say it.
+    if cfg!(target_os = "macos") {
+        assert!(said.starts_with("conbus    cannot tell:"), "{stdout}");
+    } else {
+        assert!(
+            said.starts_with("conbus    cannot tell:") || stdout.contains("limit "),
+            "{stdout}"
+        );
+    }
+}
+
 #[test]
 fn a_real_listener_is_walked_to_the_root() {
     if !have_lsof_and_ps() {
@@ -455,9 +607,9 @@ fn a_real_listener_is_walked_to_the_root() {
         .expect("run auth --url");
     let stdout = String::from_utf8_lossy(&output.stdout);
 
-    // This test's own process holds the port, so the line starts with it, and
-    // the walk ends at the root. `yes` is right too when the suite itself runs
-    // under `conbus run`; `cannot tell` is not.
+    // This test's own process holds the port, so the line starts with it. The verdict
+    // depends on what the suite runs under: `yes` under `conbus run`, and `cannot tell`
+    // on a machine whose top process does not lead its own group.
     let me = std::env::current_exe().expect("exe");
     let me = me.file_name().expect("name").to_string_lossy();
     let shown: String = me.chars().take(15).collect();
@@ -466,5 +618,5 @@ fn a_real_listener_is_walked_to_the_root() {
         .find(|line| line.starts_with("process "))
         .unwrap_or_else(|| panic!("{stdout}"));
     assert!(process.contains(&format!(": {shown}")), "{stdout}");
-    assert!(!verdict_of(&stdout).contains("cannot tell"), "{stdout}");
+    assert!(!stdout.contains("nothing lsof sees"), "{stdout}");
 }

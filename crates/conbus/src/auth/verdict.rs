@@ -5,7 +5,7 @@
 //! says what would tell. Even a `no` covers the ancestry and nothing more, so it
 //! carries what a walk cannot see.
 
-use super::ancestry::{self, Holders, Listener};
+use super::ancestry::{self, Holders, Listener, Stopped};
 use super::url::Callback;
 
 /// What was measured about the vendor programs conbus starts on its own, and
@@ -15,9 +15,9 @@ pub(super) const MEASURED: &str = "on Codex 0.166, `initialize`, `account/rateLi
 logged in` and no `open`. `thread/start` and `thread/resume` (a warm hop) and `thread/turns/list` \
 (gap fill) are unmeasured";
 
-const LIMIT: &str = "this walk cannot see a server that outlived what started it, or an app a hop \
-opened with `open` or `osascript`: both hang from the root. Every conbus read starts `codex \
-app-server`, and `conbus status` lists the hops";
+const LIMIT: &str = "this walk cannot see a server that outlived what started it and leads its own \
+process group, or an app a hop opened with `open` or `osascript`: both hang from the root. Every \
+conbus read starts `codex app-server`, and `conbus status` lists the hops";
 
 const HOPS: &str = "`conbus status` lists the hops, which can open an app";
 
@@ -67,11 +67,11 @@ fn process_line(looked: &Looked) -> Vec<String> {
         Looked::Port(port, Holders::Listeners(listeners)) => listeners
             .iter()
             .map(|listener| {
-                let stopped = listener
-                    .stopped
-                    .as_deref()
-                    .map(|why| format!(" (stopped: {why})"))
-                    .unwrap_or_default();
+                let stopped = match &listener.stopped {
+                    Some(Stopped::Lost(why)) => format!(" (stopped: {why})"),
+                    Some(Stopped::Orphan(pid)) => format!(" (pid {pid} lost its parent)"),
+                    None => String::new(),
+                };
                 format!(
                     "process   port {port}: pid {}: {}{stopped}",
                     listener.pid,
@@ -136,10 +136,13 @@ fn why_it_cannot_tell(looked: &[Looked]) -> Option<String> {
 }
 
 fn stopped_short(listener: &Listener) -> Option<String> {
-    listener.stopped.as_ref().map(|why| {
-        format!(
+    match listener.stopped.as_ref()? {
+        Stopped::Lost(why) => Some(format!(
             "the walk from pid {} ended before the root: {why}. Looking again while the page still waits would tell",
             listener.pid
-        )
-    })
+        )),
+        Stopped::Orphan(pid) => Some(format!(
+            "pid {pid} hangs from the root without leading its own process group, so what started it has exited and no walk can reach it. `ps -o lstart= -p {pid}` says when it started, to hold against the hops `conbus status` lists; every conbus read starts `codex app-server`"
+        )),
+    }
 }

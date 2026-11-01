@@ -63,6 +63,12 @@ pub(super) const NOT_THE_VENDOR: &[&str] = &[
     "https://evilx.ai/",
     "https://x.ai.evil.example/",
     "https://.x.ai/",
+    // Subdomains count only for a domain the vendor owns whole.
+    "https://www.auth.openai.com/",
+    "https://www.accounts.google.com/",
+    "https://www.console.anthropic.com/",
+    "https://gist.github.com/",
+    "chrome-extension://www.mmlmfjhmonkocbjadbfplnigmagldckm/",
     "http://auth.openai.com/",
     "ftp://github.com/",
     "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/connect.html",

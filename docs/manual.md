@@ -747,11 +747,12 @@ listening there up to the root. Then:
 
 - `conbus yes` — a process named conbus is in that ancestry.
 - `conbus no` — none is. That covers the ancestry and no more, and the line after
-  it says what a walk cannot see: a server that outlived what started it and an
-  app a hop opened both hang from the root. Every conbus read starts `codex
-  app-server`, and `conbus status` lists the hops.
-- `conbus cannot tell` — no listener, no port, a callback on another host, or a
-  walk that stopped short. It says what would tell.
+  it says what a walk cannot see: a server that outlived what started it and leads
+  its own process group, and an app a hop opened, both hang from the root. Every
+  conbus read starts `codex app-server`, and `conbus status` lists the hops.
+- `conbus cannot tell` — no listener, no port, a callback on another host, a walk
+  that stopped short, or a listener that visibly outlived what started it: directly
+  under the root, without leading its own process group. It says what would tell.
 
 `conbus auth` reads no vendor config. For the Playwright bridge, if the page says
 `Invalid token provided`, the token that client was given differs from the
