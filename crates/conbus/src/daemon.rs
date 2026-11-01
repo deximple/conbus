@@ -1130,6 +1130,11 @@ pub fn prepare(paths: &Paths, retention: Retention) -> io::Result<()> {
             "gap fill hit its start budget; the skipped range is held in cache/gap-since and resumed on the next start"
         );
     }
+    if let Some(why) = &gap_timing.codex_deferred {
+        note!(
+            "codex gap fill deferred ({why}); the range is held in cache/gap-since-codex and resumed on the next start"
+        );
+    }
     note!(
         "prepare breakdown: meta scan {} ms, gap fill {} ms \
          (claude: walk {} ms, read {} files {} MB in {} ms; \

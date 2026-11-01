@@ -517,10 +517,12 @@ filled in automatically when it starts, from Claude Code's transcripts, Codex's
 threads and any chat export. The start path spends at most fifteen seconds on
 it (`CONBUS_GAP_BUDGET_MS` overrides) so a slow vendor never holds the socket
 closed; a fill the budget cuts short is remembered in `cache/gap-since` and
-resumed on the next start, and `daemon.log` says so. `conbus backfill --gaps`
-fills the same gaps on demand without a deadline, for Claude Code, across all
-history; with `--apply` it too needs the recorder stopped. Deleting `cache/`
-drops the remembered range — run `conbus backfill --gaps` after one.
+resumed on the next start, and `daemon.log` says so. A Codex pass that could not
+run, because `codex app-server` would not start or stopped answering, keeps its
+range in `cache/gap-since-codex` the same way. `conbus backfill --gaps` fills the
+same gaps on demand without a deadline, for Claude Code and Codex, across all
+history; with `--apply` it too needs the recorder stopped. Deleting `cache/` drops
+the remembered ranges — run `conbus backfill --gaps` after one.
 
 **Claude.ai conversations** have no hooks in the desktop app. Export your data
 from Claude.ai (Settings → Privacy → Export data) and drop the zip (or

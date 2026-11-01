@@ -655,6 +655,20 @@ fn a_spool_file_nobody_can_read_does_not_stop_the_fill() {
 
 const THREAD: &str = "01a19463-cbd4-7b50-b819-000000000abc";
 
+/// A stand-in `codex app-server` that lists one completed turn, `t1`.
+const FAKE_APP_SERVER: &str = r#"#!/usr/bin/env python3
+import json, sys
+for line in sys.stdin:
+    try: msg = json.loads(line)
+    except Exception: continue
+    m = msg.get("method"); i = msg.get("id")
+    if m == "initialize": print(json.dumps({"jsonrpc":"2.0","id":i,"result":{"userAgent":"fake"}}), flush=True)
+    elif m == "thread/turns/list":
+        data = [{"id":"t1","items":[{"type":"userMessage","content":[{"type":"text","text":"during"}]},{"type":"agentMessage","text":"a1"}],
+                 "status":"completed","startedAt":1788368800,"completedAt":1788368801}]
+        print(json.dumps({"jsonrpc":"2.0","id":i,"result":{"data":data,"nextCursor":None}}), flush=True)
+"#;
+
 fn codex_prompt(turn: &str, text: &str) -> String {
     json!({"session_id": THREAD, "hook_event_name": "UserPromptSubmit", "prompt": text,
            "turn_id": turn, "cwd": "/repo", "model": "m", "permission_mode": "default",
@@ -927,4 +941,237 @@ fn a_fill_the_log_refused_keeps_the_range_from_before_it_wrote() {
         "the range was lost to the records served after it"
     );
     assert!(!marker.exists(), "a finished fill clears the marker");
+}
+
+/// A live Codex thread with a rollout touched just now, and the recorder down.
+fn a_live_codex_thread(home: &Path) {
+    let daemon = start(home);
+    hook_as(home, "codex", &codex_prompt("t0", "before"));
+    stop(daemon);
+    codex_rollout(home);
+}
+
+fn stand_in(script: &str) -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().expect("stub");
+    let path = dir.path().join("codex");
+    support::write_executable(&path, script);
+    (dir, path)
+}
+
+/// One start with this binary answering for Codex.
+fn start_with_codex(home: &Path, codex: &Path) {
+    let daemon = wait_serving(
+        home,
+        daemon_command(home)
+            .env("CONBUS_CODEX_BIN", codex)
+            .spawn()
+            .expect("daemon"),
+    );
+    stop(daemon);
+}
+
+#[test]
+fn a_codex_pass_that_could_not_run_keeps_its_range() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    a_live_codex_thread(home);
+
+    stop(start(home)); // the app-server cannot start
+
+    assert!(
+        home.join("cache/gap-since-codex").exists(),
+        "the thread was not read and nothing remembers the range"
+    );
+    assert!(
+        !home.join("cache/gap-since").exists(),
+        "a broken Codex must not hold the transcripts' range back, or every start \
+         reads further into them"
+    );
+}
+
+#[test]
+fn a_codex_pass_that_could_not_run_does_not_lose_a_deferred_range() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    a_live_codex_thread(home);
+    std::fs::create_dir_all(home.join("cache")).expect("cache");
+    std::fs::write(home.join("cache/gap-since"), "2026-10-01T00:00:00.000Z").expect("marker");
+
+    stop(start(home));
+
+    assert_eq!(
+        std::fs::read_to_string(home.join("cache/gap-since-codex")).expect("marker"),
+        "2026-10-01T00:00:00.000Z",
+        "the earlier cut's range was not carried to the pass that has not read it"
+    );
+}
+
+/// A record from later than the rollout by more than the margin, so that only a
+/// remembered range still reaches the rollout.
+fn newer_records_arrive(home: &Path) {
+    use conbus_core::event::{Body, Event, Harness, Source};
+    use conbus_core::ids::BusId;
+    use conbus_core::record::Entry;
+    use conbus_core::retention::Retention;
+    use conbus_core::segment::SegmentLog;
+
+    let epoch = conbus_core::clock::Timestamp::from_unix_seconds(0).expect("epoch");
+    let later = conbus_core::clock::Timestamp::now().seconds_since(epoch) + 2 * 3600;
+    let mut log = SegmentLog::open(home.join("log"), Retention::default()).expect("open");
+    log.append(Entry {
+        bus_id: BusId::mint(),
+        observed_at: conbus_core::clock::Timestamp::from_unix_seconds(later),
+        source: Source {
+            harness: Harness::new(Harness::CLAUDE_CODE),
+            harness_version: None,
+            vendor_session_id: Some(S.into()),
+            workspace: None,
+            entrypoint: None,
+            backfilled_from: None,
+            profile: None,
+        },
+        vendor_turn_id: None,
+        vendor_agent_id: None,
+        hook_id: None,
+        spooled_at: None,
+        event: Event::TurnStarted {
+            author: None,
+            prompt: Body::kept("a later prompt"),
+        },
+    })
+    .expect("append");
+}
+
+#[test]
+fn a_range_the_codex_pass_could_not_read_is_read_by_the_next_start_that_can() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let (_stub, fake) = stand_in(FAKE_APP_SERVER);
+    a_live_codex_thread(home);
+    stop(start(home)); // the app-server cannot start
+    newer_records_arrive(home);
+
+    start_with_codex(home, &fake);
+
+    let all = log_lines(home);
+    assert!(
+        all.iter().any(|record| record["vendor_turn_id"] == "t1"),
+        "the thread's turn was lost to newer records:\n{}",
+        show(&all)
+    );
+    assert!(
+        !home.join("cache/gap-since-codex").exists(),
+        "a pass that finished clears its marker"
+    );
+}
+
+#[test]
+fn an_app_server_that_dies_part_way_keeps_the_range() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let witness = home.join("the-stand-in-was-asked");
+    let dies = format!(
+        r#"#!/usr/bin/env python3
+import json, sys
+for line in sys.stdin:
+    msg = json.loads(line)
+    if msg.get("method") == "initialize":
+        print(json.dumps({{"jsonrpc":"2.0","id":msg.get("id"),"result":{{"userAgent":"fake"}}}}), flush=True)
+    elif msg.get("method") == "thread/turns/list":
+        open({:?}, "w").close()
+        sys.exit(1)
+"#,
+        witness.to_str().expect("utf-8")
+    );
+    let (_stub, fake) = stand_in(&dies);
+    a_live_codex_thread(home);
+
+    start_with_codex(home, &fake);
+
+    assert!(witness.exists(), "the pass reached the thread");
+    assert!(home.join("cache/gap-since-codex").exists());
+}
+
+#[test]
+fn a_thread_the_app_server_refuses_does_not_hold_the_range_for_ever() {
+    // Asking again gets the same answer, and a range that never clears has every
+    // later start bring up the app-server again.
+    const REFUSES: &str = r#"#!/usr/bin/env python3
+import json, sys
+for line in sys.stdin:
+    msg = json.loads(line)
+    if msg.get("method") == "initialize":
+        print(json.dumps({"jsonrpc":"2.0","id":msg.get("id"),"result":{"userAgent":"fake"}}), flush=True)
+    elif msg.get("method") == "thread/turns/list":
+        print(json.dumps({"jsonrpc":"2.0","id":msg.get("id"),"error":{"code":-32600,"message":"no rollout found"}}), flush=True)
+"#;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let (_stub, fake) = stand_in(REFUSES);
+    a_live_codex_thread(home);
+
+    start_with_codex(home, &fake);
+
+    assert!(!home.join("cache/gap-since-codex").exists());
+}
+
+fn backfill_gaps(home: &Path, codex: &Path, apply: bool) -> (bool, String) {
+    let mut command = Command::new(bin());
+    command.args(["backfill", "--gaps"]);
+    if apply {
+        command.arg("--apply");
+    }
+    env_for(&mut command, home);
+    let output = command
+        .env("CONBUS_CODEX_BIN", codex)
+        .output()
+        .expect("backfill");
+    (
+        output.status.success(),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+    )
+}
+
+#[test]
+fn backfill_gaps_fills_a_live_codex_thread() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let (_stub, fake) = stand_in(FAKE_APP_SERVER);
+    a_live_codex_thread(home);
+    let bus = log_lines(home)
+        .iter()
+        .find(|record| record["vendor_turn_id"] == "t0")
+        .expect("the live prompt")["bus_id"]
+        .clone();
+
+    let (ok, dry) = backfill_gaps(home, &fake, false);
+    assert!(ok, "{dry}");
+    assert!(dry.contains("1 thread(s), 1 turn(s), 2 record(s)"), "{dry}");
+    assert!(
+        !log_lines(home)
+            .iter()
+            .any(|record| record["vendor_turn_id"] == "t1"),
+        "a dry run writes nothing"
+    );
+
+    let (ok, applied) = backfill_gaps(home, &fake, true);
+    assert!(ok, "{applied}");
+    let filled: Vec<Value> = log_lines(home)
+        .into_iter()
+        .filter(|record| record["vendor_turn_id"] == "t1")
+        .collect();
+    assert_eq!(filled.len(), 2, "{}", show(&filled));
+    assert!(filled.iter().all(|record| record["bus_id"] == bus));
+}
+
+#[test]
+fn backfill_gaps_says_when_codex_could_not_be_read_and_still_fills_the_rest() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    a_live_codex_thread(home);
+
+    let (ok, said) = backfill_gaps(home, Path::new("/nonexistent/codex"), true);
+
+    assert!(ok, "{said}");
+    assert!(said.contains("codex     history unavailable"), "{said}");
 }
