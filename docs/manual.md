@@ -520,10 +520,11 @@ closed; a fill the budget cuts short is remembered in `cache/gap-since` and
 `cache/gap-read` and resumed on the next start from where it stopped, and
 `daemon.log` says so. A Codex pass that could not
 run, because `codex app-server` would not start or stopped answering, keeps its
-range in `cache/gap-since-codex` the same way, and one that stalled is left alone
-for an hour so it holds up one start, not all of them. `conbus backfill --gaps` fills the
+range in `cache/gap-since-codex` the same way, and a server or a thread that stalled
+is left alone for an hour so it holds up one start, not all of them. `conbus backfill --gaps` fills the
 same gaps on demand without a deadline, for Claude Code and Codex, across all
-history; with `--apply` it too needs the recorder stopped. Deleting `cache/` drops
+history; with `--apply` it too needs the recorder stopped, and once it has read every
+Codex thread the Codex range is done. Deleting `cache/` drops
 the remembered ranges — run `conbus backfill --gaps` after one.
 
 **Claude.ai conversations** have no hooks in the desktop app. Export your data

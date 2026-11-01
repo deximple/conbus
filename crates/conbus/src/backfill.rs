@@ -440,6 +440,28 @@ impl ReadSoFar {
     fn note(&mut self, source: &str, state: i64) {
         self.0.insert(source.to_string(), state);
     }
+
+    fn forget(&mut self, source: &str) {
+        self.0.remove(source);
+    }
+
+    /// What a fill by hand did, over what the starts before it noted. Whatever it
+    /// read is no longer stalled, and a server that answered is not either.
+    fn absorb(&mut self, ran: ReadSoFar) {
+        let answered = ran
+            .0
+            .iter()
+            .any(|(source, state)| *state != FAILED && !source.starts_with(STALLED));
+        for (source, state) in ran.0 {
+            if state != FAILED {
+                self.forget(&stalled_on(&source));
+            }
+            self.note(&source, state);
+        }
+        if answered {
+            self.forget(STALLED);
+        }
+    }
 }
 
 /// How long a start may spend filling gaps before it stops and serves.
@@ -835,6 +857,38 @@ const STALLED: &str = "codex app-server stalled";
 /// not mean paying that on every restart. By hand, `backfill --gaps` always asks.
 const STALL_BACK_OFF_SECS: i64 = 3600;
 
+/// What a start says about a server or a thread it is leaving alone.
+const LEFT_ALONE: &str = "it stalled at an earlier start, and is asked again after an hour or by `conbus backfill --gaps`";
+
+/// Noted in a held range, with the time, for a thread the app-server was given at
+/// least half its limit to answer about and did not. A thread that keeps growing
+/// answers first, so [`STALLED`] alone never gets noted and one slow thread behind
+/// it costs the whole limit at every start. Half, because the thread in hand when a
+/// limit runs out did nothing wrong: it goes behind the others, and if it really is
+/// that slow, it gets its share when it comes to the front.
+fn stalled_on(thread: &str) -> String {
+    format!("{STALLED} on {thread}")
+}
+
+/// Take out the threads the server stalled on within the back-off. Their range
+/// stays held, and the ones behind them are still read.
+fn leave_stalled_alone(
+    threads: &mut Vec<(BusId, i64)>,
+    read: &ReadSoFar,
+    now_unix: i64,
+    timing: &mut GapTiming,
+) {
+    let asked = threads.len();
+    threads.retain(|(thread, _)| {
+        !read
+            .state_of(&stalled_on(&thread.to_string()))
+            .is_some_and(|at| now_unix - at < STALL_BACK_OFF_SECS)
+    });
+    if threads.len() < asked {
+        timing.codex_deferred = Some(LEFT_ALONE.to_string());
+    }
+}
+
 /// The state of a thread with no rollout on disk to give it one.
 const NO_STATE: i64 = i64::MIN;
 
@@ -889,8 +943,11 @@ fn fill_live_codex_gaps(
     timing.codex_walk_ms = elapsed_ms(walk);
     timing.codex_unknown_files = unknown;
     timing.codex_layout_unknown = recent.is_none() && unknown > 0;
+    let now = Timestamp::now();
+    let now_unix = Timestamp::from_unix_seconds(0).map_or(0, |epoch| now.seconds_since(epoch));
     if let Some(recent) = recent.as_mut() {
         unread_first(recent, read);
+        leave_stalled_alone(recent, read, now_unix, timing);
     }
     if recent.as_ref().is_some_and(|recent| recent.is_empty()) {
         return Ok(fill);
@@ -903,17 +960,11 @@ fn fill_live_codex_gaps(
         timing.codex_deferred = Some("no time left in the start's budget".to_string());
         return Ok(fill);
     }
-    let now = Timestamp::now();
-    let now_unix = Timestamp::from_unix_seconds(0).map_or(0, |epoch| now.seconds_since(epoch));
     if read
         .state_of(STALLED)
         .is_some_and(|at| now_unix - at < STALL_BACK_OFF_SECS)
     {
-        timing.codex_deferred = Some(
-            "it stalled at an earlier start, and is asked again after an hour or by \
-             `conbus backfill --gaps`"
-                .to_string(),
-        );
+        timing.codex_deferred = Some(LEFT_ALONE.to_string());
         return Ok(fill);
     }
     let start = Instant::now();
@@ -948,6 +999,7 @@ fn fill_live_codex_gaps(
             .collect(),
     };
     unread_first(&mut sessions, read);
+    leave_stalled_alone(&mut sessions, read, now_unix, timing);
     let names: Vec<(String, BusId, i64)> = sessions
         .iter()
         .filter_map(|(session, state)| {
@@ -972,6 +1024,7 @@ fn fill_live_codex_gaps(
             break;
         }
         timing.list_turns_attempted += 1;
+        let asked = Instant::now();
         let turns = match list_turns(&mut server, name) {
             Ok(turns) => turns,
             Err(err) => {
@@ -986,6 +1039,9 @@ fn fill_live_codex_gaps(
                 // Nothing behind it will answer either. It goes behind the threads
                 // not yet asked next time, or it stops them being reached at all.
                 read.note(name, FAILED);
+                if asked.elapsed() * 2 >= server_limit {
+                    read.note(&stalled_on(name), now_unix);
+                }
                 if timing.list_turns_threads == 0 && start.elapsed() >= server_limit {
                     read.note(STALLED, now_unix);
                 }
@@ -1198,6 +1254,8 @@ pub fn fill_gaps(
     )?;
     if codex {
         let mut timing = GapTiming::default();
+        // Empty, because by hand everything is asked whatever a start has noted.
+        let mut ran = ReadSoFar::default();
         let fill = fill_live_codex_gaps(
             &held,
             log.as_mut(),
@@ -1206,10 +1264,13 @@ pub fn fill_gaps(
             StartFill {
                 timing: &mut timing,
                 deadline: Instant::now() + CODEX_DEADLINE,
-                read: &mut ReadSoFar::default(),
+                read: &mut ran,
             },
             CODEX_DEADLINE,
         )?;
+        if apply {
+            settle_codex_range(paths, ran, timing.codex_deferred.is_none());
+        }
         outcome.gap_codex_threads = fill.threads;
         outcome.gap_codex_turns = fill.turns;
         outcome.gap_codex_records = fill.records;
@@ -1227,6 +1288,23 @@ pub fn fill_gaps(
         );
     }
     Ok(outcome)
+}
+
+/// Leave the starts after a fill by hand what it found. An entry stays true whatever
+/// range it was noted in, so the thread a start stalled on is not asked again until
+/// it changes, and with everything read no Codex range is left to hold.
+fn settle_codex_range(paths: &Paths, ran: ReadSoFar, read_everything: bool) {
+    let read_marker = paths.cache_dir().join("gap-read");
+    let mut read = ReadSoFar::load(&read_marker);
+    read.absorb(ran);
+    if read.0.is_empty() {
+        let _ = fs::remove_file(&read_marker);
+    } else {
+        read.save(paths, &read_marker);
+    }
+    if read_everything {
+        let _ = fs::remove_file(paths.cache_dir().join("gap-since-codex"));
+    }
 }
 
 /// Turns the official transcript has that the live log does not.

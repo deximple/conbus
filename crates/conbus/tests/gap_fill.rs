@@ -70,7 +70,7 @@ impl Drop for Daemon {
 /// Wait until the stamp says this daemon serves: its start-up fill is done.
 fn wait_serving(home: &Path, daemon: Child) -> Daemon {
     let daemon = Daemon(daemon);
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(60);
     while Instant::now() < deadline {
         let stamped = stamp(home);
         if stamped["pid"].as_u64() == Some(u64::from(daemon.0.id()))
@@ -1156,9 +1156,18 @@ fn stand_in(script: &str) -> (tempfile::TempDir, PathBuf) {
     (dir, path)
 }
 
-/// A stand-in `codex app-server`: `body` is its loop, after [`TURNS_ANSWER`].
+/// A stand-in `codex app-server`: `body` is its loop, after [`TURNS_ANSWER`]. It runs
+/// once here, with nothing to read: the first exec of a new script can take seconds
+/// on a loaded machine, and charged to a start that reads as a server that stalled.
 fn codex_stand_in(body: &str) -> (tempfile::TempDir, PathBuf) {
-    stand_in(&format!("{TURNS_ANSWER}{body}"))
+    let (stub, fake) = stand_in(&format!("{TURNS_ANSWER}{body}"));
+    let warmed = Command::new(&fake)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .status()
+        .expect("warm the stand-in");
+    assert!(warmed.success());
+    (stub, fake)
 }
 
 /// One start with this binary answering for Codex.
@@ -1428,13 +1437,6 @@ fn threads_a_budget_cut_off_are_reached_by_later_starts() {
     let dir = tempfile::tempdir().expect("tempdir");
     let home = dir.path();
     let (_stub, fake) = codex_stand_in(SLOW_APP_SERVER);
-    // Its first exec can take seconds on a loaded machine. Charged to a start, that
-    // would read as an app-server that stalled.
-    let warmed = Command::new(&fake)
-        .stdin(Stdio::null())
-        .status()
-        .expect("warm the stand-in");
-    assert!(warmed.success());
     live_threads_touched_in_order(home);
 
     let reached = |home: &Path, thread: &str| {
@@ -1803,4 +1805,291 @@ fn a_missed_turn_the_vendor_says_a_tool_ended_gets_its_ending() {
         "no ending:\n{}",
         show(&all)
     );
+}
+
+const THREAD_A: &str = "01a19463-0000-7000-8000-00000000000a";
+const THREAD_B: &str = "01a19463-0000-7000-8000-00000000000b";
+
+/// Answers thread A. Hangs on thread B until `answer-b` exists beside the script.
+const WEDGED_ON_B: &str = r#"
+here = os.path.dirname(os.path.abspath(sys.argv[0]))
+flag = os.path.join(here, "answer-b")
+open(os.path.join(here, "launches"), "a").write("x\n")
+for line in sys.stdin:
+    msg = json.loads(line)
+    m = msg.get("method"); i = msg.get("id")
+    if m == "initialize":
+        print(json.dumps({"jsonrpc":"2.0","id":i,"result":{"userAgent":"fake"}}), flush=True)
+    elif m == "thread/list":
+        data = [{"id":"01a19463-0000-7000-8000-00000000000a","updatedAt":4000000000},{"id":"01a19463-0000-7000-8000-00000000000b","updatedAt":4000000000}]
+        print(json.dumps({"jsonrpc":"2.0","id":i,"result":{"data":data,"nextCursor":None}}), flush=True)
+    elif m == "thread/turns/list":
+        t = msg["params"]["threadId"]
+        if t.endswith("b") and not os.path.exists(flag):
+            time.sleep(600)
+        data = [{"id":"turn-of-"+t,"items":[{"type":"userMessage","content":[{"type":"text","text":"said in "+t}]},{"type":"agentMessage","text":"a"}],
+                 "status":"completed","startedAt":1788368800,"completedAt":1788368801}]
+        print(json.dumps(turns_page(msg, data)), flush=True)
+"#;
+
+fn codex_thread_live(home: &Path, thread: &str, turn: &str, text: &str) {
+    let payload = json!({"session_id": thread, "hook_event_name": "UserPromptSubmit", "prompt": text,
+        "turn_id": turn, "cwd": "/repo", "model": "m", "permission_mode": "default",
+        "transcript_path": null});
+    hook_as(home, "codex", &payload.to_string());
+}
+
+/// A thread's rollout, last written `age` seconds ago.
+fn rollout_of(home: &Path, thread: &str, age: u64) {
+    let dir = home.join(".codex/sessions/2026/11/01");
+    std::fs::create_dir_all(&dir).expect("dir");
+    let path = dir.join(format!("rollout-2026-11-01T00-00-00-{thread}.jsonl"));
+    let file = std::fs::File::create(&path).expect("rollout");
+    file.set_modified(std::time::SystemTime::now() - Duration::from_secs(age))
+        .expect("mtime");
+}
+
+/// One start on this budget, keeping what the daemon said in `notes`.
+fn timed_start(home: &Path, codex: &Path, budget_ms: &str, notes: &Path) -> Duration {
+    let file = std::fs::File::options()
+        .create(true)
+        .append(true)
+        .open(notes)
+        .expect("notes");
+    let at = Instant::now();
+    let daemon = wait_serving(
+        home,
+        daemon_command(home)
+            .env("CONBUS_CODEX_BIN", codex)
+            .env("CONBUS_GAP_BUDGET_MS", budget_ms)
+            .stderr(Stdio::from(file))
+            .spawn()
+            .expect("daemon"),
+    );
+    let took = at.elapsed();
+    stop(daemon);
+    took
+}
+
+/// Two live threads, the one that wedges the server touched longer ago, so the one
+/// that keeps growing is asked first.
+fn a_thread_behind_one_that_keeps_growing(home: &Path) {
+    let daemon = start(home);
+    codex_thread_live(home, THREAD_A, "a0", "before");
+    codex_thread_live(home, THREAD_B, "b0", "before");
+    stop(daemon);
+    rollout_of(home, THREAD_B, 60);
+    rollout_of(home, THREAD_A, 0);
+}
+
+#[test]
+fn a_thread_that_wedges_the_server_costs_one_start_not_every_start() {
+    // The stall note needed a start where no thread answered, and the thread the
+    // person keeps using always answers first: the whole limit at every start.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let (_stub, fake) = codex_stand_in(WEDGED_ON_B);
+    a_thread_behind_one_that_keeps_growing(home);
+    let notes = home.join("notes");
+    let mut asked = 0;
+    let mut times = Vec::new();
+    for _ in 0..4 {
+        rollout_of(home, THREAD_A, 0); // the person keeps using A
+        let before = std::fs::read_to_string(&notes).unwrap_or_default().len();
+        times.push(timed_start(home, &fake, "1500", &notes));
+        let said = std::fs::read_to_string(&notes).unwrap_or_default();
+        if !said[before..].contains("it stalled at an earlier start") {
+            asked += 1;
+        }
+    }
+    assert_eq!(
+        asked, 1,
+        "the wedged server was asked at {asked} of 4 starts, each costing its limit: {times:?}"
+    );
+    assert!(
+        home.join("cache/gap-since-codex").exists(),
+        "and the wedged thread's range is still held"
+    );
+}
+
+#[test]
+fn a_by_hand_fill_that_reads_a_stalled_thread_ends_the_cost() {
+    // "Until it is asked by hand": until now that run released nothing.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let (stub, fake) = codex_stand_in(WEDGED_ON_B);
+    a_thread_behind_one_that_keeps_growing(home);
+    let notes = home.join("notes");
+    timed_start(home, &fake, "1500", &notes);
+    assert!(
+        home.join("cache/gap-since-codex").exists(),
+        "the range is held"
+    );
+
+    // By hand, with a server that can answer B this time.
+    std::fs::write(stub.path().join("answer-b"), "").expect("flag");
+    let (ok, said) = backfill_gaps(home, &fake, true);
+    assert!(ok, "{said}");
+    assert!(
+        log_lines(home)
+            .iter()
+            .any(|record| record["prompt"]["text"] == format!("said in {THREAD_B}")),
+        "the hand run read B"
+    );
+    assert!(
+        !home.join("cache/gap-since-codex").exists(),
+        "and with everything read no range is held"
+    );
+    std::fs::remove_file(stub.path().join("answer-b")).expect("flag");
+
+    // B would hang now, so a start that asked it again would hold the range again.
+    rollout_of(home, THREAD_A, 0);
+    timed_start(home, &fake, "1500", &notes);
+    assert!(
+        !home.join("cache/gap-since-codex").exists(),
+        "after a by-hand fill read the thread, the next start asked it again"
+    );
+    assert!(!home.join("cache/gap-read").exists());
+}
+
+#[test]
+fn a_dry_run_by_hand_leaves_a_stalled_threads_marks_alone() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let (stub, fake) = codex_stand_in(WEDGED_ON_B);
+    a_thread_behind_one_that_keeps_growing(home);
+    timed_start(home, &fake, "1500", &home.join("notes"));
+    let held = std::fs::read_to_string(home.join("cache/gap-read")).expect("noted");
+
+    std::fs::write(stub.path().join("answer-b"), "").expect("flag");
+    let (ok, said) = backfill_gaps(home, &fake, false);
+
+    assert!(ok, "{said}");
+    assert_eq!(
+        std::fs::read_to_string(home.join("cache/gap-read")).expect("noted"),
+        held
+    );
+    assert!(home.join("cache/gap-since-codex").exists());
+}
+
+#[test]
+fn a_stalled_thread_is_asked_again_once_the_back_off_has_passed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let (stub, fake) = codex_stand_in(WEDGED_ON_B);
+    a_thread_behind_one_that_keeps_growing(home);
+    let notes = home.join("notes");
+    timed_start(home, &fake, "1500", &notes);
+
+    // Two hours ago, as far as the record of it goes.
+    let read = home.join("cache/gap-read");
+    let held = std::fs::read_to_string(&read).expect("a record of the stall");
+    let epoch = conbus_core::clock::Timestamp::from_unix_seconds(0).expect("epoch");
+    let long_ago = conbus_core::clock::Timestamp::now().seconds_since(epoch) - 2 * 3600;
+    let on_b = format!("codex app-server stalled on {THREAD_B}");
+    assert!(held.contains(&on_b), "the stall was noted: {held}");
+    let rewound: Vec<String> = held
+        .lines()
+        .map(|line| match line.split_once('\t') {
+            Some((_, source)) if source == on_b => format!("{long_ago}\t{source}"),
+            _ => line.to_string(),
+        })
+        .collect();
+    std::fs::write(&read, rewound.join("\n") + "\n").expect("rewind");
+    std::fs::write(stub.path().join("answer-b"), "").expect("flag");
+
+    timed_start(home, &fake, "1500", &notes);
+
+    assert!(
+        log_lines(home)
+            .iter()
+            .any(|record| record["prompt"]["text"] == format!("said in {THREAD_B}")),
+        "the thread was not asked again"
+    );
+    assert!(!home.join("cache/gap-since-codex").exists());
+}
+
+#[test]
+fn a_server_that_stalls_on_its_first_thread_is_left_alone_after() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let (_stub, fake) = codex_stand_in(WEDGED_ON_B);
+    let daemon = start(home);
+    codex_thread_live(home, THREAD_B, "b0", "before");
+    stop(daemon);
+    rollout_of(home, THREAD_B, 0);
+    let notes = home.join("notes");
+
+    let first = timed_start(home, &fake, "1500", &notes);
+    let second = timed_start(home, &fake, "1500", &notes);
+
+    let said = std::fs::read_to_string(&notes).unwrap_or_default();
+    assert!(
+        said.contains("it stalled at an earlier start"),
+        "asked twice: {first:?} {second:?}"
+    );
+}
+
+#[test]
+fn a_start_with_only_a_stalled_thread_left_does_not_bring_the_server_up() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let (stub, fake) = codex_stand_in(WEDGED_ON_B);
+    a_thread_behind_one_that_keeps_growing(home);
+    let notes = home.join("notes");
+    timed_start(home, &fake, "1500", &notes);
+    let launches = || {
+        std::fs::read_to_string(stub.path().join("launches"))
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+    let before = launches();
+
+    // A has not changed since it was read, and B is being left alone.
+    timed_start(home, &fake, "1500", &notes);
+
+    assert_eq!(launches(), before, "brought up with nothing to ask");
+    let said = std::fs::read_to_string(&notes).unwrap_or_default();
+    assert!(said.contains("it stalled at an earlier start"), "{said}");
+}
+
+/// A record of the stall as a start leaves it, with the range it holds.
+fn stalled_on_b_just_now(home: &Path) {
+    let epoch = conbus_core::clock::Timestamp::from_unix_seconds(0).expect("epoch");
+    let now = conbus_core::clock::Timestamp::now().seconds_since(epoch);
+    std::fs::create_dir_all(home.join("cache")).expect("cache");
+    std::fs::write(
+        home.join("cache/gap-read"),
+        format!("{now}\tcodex app-server stalled on {THREAD_B}\n"),
+    )
+    .expect("gap-read");
+}
+
+#[test]
+fn a_stalled_thread_is_left_alone_when_the_list_comes_from_thread_list() {
+    // With names the walk cannot read, the threads come from the server itself.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let (_stub, fake) = codex_stand_in(WEDGED_ON_B);
+    let daemon = start(home);
+    codex_thread_live(home, THREAD_A, "a0", "before");
+    codex_thread_live(home, THREAD_B, "b0", "before");
+    stop(daemon);
+    let sessions = home.join(".codex/sessions");
+    std::fs::create_dir_all(&sessions).expect("dir");
+    std::fs::write(sessions.join("not-a-rollout.txt"), "x").expect("file");
+    stalled_on_b_just_now(home);
+    let notes = home.join("notes");
+
+    timed_start(home, &fake, "3000", &notes);
+
+    assert!(
+        log_lines(home)
+            .iter()
+            .any(|record| record["prompt"]["text"] == format!("said in {THREAD_A}")),
+        "the thread beside it was still read"
+    );
+    let said = std::fs::read_to_string(&notes).unwrap_or_default();
+    assert!(said.contains("it stalled at an earlier start"), "{said}");
 }
