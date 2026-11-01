@@ -67,6 +67,9 @@ jobs:
       - name: canary rehearsal
         run: bash scripts/canary-rehearsal.sh
 
+      - name: sign-release rehearsal
+        run: bash scripts/sign-release-rehearsal.sh
+
   linux:
     runs-on: ubuntu-24.04
     timeout-minutes: 40
