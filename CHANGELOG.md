@@ -12,6 +12,11 @@ the entry says so when it does.
   reports them — `tokens_input`, `tokens_output`, `tokens_cache_read`,
   `tokens_cache_write`, today Cursor's `afterAgentResponse` only — and the
   `--shareable` rows carry them per RFD 0002's amendment.
+- `conbus policy`: a local `policy.json` turns into `PreToolUse` decisions,
+  off by default. The decision is made in the hook process, so a down
+  recorder cannot lift a deny; a file that does not parse decides nothing
+  and `doctor` says so. `conbus policy check` lists the effective rules and
+  `conbus policy test` runs them against one call.
 
 ### Changed
 

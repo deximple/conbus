@@ -56,6 +56,10 @@ fn run_policy(home: &Path, args: &[&str]) -> (i32, String, String) {
 
 const CANARY: &str = "conbus-policy-canary-7f3b9a";
 
+/// A vendor binary that is not there: `doctor` reads quota through the real
+/// `agy` and `codex app-server` unless told otherwise.
+const NOT_THERE: &str = "/nonexistent/conbus-test-vendor";
+
 fn deny_policy(home: &Path) {
     std::fs::write(
         home.join("policy.json"),
@@ -204,6 +208,43 @@ fn a_cursor_payload_is_never_decided() {
     assert!(
         !stdout.contains("permissionDecision"),
         "a Cursor payload was decided: {stdout}"
+    );
+}
+
+#[test]
+fn with_no_policy_the_hook_prints_no_decision_fields() {
+    let home = tempfile::tempdir().expect("tempdir");
+
+    let (code, stdout) = run_hook(
+        home.path(),
+        "claude_code",
+        &claude_pretool(&format!("echo {CANARY}")),
+    );
+
+    assert_eq!(code, 0);
+    assert!(
+        !stdout.contains("permissionDecision"),
+        "no policy file, so no decision fields: {stdout}"
+    );
+}
+
+#[test]
+fn doctor_says_when_the_policy_file_is_unreadable() {
+    let home = tempfile::tempdir().expect("tempdir");
+    std::fs::write(home.path().join("policy.json"), "{ not json").expect("write");
+
+    let doctor = Command::new(bin())
+        .arg("doctor")
+        .env("CONBUS_AGY_BIN", NOT_THERE)
+        .env("CONBUS_CODEX_BIN", NOT_THERE)
+        .env("CONBUS_HOME", home.path())
+        .output()
+        .expect("doctor");
+    let out = String::from_utf8_lossy(&doctor.stdout);
+
+    assert!(
+        out.contains("policy") && out.contains("decides nothing"),
+        "doctor must name the unreadable file: {out}"
     );
 }
 
