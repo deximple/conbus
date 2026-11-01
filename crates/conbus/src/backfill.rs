@@ -1424,9 +1424,11 @@ fn not_held<'a>(
 /// the transcript cannot, which is whether the vendor stopped.
 ///
 /// The spool is asked only when something looks missing, and after the source
-/// that made it look so: a hook that spooled before its line was written is seen
-/// here. One that spools in the moment between the two reads is not, and is
-/// written by both.
+/// that made it look so, so a hook that spooled before that read, or in the moment
+/// between the two, is seen here. What this cannot see is a hook that lands after
+/// the spool was read, for a line the source read already held. The fill and the
+/// drain then both write that turn's start, one extra `turn_started`. The hook must
+/// land in the seconds a restart takes, after the vendor wrote the line.
 ///
 /// Nor does it hold what another conversation holds: see [`Claims`]. What it does
 /// leave counts as held from here on, so a second source listing the same turn

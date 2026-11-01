@@ -2176,3 +2176,49 @@ time.sleep(60)
         "the range is held"
     );
 }
+
+/// What the race `still_missing` documents does when it fires. The bind pause only
+/// makes the moment easy to hit: any hook behind the spool read is the same.
+#[test]
+#[ignore = "a known race, left open: the hook must land after the fill read the spool, for a \
+            line it already read, which is seconds at a restart, and it costs one extra \
+            turn_started"]
+fn a_hook_that_spools_after_the_fill_read_the_spool_is_written_once() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let daemon = start(home);
+    hook(home, &prompt(S, "p0", "before"));
+    stop(daemon);
+    transcript(
+        home,
+        S,
+        &[
+            user(S, "p0", "before"),
+            user(S, "p1", "its line is already written"),
+            reply(S, "a1"),
+        ],
+    );
+    let child = daemon_command(home)
+        .env("CONBUS_TEST_PAUSE_BEFORE_BIND_MS", "4000")
+        .spawn()
+        .expect("daemon");
+    let end = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < end
+        && !log_lines(home)
+            .iter()
+            .any(|record| record["vendor_turn_id"] == "p1")
+    {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    hook(home, &prompt(S, "p1", "its line is already written"));
+    let daemon = wait_serving(home, child);
+    std::thread::sleep(Duration::from_millis(300));
+    stop(daemon);
+    let all = log_lines(home);
+    let started: Vec<Value> = all
+        .iter()
+        .filter(|record| record["vendor_turn_id"] == "p1" && record["event"] == "turn_started")
+        .cloned()
+        .collect();
+    assert_eq!(started.len(), 1, "\n{}", show(&all));
+}
