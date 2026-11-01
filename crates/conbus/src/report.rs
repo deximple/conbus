@@ -1248,6 +1248,11 @@ pub fn doctor(paths: &Paths) -> io::Result<()> {
     println!("sealing   none — no OS key store; tool bodies are elided, not sealed");
 
     println!("writable  {}", describe_appendable(&appendable(paths)));
+    // Disk is the one resource the log cannot outlast: say how much it holds
+    // and how much is left on its volume, and say it loudly under 10%.
+    if let Some(line) = disk_line(paths) {
+        println!("{line}");
+    }
 
     match std::env::var_os("HOME").map(PathBuf::from) {
         Some(home) => {
@@ -1457,6 +1462,67 @@ fn cursor_line(records: &[Record]) -> String {
     format!("cursor    adapter live — {n} record(s); briefing on sessionStart additional_context")
 }
 
+/// Free and total bytes on the volume holding `dir`, from statvfs.
+fn statvfs(dir: &std::path::Path) -> Option<(u64, u64)> {
+    let text = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()).ok()?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(text.as_ptr(), &mut stat) } != 0 {
+        return None;
+    }
+    let block = stat.f_frsize as u64;
+    Some((stat.f_bavail as u64 * block, stat.f_blocks as u64 * block))
+}
+
+/// Bytes of the log directory itself, summed rather than trusting `du`.
+fn log_bytes(paths: &Paths) -> u64 {
+    std::fs::read_dir(paths.log_dir())
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter_map(|entry| entry.metadata().ok())
+                .map(|meta| meta.len())
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
+/// `log <size> — <free> free of <total>`, warning under 10% free. Split out
+/// so the text is tested on numbers rather than on this machine's disk.
+fn disk_text(log: u64, free: u64, total: u64) -> String {
+    let pct = if total == 0 {
+        0.0
+    } else {
+        free as f64 / total as f64 * 100.0
+    };
+    let base = format!(
+        "disk      log {} — {} free of {} ({:.1}%)",
+        gib(log),
+        gib(free),
+        gib(total),
+        pct
+    );
+    if pct < 10.0 {
+        format!("{base} — WARNING: under 10% free")
+    } else {
+        base
+    }
+}
+
+fn disk_line(paths: &Paths) -> Option<String> {
+    let (free, total) = statvfs(&paths.log_dir())?;
+    Some(disk_text(log_bytes(paths), free, total))
+}
+
+fn gib(bytes: u64) -> String {
+    const GIB: f64 = 1_073_741_824.0;
+    const MIB: f64 = 1_048_576.0;
+    if bytes as f64 >= GIB {
+        format!("{:.1} GB", bytes as f64 / GIB)
+    } else {
+        format!("{:.1} MB", bytes as f64 / MIB)
+    }
+}
+
 /// The daemon's lock report, not this process's heap. Doctor calling
 /// `harden()` itself was true on Darwin even with the daemon down.
 fn describe_hardening(paths: &Paths) -> String {
@@ -1538,6 +1604,30 @@ pub fn log_index(paths: &Paths) -> io::Result<()> {
         report.closed, report.built, report.valid
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod disk_tests {
+    use super::disk_text;
+
+    const GB: u64 = 1_073_741_824;
+
+    #[test]
+    fn under_ten_percent_free_warns() {
+        let line = disk_text(500 * GB, 8 * GB, 100 * GB);
+        assert!(
+            line.contains("log 500.0 GB — 8.0 GB free of 100.0 GB"),
+            "{line}"
+        );
+        assert!(line.contains("WARNING"), "8% free must warn: {line}");
+    }
+
+    #[test]
+    fn ten_percent_or_more_free_does_not() {
+        let line = disk_text(500 * GB, 30 * GB, 100 * GB);
+        assert!(line.contains("30.0 GB free"), "{line}");
+        assert!(!line.contains("WARNING"), "{line}");
+    }
 }
 
 #[cfg(test)]
