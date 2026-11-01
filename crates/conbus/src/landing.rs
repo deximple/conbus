@@ -109,19 +109,16 @@ fn shell_single(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn cursor_opens_a_new_window_on_the_checkout() {
         let dir = tempfile::tempdir().expect("tempdir");
         let stub = dir.path().join("cursor");
         let mark = dir.path().join("args");
-        std::fs::write(
+        crate::test_support::write_executable(
             &stub,
-            format!("#!/bin/sh\nprintf '%s' \"$*\" > {}\n", mark.display()),
-        )
-        .expect("stub");
-        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+            &format!("#!/bin/sh\nprintf '%s' \"$*\" > {}\n", mark.display()),
+        );
         let workspace = dir.path().join("repo");
         std::fs::create_dir(&workspace).expect("repo");
         let opened = open_cursor(&stub, workspace.to_str());

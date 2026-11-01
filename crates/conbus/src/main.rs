@@ -26,6 +26,8 @@ mod runner;
 mod summarise;
 mod sync;
 mod takeover;
+#[cfg(test)]
+mod test_support;
 mod uninstall;
 mod usage;
 mod verdict;
