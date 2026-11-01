@@ -6,6 +6,8 @@ the entry says so when it does.
 
 ## [Unreleased]
 
+## [1.0.0-rc.3] — 2026-11-01
+
 ### Fixed
 
 - `quota`, `doctor`, `status` and `hop` no longer open a browser tab when `agy`

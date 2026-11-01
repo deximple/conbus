@@ -82,7 +82,7 @@ dependencies = [
 
 [[package]]
 name = "conbus"
-version = "1.0.0-rc.2"
+version = "1.0.0-rc.3"
 dependencies = [
  "conbus-core",
  "ed25519-dalek",
@@ -97,7 +97,7 @@ dependencies = [
 
 [[package]]
 name = "conbus-core"
-version = "1.0.0-rc.2"
+version = "1.0.0-rc.3"
 dependencies = [
  "aes-gcm",
  "getrandom 0.2.17",
