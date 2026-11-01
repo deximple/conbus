@@ -1,0 +1,22 @@
+# `cargo deny check`: known advisories, licences, and where crates come from.
+# Run by .github/workflows/supply-chain.yml on release tags, by hand and
+# weekly, not on every pull request.
+
+[graph]
+all-features = true
+
+[advisories]
+yanked = "deny"
+
+[licenses]
+allow = ["MIT", "Apache-2.0", "BSD-3-Clause", "Unicode-3.0"]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
