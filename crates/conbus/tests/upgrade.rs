@@ -15,6 +15,9 @@ fn conbus(home: &Path, conbus_home: &Path, args: &[&str]) -> std::process::Outpu
         .env("HOME", home)
         .env("CONBUS_HOME", conbus_home)
         .env("CONBUS_SKIP_LAUNCHCTL", "1")
+        // Pin XDG to the fake home: a CI image that exports XDG_CONFIG_HOME
+        // would otherwise land the Linux unit outside the tempdir.
+        .env("XDG_CONFIG_HOME", home.join(".config"))
         .output()
         .expect("run conbus")
 }
@@ -171,6 +174,110 @@ fn install_over_a_0_2_x_layout_keeps_the_persons_things() {
     assert!(
         !settings.contains("conbus hook"),
         "conbus's hooks were removed: {settings}"
+    );
+    assert!(
+        log_dir.join("segment-00000000.jsonl").exists(),
+        "uninstall must never touch the log"
+    );
+}
+
+/// The Linux half of the same story: the unit an older conbus wrote keeps the
+/// environment the operator gave it across `install --apply`, and uninstall
+/// leaves the person's hooks and log alone. Runs on the Linux CI legs; macOS
+/// has the plist version above.
+#[cfg(target_os = "linux")]
+#[test]
+fn install_over_a_0_2_x_layout_keeps_the_unit_environment() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let conbus_home = tempfile::tempdir().expect("conbus home");
+    let home = home.path();
+    let conbus_home = conbus_home.path();
+
+    let claude = home.join(".claude");
+    std::fs::create_dir_all(&claude).expect("claude dir");
+    std::fs::write(
+        claude.join("settings.json"),
+        serde_json::json!({
+            "hooks": {
+                "UserPromptSubmit": [
+                    { "hooks": [{ "type": "command", "command": "/usr/local/bin/conbus hook" }] },
+                    { "hooks": [{ "type": "command", "command": "/usr/local/bin/other-tool --watch" }] }
+                ]
+            }
+        })
+        .to_string(),
+    )
+    .expect("claude settings");
+    // A unit as 0.2.x wrote it, plus the operator's own Environment lines —
+    // including one in systemd's multi-pair form the parser must also read.
+    let units = home.join(".config").join("systemd").join("user");
+    std::fs::create_dir_all(&units).expect("unit dir");
+    let unit = units.join("sh.conbus.daemon.service");
+    std::fs::write(
+        &unit,
+        "[Unit]\nDescription=conbus recorder\n\n[Service]\nExecStart=\"/usr/local/bin/conbus\" daemon\nRestart=on-failure\nRestartSec=10\nEnvironment=\"CONBUS_RETENTION=conversation_only\"\nEnvironment=\"EXTRA_ONE=keep\" \"EXTRA_TWO=also keep\"\n\n[Install]\nWantedBy=default.target\n",
+    )
+    .expect("0.2.x unit");
+    let log_dir = conbus_home.join("log");
+    std::fs::create_dir_all(&log_dir).expect("log dir");
+    std::fs::write(
+        log_dir.join("segment-00000000.jsonl"),
+        "{\"v\":3,\"ts\":\"2026-11-01T00:00:00.000Z\",\"seq\":0}\n",
+    )
+    .expect("segment");
+
+    let first = conbus(home, conbus_home, &["install", "--apply"]);
+    assert_eq!(
+        first.status.code(),
+        Some(0),
+        "install failed: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let text = std::fs::read_to_string(&unit).expect("unit");
+    for kept in ["CONBUS_RETENTION=conversation_only", "EXTRA_ONE=keep"] {
+        assert!(
+            text.contains(kept),
+            "the unit kept the operator's environment: {text}"
+        );
+    }
+    assert!(
+        text.contains(".local/bin/conbus"),
+        "ExecStart was repointed at the installed binary: {text}"
+    );
+    assert!(
+        std::fs::read_to_string(claude.join("settings.json"))
+            .expect("settings")
+            .contains("other-tool"),
+        "someone else's hook survived"
+    );
+
+    let fingerprints: Vec<(String, String)> = [unit.clone(), claude.join("settings.json")]
+        .iter()
+        .map(|p| (p.display().to_string(), sha256(p)))
+        .collect();
+    let second = conbus(home, conbus_home, &["install", "--apply"]);
+    assert_eq!(second.status.code(), Some(0));
+    for (name, before) in &fingerprints {
+        assert_eq!(
+            &sha256(Path::new(name)),
+            before,
+            "a second install --apply rewrote {name}"
+        );
+    }
+
+    let un = conbus(home, conbus_home, &["uninstall", "--apply"]);
+    assert_eq!(
+        un.status.code(),
+        Some(0),
+        "uninstall failed: {}",
+        String::from_utf8_lossy(&un.stderr)
+    );
+    assert!(!unit.exists(), "uninstall removed conbus's own unit");
+    assert!(
+        std::fs::read_to_string(claude.join("settings.json"))
+            .expect("settings")
+            .contains("other-tool"),
+        "the person's hook survived uninstall"
     );
     assert!(
         log_dir.join("segment-00000000.jsonl").exists(),
