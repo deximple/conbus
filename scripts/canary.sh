@@ -75,6 +75,13 @@ new_bin=$install_dir/conbus.new
 # sees. launchd never inherits a shell's CONBUS_HOME/XDG_STATE_HOME, so
 # neither does this script.
 unset CONBUS_HOME XDG_STATE_HOME
+
+# A rehearsal runs real conbus under a throwaway HOME, where `agy -p` is not
+# logged in and, given a controlling terminal, opens a browser tab for OAuth.
+# Nobody asked for that, and its quota line is not what a rehearsal tests.
+if [ -n "${CONBUS_CANARY_REHEARSAL:-}" ]; then
+    export CONBUS_AGY_BIN=/usr/bin/false
+fi
 root=$HOME/.conbus
 stamp=$root/daemon.build
 daemon_log=$root/daemon.log
