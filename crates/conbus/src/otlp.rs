@@ -409,7 +409,7 @@ mod tests {
         assert_eq!(
             said,
             vec![format!(
-                "otlp: sent 2 row(s) as 40 data point(s) to http://127.0.0.1:{port}/v1/metrics (200 OK)"
+                "otlp: sent 2 row(s) as 48 data point(s) to http://127.0.0.1:{port}/v1/metrics (200 OK)"
             )]
         );
     }
@@ -457,7 +457,7 @@ mod tests {
 
         collector.request();
         let text = err.to_string();
-        assert!(text.contains("rejected 20 of 20 data point(s)"), "{text}");
+        assert!(text.contains("rejected 20 of 24 data point(s)"), "{text}");
         assert!(text.contains("older than an hour"), "{text}");
     }
 
@@ -543,6 +543,7 @@ mod tests {
                             reason: "rate_limit: canary".into(),
                         },
                         assistant_message: Some(Body::kept("here is the plan")),
+                        tokens: None,
                     },
                 ),
             ],

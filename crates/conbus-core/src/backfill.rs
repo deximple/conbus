@@ -431,6 +431,7 @@ fn close_codex(out: &mut Recovered, bus_id: BusId, source: &Source, open: Option
         event: Event::TurnEnded {
             state: TurnState::Complete,
             assistant_message: said,
+            tokens: None,
         },
     });
 }
@@ -464,6 +465,7 @@ fn close(out: &mut Recovered, bus_id: BusId, open: Option<OpenTurn>) {
         event: Event::TurnEnded {
             state: TurnState::Complete,
             assistant_message: Some(Body::kept(text)),
+            tokens: None,
         },
     });
 }
@@ -940,6 +942,7 @@ mod codex_tests {
         let Event::TurnEnded {
             assistant_message: Some(message),
             state,
+            ..
         } = &out.entries[2].event
         else {
             panic!("expected an ended turn, got {:?}", out.entries[2].event);

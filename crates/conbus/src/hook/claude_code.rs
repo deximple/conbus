@@ -287,10 +287,12 @@ fn normalize_with(
         "Stop" => Event::TurnEnded {
             state: TurnState::Complete,
             assistant_message: payload.last_assistant_message.map(Body::kept),
+            tokens: None,
         },
         "StopFailure" => Event::TurnEnded {
             state: failure_state(payload.error, payload.error_details),
             assistant_message: payload.last_assistant_message.map(Body::kept),
+            tokens: None,
         },
         // A subagent's closing text was reaching no retention level at all,
         // while the main thread's identical text was kept. Its `agent_id` is
@@ -302,6 +304,7 @@ fn normalize_with(
         "SubagentStop" => Event::TurnEnded {
             state: TurnState::Complete,
             assistant_message: payload.last_assistant_message.map(Body::kept),
+            tokens: None,
         },
         "SessionEnd" => Event::SessionEnded {
             reason: payload.reason,
@@ -696,6 +699,7 @@ mod tests {
             Event::TurnEnded {
                 state: TurnState::Complete,
                 assistant_message: Some(Body::kept("done")),
+                tokens: None,
             }
         );
 
@@ -1062,6 +1066,7 @@ mod tests {
             Event::TurnEnded {
                 state: TurnState::Complete,
                 assistant_message: None,
+                tokens: None,
             }
         );
     }
@@ -1079,6 +1084,7 @@ mod tests {
                     reason: "rate_limit".into()
                 },
                 assistant_message: None,
+                tokens: None,
             }
         );
     }
@@ -1098,6 +1104,7 @@ mod tests {
                     reason: "overloaded".into()
                 },
                 assistant_message: None,
+                tokens: None,
             }
         );
     }
@@ -1121,6 +1128,7 @@ mod tests {
                         reason: reason.into()
                     },
                     assistant_message: None,
+                    tokens: None,
                 }
             );
         }
@@ -1139,6 +1147,7 @@ mod tests {
                     reason: "something_new".into()
                 },
                 assistant_message: None,
+                tokens: None,
             },
             "an unrecognised reason must survive in the log so it can be reclassified later"
         );
@@ -1157,6 +1166,7 @@ mod tests {
             Event::TurnEnded {
                 state: TurnState::Complete,
                 assistant_message: Some(Body::kept("reviewed.")),
+                tokens: None,
             }
         );
         assert_eq!(

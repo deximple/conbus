@@ -1683,6 +1683,7 @@ mod tests {
                 reason: "rate_limit".into(),
             },
             assistant_message: None,
+            tokens: None,
         };
         let filter = LogFilter {
             grep: Some("rate_limit".into()),

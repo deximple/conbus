@@ -440,6 +440,7 @@ mod tests {
                 Event::TurnEnded {
                     state: TurnState::Complete,
                     assistant_message: None,
+                    tokens: None,
                 },
             ))
             .expect("append");
@@ -667,6 +668,7 @@ mod tests {
                 Event::TurnEnded {
                     state: TurnState::Complete,
                     assistant_message: None,
+                    tokens: None,
                 },
             ))
             .expect("append");
@@ -695,6 +697,7 @@ mod tests {
             Event::TurnEnded {
                 state: TurnState::Complete,
                 assistant_message: None,
+                tokens: None,
             },
         ))
         .expect("append");

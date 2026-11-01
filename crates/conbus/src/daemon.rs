@@ -1561,6 +1561,7 @@ mod tests {
                 reason: "rate_limit".into(),
             },
             assistant_message: None,
+            tokens: None,
         }));
 
         let Response::Recorded { seqs, .. } = response else {
@@ -1605,6 +1606,7 @@ mod tests {
                 reason: "GoUsageLimitError".into(),
             },
             assistant_message: None,
+            tokens: None,
         };
         let response = daemon.handle(req);
         let Response::Recorded { seqs, .. } = response else {
@@ -1666,6 +1668,7 @@ mod tests {
                 reason: "rate_limit".into(),
             },
             assistant_message: None,
+            tokens: None,
         };
 
         let response = daemon.handle(grok);
@@ -1703,6 +1706,7 @@ mod tests {
                 reason: "PRO_USER_USAGE_LIMIT".into(),
             },
             assistant_message: None,
+            tokens: None,
         };
         let response = daemon.handle(req);
         let Response::Recorded { seqs, .. } = response else {
@@ -1851,6 +1855,7 @@ mod tests {
         let response = daemon.handle(request(Event::TurnEnded {
             state: TurnState::Complete,
             assistant_message: None,
+            tokens: None,
         }));
 
         assert_eq!(response, Response::Orphaned);
@@ -2184,6 +2189,7 @@ mod tests {
                     reason: "rate_limit".into(),
                 },
                 assistant_message: None,
+                tokens: None,
             })
         };
 
@@ -2269,6 +2275,7 @@ mod tests {
                 reason: "rate_limit".into(),
             },
             assistant_message: None,
+            tokens: None,
         }));
 
         let scan = SegmentLog::scan(dir.path()).expect("scan");

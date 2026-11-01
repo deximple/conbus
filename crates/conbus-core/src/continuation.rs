@@ -1041,6 +1041,7 @@ mod tests {
         Event::TurnEnded {
             state,
             assistant_message: None,
+            tokens: None,
         }
     }
 

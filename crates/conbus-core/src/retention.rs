@@ -65,9 +65,11 @@ fn map_bodies(event: &Event, f: impl Fn(&Body) -> Body) -> Event {
         Event::TurnEnded {
             state,
             assistant_message,
+            tokens,
         } => Event::TurnEnded {
             state: state.clone(),
             assistant_message: assistant_message.as_ref().map(&f),
+            tokens: *tokens,
         },
         Event::Summarised {
             backend,

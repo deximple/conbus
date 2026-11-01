@@ -16,7 +16,7 @@ use crate::otlp;
 /// How many names a top-N line prints.
 const TOP: usize = 5;
 
-const COST: &str = "cost      not in this log: no hook payload carries tokens or prices";
+const COST: &str = "cost      not in this log: no hook payload carries prices";
 
 /// What `conbus usage` prints.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -198,7 +198,7 @@ fn render_shareable(ledger: &Ledger) -> io::Result<Vec<String>> {
 
 fn describe(total: &HarnessTotal) -> Vec<String> {
     let c = &total.counts;
-    vec![
+    let mut lines = vec![
         format!(
             "harness   {} — {} conversation(s): attended {} · unattended {} · unknown {}",
             total.harness, total.conversations, total.attended, total.unattended, total.unknown
@@ -223,7 +223,17 @@ fn describe(total: &HarnessTotal) -> Vec<String> {
             c.permission_asks,
             ago((c.tool_ms / 1_000) as i64)
         ),
-    ]
+    ];
+    // Only a harness whose hook meters turns earns this line. Printing a zero
+    // for one that cannot would claim a measurement nobody made — the same
+    // reason `failing` stays silent on a clean week rather than printing 0.
+    if c.tokens_input + c.tokens_output + c.tokens_cache_read + c.tokens_cache_write > 0 {
+        lines.push(format!(
+            "          tokens: in {} · out {} · cache read {} · cache write {}",
+            c.tokens_input, c.tokens_output, c.tokens_cache_read, c.tokens_cache_write
+        ));
+    }
+    lines
 }
 
 /// What the window left out, so a small number is not mistaken for a quiet
@@ -321,6 +331,7 @@ mod tests {
                             reason: "rate_limit".into(),
                         },
                         assistant_message: None,
+                        tokens: None,
                     },
                 ),
                 record(
@@ -382,6 +393,41 @@ mod tests {
         // A usage report silent about cost reads as one that has it.
         let text = render(&week(), "from 2026-09-17").join("\n");
         assert!(text.contains("cost      not in this log"), "{text}");
+    }
+
+    #[test]
+    fn tokens_print_only_when_the_harness_reported_them() {
+        // Cursor's hook meters its turns, so its line is real. A harness that
+        // cannot report tokens gets no line at all — a printed 0 would claim
+        // a measurement nobody made.
+        let tokens = |input, output, cache_read, cache_write| Event::TurnEnded {
+            state: TurnState::Complete,
+            assistant_message: None,
+            tokens: Some(conbus_core::event::TurnTokens {
+                input,
+                output,
+                cache_read,
+                cache_write,
+            }),
+        };
+        let ledger = Ledger::fold(
+            &[record(
+                "2026-09-22T09:00:00.000Z",
+                ONE,
+                Harness::CURSOR,
+                None,
+                tokens(10, 4, 6, 2),
+            )],
+            "2026-09-17",
+        );
+        let text = render(&ledger, "from 2026-09-17").join("\n");
+        assert!(
+            text.contains("tokens: in 2 · out 4 · cache read 6 · cache write 2"),
+            "{text}"
+        );
+
+        let text = render(&week(), "from 2026-09-17").join("\n");
+        assert!(!text.contains("tokens:"), "{text}");
     }
 
     #[test]
