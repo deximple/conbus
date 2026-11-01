@@ -1087,9 +1087,12 @@ fn fill_live_codex_gaps(
 }
 
 /// What a held range has read in this state is done. What it has not read at all
-/// goes first, or the threads a budget reaches are the same ones each start.
+/// goes first, or the threads a budget reaches are the same ones each start. A thread
+/// with no state cannot be current, since nothing says it has not changed since.
 fn unread_first(threads: &mut Vec<(BusId, i64)>, read: &ReadSoFar) {
-    threads.retain(|(thread, state)| !read.is_current(&thread.to_string(), *state));
+    threads.retain(|(thread, state)| {
+        *state == NO_STATE || !read.is_current(&thread.to_string(), *state)
+    });
     threads.sort_by_key(|(thread, _)| read.knows(&thread.to_string()));
 }
 

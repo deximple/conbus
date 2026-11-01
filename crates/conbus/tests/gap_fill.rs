@@ -2309,3 +2309,74 @@ fn a_hook_that_spools_after_the_fill_read_the_spool_is_written_once() {
         .collect();
     assert_eq!(started.len(), 1, "\n{}", show(&all));
 }
+
+#[test]
+fn a_thread_read_with_no_rollout_state_is_read_again() {
+    // In the `thread/list` fallback there is no rollout to give a thread a state, so a
+    // thread noted once stayed "already read" for as long as the range was held.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let second_turn = home.join("second-turn-exists");
+    let b_answers = home.join("b-answers");
+    let script = format!(
+        r#"
+def turn(i, said):
+    return {{"id":i,"items":[{{"type":"userMessage","content":[{{"type":"text","text":said}}]}},{{"type":"agentMessage","text":"a"}}],
+            "status":"completed","startedAt":1788368800,"completedAt":1788368801}}
+for line in sys.stdin:
+    msg = json.loads(line)
+    m = msg.get("method"); i = msg.get("id")
+    if m == "initialize":
+        print(json.dumps({{"jsonrpc":"2.0","id":i,"result":{{"userAgent":"fake"}}}}), flush=True)
+    elif m == "thread/list":
+        data = [{{"id":{a:?},"updatedAt":4000000000}},{{"id":{b:?},"updatedAt":4000000000}}]
+        print(json.dumps({{"jsonrpc":"2.0","id":i,"result":{{"data":data,"nextCursor":None}}}}), flush=True)
+    elif m == "thread/turns/list":
+        t = msg["params"]["threadId"]
+        if t == {b:?} and not os.path.exists({answers:?}):
+            print(json.dumps({{"jsonrpc":"2.0","id":i,"error":{{"code":-32001,"message":"Server overloaded; retry later."}}}}), flush=True)
+            continue
+        data = [turn("first-"+t, "first in "+t)]
+        if os.path.exists({second:?}):
+            data.append(turn("second-"+t, "second in "+t))
+        print(json.dumps(turns_page(msg, data)), flush=True)
+"#,
+        a = THREAD_A,
+        b = THREAD_B,
+        answers = b_answers.to_str().expect("utf-8"),
+        second = second_turn.to_str().expect("utf-8"),
+    );
+    let (_stub, fake) = codex_stand_in(&script);
+    let daemon = start(home);
+    codex_thread_live(home, THREAD_A, "a0", "before");
+    codex_thread_live(home, THREAD_B, "b0", "before");
+    stop(daemon);
+    // A name the walk cannot read, so the pass falls back to `thread/list`.
+    let sessions = home.join(".codex/sessions");
+    std::fs::create_dir_all(&sessions).expect("dir");
+    std::fs::write(sessions.join("not-a-rollout.txt"), "x").expect("file");
+
+    start_with_codex(home, &fake);
+    assert!(
+        home.join("cache/gap-since-codex").exists(),
+        "B holds the range"
+    );
+    assert!(
+        log_lines(home)
+            .iter()
+            .any(|record| record["prompt"]["text"] == format!("first in {THREAD_A}"))
+    );
+
+    // A hookless second turn lands in A, and B can now be read.
+    std::fs::write(&second_turn, "").expect("flag");
+    std::fs::write(&b_answers, "").expect("flag");
+    start_with_codex(home, &fake);
+
+    let all = log_lines(home);
+    assert!(
+        all.iter()
+            .any(|record| record["prompt"]["text"] == format!("second in {THREAD_A}")),
+        "A's new turn was skipped as already read:\n{}",
+        show(&all)
+    );
+}
