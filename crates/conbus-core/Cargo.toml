@@ -13,6 +13,7 @@ aes-gcm = { version = "0.10", default-features = false, features = ["aes", "allo
 getrandom = "0.2"
 serde.workspace = true
 serde_json.workspace = true
+sha2 = "0.10"
 time.workspace = true
 uuid.workspace = true
 

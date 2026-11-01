@@ -220,6 +220,13 @@ conbus log --since 2026-09-20            # a date or any prefix of a timestamp
 conbus log --grep "migration"         # records whose text contains this
 conbus log --json                     # one JSON record per line, for scripts
 conbus log --reveal --bus-id 01a0c7f2 # decrypt sealed tool bodies (section 11)
+conbus log index                    # build the derived read cache under ~/.conbus/cache
+```
+
+Reads that never print a tool body run against a derived cache of digested
+records under `~/.conbus/cache/`; it is rebuilt automatically on the first
+read and `conbus log index` builds it explicitly. Deleting `cache/` loses
+nothing. `CONBUS_NO_CACHE=1` reads the segments directly, as 0.2.x did.
 ```
 
 **Counting it:** `conbus usage` folds the log into what your agents did, per

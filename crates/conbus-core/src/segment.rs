@@ -7,6 +7,7 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use crate::clock::Timestamp;
+use crate::event::{Body, Event, ToolOutcome};
 use crate::record::{Entry, Record, SCHEMA_VERSION};
 use crate::retention::Retention;
 
@@ -774,5 +775,404 @@ mod tests {
                 prompt: Body::kept("first")
             }
         );
+    }
+}
+
+// ---- The derived sidecar cache ----
+//
+// Reads that never print a tool body do not need one: every field the fold,
+// the report and the daemon look at sits on the envelope, and the one place a
+// body matters is equality — the twin check compares whole events. `meta`
+// replaces only the bodies a tool call carries with an equality-preserving
+// digest, and the sidecars under `cache/meta/` hold the transformed lines for
+// every closed segment. They are derived data the way the SQLite index is:
+// delete them and nothing is lost.
+
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::fmt::Write as _;
+
+/// `D(text)` — a digest that cannot be mistaken for the text it stands for:
+/// the NUL byte is not valid in a prompt or a shell transcript's shape, and
+/// two bodies are equal after `meta` iff they were equal before, so the twin
+/// check and every hash that covers a body keep their answers.
+fn digest(text: &str) -> String {
+    let mut hexed = String::with_capacity(71);
+    let _ = write!(hexed, "\0sha256:");
+    for byte in Sha256::digest(text.as_bytes()) {
+        let _ = write!(hexed, "{byte:02x}");
+    }
+    hexed
+}
+
+/// One tool body as the cache keeps it. Variant, nonce and the withheld size
+/// survive, so equality is preserved in every direction.
+fn meta_body(body: &Body) -> Body {
+    match body {
+        Body::Kept { text } => Body::Kept { text: digest(text) },
+        Body::Clipped {
+            text,
+            original_bytes,
+        } => Body::Clipped {
+            text: digest(text),
+            original_bytes: *original_bytes,
+        },
+        Body::Sealed {
+            alg,
+            nonce,
+            ciphertext,
+            original_bytes,
+        } => Body::Sealed {
+            alg: alg.clone(),
+            nonce: nonce.clone(),
+            ciphertext: digest(ciphertext),
+            original_bytes: *original_bytes,
+        },
+        other => other.clone(),
+    }
+}
+
+/// The record the cache holds: the same record with only the tool bodies
+/// digested. Conversation text — prompt and assistant message — stays
+/// verbatim, because restore's last_prompt and gap fill's missing_from read it
+/// as text.
+pub fn meta(record: &Record) -> Record {
+    let mut record = record.clone();
+    match &mut record.event {
+        Event::ToolRequested { input, .. } | Event::ToolDenied { input, .. } => {
+            *input = meta_body(input);
+        }
+        Event::PermissionAsked { input, .. } => {
+            *input = meta_body(input);
+        }
+        Event::ToolUse { input, outcome, .. } => {
+            *input = meta_body(input);
+            match outcome {
+                ToolOutcome::Succeeded { output } => *output = meta_body(output),
+                ToolOutcome::Failed { error, .. } => *error = meta_body(error),
+            }
+        }
+        _ => {}
+    }
+    record
+}
+
+/// What one segment parses to, in the same rules `scan_each` applies: a newer
+/// schema is a defect, a broken line is a defect, and neither ends the read.
+fn parse_segment(path: &Path) -> io::Result<(Vec<Record>, Vec<Defect>)> {
+    let mut records = Vec::new();
+    let mut defects = Vec::new();
+    for (index, line) in byte_lines(path)?.into_iter().enumerate() {
+        if line.is_empty() {
+            continue;
+        }
+        match serde_json::from_slice::<Record>(&line) {
+            Ok(record) if record.schema_version > SCHEMA_VERSION => defects.push(Defect {
+                segment: path.to_path_buf(),
+                line: index as u64 + 1,
+                reason: format!(
+                    "record schema v{} is newer than this build's v{SCHEMA_VERSION}",
+                    record.schema_version
+                ),
+            }),
+            Ok(record) => records.push(record),
+            Err(err) => defects.push(Defect {
+                segment: path.to_path_buf(),
+                line: index as u64 + 1,
+                reason: err.to_string(),
+            }),
+        }
+    }
+    Ok((records, defects))
+}
+
+/// A sidecar's header line. It is only ever a cache entry: a stale one is
+/// ignored and rebuilt, never trusted.
+#[derive(Serialize, Deserialize)]
+struct SidecarHeader {
+    sidecar: u32,
+    conbus: String,
+    schema: u32,
+    segment: String,
+    bytes: u64,
+    records: u64,
+    first_ts: Option<String>,
+    last_ts: Option<String>,
+    defects: Vec<SidecarDefect>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SidecarDefect {
+    line: u64,
+    reason: String,
+}
+
+fn sidecar_path(cache: &Path, segment: &Path) -> PathBuf {
+    cache.join("meta").join(
+        segment
+            .file_name()
+            .unwrap_or_else(|| std::ffi::OsStr::new("segment")),
+    )
+}
+
+/// A sidecar only answers for the exact file it was built from: this build's
+/// version and schema, the same name, and a length that has not changed. The
+/// newest segment never has one — it can still grow.
+fn read_sidecar(cache: &Path, segment: &Path) -> Option<(Vec<Record>, Vec<Defect>)> {
+    let text = std::fs::read_to_string(sidecar_path(cache, segment)).ok()?;
+    let mut lines = text.lines();
+    let header: SidecarHeader = serde_json::from_str(lines.next()?).ok()?;
+    let bytes = std::fs::metadata(segment).ok()?.len();
+    let name = segment.file_name()?.to_str()?;
+    if header.sidecar != 1
+        || header.conbus != env!("CARGO_PKG_VERSION")
+        || header.schema != SCHEMA_VERSION
+        || header.segment != name
+        || header.bytes != bytes
+    {
+        return None;
+    }
+    let mut records = Vec::with_capacity(header.records as usize);
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        // A sidecar line that does not read is the cache lying: rebuild.
+        records.push(serde_json::from_str::<Record>(line).ok()?);
+    }
+    if records.len() as u64 != header.records {
+        return None;
+    }
+    let defects = header
+        .defects
+        .into_iter()
+        .map(|defect| Defect {
+            segment: segment.to_path_buf(),
+            line: defect.line,
+            reason: defect.reason,
+        })
+        .collect();
+    Some((records, defects))
+}
+
+/// Write the sidecar for a parsed segment, best effort — every failure here
+/// is invisible, because the next reader rebuilds the same bytes. Two readers
+/// can build the same sidecar at once: each writes a unique temp name beside
+/// the target and renames, and a rename is atomic, so the last writer wins
+/// with a whole file and no lock is needed.
+fn write_sidecar(cache: &Path, segment: &Path, records: &[Record], defects: &[Defect]) {
+    let run = || -> io::Result<()> {
+        let dir = cache.join("meta");
+        std::fs::create_dir_all(&dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(cache, std::fs::Permissions::from_mode(0o700));
+        }
+        let bytes = std::fs::metadata(segment)?.len();
+        let name = segment
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("segment")
+            .to_string();
+        let header = SidecarHeader {
+            sidecar: 1,
+            conbus: env!("CARGO_PKG_VERSION").to_string(),
+            schema: SCHEMA_VERSION,
+            segment: name.clone(),
+            bytes,
+            records: records.len() as u64,
+            first_ts: records.first().map(|r| r.ts.to_string()),
+            last_ts: records.last().map(|r| r.ts.to_string()),
+            defects: defects
+                .iter()
+                .map(|d| SidecarDefect {
+                    line: d.line,
+                    reason: d.reason.clone(),
+                })
+                .collect(),
+        };
+        let mut text = serde_json::to_string(&header).map_err(io::Error::other)?;
+        text.push('\n');
+        for record in records {
+            text.push_str(&serde_json::to_string(record).map_err(io::Error::other)?);
+            text.push('\n');
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+            let mut builder = std::fs::DirBuilder::new();
+            builder.mode(0o700);
+            let _ = builder.create(&dir);
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+            let temp = dir.join(format!(
+                ".{name}.{}-{}.tmp",
+                std::process::id(),
+                Timestamp::now()
+            ));
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true).mode(0o600);
+            use std::io::Write as _;
+            options
+                .open(&temp)
+                .and_then(|mut file| file.write_all(text.as_bytes()))?;
+            std::fs::rename(&temp, sidecar_path(cache, segment))
+        }
+        #[cfg(not(unix))]
+        {
+            let temp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
+            std::fs::write(&temp, &text)?;
+            std::fs::rename(&temp, sidecar_path(cache, segment))
+        }
+    };
+    let _ = run();
+}
+
+/// Load one segment for a meta scan: a valid sidecar answers, anything else
+/// is parsed and — for a closed segment — its sidecar refreshed best effort.
+fn load_meta_segment(
+    segment: &Path,
+    closed: bool,
+    cache: Option<&Path>,
+) -> io::Result<(Vec<Record>, Vec<Defect>)> {
+    if closed
+        && let Some(cache) = cache
+        && let Some(loaded) = read_sidecar(cache, segment)
+    {
+        return Ok(loaded);
+    }
+    let (records, defects) = parse_segment(segment)?;
+    let records: Vec<Record> = records.iter().map(meta).collect();
+    if closed && let Some(cache) = cache {
+        write_sidecar(cache, segment, &records, &defects);
+    }
+    Ok((records, defects))
+}
+
+/// What `build_cache` reports.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct CacheReport {
+    /// Segments eligible for a sidecar — every one but the newest.
+    pub closed: u64,
+    /// Sidecars written or rewritten this run.
+    pub built: u64,
+    /// Sidecars that were already valid.
+    pub valid: u64,
+}
+
+impl SegmentLog {
+    /// The records a reader that never prints tool bodies sees — closed
+    /// segments served from their sidecars, the newest parsed live, every
+    /// record through `meta`. `cache = None`, or `CONBUS_NO_CACHE=1`, parses
+    /// every segment and touches no cache. Output is record-for-record what
+    /// `scan_each` plus `meta` gives, defects included.
+    pub fn scan_meta_each(
+        dir: impl AsRef<Path>,
+        cache: Option<&Path>,
+        mut each: impl FnMut(Record),
+    ) -> io::Result<Vec<Defect>> {
+        let segments = segment_paths(dir.as_ref())?;
+        let no_cache = cache.is_none() || std::env::var_os("CONBUS_NO_CACHE").is_some();
+        let cache = cache.map(Path::to_path_buf);
+        let newest = segments.last().cloned();
+
+        // Parse in parallel — order is what matters, so each chunk returns
+        // its segments' results and they are emitted strictly in name order.
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(8);
+        // In waves of `workers` segments, each wave handed over in order before
+        // the next is read: parallel, and never more than a wave in memory. The
+        // daemon folds its state through this at start, and holding the whole
+        // log's records at once is what `scan_each` was written to stop.
+        let mut defects = Vec::new();
+        for wave in segments.chunks(workers) {
+            let loaded: Vec<io::Result<(Vec<Record>, Vec<Defect>)>> = std::thread::scope(|scope| {
+                let handles: Vec<_> = wave
+                    .iter()
+                    .map(|segment| {
+                        let closed = newest.as_ref() != Some(segment) && !no_cache;
+                        let cache = cache.as_deref();
+                        scope.spawn(move || load_meta_segment(segment, closed, cache))
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|handle| {
+                        handle
+                            .join()
+                            .unwrap_or_else(|_| Err(io::Error::other("a cache worker panicked")))
+                    })
+                    .collect()
+            });
+            for result in loaded {
+                let (records, segment_defects) = result?;
+                for record in records {
+                    each(record);
+                }
+                defects.extend(segment_defects);
+            }
+        }
+        Ok(defects)
+    }
+
+    /// `scan` for the readers that never print tool bodies.
+    pub fn scan_meta(dir: impl AsRef<Path>, cache: Option<&Path>) -> io::Result<Scan> {
+        let mut records = Vec::new();
+        let defects = Self::scan_meta_each(dir, cache, |record| records.push(record))?;
+        Ok(Scan { records, defects })
+    }
+
+    /// The explicit build: refresh every closed segment's sidecar and say how
+    /// many were written, how many were already valid. Writes only under
+    /// `cache`.
+    pub fn build_cache(dir: impl AsRef<Path>, cache: impl AsRef<Path>) -> io::Result<CacheReport> {
+        let segments = segment_paths(dir.as_ref())?;
+        let cache = cache.as_ref();
+        let mut report = CacheReport::default();
+        for segment in &segments[..segments.len().saturating_sub(1)] {
+            report.closed += 1;
+            if read_sidecar(cache, segment).is_some() {
+                report.valid += 1;
+                continue;
+            }
+            let (records, defects) = parse_segment(segment)?;
+            let records: Vec<Record> = records.iter().map(meta).collect();
+            write_sidecar(cache, segment, &records, &defects);
+            report.built += 1;
+        }
+        Ok(report)
+    }
+
+    /// The last `n` records `keep` accepts, in append order, reading full
+    /// records newest-first and never opening a segment it does not need.
+    /// Defects come back in segment order, as `scan` reports them.
+    pub fn tail(
+        dir: impl AsRef<Path>,
+        n: usize,
+        keep: impl Fn(&Record) -> bool,
+    ) -> io::Result<(Vec<Record>, Vec<Defect>)> {
+        let segments = segment_paths(dir.as_ref())?;
+        let mut kept: Vec<Record> = Vec::new();
+        let mut defects = Vec::new();
+        for segment in segments.iter().rev() {
+            let (records, segment_defects) = parse_segment(segment)?;
+            for record in records.iter().rev() {
+                if kept.len() >= n {
+                    break;
+                }
+                if keep(record) {
+                    kept.push(record.clone());
+                }
+            }
+            defects.extend(segment_defects);
+            if kept.len() >= n {
+                break;
+            }
+        }
+        kept.reverse();
+        defects.sort_by(|a, b| a.segment.cmp(&b.segment).then(a.line.cmp(&b.line)));
+        Ok((kept, defects))
     }
 }

@@ -82,7 +82,7 @@ pub fn window(
 
 /// Rows a sync may send. The log stays in this module; `sync` never opens it.
 pub fn shareable_rows(paths: &Paths) -> io::Result<Vec<SharedRow>> {
-    let scan = SegmentLog::scan(paths.log_dir())?;
+    let scan = SegmentLog::scan_meta(paths.log_dir(), Some(&paths.cache_dir()))?;
     Ok(Ledger::fold(&scan.records, "").shareable())
 }
 
@@ -98,7 +98,7 @@ pub fn run(
     output: Output,
     collector: Option<&otlp::Endpoint>,
 ) -> io::Result<()> {
-    let scan = SegmentLog::scan(paths.log_dir())?;
+    let scan = SegmentLog::scan_meta(paths.log_dir(), Some(&paths.cache_dir()))?;
     let ledger = Ledger::fold_between(&scan.records, &window.since, window.until.as_deref());
     let lines = match output {
         Output::Text => render(&ledger, &window.label),

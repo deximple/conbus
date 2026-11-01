@@ -36,7 +36,7 @@ pub fn decide_from(paths: &Paths, records: &[Record], from: Option<&str>) -> io:
 }
 
 pub fn run(paths: &Paths, from: Option<String>, to: Option<String>, apply: bool) -> io::Result<()> {
-    let scan = SegmentLog::scan(paths.log_dir())?;
+    let scan = SegmentLog::scan_meta(paths.log_dir(), Some(&paths.cache_dir()))?;
     let (current, other, automatic) = plan(paths, &scan.records, from.as_deref())?;
     let decision = match to.as_deref() {
         Some(name) => directed(&current, &other, name)?,

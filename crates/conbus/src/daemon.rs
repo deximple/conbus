@@ -150,7 +150,8 @@ impl Daemon {
             return Ok(0);
         }
         let log_dir = watch.log_dir.clone();
-        let mut held = SegmentLog::scan(&log_dir)?.records;
+        let cache_dir = log_dir.parent().map(|root| root.join("cache"));
+        let mut held = SegmentLog::scan_meta(&log_dir, cache_dir.as_deref())?.records;
         let mut n = 0u64;
         for (_i, dir, official_only, _signature) in &changed {
             n += if *official_only {
@@ -159,11 +160,11 @@ impl Daemon {
                 crate::backfill::ingest_chat_exports(dir, &held, &mut self.log)?
             };
             if n > 0 {
-                held = SegmentLog::scan(&log_dir)?.records;
+                held = SegmentLog::scan_meta(&log_dir, cache_dir.as_deref())?.records;
             }
         }
         if n > 0 {
-            if let Ok(scan) = SegmentLog::scan(&log_dir) {
+            if let Ok(scan) = SegmentLog::scan_meta(&log_dir, cache_dir.as_deref()) {
                 self.registry = Registry::restore(&scan.records);
                 self.chapters = Self::chapters(&scan.records);
             }
@@ -1025,13 +1026,14 @@ struct Restored {
 pub fn prepare(paths: &Paths, retention: Retention) -> io::Result<()> {
     // No core dump of a process holding every prompt on the machine.
     let _ = harden::harden();
-    let mut scan = SegmentLog::scan(paths.log_dir()).unwrap_or_else(|err| {
-        note!(
-            "could not read {} ({err}); nothing to fill or repair from",
-            paths.log_dir().display()
-        );
-        Scan::default()
-    });
+    let mut scan =
+        SegmentLog::scan_meta(paths.log_dir(), Some(&paths.cache_dir())).unwrap_or_else(|err| {
+            note!(
+                "could not read {} ({err}); nothing to fill or repair from",
+                paths.log_dir().display()
+            );
+            Scan::default()
+        });
     let mut log = SegmentLog::open(paths.log_dir(), retention)?;
     // Official transcripts only, same parser as `backfill --gaps`. Turns
     // that happened while no recorder was running join the live `bus_id`
@@ -1040,7 +1042,7 @@ pub fn prepare(paths: &Paths, retention: Retention) -> io::Result<()> {
         Ok(0) => {}
         Ok(n) => {
             note!("filled {n} gap record(s) from official transcripts");
-            scan = SegmentLog::scan(paths.log_dir()).unwrap_or(scan);
+            scan = SegmentLog::scan_meta(paths.log_dir(), Some(&paths.cache_dir())).unwrap_or(scan);
         }
         Err(err) => note!("gap fill skipped ({err})"),
     }
@@ -1092,7 +1094,7 @@ fn restore(paths: &Paths, retention: Retention) -> io::Result<(SegmentLog, Resto
     let mut registry = conbus_core::registry::Restoring::default();
     let mut chapters = HashMap::new();
     let mut records = 0;
-    let folded = SegmentLog::scan_each(paths.log_dir(), |record| {
+    let folded = SegmentLog::scan_meta_each(paths.log_dir(), Some(&paths.cache_dir()), |record| {
         registry.absorb(&record);
         Chapter::apply(&mut chapters, &record);
         records += 1;

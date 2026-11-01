@@ -102,7 +102,7 @@ fn reasks_within_three(records: &[Record]) -> u64 {
 }
 
 pub fn run(paths: &Paths) -> io::Result<()> {
-    let scan = SegmentLog::scan(paths.log_dir())?;
+    let scan = SegmentLog::scan_meta(paths.log_dir(), Some(&paths.cache_dir()))?;
     let verdict = Verdict::score(&scan.records, Timestamp::now());
     print_verdict(&verdict);
     Ok(())

@@ -115,6 +115,11 @@ impl Paths {
         self.root.join("log")
     }
 
+    /// The derived cache directory: sidecars a rebuild always reproduces.
+    pub fn cache_dir(&self) -> PathBuf {
+        self.root.join("cache")
+    }
+
     /// The daemon's control socket.
     pub fn socket(&self) -> PathBuf {
         self.root.join("conbus.sock")

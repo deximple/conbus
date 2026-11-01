@@ -135,6 +135,7 @@ fn main() -> ExitCode {
             run(|paths| daemon::prepare(paths, Retention::from_env()))
         }
         Command::Log { json, filter } => run(|paths| report::log(paths, json, &filter)),
+        Command::LogIndex => run(report::log_index),
         // Printed, never written, and without the data directory `run`
         // resolves first: the block needs no log, and an MDM script may run
         // it with no HOME at all.
