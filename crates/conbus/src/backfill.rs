@@ -567,7 +567,7 @@ fn append_gaps_at_start_in(
             .checked_duration_since(Instant::now())
             .unwrap_or(std::time::Duration::ZERO)
             .min(std::time::Duration::from_secs(8));
-        n += fill_live_codex_gaps(
+        let fill = fill_live_codex_gaps(
             held,
             Some(&mut *log),
             codex_since,
@@ -578,8 +578,11 @@ fn append_gaps_at_start_in(
                 read: &mut read,
             },
             server_limit,
-        )?
-        .records;
+        )?;
+        n += fill.records;
+        if timing.codex_deferred.is_none() {
+            timing.codex_deferred = fill.refused_for_now;
+        }
     }
     if !timing.budget_exhausted {
         let export = Instant::now();
@@ -901,9 +904,11 @@ struct CodexFill {
     threads: u64,
     turns: u64,
     records: u64,
-    /// Threads the app-server said no about. Asking again gets the same answer,
-    /// so these do not hold the range.
+    /// Threads the app-server said no about.
     refused: u64,
+    /// The first of those answers that asking again could change, which holds the
+    /// range. `-32001`, "Server overloaded; retry later", is one the real server has.
+    refused_for_now: Option<String>,
 }
 
 /// Official app-server only. Live Codex threads the recorder already bound.
@@ -1034,6 +1039,10 @@ fn fill_live_codex_gaps(
                 }
                 if crate::appserver::is_refusal(&err) {
                     fill.refused += 1;
+                    if !crate::appserver::is_unknown_method(&err, "thread/turns/list") {
+                        read.note(name, FAILED);
+                        fill.refused_for_now.get_or_insert(why);
+                    }
                     continue;
                 }
                 // Nothing behind it will answer either. It goes behind the threads
@@ -1269,7 +1278,8 @@ pub fn fill_gaps(
             CODEX_DEADLINE,
         )?;
         if apply {
-            settle_codex_range(paths, ran, timing.codex_deferred.is_none());
+            let read_everything = timing.codex_deferred.is_none() && fill.refused_for_now.is_none();
+            settle_codex_range(paths, ran, read_everything);
         }
         outcome.gap_codex_threads = fill.threads;
         outcome.gap_codex_turns = fill.turns;

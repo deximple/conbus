@@ -74,6 +74,18 @@ pub fn is_refusal(err: &io::Error) -> bool {
     err.to_string().starts_with(REFUSED)
 }
 
+/// Whether the server said it has no such method: the one refusal that asking again
+/// cannot change. JSON-RPC's own word for it is -32601. The real server parses a
+/// request into an enum, and its binary holds "Invalid request: " and "unknown
+/// variant" but no "method not found", so it would answer in those words. A real
+/// server has not been seen doing so.
+pub fn is_unknown_method(err: &io::Error, method: &str) -> bool {
+    let said = err.to_string();
+    is_refusal(err)
+        && (said.contains("\"code\":-32601")
+            || said.contains(&format!("unknown variant `{method}`")))
+}
+
 pub struct AppServer {
     /// `None` once reaped, when its id can belong to someone else.
     child: Arc<Mutex<Option<Child>>>,
@@ -255,6 +267,30 @@ mod tests {
             "the install layout is both binaries in one directory"
         );
         assert_eq!(executable(&dir.path().join("missing")), None);
+    }
+
+    #[test]
+    fn only_a_server_saying_it_has_no_such_method_is_read_as_that() {
+        let refused =
+            |error: &str| io::Error::other(format!("{REFUSED} thread/turns/list: {error}"));
+        let method = "thread/turns/list";
+        for no_such_method in [
+            r#"{"code":-32601,"message":"method not found"}"#,
+            r#"{"code":-32600,"message":"Invalid request: unknown variant `thread/turns/list`, expected one of `initialize`"}"#,
+        ] {
+            assert!(is_unknown_method(&refused(no_such_method), method));
+        }
+        for for_now_or_this_thread in [
+            r#"{"code":-32001,"message":"Server overloaded; retry later."}"#,
+            r#"{"code":-32600,"message":"no rollout found for thread"}"#,
+            r#"{"code":-32600,"message":"Invalid request: unknown variant `asc`, expected one of `x`"}"#,
+        ] {
+            assert!(!is_unknown_method(&refused(for_now_or_this_thread), method));
+        }
+        let gone = io::Error::other(
+            "codex app-server closed without answering unknown variant `thread/turns/list`",
+        );
+        assert!(!is_unknown_method(&gone, method));
     }
 
     #[test]

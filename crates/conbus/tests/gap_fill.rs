@@ -1303,26 +1303,113 @@ for line in sys.stdin:
     assert!(home.join("cache/gap-since-codex").exists());
 }
 
-#[test]
-fn a_thread_the_app_server_refuses_does_not_hold_the_range_for_ever() {
-    // Asking again gets the same answer, and a range that never clears has every
-    // later start bring up the app-server again.
-    const REFUSES: &str = r#"
+/// A stand-in that answers every `thread/turns/list` with this error.
+fn refuses_with(error: &str) -> String {
+    format!(
+        r#"
 for line in sys.stdin:
     msg = json.loads(line)
     if msg.get("method") == "initialize":
-        print(json.dumps({"jsonrpc":"2.0","id":msg.get("id"),"result":{"userAgent":"fake"}}), flush=True)
+        print(json.dumps({{"jsonrpc":"2.0","id":msg.get("id"),"result":{{"userAgent":"fake"}}}}), flush=True)
     elif msg.get("method") == "thread/turns/list":
-        print(json.dumps({"jsonrpc":"2.0","id":msg.get("id"),"error":{"code":-32600,"message":"no rollout found"}}), flush=True)
-"#;
+        print(json.dumps({{"jsonrpc":"2.0","id":msg.get("id"),"error":{error}}}), flush=True)
+"#
+    )
+}
+
+#[test]
+fn a_server_without_the_method_does_not_hold_the_range_for_ever() {
+    // Asking again gets the same answer, and a range that never clears has every
+    // later start bring up the app-server again.
+    for error in [
+        r#"{"code":-32601,"message":"method not found"}"#,
+        r#"{"code":-32600,"message":"Invalid request: unknown variant `thread/turns/list`, expected one of `initialize`"}"#,
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = dir.path();
+        let (_stub, fake) = codex_stand_in(&refuses_with(error));
+        a_live_codex_thread(home);
+
+        start_with_codex(home, &fake);
+
+        assert!(!home.join("cache/gap-since-codex").exists(), "{error}");
+    }
+}
+
+#[test]
+fn a_thread_a_server_refuses_keeps_the_range_whatever_it_says() {
+    // Only "no such method" says asking again cannot help. The cost of this one is
+    // an app-server start at each restart, for as long as the server says it.
     let dir = tempfile::tempdir().expect("tempdir");
     let home = dir.path();
-    let (_stub, fake) = codex_stand_in(REFUSES);
+    let (_stub, fake) = codex_stand_in(&refuses_with(
+        r#"{"code":-32600,"message":"no rollout found"}"#,
+    ));
     a_live_codex_thread(home);
 
     start_with_codex(home, &fake);
 
+    assert!(home.join("cache/gap-since-codex").exists());
+}
+
+#[test]
+fn a_refusal_that_says_retry_later_keeps_the_range() {
+    // Not every refusal is permanent: -32001 is the real server's overloaded answer.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let flag = home.join("refused-once");
+    let script = format!(
+        r#"
+for line in sys.stdin:
+    msg = json.loads(line)
+    m = msg.get("method"); i = msg.get("id")
+    if m == "initialize":
+        print(json.dumps({{"jsonrpc":"2.0","id":i,"result":{{"userAgent":"fake"}}}}), flush=True)
+    elif m == "thread/turns/list":
+        if not os.path.exists({flag:?}):
+            open({flag:?}, "w").close()
+            print(json.dumps({{"jsonrpc":"2.0","id":i,"error":{{"code":-32001,"message":"Server overloaded; retry later."}}}}), flush=True)
+            continue
+        data = [{{"id":"t1","items":[{{"type":"userMessage","content":[{{"type":"text","text":"missed"}}]}},{{"type":"agentMessage","text":"a"}}],
+                 "status":"completed","startedAt":1788368800,"completedAt":1788368801}}]
+        print(json.dumps(turns_page(msg, data)), flush=True)
+"#,
+        flag = flag.to_str().expect("utf-8")
+    );
+    let (_stub, fake) = codex_stand_in(&script);
+    a_live_codex_thread(home);
+
+    start_with_codex(home, &fake);
+    assert!(flag.exists(), "the first start was refused");
+    newer_records_arrive(home);
+    start_with_codex(home, &fake);
+
+    let all = log_lines(home);
+    assert!(
+        all.iter().any(|record| record["vendor_turn_id"] == "t1"),
+        "the missed turn was lost:\n{}",
+        show(&all)
+    );
     assert!(!home.join("cache/gap-since-codex").exists());
+}
+
+#[test]
+fn a_refused_thread_by_hand_is_counted_and_keeps_the_range() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let (_stub, fake) = codex_stand_in(&refuses_with(
+        r#"{"code":-32001,"message":"Server overloaded; retry later."}"#,
+    ));
+    a_live_codex_thread(home);
+    start_with_codex(home, &fake);
+    assert!(home.join("cache/gap-since-codex").exists());
+
+    let (ok, said) = backfill_gaps(home, &fake, true);
+
+    assert!(ok, "{said}");
+    assert!(said.contains("1 thread/turns/list refused"), "{said}");
+    assert!(!said.contains("unavailable"), "{said}");
+    assert!(home.join("cache/gap-since-codex").exists(), "not read yet");
 }
 
 fn backfill_gaps(home: &Path, codex: &Path, apply: bool) -> (bool, String) {
