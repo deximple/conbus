@@ -194,6 +194,7 @@ record.
   at $249 per organisation, one shown at random per visitor) are colour, not a
   gate: a click costs nothing.
 - At most a third of E2 and E3 from the operator's own network, as before.
+- E1's first item is done: the repository is public.
 
 The original gates, superseded:
 
@@ -204,6 +205,8 @@ The original gates, superseded:
 | **V2 — value** (≥3 pilots, by 2026-12-22) | ≥2 of 3 send week-2 rows without a reminder **and** forward the report or change a plan or an automation; **and** ≥1 moves money at the tested price — a prepaid pilot of at least $250, or an order form starting by 2027-01-31 | 0 of 3 |
 | **Host** | V1 and V2 passed, ≥$1,000 a month in signed commitments, and the operator has chosen hosting, billing and the legal texts | — |
 
+- **V0 passed.** The desk count ran: on 2026-10-09 at least six of the first
+  thirty reachable organisations met the buyer profile.
 - **The middle has a rule.** V1 at 3–4 of 12: six more interviews with a changed
   profile, then decide.
 - **Against politeness.** Screen on profile only, and log how many leads were
