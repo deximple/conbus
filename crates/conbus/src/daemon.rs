@@ -8,6 +8,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::Duration;
 
 use conbus_core::clock::Timestamp;
@@ -71,6 +72,22 @@ pub struct Daemon {
     /// Spool entries read once and not worth reading again yet. A spool can hold
     /// thousands of them, and a drain runs in front of every hook behind it.
     parked: HashMap<PathBuf, Parked>,
+    lost_seals: LostSeals,
+}
+
+/// How often a count of lost seals is written when no drain pass adds to it.
+/// That is the live path, a Keychain that will not answer, which can go on for as
+/// long as the machine runs.
+const LOST_SEALS_EVERY: Duration = Duration::from_secs(10 * 60);
+
+/// Tool bodies that reached the log elided where `encrypted_tools` promises a
+/// seal. Counted and not logged one by one: a restart with a full spool would
+/// fill the drop log with these, and past its cap the next real drop has no line.
+#[derive(Default)]
+struct LostSeals {
+    /// How many since the last line that said so.
+    unsaid: u64,
+    said_at: Option<std::time::Instant>,
 }
 
 /// How long a spooled event waits for its session to get a conversation.
@@ -208,6 +225,7 @@ impl Daemon {
             held_bytes: 0,
             refusal: None,
             parked: HashMap::new(),
+            lost_seals: LostSeals::default(),
         }
     }
 
@@ -676,28 +694,40 @@ impl Daemon {
     }
 
     /// `encrypted_tools` promises a sealed body. One that reached the log elided
-    /// is lost for good, so it gets a line where `doctor` will show it. Mostly
+    /// is lost for good, so it is counted, and `doctor` shows the total. Mostly
     /// these came through the spool, where the hook has no key and will not store
     /// plaintext, and the rest are a Keychain that would not answer.
-    fn count_a_lost_seal(&self, record: &Record) {
-        if self.log.retention() != Retention::EncryptedTools
-            || !conbus_core::seal::seals_here()
-            || !conbus_core::retention::elided_tool_body(&record.event)
+    fn count_a_lost_seal(&mut self, record: &Record) {
+        if self.log.retention() == Retention::EncryptedTools
+            && conbus_core::seal::seals_here()
+            && conbus_core::retention::elided_tool_body(&record.event)
         {
-            return;
+            self.lost_seals.unsaid += 1;
         }
-        let session: String = record
-            .source
-            .vendor_session_id
-            .as_deref()
-            .unwrap_or_default()
-            .chars()
-            .take(8)
-            .collect();
-        self.write_drop(
-            &crate::drops::Dropped::new("tool bodies elided, not sealed")
-                .with_detail(format!("{} for session {session}", kind_of(&record.event))),
-        );
+    }
+
+    /// Say what has been counted, as one line however many it is.
+    fn say_lost_seals(&mut self) {
+        let unsaid = std::mem::take(&mut self.lost_seals.unsaid);
+        if unsaid > 0 {
+            self.write_drop(
+                &crate::drops::Dropped::new(crate::drops::LOST_SEALS)
+                    .with_detail(crate::drops::seals_detail(unsaid)),
+            );
+            self.lost_seals.said_at = Some(std::time::Instant::now());
+        }
+    }
+
+    /// At the end of a drain pass: now if the pass added to the count, or if the
+    /// last line was long enough ago.
+    fn say_lost_seals_after_a_pass(&mut self, counted_before: u64) {
+        let due = self
+            .lost_seals
+            .said_at
+            .is_none_or(|at| at.elapsed() >= LOST_SEALS_EVERY);
+        if due || self.lost_seals.unsaid > counted_before {
+            self.say_lost_seals();
+        }
     }
 
     fn write_drop(&self, dropped: &crate::drops::Dropped) {
@@ -1638,7 +1668,13 @@ pub fn serve(paths: &Paths, retention: Retention) -> io::Result<()> {
     );
 
     listener.set_nonblocking(true)?;
+    // Only now: nothing before this point has anything to say on its way out, and
+    // a daemon asked to go in the middle of a long start should simply go.
+    listen_for_shutdown();
     loop {
+        if let Some(signal) = asked_to_go() {
+            go_as_asked(&mut daemon, signal);
+        }
         let mut fds = [libc::pollfd {
             fd: listener.as_raw_fd(),
             events: libc::POLLIN,
@@ -1667,6 +1703,9 @@ pub fn serve(paths: &Paths, retention: Retention) -> io::Result<()> {
                         note!("connection failed: {err}");
                     }
                     drain_pending(&mut daemon);
+                    if asked_to_go().is_some() {
+                        break;
+                    }
                 }
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
                 Err(err) => {
@@ -1676,6 +1715,53 @@ pub fn serve(paths: &Paths, retention: Retention) -> io::Result<()> {
             }
         }
     }
+}
+
+/// The signal a service manager or a person asked this daemon to go with.
+static GOING: AtomicI32 = AtomicI32::new(0);
+
+extern "C" fn note_the_signal(signal: libc::c_int) {
+    GOING.store(signal, Ordering::Relaxed);
+}
+
+/// Hear SIGTERM and SIGINT rather than die of them where they land, so what only
+/// memory holds can still be said. The loop looks after every connection, and a
+/// poll in progress returns early because `SA_RESTART` is not set.
+fn listen_for_shutdown() {
+    for signal in [libc::SIGTERM, libc::SIGINT] {
+        // SAFETY: the handler only stores to an atomic, which is async-signal-safe,
+        // and `action` is fully initialised before the call reads it.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = note_the_signal as *const () as usize;
+            libc::sigemptyset(&mut action.sa_mask);
+            if libc::sigaction(signal, &action, std::ptr::null_mut()) != 0 {
+                note!(
+                    "could not listen for signal {signal}: {}",
+                    io::Error::last_os_error()
+                );
+            }
+        }
+    }
+}
+
+fn asked_to_go() -> Option<libc::c_int> {
+    match GOING.load(Ordering::Relaxed) {
+        0 => None,
+        signal => Some(signal),
+    }
+}
+
+/// Say what is left, then die of the signal that was sent. launchd and systemd
+/// read a signal death, so what they see does not change.
+fn go_as_asked(daemon: &mut Daemon, signal: libc::c_int) -> ! {
+    daemon.say_lost_seals();
+    // SAFETY: restoring the default action and raising a signal touch no memory.
+    unsafe {
+        libc::signal(signal, libc::SIG_DFL);
+        libc::raise(signal);
+    }
+    std::process::exit(128 + signal)
 }
 
 /// Hand off everything the connection queued, without waiting for any of it.
@@ -1975,6 +2061,12 @@ fn outlived(file: &Path, life: Duration) -> bool {
 /// it for `WAITING_LIFE`, and a session with no conversation yet for
 /// `ORPHAN_LIFE`; any other refusal is a drop with the reason.
 fn drain_spool(daemon: &mut Daemon, paths: &Paths) {
+    let counted_before = daemon.lost_seals.unsaid;
+    drain_pass(daemon, paths);
+    daemon.say_lost_seals_after_a_pass(counted_before);
+}
+
+fn drain_pass(daemon: &mut Daemon, paths: &Paths) {
     daemon.land_held();
     let Ok(entries) = std::fs::read_dir(paths.spool_dir()) else {
         return;
@@ -1989,6 +2081,11 @@ fn drain_spool(daemon: &mut Daemon, paths: &Paths) {
     let mut parked = std::mem::take(&mut daemon.parked);
     let now = std::time::SystemTime::now();
     for file in files {
+        // The files stay, and the next daemon reads them. A service manager
+        // asking this one to go should not wait out a spool of thousands.
+        if asked_to_go().is_some() {
+            break;
+        }
         if let Some(entry) = parked.remove(&file)
             && !entry.due(&daemon.registry, now)
         {
@@ -2444,6 +2541,64 @@ mod tests {
             Stopped::Displaced,
             "and a restart folds the same log the same way"
         );
+    }
+
+    #[test]
+    fn lost_seals_are_said_when_a_pass_adds_to_them_or_after_ten_minutes() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let (mut daemon, paths) = rooted_over_a_closed_log(home.path());
+        open_the_log(&paths.log_dir());
+        let said = || {
+            fs::read_to_string(paths.root().join("drops.jsonl"))
+                .unwrap_or_default()
+                .lines()
+                .map(String::from)
+                .collect::<Vec<_>>()
+        };
+
+        // Nothing to say is nothing said, however long it has been.
+        drain_spool(&mut daemon, &paths);
+        assert!(said().is_empty());
+
+        // A first count goes out at the next pass.
+        daemon.lost_seals.unsaid = 2;
+        drain_spool(&mut daemon, &paths);
+        assert_eq!(said().len(), 1);
+        assert!(
+            said()[0].contains("\"detail\":\"2 tool event(s)\""),
+            "{:?}",
+            said()
+        );
+
+        // The live path counts between passes, and that waits.
+        daemon.lost_seals.unsaid = 5;
+        drain_spool(&mut daemon, &paths);
+        assert_eq!(said().len(), 1, "inside the ten minutes");
+        assert_eq!(daemon.lost_seals.unsaid, 5, "and not forgotten");
+
+        // A pass that adds to it does not.
+        let before = daemon.lost_seals.unsaid;
+        daemon.lost_seals.unsaid += 1;
+        daemon.say_lost_seals_after_a_pass(before);
+        assert_eq!(said().len(), 2);
+        assert!(
+            said()[1].contains("\"detail\":\"6 tool event(s)\""),
+            "{:?}",
+            said()
+        );
+
+        // And nor does ten minutes.
+        daemon.lost_seals.unsaid = 7;
+        daemon.lost_seals.said_at = std::time::Instant::now().checked_sub(LOST_SEALS_EVERY);
+        drain_spool(&mut daemon, &paths);
+        assert_eq!(said().len(), 3);
+        assert!(
+            said()[2].contains("\"detail\":\"7 tool event(s)\""),
+            "{:?}",
+            said()
+        );
+        drain_spool(&mut daemon, &paths);
+        assert_eq!(said().len(), 3, "nothing since");
     }
 
     #[test]

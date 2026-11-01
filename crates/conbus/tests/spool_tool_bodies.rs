@@ -26,6 +26,10 @@ impl Drop for Daemon {
 }
 
 fn start(home: &Path, retention: &str) -> Daemon {
+    start_with_key(home, retention, KEK)
+}
+
+fn start_with_key(home: &Path, retention: &str, key: &str) -> Daemon {
     let child = Command::new(bin())
         .arg("daemon")
         .env("CONBUS_HOME", home)
@@ -33,7 +37,7 @@ fn start(home: &Path, retention: &str) -> Daemon {
         .env("CONBUS_SKIP_LAUNCHCTL", "1")
         .env("CONBUS_CODEX_BIN", "/nonexistent/codex")
         .env("CONBUS_RETENTION", retention)
-        .env("CONBUS_KEK_HEX", KEK)
+        .env("CONBUS_KEK_HEX", key)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -57,6 +61,66 @@ fn start(home: &Path, retention: &str) -> Daemon {
 
 fn stop(daemon: Daemon) {
     drop(daemon);
+}
+
+/// Ask it to go, as launchd and systemd do, and say what it died of.
+fn ask_to_go(mut daemon: Daemon) -> Option<i32> {
+    use std::os::unix::process::ExitStatusExt;
+    // SAFETY: a plain kill(2) on a child this test still holds, so the pid is its.
+    unsafe { libc::kill(daemon.0.id() as libc::pid_t, libc::SIGTERM) };
+    daemon.0.wait().expect("wait").signal()
+}
+
+/// A value that is not a key: what a Keychain that will not answer looks like.
+const NOT_A_KEY: &str = "not a key";
+
+fn chmod(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("chmod");
+}
+
+/// Past the 2 s idle tick, so a drain has really had its chance.
+fn past_a_drain() {
+    std::thread::sleep(Duration::from_millis(2600));
+}
+
+fn until(what: &str, done: impl Fn() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        if done() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("never: {what}");
+}
+
+/// A log with one prompt in it and no daemon: the next one has to open the
+/// segment again, which a mode can refuse.
+fn a_log_with_one_turn(home: &Path, key: &str) -> std::path::PathBuf {
+    let daemon = start_with_key(home, "encrypted_tools", key);
+    hook(home, &prompt());
+    stop(daemon);
+    home.join("log/segment-00000000.jsonl")
+}
+
+fn tool_records(home: &Path, kind: &str) -> usize {
+    let mut paths: Vec<_> = std::fs::read_dir(home.join("log"))
+        .expect("log")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .collect();
+    paths.sort();
+    paths
+        .iter()
+        .flat_map(|path| {
+            String::from_utf8_lossy(&std::fs::read(path).unwrap_or_default())
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .collect::<Vec<_>>()
+        })
+        .filter(|record| record["event"] == "tool_requested" && record["input"]["kind"] == kind)
+        .count()
 }
 
 fn hook(home: &Path, payload: &serde_json::Value) {
@@ -180,47 +244,152 @@ fn a_spooled_tool_body_that_could_not_be_sealed_is_counted_where_a_person_looks(
         "elided"
     );
     let said = drops(home.path());
-    assert_eq!(said.lines().count(), 1, "one record, one line: {said}");
-    assert!(said.contains("elided, not sealed"), "{said}");
+    assert_eq!(said.lines().count(), 1, "{said}");
     assert!(
-        said.contains("tool_requested for session ea1d23e9"),
+        said.contains("\"reason\":\"tool bodies elided, not sealed\""),
         "{said}"
     );
+    assert!(said.contains("\"detail\":\"1 tool event(s)\""), "{said}");
     assert!(!said.contains("the secret command"), "{said}");
     let doctor = doctor(home.path());
-    assert!(doctor.contains("elided, not sealed"), "{doctor}");
+    assert!(
+        doctor.contains("1× tool bodies elided, not sealed"),
+        "{doctor}"
+    );
 }
 
 #[test]
-fn a_key_that_could_not_be_read_is_counted_the_same_way() {
-    // A value that is not a key stands in for a Keychain that would not answer.
+fn a_spool_of_thousands_costs_one_line_and_doctor_counts_them_all() {
+    // One line per record let a single start fill the drop log, and past its cap
+    // the next real drop has no line at all.
+    const SPOOLED: usize = 3_000;
     let home = tempfile::tempdir().expect("tempdir");
-    let daemon = Command::new(bin())
-        .arg("daemon")
-        .env("CONBUS_HOME", home.path())
-        .env("HOME", home.path())
-        .env("CONBUS_SKIP_LAUNCHCTL", "1")
-        .env("CONBUS_CODEX_BIN", "/nonexistent/codex")
-        .env("CONBUS_RETENTION", "encrypted_tools")
-        .env("CONBUS_KEK_HEX", "not a key")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("daemon");
-    let daemon = Daemon(daemon);
-    let socket = home.path().join("conbus.sock");
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while Instant::now() < deadline && std::os::unix::net::UnixStream::connect(&socket).is_err() {
-        std::thread::sleep(Duration::from_millis(20));
+    a_log_with_one_turn(home.path(), KEK);
+    hook(home.path(), &tool_call("template"));
+    let spool = home.path().join("spool");
+    let template = std::fs::read_dir(&spool)
+        .expect("spool")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .next()
+        .expect("the hook spooled");
+    let mut entry: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&template).expect("read")).expect("json");
+    std::fs::remove_file(&template).expect("remove");
+    for n in 0..SPOOLED {
+        let id = format!("01a19463-cbd4-7b50-b819-{n:012}");
+        entry["hid"] = serde_json::json!(id);
+        entry["event"]["tool_use_id"] = serde_json::json!(format!("t{n}"));
+        std::fs::write(spool.join(format!("{id}.json")), entry.to_string()).expect("entry");
     }
 
-    hook(home.path(), &prompt());
-    hook(home.path(), &tool_call("live"));
+    let daemon = start(home.path(), "encrypted_tools");
+    drain(home.path());
+    past_a_drain();
     stop(daemon);
 
-    assert_eq!(tool_record(home.path(), "live")["input"]["kind"], "elided");
-    assert!(drops(home.path()).contains("elided, not sealed"));
+    assert_eq!(tool_records(home.path(), "elided"), SPOOLED);
+    let said = drops(home.path());
+    assert_eq!(said.lines().count(), 1, "{said}");
+    assert!(
+        said.contains(&format!("\"detail\":\"{SPOOLED} tool event(s)\"")),
+        "{said}"
+    );
+    let doctor = doctor(home.path());
+    assert!(
+        doctor.contains(&format!("{SPOOLED}× tool bodies elided, not sealed")),
+        "{doctor}"
+    );
+    assert!(doctor.contains(&format!("{SPOOLED} recorded")), "{doctor}");
+}
+
+#[test]
+fn a_key_that_could_not_be_read_is_counted_and_said_at_most_so_often() {
+    // This is the live path, and it can go on for as long as the machine runs. So
+    // it is said once, then every ten minutes, and whatever is left on the way out.
+    let home = tempfile::tempdir().expect("tempdir");
+    let daemon = start_with_key(home.path(), "encrypted_tools", NOT_A_KEY);
+    hook(home.path(), &prompt());
+    hook(home.path(), &tool_call("first"));
+    until("the first count is said", || !drops(home.path()).is_empty());
+    assert_eq!(tool_record(home.path(), "first")["input"]["kind"], "elided");
+    hook(home.path(), &tool_call("second"));
+    hook(home.path(), &tool_call("third"));
+    past_a_drain();
+    let inside_the_ten_minutes = drops(home.path()).lines().count();
+
+    let died_of = ask_to_go(daemon);
+
+    assert_eq!(inside_the_ten_minutes, 1, "{}", drops(home.path()));
+    let said = drops(home.path());
+    let lines: Vec<&str> = said.lines().collect();
+    assert_eq!(lines.len(), 2, "{said}");
+    assert!(
+        lines[0].contains("\"detail\":\"1 tool event(s)\""),
+        "{said}"
+    );
+    assert!(
+        lines[1].contains("\"detail\":\"2 tool event(s)\""),
+        "{said}"
+    );
+    assert_eq!(
+        died_of,
+        Some(libc::SIGTERM),
+        "launchd and systemd read how it died, and that has not changed"
+    );
+    let doctor = doctor(home.path());
+    assert!(
+        doctor.contains("3× tool bodies elided, not sealed"),
+        "{doctor}"
+    );
+}
+
+#[test]
+fn a_held_tool_body_that_could_not_be_sealed_is_counted_too() {
+    // A record the log refused comes back through a different path from every
+    // other write, and it can be elided there as well.
+    let home = tempfile::tempdir().expect("tempdir");
+    let segment = a_log_with_one_turn(home.path(), NOT_A_KEY);
+    chmod(&segment, 0o400);
+    let daemon = start_with_key(home.path(), "encrypted_tools", NOT_A_KEY);
+
+    hook(home.path(), &tool_call("held"));
+    chmod(&segment, 0o600);
+    until("it lands", || tool_records(home.path(), "elided") == 1);
+    until("it says so", || {
+        drops(home.path()).contains("elided, not sealed")
+    });
+    stop(daemon);
+
+    assert!(
+        drops(home.path()).contains("\"detail\":\"1 tool event(s)\""),
+        "{}",
+        drops(home.path())
+    );
+}
+
+#[test]
+fn a_held_tool_body_lands_sealed_and_its_elided_copy_costs_nothing() {
+    // The daemon holds what the hook sent, and the hook's own copy has no body.
+    // The copy goes when the record lands, so nothing is written twice or lost.
+    let home = tempfile::tempdir().expect("tempdir");
+    let segment = a_log_with_one_turn(home.path(), KEK);
+    chmod(&segment, 0o400);
+    let daemon = start(home.path(), "encrypted_tools");
+
+    hook(home.path(), &tool_call("held"));
+    chmod(&segment, 0o600);
+    until("it lands", || tool_records(home.path(), "sealed") == 1);
+    drain(home.path());
+    past_a_drain();
+    stop(daemon);
+
+    assert_eq!(tool_records(home.path(), "elided"), 0);
+    assert!(
+        !drops(home.path()).contains("elided, not sealed"),
+        "{}",
+        drops(home.path())
+    );
 }
 
 #[test]

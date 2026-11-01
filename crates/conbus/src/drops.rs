@@ -42,6 +42,29 @@ const STDERR_EVERY: Duration = Duration::from_secs(60);
 /// and the individual lines are not.
 const CAP_BYTES: u64 = 4 * 1024 * 1024;
 
+/// The reason for tool bodies that reached the log elided under
+/// `encrypted_tools`. These are counted rather than logged one by one: a line's
+/// detail is [`seals_detail`]'s, and it stands for that many.
+pub const LOST_SEALS: &str = "tool bodies elided, not sealed";
+
+/// What a [`LOST_SEALS`] line says after its reason.
+pub fn seals_detail(count: u64) -> String {
+    format!("{count} tool event(s)")
+}
+
+/// How many drops one line of the log stands for.
+fn drops_in(reason: &str, value: &serde_json::Value) -> usize {
+    if reason != LOST_SEALS {
+        return 1;
+    }
+    value
+        .get("detail")
+        .and_then(|detail| detail.as_str())
+        .and_then(|detail| detail.strip_suffix(" tool event(s)"))
+        .and_then(|count| count.parse().ok())
+        .unwrap_or(1)
+}
+
 fn drops_file(paths: &Paths) -> std::path::PathBuf {
     paths.root().join("drops.jsonl")
 }
@@ -241,6 +264,8 @@ pub fn summary(paths: &Paths) -> Summary {
     };
     let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
     let mut transient = 0;
+    // A line that stands for more than one drop, past the one line it is.
+    let mut beyond_one_each = 0;
     // First-seen order per family gloss, so identical reasons merge and
     // different ones under one family stay one row.
     let mut families: Vec<(&'static str, String, usize)> = Vec::new();
@@ -266,19 +291,21 @@ pub fn summary(paths: &Paths) -> Summary {
             continue;
         }
         let gloss = classify(reason);
+        let drops = drops_in(reason, &value);
+        beyond_one_each += drops.saturating_sub(1);
         match families
             .iter_mut()
             // One row per family — the first-seen text speaks for it; only
             // the unclassified `other` family still splits on exact text.
             .find(|(g, t, _)| *g == gloss && (*g != "other" || t == reason))
         {
-            Some((_, _, n)) => *n += 1,
-            None => families.push((gloss, reason.to_string(), 1)),
+            Some((_, _, n)) => *n += drops,
+            None => families.push((gloss, reason.to_string(), drops)),
         }
     }
     families.sort_by_key(|a| std::cmp::Reverse(a.2));
     Summary {
-        count: lines.len(),
+        count: lines.len() + beyond_one_each,
         transient,
         capped: text.len() as u64 >= CAP_BYTES,
         last,
@@ -494,6 +521,63 @@ mod tests {
         assert!(rendered.contains("adapter"), "{rendered}");
         // The transient one is still folded into its own count, not a reason.
         assert!(rendered.contains("1 transient connection"), "{rendered}");
+    }
+
+    #[test]
+    fn lost_seals_are_reported_as_what_the_lines_counted_not_as_lines() {
+        let dir = home();
+        let paths = paths_at(dir.path());
+        for count in [3_000, 40_000] {
+            append(
+                &paths,
+                &Dropped::new(LOST_SEALS).with_detail(seals_detail(count)),
+            );
+        }
+        append(&paths, &Dropped::new("no mapping for hook event \"A\""));
+
+        let summary = summary(&paths);
+
+        assert_eq!(summary.count, 43_001);
+        assert_eq!(summary.reasons[0].0.text, LOST_SEALS);
+        assert_eq!(summary.reasons[0].1, 43_000);
+        let rendered = describe(&summary);
+        assert!(rendered.contains("43001 recorded"), "{rendered}");
+        assert!(
+            rendered.contains("43000× tool bodies elided, not sealed"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_lost_seal_line_that_names_no_count_is_one() {
+        // The shape a build of this branch wrote before the count, and anything
+        // else that does not read: it is still at least one drop.
+        let dir = home();
+        let paths = paths_at(dir.path());
+        append(
+            &paths,
+            &Dropped::new(LOST_SEALS).with_detail("tool_requested for session ea1d23e9"),
+        );
+        append(&paths, &Dropped::new(LOST_SEALS));
+
+        let summary = summary(&paths);
+
+        assert_eq!(summary.count, 2);
+        assert_eq!(summary.reasons[0].1, 2);
+    }
+
+    #[test]
+    fn a_count_in_another_reasons_detail_is_not_read_as_one() {
+        let dir = home();
+        let paths = paths_at(dir.path());
+        append(
+            &paths,
+            &Dropped::new("something else").with_detail("9 tool event(s)"),
+        );
+
+        let summary = summary(&paths);
+
+        assert_eq!(summary.count, 1);
     }
 
     #[test]
