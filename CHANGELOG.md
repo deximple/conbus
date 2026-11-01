@@ -23,6 +23,10 @@ the entry says so when it does.
   a split session was written under is consulted, so its older turns are not
   written again. A prompt whose hook was lost is filled even when the turn's other
   events arrived, without a second ending.
+- A restart no longer writes a spooled turn twice, through the transcript pass or
+  the Codex pass. Gap fill leaves what the spool holds to the drain, so the hook's
+  records are the ones written, and a turn still running at the restart does not
+  get an ending from its partial text.
 
 ## [1.0.0-rc.3] — 2026-11-01
 
