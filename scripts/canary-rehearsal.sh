@@ -54,11 +54,11 @@ write_fake() {
         hookfail) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "hooks     codex        MISSING — /h hooks.json has no conbus entry"' ;;
         dropper) doctor='echo "{\"ts\":\"2030-01-01T00:00:00.000Z\",\"reason\":\"post-swap fault\"}" >> "$HOME/.conbus/drops.jsonl"; echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "hooks     claude_code  runs — x"' ;;
         swapdrop) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "hooks     claude_code  runs — x"'
-            install_body='touch "$HOME/.install-called"; printf "{\"ts\":\"%s\",\"reason\":\"the daemon refused the record: this daemon speaks protocol v5; the hook speaks v6. Restart the daemon.\"}\n" "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)" >> "$HOME/.conbus/drops.jsonl"' ;;
+            install_body='touch "$HOME/.install-called"; printf "{\"ts\":\"%s\",\"reason\":\"the daemon refused the record: this daemon speaks protocol v5; the hook speaks v6. Restart the daemon.\"}\n" "$(perl -MTime::HiRes=gettimeofday -MPOSIX=strftime -e "(\$s,\$u)=gettimeofday; printf \"%s.%03dZ\", strftime(\"%Y-%m-%dT%H:%M:%S\", gmtime(\$s)), int(\$u/1000)")" >> "$HOME/.conbus/drops.jsonl"' ;;
         sessions) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "hooks     claude_code  runs — x"'
-            install_body='touch "$HOME/.install-called"; printf "{\"ts\":\"%s\",\"reason\":\"the hook payload names no session; an empty id would merge unrelated sessions into one conversation\"}\n" "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)" >> "$HOME/.conbus/drops.jsonl"' ;;
+            install_body='touch "$HOME/.install-called"; printf "{\"ts\":\"%s\",\"reason\":\"the hook payload names no session; an empty id would merge unrelated sessions into one conversation\"}\n" "$(perl -MTime::HiRes=gettimeofday -MPOSIX=strftime -e "(\$s,\$u)=gettimeofday; printf \"%s.%03dZ\", strftime(\"%Y-%m-%dT%H:%M:%S\", gmtime(\$s)), int(\$u/1000)")" >> "$HOME/.conbus/drops.jsonl"' ;;
         knowndrop) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "hooks     claude_code  runs — x"'
-            install_body='touch "$HOME/.install-called"; printf "{\"ts\":\"%s\",\"reason\":\"socket closed early\"}\n" "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)" >> "$HOME/.conbus/drops.jsonl"' ;;
+            install_body='touch "$HOME/.install-called"; printf "{\"ts\":\"%s\",\"reason\":\"socket closed early\"}\n" "$(perl -MTime::HiRes=gettimeofday -MPOSIX=strftime -e "(\$s,\$u)=gettimeofday; printf \"%s.%03dZ\", strftime(\"%Y-%m-%dT%H:%M:%S\", gmtime(\$s)), int(\$u/1000)")" >> "$HOME/.conbus/drops.jsonl"' ;;
         notokens) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "hooks     claude_code  runs — x"' ;;
         stuck) doctor='sleep 3600' ;;
         stuckboot) doctor='printf "{\"build\":\"'"$tag"'\",\"pid\":$$,\"started\":\"2026-11-01T10:00:00.000Z\",\"serving\":\"2026-11-01T10:00:04.000Z\"}\n" > "$HOME/.conbus/daemon.build"; sleep 3600' ;;
@@ -745,6 +745,54 @@ code=0
 run verdict >"$tmp/verdict-rdrop.out" 2>&1 || code=$?
 expect 1 "$code" "a drop during a planned restart fails"
 expect_grep '^FAIL drops' "$tmp/verdict-rdrop.out" "the planned-restart drop is named FAIL"
+
+# A drop log at the 4 MiB cap went blind — every later drop was silently
+# discarded, so drops can never be PASS on it. The live log did exactly
+# this for seven days in October; preflight must refuse a swap over it too.
+past=$(date -u -v-7d -v-1H +%Y-%m-%dT%H:%M:%S.000Z 2>/dev/null || date -u -d '7 days ago 1 hour ago' +%Y-%m-%dT%H:%M:%S.000Z)
+verdict_fixture
+cat >"$home/.conbus/canary.json" <<EOF
+{"swapped":"$past","prev_build":"01d","candidate_build":"beef","candidate_sha256":"x","restarts":[]}
+EOF
+# perl, not `yes | head` — head exits mid-stream and yes dies on SIGPIPE,
+# which set -o pipefail turns into a rehearsal failure that is not the
+# scenario's.
+perl -e 'print "{\"ts\":\"2026-10-30T09:00:00.000Z\",\"reason\":\"old flood\"}\n" x 80000' \
+    >"$home/.conbus/drops.jsonl"
+code=0
+run verdict >"$tmp/verdict-capped.out" 2>&1 || code=$?
+expect 0 "$code" "an unchecked drops line does not fail the verdict"
+expect_grep '^UNCHECKED drops' "$tmp/verdict-capped.out" \
+    "a drops.jsonl at the cap cannot pass drops"
+if grep -q '^PASS drops' "$tmp/verdict-capped.out"; then
+    echo "rehearsal: FAIL: a capped drops.jsonl passed drops" >&2
+    exit 1
+fi
+code=0
+run preflight >"$tmp/preflight-capped.out" 2>&1 || code=$?
+expect 1 "$code" "preflight refuses a swap over a blind drop log"
+expect_grep '^FAIL drops-cap' "$tmp/preflight-capped.out" \
+    "the capped drops.jsonl is the named failure"
+
+# A rotated log still sees both sides: the new reason lives only in the
+# generation that was renamed away — a flood mid-window rotates the file
+# and the fresh drops.jsonl holds nothing new. Reading drops.jsonl alone
+# misses it.
+verdict_fixture
+new_drop=$(date -u -v-1H +%Y-%m-%dT%H:%M:%S.000Z 2>/dev/null || date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%S.000Z)
+cat >"$home/.conbus/drops.1.jsonl" <<EOF
+{"ts":"2026-10-15T09:00:00.000Z","reason":"socket closed early"}
+{"ts":"$new_drop","reason":"a fault after the rotation"}
+EOF
+cat >"$home/.conbus/drops.jsonl" <<'EOF'
+{"ts":"2026-10-15T09:00:00.000Z","reason":"socket closed early"}
+EOF
+code=0
+run verdict >"$tmp/verdict-rotated.out" 2>&1 || code=$?
+expect 1 "$code" "a new drop reason in the rotated generation is caught"
+expect_grep 'a fault after the rotation' "$tmp/verdict-rotated.out" \
+    "the post-rotation reason is named"
+rm -f "$home/.conbus/drops.1.jsonl"
 
 # Inside the window the verdict is "incomplete", not a pass.
 cat >"$home/.conbus/canary.json" <<EOF
