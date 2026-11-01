@@ -193,12 +193,12 @@ pub fn describe(locations: &Locations) -> String {
         if claude_registered.is_none() && mentions_conbus_hook(&text) {
             claude_registered = Some(file.clone());
         }
-        if file == main_settings {
-            locked = serde_json::from_str::<Value>(&text)
-                .ok()
-                .and_then(|v| v.get("allowManagedHooksOnly")?.as_bool())
-                .unwrap_or(false);
-        }
+        // The lock is on if any managed file sets it — a drop-in in
+        // managed-settings.d/ locks as hard as the main file.
+        locked |= serde_json::from_str::<Value>(&text)
+            .ok()
+            .and_then(|v| v.get("allowManagedHooksOnly")?.as_bool())
+            .unwrap_or(false);
     }
     let lock = if locked {
         "allowManagedHooksOnly on"
@@ -515,6 +515,32 @@ mod tests {
         let (expected, _) = merge(&empty_document(), target.events, &target.command);
 
         assert_eq!(claude_code_block(binary), expected);
+    }
+
+    #[test]
+    fn a_lock_in_a_drop_in_still_locks() {
+        // An organisation can set `allowManagedHooksOnly` in a
+        // managed-settings.d/ drop-in rather than the main file; the lock
+        // fires either way, and a doctor that only read the main file would
+        // report user-level hooks as healthy while they cannot run.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let claude_dir = dir.path().join("claude-managed");
+        std::fs::create_dir_all(claude_dir.join("managed-settings.d")).expect("dirs");
+        std::fs::write(
+            claude_dir.join("managed-settings.d").join("lock.json"),
+            r#"{"allowManagedHooksOnly": true}"#,
+        )
+        .expect("drop-in");
+        let locations = Locations {
+            claude_dir,
+            codex_requirements: dir.path().join("requirements.toml"),
+            cursor_hooks: dir.path().join("cursor-hooks.json"),
+        };
+
+        let line = describe(&locations);
+
+        assert!(line.contains("allowManagedHooksOnly on"), "{line}");
+        assert!(line.contains("will not fire"), "{line}");
     }
 
     #[test]
