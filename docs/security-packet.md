@@ -31,6 +31,8 @@ else `~/.conbus`.
 | `conbus.sock` | the recorder's socket | `0600` |
 | `facts.jsonl`, `links.jsonl`, `takeover.json`, `quota/`, `drops.jsonl`, `daemon.log`, `chat-export/` | derived state, and the recorder's own messages | inside the `0700` root |
 | `policy.json` | the person's own `PreToolUse` rules, if they wrote any — off otherwise | inside the `0700` root |
+| `cache/meta/` | a derived read cache: the log's records with tool bodies replaced by SHA-256 digests (prompts and replies as in the log); deleting it loses nothing | directories `0700`, files `0600` |
+| `spool/` | hook requests waiting for a recorder that is restarting: retention applied before writing (tool bodies elided unless `full`), at most 1 MiB each and 16 MiB in all, deleted once ingested, never written where no recorder ever ran | directory `0700`, files `0600` |
 
 - **Retention.** By default, prompts and replies are kept and tool inputs and
   outputs are not written, only their size. `CONBUS_RETENTION` changes that:
@@ -190,10 +192,15 @@ reads the file before sending it. No sync code exists, and none will before
   (team `4UN6WC576K`) and notarized by Apple.
   - The signature has the hardened runtime and one entitlement,
     `com.apple.security.automation.apple-events`.
-  - The workflow first publishes an ad-hoc package, which
-    `scripts/sign-release.sh` on the operator's Mac replaces
-    (`docs/release.md`). Neither the certificate nor the notary credentials
-    is in the repository or CI.
+  - A release tag is created as a draft (a `-rc.N` tag as a prerelease), so
+    `latest` never points at the workflow's ad-hoc package;
+    `scripts/sign-release.sh` on the operator's Mac replaces it and only then
+    publishes the release (`docs/release.md`). Neither the certificate nor the
+    notary credentials is in the repository or CI.
+  - Each package carries GitHub build provenance and a CycloneDX bill of
+    materials; `cargo deny` checks advisories, licences and sources on every
+    release tag and weekly. `install.sh` on macOS refuses a release from this
+    repository that is not signed with team `4UN6WC576K`.
   - 0.2.5 was ad-hoc signed on both halves. 0.2.4 and earlier shipped the
     Intel half unsigned.
 - **Licence.** Apache-2.0.

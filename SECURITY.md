@@ -45,5 +45,6 @@ one page what conbus keeps, runs, changes and sends, and its known gaps.
 
 ## Supported versions
 
-Only the latest release is supported. conbus is 0.x; fixes land in the next
-release rather than being backported.
+The latest 1.x release is supported; fixes land in the next 1.x release rather
+than being backported. A release candidate (`v1.0.0-rc.N`) is supported until
+the release it precedes ships. 0.x releases are no longer supported.
