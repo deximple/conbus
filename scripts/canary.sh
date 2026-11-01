@@ -45,6 +45,12 @@
 #     time unless --since overrides it; its budgets come from
 #     CONBUS_CANARY_TAIL_MS / _USAGE_MS / _DOCTOR_MS / _SERVING_MS /
 #     _RSS_MB / _WINDOW_DAYS, defaulting to the plan's M3 targets.
+#   - preflight fails on doctor's `disk` warning unless
+#     CONBUS_CANARY_DISK_WARN_OK=1 downgrades it to WARN.
+#   - every rollback — the automatic one after a failed start and the
+#     `rollback` subcommand — is verified: the restored build must write a
+#     daemon.build stamp with a new pid and doctor must listen with no
+#     DIFFERS, else the script exits 3.
 #
 # The install dir is detected exactly the way install.sh places it:
 # $HOME/.local/bin. Swaps write beside the target and rename — never a copy
@@ -308,6 +314,58 @@ wait_for_serving() {
     return 1
 }
 
+# Wait for the stamp to name <build> with a pid that is not <not_pid> — the
+# proof a rollback actually booted. A restored 0.2.x stamp carries no
+# `serving` key, so unlike wait_for_serving this never asks for one.
+wait_for_build() {
+    want_build=$1
+    not_pid=$2
+    n=0
+    limit=$((serving_limit * 2))
+    while [ $n -lt "$limit" ]; do
+        if [ -f "$stamp" ]; then
+            pid=$(sed -n 's/.*"pid":\([0-9]*\).*/\1/p' "$stamp")
+            b=$(sed -n 's/.*"build":"\([^"]*\)".*/\1/p' "$stamp")
+            if [ "$b" = "$want_build" ] && [ -n "$pid" ] && [ "$pid" != "$not_pid" ]; then
+                echo "$pid"
+                return 0
+            fi
+        fi
+        sleep 0.5
+        n=$((n + 1))
+    done
+    return 1
+}
+
+# After a rollback the old build must come back: a stamp naming it with a
+# pid the candidate never had, then a doctor that is listening and agrees.
+# Verified prints and returns; anything else exits 3 — a rollback nobody
+# verified is worse news than the failure that caused it.
+verify_rollback() {
+    prev_build=$1
+    cand_pid=$2
+    mode=$3
+    if [ "$mode" = rehearsal ]; then
+        # The reload is skipped under rehearsal; let the fake boot the old
+        # build's daemon the way install --apply would have.
+        "$bin" doctor >/dev/null 2>&1 || true
+    fi
+    rb_pid=$(wait_for_build "$prev_build" "$cand_pid") || {
+        say "ROLLBACK NOT VERIFIED — no $prev_build stamp inside ${serving_limit}s; run 'canary.sh status'"
+        exit 3
+    }
+    doctor_out=$("$bin" doctor 2>&1 || true)
+    if echo "$doctor_out" | grep -q 'DIFFERS'; then
+        say "ROLLBACK NOT VERIFIED — doctor reports a different build; run 'canary.sh status'"
+        exit 3
+    fi
+    if ! echo "$doctor_out" | grep -q 'listening'; then
+        say "ROLLBACK NOT VERIFIED — the daemon is not listening; run 'canary.sh status'"
+        exit 3
+    fi
+    say "rollback verified: $prev_build pid $rb_pid listening"
+}
+
 # Report the socket state and fail (1) only when a real reload did not come
 # up; in rehearsal, not-listening is expected.
 check_doctor() {
@@ -477,7 +535,13 @@ do_preflight() {
     esac
     disk_line=$(echo "$doctor_out" | grep '^disk' || true)
     case $disk_line in
-        *WARNING*) check 1 disk "$disk_line" ;;
+        *WARNING*)
+            if [ "${CONBUS_CANARY_DISK_WARN_OK:-}" = 1 ]; then
+                check 2 disk "$disk_line (accepted by CONBUS_CANARY_DISK_WARN_OK)"
+            else
+                check 1 disk "$disk_line"
+            fi
+            ;;
         *) check 0 disk "${disk_line:-no disk line}" ;;
     esac
     if echo "$doctor_out" | grep -q 'DIFFERS'; then
@@ -1143,14 +1207,19 @@ case $sub in
 
         if [ -n "$fail_reason" ]; then
             say "start: $fail_reason — rolling back"
-            mv -f "$rollback_bin" "$bin"
-            if reregister_daemon "$mode"; then
-                wait_for_serving "$old_stamp_pid" || true
+            cand_pid=""
+            if [ -f "$stamp" ]; then
+                cand_pid=$(sed -n 's/.*"pid":\([0-9]*\).*/\1/p' "$stamp")
             fi
+            mv -f "$rollback_bin" "$bin"
+            reregister_daemon "$mode" || true
+            # The rollback happened whether or not it boots — record it
+            # before verification, which exits 3 when it cannot confirm.
             state_write "$swapped_ts" "$prev_build" "$cand_build" "$cand_sha" '[]' \
                 "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
             say "rolled back $bin to $("$bin" --version 2>&1 || echo unknown)"
             say_spool
+            verify_rollback "$prev_build" "$cand_pid" "$mode"
             die "start failed: $fail_reason (rolled back automatically)"
         fi
 
@@ -1170,13 +1239,13 @@ case $sub in
         if [ -f "$stamp" ]; then
             old_stamp_pid=$(sed -n 's/.*"pid":\([0-9]*\).*/\1/p' "$stamp")
         fi
+        cand_pid=$old_stamp_pid
         mv -f "$rollback_bin" "$bin"
-        say "rolled back $bin to $("$bin" --version 2>&1 || echo unknown) ($mode)"
-
-        reload=0
-        if reregister_daemon "$mode"; then reload=1; fi
-        if [ "$reload" = 1 ]; then wait_for_serving "$old_stamp_pid" || true; fi
-        check_doctor "$mode"
+        restored_version=$("$bin" --version 2>&1 || echo unknown)
+        say "rolled back $bin to $restored_version ($mode)"
+        prev_build=$(echo "$restored_version" | sed -n 's/.*(\([0-9a-f]*\)).*/\1/p')
+        reregister_daemon "$mode" || true
+        verify_rollback "$prev_build" "$cand_pid" "$mode"
         say_spool
         ;;
 
