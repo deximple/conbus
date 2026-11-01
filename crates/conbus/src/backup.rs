@@ -9,15 +9,22 @@
 //! under a temporary name, read back, and only then renamed, so a segment's real
 //! name at the destination always means a whole file. The manifest is written
 //! last; a file with its real name and no row is what a run that died leaves
-//! behind, and the next run checks it against the log and keeps it.
+//! behind, and the next run checks it against the log and keeps it. One with no
+//! segment left to compare with stays too, but nothing vouches for it.
 //!
 //! A copy is never overwritten with different bytes. The one exception is a copy
 //! that is an exact prefix of the log's segment: after a restore the newest
 //! restored segment is open again and grows, and taking the longer file loses
-//! nothing.
+//! nothing. The open segment itself is compared the same way, so a new log under
+//! an old name is refused at once, not when it closes.
+//!
+//! `<root>/backup.json` lists every folder a backup has gone to, on record before
+//! the first copy lands, because a person removing conbus has nothing else to tell
+//! them where plain text was left.
 
 mod copy;
 mod destination;
+mod record;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
@@ -26,24 +33,29 @@ use std::io;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-use conbus_core::clock::{Timestamp, ago};
+use conbus_core::clock::Timestamp;
 use conbus_core::paths::Paths;
 use conbus_core::segment::SegmentLog;
 use serde::{Deserialize, Serialize};
 
 use crate::report::gib;
 use copy::{Job, digest_file, digest_start, write_atomic};
+use record::{LastRun, Record, read_record, write_record};
+pub use record::{describe, left_behind};
 
 const BACKUP_DIR: &str = "conbus-backup";
 const MANIFEST: &str = "manifest.json";
 const MANIFEST_FORMAT: u32 = 1;
+const RECORD: &str = "backup.json";
 
 const SAME_DISK: &str = "same disk: protects against deletion, not a failed disk";
-const ONE_COPY: &str = "backup    none: this log has one copy";
+
+const NETWORK: &str = "network share: this copy leaves this machine, in plain text";
 
 const FIRST_RUN_NOTES: &[&str] = &[
-    "note      prompts and replies are plain text in this backup: an unencrypted \
-     external disk exposes them to whoever holds it",
+    "note      prompts and replies are plain text in this backup, and so are tool inputs and \
+     outputs if the log was written under CONBUS_RETENTION=full: an unencrypted external disk \
+     exposes them to whoever holds it",
     "note      tool bodies sealed under encrypted_tools need the log-kek key in the login \
      Keychain of the Mac that wrote them, which a backup does not copy: on another machine \
      they stay unreadable",
@@ -104,16 +116,6 @@ struct Manifest {
 
 type Rows = BTreeMap<String, Row>;
 
-/// `<root>/backup.json`: the last good run. All `doctor` ever reads.
-#[derive(Serialize, Deserialize)]
-struct Record {
-    destination: String,
-    last_ok: Timestamp,
-    segments: u64,
-    bytes: u64,
-    same_volume: bool,
-}
-
 fn refuse(why: impl std::fmt::Display) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
@@ -156,57 +158,137 @@ fn copy_to(paths: &Paths, to: &Path, home: Option<&Path>) -> io::Result<()> {
     }
     let folder = destination::check(paths.root(), to, home)?;
     let _running = hold_lock(&log_dir)?;
+    // The only list of where plain text went, so a run must not overwrite one it
+    // cannot read.
+    let record = read_record(paths)?.unwrap_or_default();
     let layout = Layout::of(&folder);
+    destination::refuse_if_disk_went_away(paths, &record, &folder, &layout)?;
     let segments = SegmentLog::segments(&log_dir)?;
-    let closed = segments.split_last().map_or(&[][..], |(_, closed)| closed);
     let manifest = read_manifest(&layout.manifest)?;
     let first_here = manifest.is_none();
-    let mut rows = manifest.unwrap_or_default();
-    let planned = plan(closed, &rows, &layout.log)?;
+    let rows = manifest.unwrap_or_default();
+    let planned = plan(&segments, &rows, &layout.log)?;
 
-    let same_volume = destination::on_log_volume(&log_dir, &folder)?;
-    let clones = same_volume && copy::volume_clones(destination::existing_folder(&folder));
-    destination::refuse_if_disk_went_away(paths, &folder, same_volume)?;
+    let standing = destination::standing(&log_dir, &folder)?;
     let new_bytes = planned.copy.iter().map(|job| job.size).sum();
     let new_files = planned.copy.len() as u64;
-    destination::refuse_if_full(&folder, new_bytes, new_files, rows.len() as u64, clones)?;
+    let room_for = rows.len() as u64;
+    destination::refuse_if_full(&folder, new_bytes, new_files, room_for, standing.clones)?;
 
+    // On record before the first copy lands: however this run ends, something
+    // says where the plain text went.
+    let name = folder.to_string_lossy().into_owned();
+    let record = if record.knows(&name) {
+        record
+    } else {
+        let record = record.with_destination(&name);
+        write_record(paths, &record)?;
+        record
+    };
     layout.create(&folder)?;
     if first_here {
         for note in FIRST_RUN_NOTES {
             println!("{note}");
         }
     }
-    copy::remove_leftovers(&layout)?;
+    copy::remove_leftovers(&layout, paths.root())?;
     let copies = planned
         .copy
         .iter()
-        .map(|job| copy::copy_verified(job, &layout.log, clones))
+        .map(|job| copy::copy_verified(job, &layout.log, standing.clones))
         .collect::<io::Result<Vec<_>>>()?;
     copy::sync_dir(&layout.log);
+    let finished = Finished {
+        folder: &name,
+        layout: &layout,
+        segments: &segments,
+        rows,
+        adopted: planned.adopted,
+        unvouched: planned.unvouched,
+        copies,
+        first_here,
+        standing,
+    };
+    finish(paths, &log_dir, record, finished)
+}
 
+/// What a run has done by the time every copy is in place.
+struct Finished<'a> {
+    folder: &'a str,
+    layout: &'a Layout,
+    segments: &'a [PathBuf],
+    rows: Rows,
+    adopted: Vec<Row>,
+    unvouched: Vec<String>,
+    copies: Vec<(Row, bool)>,
+    first_here: bool,
+    standing: destination::Standing,
+}
+
+/// The manifest, then the count, then the record: the last good time moves only
+/// once all of it has worked.
+fn finish(paths: &Paths, log_dir: &Path, record: Record, run: Finished) -> io::Result<()> {
+    let Finished {
+        folder,
+        layout,
+        segments,
+        mut rows,
+        adopted,
+        unvouched,
+        copies,
+        first_here,
+        standing,
+    } = run;
     // Nothing new, nothing written: a rerun must not wear a backup disk, or fail
     // on a full or read-only one with nothing left to do.
-    if first_here || !copies.is_empty() || !planned.adopted.is_empty() {
+    if first_here || !copies.is_empty() || !adopted.is_empty() {
         let written = copies.iter().map(|(row, _)| row.clone());
-        rows.extend(planned.adopted.into_iter().chain(written).map(keyed));
+        rows.extend(adopted.into_iter().chain(written).map(keyed));
         write_manifest(&layout.manifest, &rows)?;
         copy::sync_dir(&layout.dir);
     }
-    let bytes = rows.values().map(|row| row.size).sum();
-    write_record(paths, &folder, &rows, bytes, same_volume)?;
+    let newer = newer_records(log_dir, &rows)?;
 
-    let names: BTreeSet<String> = segments.iter().map(|path| file_name(path)).collect();
+    let there = held_sizes(&layout.log)?;
+    let in_log: BTreeSet<String> = segments.iter().map(|path| file_name(path)).collect();
+    let held: Vec<&Row> = rows
+        .values()
+        .filter(|row| there.contains_key(&row.name))
+        .collect();
+    let bytes = held.iter().map(|row| row.size).sum();
+    let lost: Vec<String> = rows
+        .keys()
+        .filter(|name| !there.contains_key(*name) && !in_log.contains(*name))
+        .cloned()
+        .collect();
+    let record = record.finished(LastRun {
+        destination: folder.to_string(),
+        last_ok: Timestamp::now(),
+        segments: held.len() as u64,
+        bytes,
+        same_volume: standing.same_volume,
+        same_disk: standing.same_disk,
+        network: standing.network,
+        lost: lost.len() as u64,
+    });
+    write_record(paths, &record)?;
+
     print_report(&Report {
-        layout: &layout,
+        layout,
         copied: copies.len(),
         cloned: copies.iter().filter(|(_, cloned)| *cloned).count(),
         copied_bytes: copies.iter().map(|(row, _)| row.size).sum(),
-        held: rows.len(),
+        held: held.len(),
         held_bytes: bytes,
-        gone: rows.keys().filter(|name| !names.contains(*name)).count(),
-        newer: newer_records(&log_dir, &rows)?,
-        same_volume,
+        gone: held
+            .iter()
+            .filter(|row| !in_log.contains(&row.name))
+            .count(),
+        lost: &lost,
+        unvouched: &unvouched,
+        newer,
+        same_disk: standing.same_disk,
+        network: standing.network,
     });
     Ok(())
 }
@@ -232,6 +314,8 @@ fn hold_lock(log_dir: &Path) -> io::Result<File> {
 struct Plan {
     copy: Vec<Job>,
     adopted: Vec<Row>,
+    /// Copies with no row and no closed segment to compare them with.
+    unvouched: Vec<String>,
 }
 
 enum Step {
@@ -245,7 +329,11 @@ enum Step {
 /// A file is only hashed when its size cannot settle the question, so a rerun
 /// costs a `stat` per segment. A closed segment changed in place at the same size
 /// is therefore not noticed here; the copy stays as it was.
-fn plan(closed: &[PathBuf], rows: &Rows, log: &Path) -> io::Result<Plan> {
+fn plan(segments: &[PathBuf], rows: &Rows, log: &Path) -> io::Result<Plan> {
+    let closed = segments.split_last().map_or(&[][..], |(_, closed)| closed);
+    if let Some(open) = segments.last() {
+        refuse_if_not_its_copy(open, rows)?;
+    }
     let held = held_sizes(log)?;
     let mut copy = Vec::new();
     let mut adopted = Vec::new();
@@ -263,16 +351,35 @@ fn plan(closed: &[PathBuf], rows: &Rows, log: &Path) -> io::Result<Plan> {
             Step::Adopt(row) => adopted.push(row),
         }
     }
-    // Its real name means it was read back once, and the segment it came from is
-    // gone or open. There is nothing to compare it with, and it may be all
-    // that is left of those records.
+    // It may be all that is left of those records, so it stays. But with nothing
+    // to compare it with, nothing can say it is whole or even from this log.
     let closed_names: BTreeSet<String> = closed.iter().map(|path| file_name(path)).collect();
-    for name in held.keys() {
-        if !rows.contains_key(name) && !closed_names.contains(name) {
-            adopted.push(digest_file(&log.join(name))?.into_row(name));
-        }
+    let unvouched = held
+        .keys()
+        .filter(|name| !rows.contains_key(*name) && !closed_names.contains(*name))
+        .cloned()
+        .collect();
+    Ok(Plan {
+        copy,
+        adopted,
+        unvouched,
+    })
+}
+
+/// The open segment is never copied, but with a row in the manifest it has to be
+/// that copy and perhaps more: a restored segment growing. Anything else is a new
+/// log under an old name, and counting it from the old row's length would call its
+/// records already safe. At most one segment to hash, and only when it has a row.
+fn refuse_if_not_its_copy(open: &Path, rows: &Rows) -> io::Result<()> {
+    let name = file_name(open);
+    let Some(row) = rows.get(&name) else {
+        return Ok(());
+    };
+    let size = fs::metadata(open).map_err(named(open))?.len();
+    if size < row.size || digest_start(open, row.size)?.sha256 != row.sha256 {
+        return Err(differs(&name, size, row.size));
     }
-    Ok(Plan { copy, adopted })
+    Ok(())
 }
 
 fn held_sizes(log: &Path) -> io::Result<BTreeMap<String, u64>> {
@@ -329,8 +436,9 @@ fn differs(name: &str, in_log: u64, in_backup: u64) -> io::Error {
     refuse(format!(
         "{name} in the log ({in_log} bytes) differs from the copy in the backup ({in_backup} \
          bytes). Nothing was copied and the backup is untouched. If the log's copy is damaged, \
-         restore that file from the backup (manual, section 11); if this folder holds another \
-         log's backup, choose another folder"
+         delete that file from the log and restore it from the backup (manual, section 11). If \
+         a recorder started a new log here, stop it and move that log aside before restoring. \
+         If this folder holds another log's backup, choose another folder"
     ))
 }
 
@@ -378,83 +486,6 @@ fn write_manifest(path: &Path, rows: &Rows) -> io::Result<()> {
     write_atomic(path, &text)
 }
 
-// ---- The record, and doctor's line ----
-
-fn read_record(paths: &Paths) -> io::Result<Option<Record>> {
-    let path = paths.backup_record();
-    let text = match fs::read(&path) {
-        Ok(text) => text,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(named(&path)(err)),
-    };
-    serde_json::from_slice(&text)
-        .map(Some)
-        .map_err(|err| named(&path)(io::Error::other(err)))
-}
-
-fn write_record(
-    paths: &Paths,
-    folder: &Path,
-    rows: &Rows,
-    bytes: u64,
-    same_volume: bool,
-) -> io::Result<()> {
-    let record = Record {
-        destination: folder.to_string_lossy().into_owned(),
-        last_ok: Timestamp::now(),
-        segments: rows.len() as u64,
-        bytes,
-        same_volume,
-    };
-    let text = serde_json::to_vec_pretty(&record).map_err(io::Error::other)?;
-    write_atomic(&paths.backup_record(), &text)
-}
-
-/// `doctor`'s one line, from the record alone. It never looks at the destination:
-/// that could be an unplugged disk, or a sleeping one this would wake.
-pub fn describe(paths: &Paths) -> String {
-    match read_record(paths) {
-        Ok(Some(record)) => describe_record(&record, Timestamp::now()),
-        Ok(None) => ONE_COPY.to_string(),
-        Err(err) => format!("backup    unknown: {err}; this log may have one copy"),
-    }
-}
-
-fn describe_record(record: &Record, now: Timestamp) -> String {
-    if record.segments == 0 {
-        return format!(
-            "{ONE_COPY} ({} holds no segment yet: nothing had closed)",
-            record.destination
-        );
-    }
-    let count = match record.segments {
-        1 => "1 segment".to_string(),
-        n => format!("{} segments", grouped(n)),
-    };
-    let line = format!(
-        "backup    last ok {} ago to {} ({count})",
-        ago(now.seconds_since(record.last_ok)),
-        record.destination
-    );
-    if record.same_volume {
-        format!("{line} — {SAME_DISK}")
-    } else {
-        line
-    }
-}
-
-fn grouped(n: u64) -> String {
-    let digits = n.to_string();
-    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
-    for (at, digit) in digits.chars().enumerate() {
-        if at > 0 && (digits.len() - at).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(digit);
-    }
-    out
-}
-
 // ---- What a run says ----
 
 /// Records the backup does not hold: everything in a segment it has no row for,
@@ -464,6 +495,10 @@ fn newer_records(log_dir: &Path, rows: &Rows) -> io::Result<u64> {
     let mut newer = 0;
     for segment in SegmentLog::segments(log_dir)? {
         let held = rows.get(&file_name(&segment)).map_or(0, |row| row.size);
+        // No longer than its copy: nothing to read, and no reason to open it.
+        if held > 0 && fs::metadata(&segment).map_err(named(&segment))?.len() <= held {
+            continue;
+        }
         newer += SegmentLog::count_records(&segment, held).map_err(named(&segment))?;
     }
     Ok(newer)
@@ -477,8 +512,21 @@ struct Report<'a> {
     held: usize,
     held_bytes: u64,
     gone: usize,
+    lost: &'a [String],
+    unvouched: &'a [String],
     newer: u64,
-    same_volume: bool,
+    same_disk: bool,
+    network: bool,
+}
+
+/// A few names, and how many more there are.
+fn some_of(names: &[String]) -> String {
+    const SHOWN: usize = 5;
+    let shown = names[..names.len().min(SHOWN)].join(", ");
+    match names.len().saturating_sub(SHOWN) {
+        0 => shown,
+        more => format!("{shown} and {more} more"),
+    }
 }
 
 fn print_report(report: &Report) {
@@ -507,6 +555,22 @@ fn print_report(report: &Report) {
             gone => format!("; {gone} no longer in the log"),
         }
     );
+    if !report.lost.is_empty() {
+        println!(
+            "backup    LOST {} segment(s), gone from the log and from this backup: {}; --verify \
+             keeps naming them",
+            report.lost.len(),
+            some_of(report.lost)
+        );
+    }
+    if !report.unvouched.is_empty() {
+        println!(
+            "backup    not vouched for: {}. No manifest row and no segment in the log to compare \
+             with, so --verify keeps naming them. They may be all that is left of those records, \
+             or not from this log",
+            some_of(report.unvouched)
+        );
+    }
     if report.held == 0 {
         println!("backup    nothing has closed yet: this log still has one copy");
     }
@@ -515,8 +579,11 @@ fn print_report(report: &Report) {
          rolls over",
         report.newer
     );
-    if report.same_volume {
+    if report.same_disk {
         println!("backup    {SAME_DISK}");
+    }
+    if report.network {
+        println!("backup    {NETWORK}");
     }
 }
 
@@ -542,7 +609,9 @@ fn verify(to: &Path) -> io::Result<()> {
         .filter(|path| !rows.contains_key(&file_name(path)))
         .map(|path| {
             format!(
-                "{}: not in the manifest; conbus backup checks it and adds it",
+                "{}: not in the manifest, so nothing vouches for it. If the log still has that \
+                 segment, conbus backup compares them and adds it. If not, it may be all that \
+                 is left of those records, or not from this log",
                 path.display()
             )
         });
@@ -600,58 +669,10 @@ fn row_problem(log: &Path, row: &Row) -> Option<String> {
 mod tests {
     use super::*;
 
-    fn record(segments: u64, same_volume: bool, age: i64) -> (Record, Timestamp) {
-        let now: Timestamp = "2026-11-02T12:00:00.000Z".parse().expect("ts");
-        let last_ok = Timestamp::from_unix_seconds(
-            now.seconds_since(Timestamp::from_unix_seconds(0).expect("epoch")) - age,
-        )
-        .expect("ts");
-        (
-            Record {
-                destination: "/Volumes/My Disk".into(),
-                last_ok,
-                segments,
-                bytes: 1,
-                same_volume,
-            },
-            now,
-        )
-    }
-
     #[test]
-    fn counts_read_the_way_a_person_writes_them() {
-        assert_eq!(grouped(0), "0");
-        assert_eq!(grouped(999), "999");
-        assert_eq!(grouped(1_000), "1,000");
-        assert_eq!(grouped(1_460), "1,460");
-        assert_eq!(grouped(1_234_567), "1,234,567");
-    }
-
-    #[test]
-    fn doctors_line_says_how_old_where_and_how_much() {
-        let (last, now) = record(1_460, false, 3 * 3_600 + 5);
-        assert_eq!(
-            describe_record(&last, now),
-            "backup    last ok 3h ago to /Volumes/My Disk (1,460 segments)"
-        );
-        let (last, now) = record(1, false, 90);
-        assert_eq!(
-            describe_record(&last, now),
-            "backup    last ok 1m ago to /Volumes/My Disk (1 segment)"
-        );
-    }
-
-    #[test]
-    fn doctors_line_says_a_same_disk_backup_is_not_a_second_disk() {
-        let (last, now) = record(2, true, 60);
-        assert!(describe_record(&last, now).ends_with(&format!("(2 segments) — {SAME_DISK}")));
-    }
-
-    #[test]
-    fn a_backup_holding_nothing_is_still_one_copy() {
-        let (last, now) = record(0, true, 60);
-        let line = describe_record(&last, now);
-        assert!(line.starts_with(ONE_COPY), "{line}");
-        assert!(!line.contains("last ok"), "{line}");
+    fn a_few_names_and_how_many_more() {
+        let names: Vec<String> = (0..7).map(|n| format!("s{n}")).collect();
+        assert_eq!(some_of(&names[..2]), "s0, s1");
+        assert_eq!(some_of(&names), "s0, s1, s2, s3, s4 and 2 more");
     }
 }

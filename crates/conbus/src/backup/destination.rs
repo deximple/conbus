@@ -9,23 +9,28 @@ use std::path::{Path, PathBuf};
 use conbus_core::paths::Paths;
 use conbus_core::segment::DEFAULT_SEGMENT_BYTES;
 
-use super::{Layout, named, read_record, refuse};
+use super::{Layout, Record, copy, named, refuse};
 use crate::report::{gib, statvfs};
+use conbus_core::segment::SegmentLog;
 
-/// Where macOS mounts other disks. A folder made here with the disk unplugged
-/// would sit on the internal disk under a name that looks external.
-const VOLUMES: &str = "/Volumes";
-
-/// Cloud-synced folders, relative to the home directory. `OneDrive*` is a prefix
-/// and has its own check. Only ever `stat`ed, never listed: reading inside iCloud
-/// Drive can stall for minutes or put a permission dialog on the person's screen.
+/// Cloud-synced folders, relative to the home directory. A run `stat`s these, on
+/// every run, and never lists them: reading inside iCloud Drive can stall for
+/// minutes or put a permission dialog on the person's screen.
 const CLOUD_FOLDERS: &[&[&str]] = &[
     &["Library", "Mobile Documents"],
     &["Library", "CloudStorage"],
     &["Dropbox"],
     &["Google Drive"],
 ];
-const ONEDRIVE: &str = "OneDrive";
+
+/// Cloud-synced folders named by how they start: `OneDrive - Acme`,
+/// `Dropbox (Personal)`. Found by reading the names in the home directory.
+const CLOUD_PREFIXES: &[&str] = &["OneDrive", "Dropbox ("];
+
+/// Folders iCloud can sync, a setting conbus cannot see. Compared with the path
+/// a person asked for and never `stat`ed: a metadata read of these two has stalled
+/// on a real Mac, so a run for any other folder must not go near them.
+const SYNCABLE_FOLDERS: &[&str] = &["Desktop", "Documents"];
 
 /// What a run needs free beyond the bytes themselves. A clone still costs an
 /// inode and its extent records: under 1 KiB each on an APFS volume with nothing
@@ -41,14 +46,21 @@ const RESERVE: u64 = DEFAULT_SEGMENT_BYTES;
 /// really is, and again on anything already inside it, which could lead
 /// somewhere else. Returns the folder as it really is.
 pub(super) fn check(root: &Path, to: &Path, home: Option<&Path>) -> io::Result<PathBuf> {
+    let Some(home) = home else {
+        return Err(refuse(
+            "no HOME to check the folder against the cloud-synced ones; set HOME",
+        ));
+    };
+    // By name first, before anything looks at the folder.
+    let spelled = std::path::absolute(to).unwrap_or_else(|_| to.to_path_buf());
+    refuse_by_name(&spelled, home)?;
     let root = fs::canonicalize(root).map_err(named(root))?;
     let folder = resolve(to)?;
-    let spelled = std::path::absolute(to).unwrap_or_else(|_| to.to_path_buf());
-    refuse_location(&folder, &spelled, &root, home)?;
+    refuse_location(&folder, &root, home)?;
     let layout = Layout::of(&folder);
     for inner in [&layout.dir, &layout.log] {
         if fs::symlink_metadata(inner).is_ok() {
-            refuse_location(&resolve(inner)?, inner, &root, home)?;
+            refuse_location(&resolve(inner)?, &root, home)?;
         }
     }
     Ok(folder)
@@ -100,16 +112,11 @@ fn resolve_new(to: &Path) -> io::Result<PathBuf> {
     Ok(real.join(name))
 }
 
-fn refuse_location(
-    folder: &Path,
-    spelled: &Path,
-    root: &Path,
-    home: Option<&Path>,
-) -> io::Result<()> {
-    if let Some(volume) = unmounted_volume(folder, Path::new(VOLUMES)) {
+fn refuse_location(folder: &Path, root: &Path, home: &Path) -> io::Result<()> {
+    if let Some(volume) = unmounted_volume(folder, &mount_holders()) {
         return Err(refuse(format!(
-            "{} is not mounted, and conbus will not create a folder of that name on the \
-             internal disk; plug the disk in and run this again",
+            "{} is not mounted, and conbus will not create a folder of that name on another \
+             disk; plug the disk in and run this again",
             volume.display()
         )));
     }
@@ -127,19 +134,48 @@ fn refuse_location(
             root.display()
         )));
     }
-    let Some(home) = home else {
-        return Err(refuse(
-            "no HOME to check the folder against the cloud-synced ones; set HOME",
-        ));
-    };
-    if let Some(cloud) = cloud_folder(folder, spelled, home) {
-        return Err(refuse(format!(
-            "{} is in a cloud-synced folder ({}). The log holds prompts and replies in plain \
-             text, and conbus promises they do not leave this machine; encrypted cloud backup \
-             is not offered yet. Choose a folder on a local or external disk",
-            folder.display(),
-            cloud.display()
-        )));
+    refuse_by_name(folder, home)?;
+    match existing_cloud_folders(home)
+        .into_iter()
+        .find(|cloud| is_inside(folder, cloud))
+    {
+        Some(cloud) => Err(in_a_cloud_folder(folder, &cloud)),
+        None => Ok(()),
+    }
+}
+
+fn in_a_cloud_folder(folder: &Path, cloud: &Path) -> io::Error {
+    refuse(format!(
+        "{} is in a cloud-synced folder ({}). The log holds prompts and replies in plain text, \
+         and conbus promises they do not leave this machine; encrypted cloud backup is not \
+         offered yet. Choose a folder on a local or external disk",
+        folder.display(),
+        cloud.display()
+    ))
+}
+
+/// What can be told from how a path is spelled, without looking at anything it
+/// names. Works for a folder that does not exist yet: a client installed tomorrow
+/// syncs what is already there.
+fn refuse_by_name(path: &Path, home: &Path) -> io::Result<()> {
+    let real_home = fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+    for home in [home, real_home.as_path()] {
+        if let Some(cloud) = named_cloud_folder(path, home) {
+            return Err(in_a_cloud_folder(path, &cloud));
+        }
+        if let Some(syncable) = SYNCABLE_FOLDERS
+            .iter()
+            .find_map(|name| spelled_under(path, home, &[name]))
+        {
+            return Err(refuse(format!(
+                "{} is under {}. On a Mac iCloud can sync Desktop and Documents, conbus cannot \
+                 see that setting, and the log holds prompts and replies in plain text, which \
+                 conbus promises do not leave this machine. Choose another folder, such as {}",
+                path.display(),
+                syncable.display(),
+                home.join("conbus-backup").display()
+            )));
+        }
     }
     Ok(())
 }
@@ -158,18 +194,42 @@ fn is_inside(inner: &Path, outer: &Path) -> bool {
     inner.ancestors().any(|at| identity(at) == Some(outer))
 }
 
-/// The folder under `volumes` that `folder` depends on, when that is not a disk:
-/// absent, a plain folder on the same device as `volumes` (what a stale mount
-/// point leaves), or `volumes` itself.
-fn unmounted_volume(folder: &Path, volumes: &Path) -> Option<PathBuf> {
-    let holder = identity(volumes)?;
+/// Where this system mounts other disks. A folder made here with the disk
+/// unplugged would sit on another disk under a name that looks like the right one.
+#[cfg(target_os = "macos")]
+fn mount_holders() -> Vec<PathBuf> {
+    vec![PathBuf::from("/Volumes")]
+}
+
+/// Deepest first: under `/media/me` a disk is the next level down, not `me`.
+#[cfg(not(target_os = "macos"))]
+fn mount_holders() -> Vec<PathBuf> {
+    let user = std::env::var_os("USER").or_else(|| std::env::var_os("LOGNAME"));
+    user.iter()
+        .flat_map(|user| {
+            [
+                Path::new("/run/media").join(user),
+                Path::new("/media").join(user),
+            ]
+        })
+        .chain([PathBuf::from("/media"), PathBuf::from("/mnt")])
+        .collect()
+}
+
+/// The folder under a mount holder that `folder` depends on, when that is not a
+/// disk: absent, a plain folder on the holder's own device (what a stale mount
+/// point leaves), or the holder itself. Only the first holder `folder` is under
+/// has a say.
+fn unmounted_volume(folder: &Path, holders: &[PathBuf]) -> Option<PathBuf> {
+    let holder = holders.iter().find(|holder| is_inside(folder, holder))?;
+    let held = identity(holder)?;
     let mut below: Option<&Path> = None;
     for at in folder.ancestors() {
-        if identity(at) == Some(holder) {
+        if identity(at) == Some(held) {
             let Some(volume) = below else {
                 return Some(at.to_path_buf());
             };
-            let mounted = identity(volume).is_some_and(|(device, _)| device != holder.0);
+            let mounted = identity(volume).is_some_and(|(device, _)| device != held.0);
             return (!mounted).then(|| volume.to_path_buf());
         }
         below = Some(at);
@@ -177,60 +237,54 @@ fn unmounted_volume(folder: &Path, volumes: &Path) -> Option<PathBuf> {
     None
 }
 
-fn is_onedrive(name: &OsStr) -> bool {
-    name.to_str()
-        .and_then(|name| name.get(..ONEDRIVE.len()))
-        .is_some_and(|start| start.eq_ignore_ascii_case(ONEDRIVE))
+fn has_cloud_prefix(name: &OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    CLOUD_PREFIXES.iter().any(|prefix| {
+        name.get(..prefix.len())
+            .is_some_and(|start| start.eq_ignore_ascii_case(prefix))
+    })
 }
 
 fn under_home(home: &Path, folder: &[&str]) -> PathBuf {
     folder.iter().fold(home.to_path_buf(), |at, n| at.join(n))
 }
 
-/// The cloud folder `path` is spelled into, if any. Works for a folder that does
-/// not exist yet: a client installed tomorrow syncs what is already there.
-fn named_cloud_folder(path: &Path, home: &Path) -> Option<PathBuf> {
+/// `home/folder`, if `path` is that or anything under it, in any case: the
+/// default Mac volume does not care about case.
+fn spelled_under(path: &Path, home: &Path, folder: &[&str]) -> Option<PathBuf> {
     let parts: Vec<&OsStr> = path.strip_prefix(home).ok()?.iter().collect();
-    if is_onedrive(parts.first()?) {
-        return Some(home.join(parts[0]));
-    }
     let same = |part: &OsStr, name: &str| {
         part.to_str()
             .is_some_and(|part| part.eq_ignore_ascii_case(name))
     };
+    (parts.len() >= folder.len() && folder.iter().zip(&parts).all(|(n, p)| same(p, n)))
+        .then(|| under_home(home, folder))
+}
+
+/// The cloud folder `path` is spelled into, if any.
+fn named_cloud_folder(path: &Path, home: &Path) -> Option<PathBuf> {
+    let first = path.strip_prefix(home).ok()?.iter().next()?;
+    if has_cloud_prefix(first) {
+        return Some(home.join(first));
+    }
     CLOUD_FOLDERS
         .iter()
-        .find(|folder| {
-            parts.len() >= folder.len() && folder.iter().zip(&parts).all(|(n, p)| same(p, n))
-        })
-        .map(|folder| under_home(home, folder))
+        .find_map(|folder| spelled_under(path, home, folder))
 }
 
 /// The cloud folders present in this home, by whatever they point at: `~/Dropbox`
 /// may be a link to another disk, and what is there still syncs.
 fn existing_cloud_folders(home: &Path) -> Vec<PathBuf> {
     let fixed = CLOUD_FOLDERS.iter().map(|folder| under_home(home, folder));
-    let onedrive = fs::read_dir(home)
+    let prefixed = fs::read_dir(home)
         .into_iter()
         .flatten()
         .filter_map(Result::ok)
-        .filter(|entry| is_onedrive(&entry.file_name()))
+        .filter(|entry| has_cloud_prefix(&entry.file_name()))
         .map(|entry| entry.path());
-    fixed.chain(onedrive).collect()
-}
-
-fn cloud_folder(folder: &Path, spelled: &Path, home: &Path) -> Option<PathBuf> {
-    let real_home = fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
-    for path in [folder, spelled] {
-        for home in [home, real_home.as_path()] {
-            if let Some(found) = named_cloud_folder(path, home) {
-                return Some(found);
-            }
-        }
-    }
-    existing_cloud_folders(home)
-        .into_iter()
-        .find(|cloud| is_inside(folder, cloud))
+    fixed.chain(prefixed).collect()
 }
 
 /// `folder` if it is there yet, otherwise the parent `resolve` found.
@@ -242,28 +296,56 @@ pub(super) fn existing_folder(folder: &Path) -> &Path {
     }
 }
 
-pub(super) fn on_log_volume(log_dir: &Path, folder: &Path) -> io::Result<bool> {
+/// How the destination stands to the log.
+pub(super) struct Standing {
+    pub same_volume: bool,
+    /// The same volume, or another volume in the same APFS container, which fails
+    /// with it. Separate partitions of one physical disk do not show up here.
+    pub same_disk: bool,
+    pub network: bool,
+    pub clones: bool,
+}
+
+pub(super) fn standing(log_dir: &Path, folder: &Path) -> io::Result<Standing> {
     let here = existing_folder(folder);
     let log = fs::metadata(log_dir).map_err(named(log_dir))?;
-    Ok(log.dev() == fs::metadata(here).map_err(named(here))?.dev())
+    let same_volume = log.dev() == fs::metadata(here).map_err(named(here))?.dev();
+    let (log_volume, here_volume) = (copy::volume_of(log_dir), copy::volume_of(here));
+    Ok(Standing {
+        same_volume,
+        same_disk: same_volume
+            || (log_volume.disk.is_some() && log_volume.disk == here_volume.disk),
+        network: here_volume.network,
+        clones: same_volume && here_volume.clones,
+    })
 }
 
 /// A mount folder outlives its disk (`/mnt/disk`, a stale `/Volumes/Name`), and
-/// with the disk gone it is just a folder on the log's own disk. Only the record
-/// can tell that apart from a person choosing that folder.
+/// with the disk gone it is just a folder on some other disk. A run has finished
+/// here before, and neither a manifest nor a copy is here now: copying would put
+/// the whole log somewhere nobody chose. A run that was interrupted before its
+/// first finish has no such claim, so it can go on.
 pub(super) fn refuse_if_disk_went_away(
     paths: &Paths,
+    record: &Record,
     folder: &Path,
-    same_volume: bool,
+    layout: &Layout,
 ) -> io::Result<()> {
-    let Ok(Some(last)) = read_record(paths) else {
-        return Ok(());
-    };
-    if same_volume && !last.same_volume && last.destination == folder.to_string_lossy() {
+    let name = folder.to_string_lossy();
+    let expected = record
+        .destinations
+        .iter()
+        .any(|known| known.finished && known.path == name);
+    if expected
+        && !layout.manifest.exists()
+        && SegmentLog::segments(&layout.log)
+            .map_err(named(&layout.log))?
+            .is_empty()
+    {
         return Err(refuse(format!(
-            "{} was on another disk at the last backup and is on the log's disk now, so that \
-             disk is probably not mounted. Mount it and run this again; if the folder really \
-             moved here, delete {} first",
+            "{} held a backup at its last run and holds none now, so its disk is probably not \
+             mounted. Mount it and run this again. If you removed that backup on purpose, take \
+             this folder out of the destinations in {} first",
             folder.display(),
             paths.backup_record().display()
         )));
@@ -319,14 +401,15 @@ mod tests {
         let stale = volumes.join("My Disk");
         fs::create_dir(&stale).expect("dir");
 
+        let holders = [volumes.clone()];
         assert_eq!(
-            unmounted_volume(&stale.join("backups"), &volumes),
+            unmounted_volume(&stale.join("backups"), &holders),
             Some(stale.clone())
         );
-        assert_eq!(unmounted_volume(&stale, &volumes), Some(stale.clone()));
+        assert_eq!(unmounted_volume(&stale, &holders), Some(stale.clone()));
         let absent = volumes.join("Unplugged");
-        assert_eq!(unmounted_volume(&absent, &volumes), Some(absent));
-        assert_eq!(unmounted_volume(&volumes, &volumes), Some(volumes.clone()));
+        assert_eq!(unmounted_volume(&absent, &holders), Some(absent));
+        assert_eq!(unmounted_volume(&volumes, &holders), Some(volumes.clone()));
     }
 
     #[test]
@@ -338,8 +421,9 @@ mod tests {
             identity(Path::new("/dev")).map(|id| id.0),
             identity(root).map(|id| id.0)
         );
-        assert_eq!(unmounted_volume(Path::new("/dev/fd"), root), None);
-        assert_eq!(unmounted_volume(Path::new("/dev"), root), None);
+        let holders = [root.to_path_buf()];
+        assert_eq!(unmounted_volume(Path::new("/dev/fd"), &holders), None);
+        assert_eq!(unmounted_volume(Path::new("/dev"), &holders), None);
     }
 
     #[test]
@@ -349,8 +433,48 @@ mod tests {
         let volumes = base.join("Volumes");
         fs::create_dir(&volumes).expect("dir");
 
-        assert_eq!(unmounted_volume(&base.join("elsewhere"), &volumes), None);
-        assert_eq!(unmounted_volume(&base, &base.join("no-such")), None);
+        assert_eq!(
+            unmounted_volume(&base.join("elsewhere"), std::slice::from_ref(&volumes)),
+            None
+        );
+        assert_eq!(unmounted_volume(&base, &[base.join("no-such")]), None);
+    }
+
+    #[test]
+    fn under_a_persons_own_mount_folder_the_disk_is_the_next_level_down() {
+        // `/media/me` is a holder as well as a folder under `/media`, and it is
+        // the deeper one that decides, or every mounted disk there would be
+        // refused for `me` not being a disk.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let base = temp.path().canonicalize().expect("canonical");
+        let (media, mine) = (base.join("media"), base.join("media").join("me"));
+        fs::create_dir_all(&mine).expect("dirs");
+        let holders = [mine.clone(), media.clone()];
+
+        let stale = mine.join("Disk");
+        fs::create_dir(&stale).expect("dir");
+        assert_eq!(
+            unmounted_volume(&stale.join("backups"), &holders),
+            Some(stale.clone())
+        );
+        let someone_elses = media.join("them");
+        assert_eq!(
+            unmounted_volume(&someone_elses.join("Disk"), &holders),
+            Some(someone_elses),
+            "with no holder deeper, the level under /media is what must be a disk"
+        );
+        assert_eq!(unmounted_volume(&mine, &holders), Some(mine.clone()));
+        assert_eq!(unmounted_volume(&base.join("elsewhere"), &holders), None);
+    }
+
+    #[test]
+    fn a_cloud_folder_named_by_how_it_starts() {
+        for name in ["OneDrive", "OneDrive - Acme", "onedrive", "Dropbox (Acme)"] {
+            assert!(has_cloud_prefix(OsStr::new(name)), "{name}");
+        }
+        for name in ["Dropbox", "Dropboxes", "Dropbox-notes", "Drive", "하나"] {
+            assert!(!has_cloud_prefix(OsStr::new(name)), "{name}");
+        }
     }
 
     #[test]

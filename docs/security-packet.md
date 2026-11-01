@@ -32,7 +32,7 @@ else `~/.conbus`. The one exception is a backup the person makes
 | `conbus.sock` | the recorder's socket | `0600` |
 | `facts.jsonl`, `links.jsonl`, `takeover.json`, `quota/`, `drops.jsonl`, `daemon.log`, `chat-export/` | derived state, and the recorder's own messages | inside the `0700` root |
 | `policy.json` | the person's own `PreToolUse` rules, if they wrote any — off otherwise | inside the `0700` root |
-| `backup.json` | the last good `conbus backup`: the destination's path, the time, segment and byte counts, and whether it is the log's own volume; no log text | `0600`, inside the `0700` root |
+| `backup.json` | every folder a `conbus backup` has gone to, and the last good run: its folder, the time, segment and byte counts, and how that folder stands to the log; no log text | `0600`, inside the `0700` root |
 | `cache/meta/` | a derived read cache: the log's records with tool bodies replaced by SHA-256 digests (prompts and replies as in the log); deleting it loses nothing | directories `0700`, files `0600` |
 | `spool/` | hook requests waiting for a recorder that is restarting: retention applied before writing (tool bodies elided unless `full`), at most 1 MiB each and 16 MiB in all, deleted once ingested, never written where no recorder ever ran | directory `0700`, files `0600` |
 
@@ -113,23 +113,31 @@ connection.
   and SHA-256 digests, under `FOLDER/conbus-backup/` (directories `0700`, files
   `0600`), and `backup.json` in the root. Only `log/`: not `policy.json`, the
   facts, or anything else in the root.
-- **Prompts and replies are plain text at the destination.** Modes do not protect
-  an external disk: macOS mounts those with ownership ignored, and exFAT has no
-  modes. Whoever holds an unencrypted disk can read the log. conbus does not know
-  whether the destination is encrypted.
+- **Prompts and replies are plain text at the destination,** and so are tool bodies
+  if the log was written under `CONBUS_RETENTION=full`. Modes do not protect an
+  external disk: macOS mounts those with ownership ignored, and exFAT has no modes.
+  Whoever holds an unencrypted disk can read the log. conbus does not know whether the
+  destination is encrypted.
 - **Sealed tool bodies stay sealed.** Under `encrypted_tools` they are sealed with
   the Keychain key `log-kek`, which a backup does not copy, so on another machine
   they stay unreadable.
 - **What it refuses, with no override.** A folder inside the root or holding it.
   A folder under `~/Library/Mobile Documents`, `~/Library/CloudStorage`,
-  `~/Dropbox`, `~/Google Drive` or `~/OneDrive*`, whether spelled that way or
-  reached through a symlink, and whether or not it exists yet. A folder whose
-  parent is missing, or a `/Volumes/NAME` with no disk mounted, so an unplugged
-  disk fails rather than creating a look-alike folder on the internal disk.
-- **What that refusal cannot see.** It knows those names and nothing else: not
-  iCloud's Desktop & Documents setting, another sync tool, or a network share.
-  Choosing one of those sends plain text wherever that goes. Encrypted cloud
-  backup is not offered.
+  `~/Dropbox`, `~/Dropbox (…)`, `~/Google Drive` or `~/OneDrive*`, whether spelled
+  that way or reached through a symlink, and whether or not it exists yet. `~/Desktop`
+  and `~/Documents`, by name and without looking at them, because iCloud can sync them
+  and conbus cannot see that setting. A folder whose parent is missing, a folder under
+  `/Volumes` (or `/mnt`, `/media`, `/media/$USER` and `/run/media/$USER` on Linux) with
+  no disk mounted, or one that held a backup at its last run and holds none now, so an
+  unplugged disk fails rather than creating a look-alike folder on another disk.
+- **What that refusal cannot see.** It knows those names and nothing else, so another
+  sync tool is not refused, and choosing one sends plain text wherever that goes.
+  Encrypted cloud backup is not offered. A network share is not refused either: on a
+  Mac the run and `doctor` say the copy leaves this machine, and on Linux conbus cannot
+  tell.
+- **Same disk.** On the log's own volume, or another volume in its APFS container, the
+  run and `doctor` say it protects against deletion, not a failed disk. A separate
+  partition of the same physical disk is not flagged.
 - **Deleting the root does not delete a backup.** See
   [Removing it](#removing-it).
 
@@ -251,9 +259,9 @@ key; its tool bodies were elided). On a managed Mac,
 remove the managed entries first and the system-wide binary last;
 [the fleet guide](fleet.md#7-taking-it-back-out) gives the order.
 `uninstall` touches neither. A backup is not in the root, so neither command
-removes it: `conbus doctor` names the last folder used, and
-`rm -rf FOLDER/conbus-backup` removes the copy. Do that first, while the record
-that names the folder still exists.
+removes it. `conbus uninstall` prints every folder a backup went to, on record
+before the first copy landed there, and `rm -rf FOLDER/conbus-backup` removes each
+copy. Do that before removing the root, which takes that list with it.
 
 ## Known gaps
 

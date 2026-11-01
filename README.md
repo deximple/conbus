@@ -158,8 +158,10 @@ is treated like `conbus go cursor`.
 
   `conbus backup --to FOLDER` (experimental) writes a plain-text copy of the
   log's closed segments to a folder you name, only when you run it. It refuses
-  cloud-synced folders. [Manual, section 11](docs/manual.md#backing-it-up-experimental)
-  has what a backup is not, and how to restore one.
+  cloud-synced folders and `~/Desktop` and `~/Documents`, and on a network share it
+  says the copy leaves this machine.
+  [Manual, section 11](docs/manual.md#backing-it-up-experimental) has what a backup
+  is not, and how to restore one.
 
   To read quota, conbus asks the vendor CLIs you already use (`codex
   app-server`, `agy`); deciding a hop asks `gh` for the checkout's pull request.
@@ -178,7 +180,8 @@ Every hook entry that runs conbus comes out of every vendor file — nothing
 else does — the StatusLine goes back to yours, and the plugin, launchd agent
 and binary are deleted. **Your log is kept**; uninstall prints where it is,
 and `rm -rf ~/.conbus` removes it if you want it gone. A backup you made stays
-in the folder you named until you delete it; `conbus doctor` names that folder.
+in plain text in the folder you named until you delete it. Uninstall prints every
+folder a backup went to; `rm -rf ~/.conbus` takes that list with it.
 
 ## Limits
 

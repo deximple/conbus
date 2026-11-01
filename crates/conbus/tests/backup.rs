@@ -4,6 +4,8 @@
 //! Every run here sets `CONBUS_HOME` and `HOME` under `/tmp`, and points the
 //! vendor binaries nowhere.
 
+mod support;
+
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
@@ -21,6 +23,13 @@ const DAY: &str = "2026-10-01";
 const SMALL_SEGMENT: u64 = 1024;
 const SAME_DISK: &str = "same disk: protects against deletion, not a failed disk";
 
+/// The manuals themselves: a restore test runs what a person would paste, so
+/// removing a line from either manual fails a test.
+const MANUAL: &str = include_str!("../../../docs/manual.md");
+const MANUAL_KO: &str = include_str!("../../../docs/manual.ko.md");
+/// The disk the manuals' examples name, replaced with each test's own folder.
+const EXAMPLE_DISK: &str = "/Volumes/My Disk";
+
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_conbus")
 }
@@ -32,6 +41,8 @@ struct World {
     base: PathBuf,
     root: PathBuf,
     home: PathBuf,
+    /// Find the root through `XDG_STATE_HOME` rather than `CONBUS_HOME`.
+    xdg_state: Option<PathBuf>,
 }
 
 impl World {
@@ -49,6 +60,7 @@ impl World {
             base,
             root,
             home,
+            xdg_state: None,
         }
     }
 
@@ -67,28 +79,47 @@ impl World {
     /// Append through the recorder's own writer, so a segment here is what a
     /// recorder writes, only smaller.
     fn write_turns(&self, turns: u64, segment_bytes: u64) {
+        // No two writes say the same thing, as no two real logs do: a new log must
+        // not come out byte for byte the old one and pass as its copy.
+        static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let write = WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut log =
             SegmentLog::open_with_segment_size(self.log(), Retention::Full, segment_bytes)
                 .expect("log");
         for turn in 0..turns {
-            for event in turn_events(turn) {
+            for event in turn_events(write, turn) {
                 let second = log.next_sequence();
                 log.append(entry(second, event)).expect("append");
             }
         }
     }
 
-    fn command(&self) -> Command {
-        let mut command = Command::new(bin());
+    /// What every run of conbus here sees, whether or not through a shell.
+    fn set_env(&self, command: &mut Command) {
+        match &self.xdg_state {
+            Some(state) => {
+                command
+                    .env_remove("CONBUS_HOME")
+                    .env("XDG_STATE_HOME", state);
+            }
+            None => {
+                command
+                    .env("CONBUS_HOME", &self.root)
+                    .env_remove("XDG_STATE_HOME");
+            }
+        }
         command
-            .env("CONBUS_HOME", &self.root)
             .env("HOME", &self.home)
             .env("CONBUS_SKIP_LAUNCHCTL", "1")
             .env("CONBUS_AGY_BIN", "/nonexistent/x")
             .env("CONBUS_CODEX_BIN", "/nonexistent/x")
-            .env_remove("XDG_STATE_HOME")
             .env_remove("CONBUS_NO_CACHE")
             .stdin(Stdio::null());
+    }
+
+    fn command(&self) -> Command {
+        let mut command = Command::new(bin());
+        self.set_env(&mut command);
         command
     }
 
@@ -167,12 +198,12 @@ fn entry(second: u64, event: Event) -> Entry {
 }
 
 /// One turn. The prompt's length varies, so no two segments are the same size.
-fn turn_events(turn: u64) -> [Event; 3] {
+fn turn_events(write: u64, turn: u64) -> [Event; 3] {
     [
         Event::TurnStarted {
             author: None,
             prompt: Body::kept(format!(
-                "prompt {turn} {}",
+                "prompt {write}.{turn} {}",
                 "p".repeat((turn % 37) as usize)
             )),
         },
@@ -310,25 +341,122 @@ fn fingerprint(dir: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
     found
 }
 
-/// The manual's restore, as written: a shell, a glob and `cp -n`. Its exit
-/// status is not asserted because `cp -n` over an existing file exits 1 on some
-/// platforms; what landed is what the tests check.
-fn restore(folder: &Path, root: &Path) {
-    Command::new("/bin/sh")
-        .args([
-            "-c",
-            r#"mkdir -p -m 700 "$2/log"
-               find "$2/log" -name 'segment-*.jsonl' -empty -delete
-               cp -n "$1"/conbus-backup/log/*.jsonl "$2/log/"
-               chmod 600 "$2"/log/*.jsonl
-               rm -rf "$2/cache/meta""#,
-            "sh",
-        ])
-        .arg(folder)
-        .arg(root)
-        .stderr(Stdio::null())
-        .status()
+/// The fenced shell blocks of a manual.
+fn bash_blocks(manual: &str) -> Vec<String> {
+    let mut blocks = Vec::new();
+    let mut open: Option<String> = None;
+    for line in manual.lines() {
+        match (&mut open, line) {
+            (None, "```bash") => open = Some(String::new()),
+            (Some(_), "```") => blocks.extend(open.take()),
+            (Some(block), _) => {
+                block.push_str(line);
+                block.push('\n');
+            }
+            (None, _) => {}
+        }
+    }
+    blocks
+}
+
+/// A manual's restore block for one platform, named by what stops its recorder.
+fn restore_block(manual: &str, stopped_by: &str) -> String {
+    let mut found: Vec<String> = bash_blocks(manual)
+        .into_iter()
+        .filter(|block| block.contains("conbus-backup/log/") && block.contains(stopped_by))
+        .collect();
+    assert_eq!(found.len(), 1, "one restore block uses {stopped_by}");
+    found.remove(0)
+}
+
+/// Stand-ins for what must not really run: the service managers, and `conbus`
+/// itself only to note each call and to keep `install` from doing anything,
+/// since a test's recorder is not started that way. Everything else `conbus` is
+/// asked for is the real binary.
+fn stubs(world: &World) -> PathBuf {
+    let dir = world.base.join("stubs");
+    if dir.exists() {
+        return dir;
+    }
+    fs::create_dir(&dir).expect("stubs");
+    let calls = world.base.join("calls");
+    let calls = calls.display();
+    for tool in ["launchctl", "systemctl"] {
+        support::write_executable(
+            &dir.join(tool),
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"{tool} $*\" >> '{calls}'\nexit \"${{STOP_EXIT:-0}}\"\n"
+            ),
+        );
+    }
+    support::write_executable(
+        &dir.join("conbus"),
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"conbus $*\" >> '{calls}'\n\
+             if [ \"$1\" = install ] && [ -z \"$REAL_INSTALL\" ]; then exit 0; fi\n\
+             exec '{}' \"$@\"\n",
+            bin()
+        ),
+    );
+    dir
+}
+
+/// What a pasted restore did.
+struct Restored {
+    out: Output,
+    calls: Vec<String>,
+}
+
+impl Restored {
+    fn started_the_recorder(&self) -> bool {
+        self.calls
+            .iter()
+            .any(|call| call.starts_with("conbus install"))
+    }
+}
+
+/// A shell set up the way a person's would be for a restore on this `world`.
+fn restore_shell(world: &World, shell: &str) -> Command {
+    let mut command = Command::new(shell);
+    world.set_env(&mut command);
+    command.env("PATH", format!("{}:/usr/bin:/bin", stubs(world).display()));
+    command
+}
+
+fn calls_so_far(world: &World) -> Vec<String> {
+    fs::read_to_string(world.base.join("calls"))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// Run a block as written, but for the folder it names.
+fn run_block(world: &World, folder: &Path, block: &str, env: &[(&str, &str)]) -> Restored {
+    assert!(block.contains(EXAMPLE_DISK), "the block names no disk");
+    let script = block.replace(EXAMPLE_DISK, folder.to_str().expect("utf-8"));
+    let _ = fs::remove_file(world.base.join("calls"));
+    let out = restore_shell(world, "/bin/sh")
+        .args(["-c", &script])
+        .envs(env.iter().copied())
+        .output()
         .expect("run the restore");
+    Restored {
+        out,
+        calls: calls_so_far(world),
+    }
+}
+
+/// The manual's restore, as a person would paste it.
+fn try_restore(world: &World, folder: &Path) -> Restored {
+    run_block(world, folder, &restore_block(MANUAL, "launchctl"), &[])
+}
+
+/// A restore that has to work, right through to starting the recorder.
+fn restore(world: &World, folder: &Path) {
+    let restored = try_restore(world, folder);
+    ok(&restored.out);
+    assert!(restored.started_the_recorder(), "{:?}", restored.calls);
 }
 
 // ---- What it copies ----
@@ -495,6 +623,21 @@ fn what_is_copied_is_closed_to_its_owner_even_when_the_source_is_not() {
 }
 
 #[test]
+fn its_own_folders_are_closed_even_if_something_left_them_open() {
+    let world = World::with_log();
+    let folder = world.base.join("dest");
+    fs::create_dir_all(backup_log(&folder)).expect("dirs");
+    for dir in [folder.join("conbus-backup"), backup_log(&folder)] {
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+
+    ok(&world.backup(&folder));
+
+    assert_eq!(mode(&folder.join("conbus-backup")), 0o700);
+    assert_eq!(mode(&backup_log(&folder)), 0o700);
+}
+
+#[test]
 fn a_folder_that_already_exists_keeps_its_own_mode() {
     // The folder may be a disk's root, or somewhere else that is the person's.
     let world = World::with_log();
@@ -574,129 +717,197 @@ fn a_run_stopped_midway_leaves_only_whole_files_and_the_next_run_finishes() {
 
 /// A child that goes when the test does, whatever way the test ends: one left
 /// blocked on a FIFO would hold a disk image mounted for ever.
-struct Stopping(std::process::Child);
+struct Stopping(Option<std::process::Child>);
 
 impl Drop for Stopping {
     fn drop(&mut self) {
-        if matches!(self.0.try_wait(), Ok(None)) {
+        if let Some(child) = &mut self.0
+            && matches!(child.try_wait(), Ok(None))
+        {
             // SAFETY: not yet reaped, so the pid is still this child's.
-            unsafe { libc::kill(self.0.id() as libc::pid_t, libc::SIGTERM) };
-            let _ = self.0.wait();
+            unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+            let _ = child.wait();
         }
     }
 }
 
-/// A closed "segment" that is a FIFO: the run blocks reading it, at a moment the
-/// test chooses, with part of the file written. No timing is involved. Only a real
-/// copy gets this far, so `folder` must be on a volume where no clone is made.
-fn a_copy_caught_halfway_is_not_a_segment(world: &World, folder: &Path) {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    use std::time::{Duration, Instant};
+/// A folder where a run really writes the bytes. On a Mac that means another
+/// volume, because on the log's own it would clone.
+#[cfg(target_os = "macos")]
+fn folder_for_a_real_copy(world: &World) -> (PathBuf, Image) {
+    let image = Image::attach(&world.base, "copy", "HFS+", "16m");
+    (image.mount.join("backups"), image)
+}
 
-    let (closed, _) = split_open(world);
-    let caught = closed.last().expect("a closed segment");
-    let source = world.log().join(caught);
-    let whole = fs::read(&source).expect("read");
-    fs::remove_file(&source).expect("rm");
-    let fifo = std::ffi::CString::new(source.to_str().expect("utf-8")).expect("path");
-    // SAFETY: `fifo` is a NUL-terminated path that lives across the call.
-    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0, "mkfifo");
-    let mut child = Stopping(
-        world
+#[cfg(not(target_os = "macos"))]
+fn folder_for_a_real_copy(world: &World) -> (PathBuf, ()) {
+    (world.base.join("dest"), ())
+}
+
+/// A run held open partway through a copy. The last closed "segment" is a FIFO,
+/// so the run blocks reading it, at a moment the test chooses, with part of the
+/// file written. No timing is involved. `folder` has to be somewhere a real copy
+/// is made, since a clone would not read the FIFO.
+struct CaughtRun {
+    child: Stopping,
+    feed: File,
+    source: PathBuf,
+    whole: Vec<u8>,
+    name: String,
+    temp: PathBuf,
+}
+
+impl CaughtRun {
+    fn start(world: &World, folder: &Path) -> Self {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::time::{Duration, Instant};
+
+        let (closed, _) = split_open(world);
+        let name = closed.last().expect("a closed segment").clone();
+        let source = world.log().join(&name);
+        let whole = fs::read(&source).expect("read");
+        fs::remove_file(&source).expect("rm");
+        let fifo = std::ffi::CString::new(source.to_str().expect("utf-8")).expect("path");
+        // SAFETY: `fifo` is a NUL-terminated path that lives across the call.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0, "mkfifo");
+        let child = world
             .command()
             .args(["backup", "--to"])
             .arg(folder)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .spawn()
-            .expect("spawn"),
-    );
-    // Not blocking: a run that never reaches this file must fail the test, not
-    // hang it. With no reader yet the open fails, so ask until there is one.
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let mut feed = loop {
-        match fs::OpenOptions::new()
-            .write(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(&source)
-        {
-            Ok(feed) => break feed,
-            Err(err) => {
-                assert!(Instant::now() < deadline, "the run never opened it: {err}");
-                std::thread::sleep(Duration::from_millis(5));
+            .expect("spawn");
+        let pid = child.id();
+        let child = Stopping(Some(child));
+        // Not blocking: a run that never reaches this file must fail the test,
+        // not hang it. With no reader yet the open fails, so ask until there is.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut feed = loop {
+            match fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&source)
+            {
+                Ok(feed) => break feed,
+                Err(err) => {
+                    assert!(Instant::now() < deadline, "the run never opened it: {err}");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
             }
+        };
+        feed.write_all(&whole[..whole.len() / 2])
+            .expect("feed half");
+        let temp = backup_log(folder).join(format!(".{name}.{pid}.tmp"));
+        while fs::metadata(&temp).map_or(0, |meta| meta.len()) == 0 {
+            assert!(Instant::now() < deadline, "no temporary file appeared");
+            std::thread::sleep(Duration::from_millis(5));
         }
-    };
-    feed.write_all(&whole[..whole.len() / 2])
-        .expect("feed half");
-    let log = backup_log(folder);
-    let temp = log.join(format!(".{caught}.{}.tmp", child.0.id()));
-    while fs::metadata(&temp).map_or(0, |meta| meta.len()) == 0 {
-        assert!(Instant::now() < deadline, "no temporary file appeared");
-        std::thread::sleep(Duration::from_millis(5));
+        CaughtRun {
+            child,
+            feed,
+            source,
+            whole,
+            name,
+            temp,
+        }
     }
 
+    /// Stop it where it stands, as a signal would.
+    fn stop(mut self) {
+        let mut child = self.child.0.take().expect("the run");
+        // SAFETY: not yet reaped, so the pid is still this child's.
+        unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+        child.wait().expect("wait");
+        drop(self.feed);
+        fs::remove_file(&self.source).expect("rm the fifo");
+        fs::write(&self.source, &self.whole).expect("put the segment back");
+    }
+
+    /// Let it finish: the rest of the file, then the end of it.
+    fn finish(mut self) -> Output {
+        use std::io::Write;
+        use std::time::{Duration, Instant};
+
+        self.feed
+            .write_all(&self.whole[self.whole.len() / 2..])
+            .expect("feed the rest");
+        drop(self.feed);
+        let mut child = self.child.0.take().expect("the run");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while matches!(child.try_wait(), Ok(None)) {
+            if Instant::now() >= deadline {
+                self.child.0 = Some(child);
+                panic!("the run did not finish");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let out = child.wait_with_output().expect("wait");
+        fs::remove_file(&self.source).expect("rm the fifo");
+        fs::write(&self.source, &self.whole).expect("put the segment back");
+        out
+    }
+}
+
+#[test]
+fn half_a_copy_never_has_the_segments_name() {
+    let world = World::with_log();
+    let (folder, _volume) = folder_for_a_real_copy(&world);
+    let caught = CaughtRun::start(&world, &folder);
+    let log = backup_log(&folder);
+    let (name, temp, whole) = (
+        caught.name.clone(),
+        caught.temp.clone(),
+        caught.whole.clone(),
+    );
+
     assert!(
-        !log.join(caught).exists(),
+        !log.join(&name).exists(),
         "half a file must not have the segment's name"
     );
-    assert!(!segment_names(&log).contains(caught));
+    assert!(!segment_names(&log).contains(&name));
     let glob = Command::new("/bin/sh")
-        .args(["-c", r#"ls "$1"/*.jsonl"#, "sh"])
+        .args(["-c", r#"ls "$1"/segment-*.jsonl"#, "sh"])
         .arg(&log)
         .output()
         .expect("run ls");
     assert!(
-        !stdout(&glob).contains(caught.as_str()),
+        !stdout(&glob).contains(name.as_str()),
         "the manual's glob must not take it for one"
     );
 
-    // SAFETY: not yet reaped, so the pid is still this child's.
-    unsafe { libc::kill(child.0.id() as libc::pid_t, libc::SIGTERM) };
-    child.0.wait().expect("wait");
-    drop(feed);
+    caught.stop();
     assert!(temp.exists(), "a killed run cannot tidy up");
-    assert!(!log.join(caught).exists());
+    assert!(!log.join(&name).exists());
 
-    fs::remove_file(&source).expect("rm the fifo");
-    fs::write(&source, &whole).expect("put the segment back");
-    ok(&world.backup(folder));
+    ok(&world.backup(&folder));
     assert!(!temp.exists(), "the next run removes it");
-    assert_eq!(fs::read(log.join(caught)).expect("read"), whole);
-    ok(&world.verify(folder));
-}
-
-#[cfg(not(target_os = "macos"))]
-#[test]
-fn half_a_copy_never_has_the_segments_name() {
-    let world = World::with_log();
-    a_copy_caught_halfway_is_not_a_segment(&world, &world.base.join("dest"));
+    assert_eq!(fs::read(log.join(&name)).expect("read"), whole);
+    ok(&world.verify(&folder));
 }
 
 /// Segments this size cannot be written under the `ulimit -f 1` below.
 const LARGER_THAN_THE_LIMIT: u64 = 8 * 1024;
 
-/// A write the OS refuses partway: a file-size limit stands in for a disk that
-/// fills up after the free-space check passed. Only a real copy writes, so
-/// `folder` must be on a volume where no clone is made.
-fn a_copy_that_cannot_finish_leaves_nothing_that_looks_finished(world: &World, folder: &Path) {
-    let shell = world.command();
-    let limited = Command::new("/bin/sh")
+/// `conbus backup` with writes capped at one block of 512 bytes.
+fn under_a_size_limit(world: &World, folder: &Path) -> Output {
+    let mut limited = Command::new("/bin/sh");
+    world.set_env(&mut limited);
+    limited
         .args(["-c", r#"trap "" XFSZ; ulimit -f 1; exec "$@""#, "sh"])
         .arg(bin())
         .args(["backup", "--to"])
         .arg(folder)
-        .envs(
-            shell
-                .get_envs()
-                .filter_map(|(key, value)| Some((key.to_owned(), value?.to_owned()))),
-        )
-        .env_remove("XDG_STATE_HOME")
-        .env_remove("CONBUS_NO_CACHE")
-        .stdin(Stdio::null())
         .output()
-        .expect("run under a file-size limit");
+        .expect("run under a file-size limit")
+}
+
+/// A write the OS refuses partway: a file-size limit stands in for a disk that
+/// fills up after the free-space check passed. Only a real copy writes, so
+/// `folder` must be on a volume where no clone is made.
+fn a_copy_that_cannot_finish_leaves_nothing_that_looks_finished(world: &World, folder: &Path) {
+    let limited = under_a_size_limit(world, folder);
 
     assert_eq!(limited.status.code(), Some(1), "{}", stderr(&limited));
     assert!(stderr(&limited).contains("segment-00000000.jsonl"));
@@ -707,8 +918,9 @@ fn a_copy_that_cannot_finish_leaves_nothing_that_looks_finished(world: &World, f
         .filter_map(|entry| entry.file_name().into_string().ok())
         .collect();
     assert_eq!(left, Vec::<String>::new(), "no half file, by any name");
-    assert!(
-        !world.root.join("backup.json").exists(),
+    assert_eq!(
+        world.record().get("last_ok"),
+        None,
         "a run that failed is not a good run"
     );
 
@@ -716,12 +928,11 @@ fn a_copy_that_cannot_finish_leaves_nothing_that_looks_finished(world: &World, f
     ok(&world.verify(folder));
 }
 
-#[cfg(not(target_os = "macos"))]
 #[test]
-fn a_write_the_os_refuses_leaves_no_half_file_and_no_record() {
+fn a_write_the_os_refuses_leaves_no_half_file_and_no_good_run() {
     let world = World::empty();
     world.write_turns(40, LARGER_THAN_THE_LIMIT);
-    let folder = world.base.join("dest");
+    let (folder, _volume) = folder_for_a_real_copy(&world);
     a_copy_that_cannot_finish_leaves_nothing_that_looks_finished(&world, &folder);
 }
 
@@ -739,11 +950,59 @@ fn a_half_written_temporary_file_is_not_a_segment_and_does_not_survive() {
     ok(&world.verify(&folder));
     assert_eq!(segment_names(&log), closed);
 
+    let half_manifest = folder.join("conbus-backup/.manifest.json.4242.tmp");
+    fs::write(&half_manifest, b"{\"format\":1,").expect("plant");
+    let half_record = world.root.join(".backup.json.4242.tmp");
+    fs::write(&half_record, b"{\"dest").expect("plant");
+
     ok(&world.backup(&folder));
     assert!(
         !half.exists(),
         "the next run removes what the last one left"
     );
+    assert!(!half_manifest.exists(), "beside the manifest too");
+    assert!(!half_record.exists(), "and in the root");
+}
+
+#[test]
+fn a_manifest_that_cannot_be_written_leaves_the_old_one_whole() {
+    let world = World::with_log();
+    let (folder, _volume) = folder_for_a_real_copy(&world);
+    ok(&world.backup(&folder));
+    let manifest = folder.join("conbus-backup/manifest.json");
+    let before = fs::read(&manifest).expect("manifest");
+    assert!(before.len() > 512, "larger than the limit below");
+    // The open segment closes, and is small enough to copy under the limit, so
+    // only the manifest fails.
+    let (_, open) = split_open(&world);
+    let index: u64 = open
+        .trim_start_matches("segment-")
+        .trim_end_matches(".jsonl")
+        .parse()
+        .expect("an index");
+    let small_enough = world.log().join(&open);
+    let bytes = fs::read(&small_enough).expect("read");
+    let first_line = bytes
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .expect("a line");
+    assert!(first_line < 512, "fits under the limit");
+    fs::write(&small_enough, &bytes[..=first_line]).expect("one record");
+    fs::write(
+        world.log().join(format!("segment-{:08}.jsonl", index + 1)),
+        b"{}\n",
+    )
+    .expect("a new open segment");
+
+    let limited = under_a_size_limit(&world, &folder);
+
+    assert_eq!(limited.status.code(), Some(1), "{}", stderr(&limited));
+    assert!(
+        stderr(&limited).contains("manifest.json"),
+        "{}",
+        stderr(&limited)
+    );
+    assert_eq!(fs::read(&manifest).expect("manifest"), before);
 }
 
 #[test]
@@ -780,9 +1039,10 @@ fn a_segment_with_no_manifest_row_that_differs_from_the_log_is_refused() {
 }
 
 #[test]
-fn a_copy_with_no_row_and_no_segment_left_to_compare_is_kept() {
+fn a_copy_with_no_row_and_no_segment_left_to_compare_is_kept_but_not_vouched_for() {
     // A run that died before its manifest, then a stray rm in the log. The copy
-    // may be all that is left of those records.
+    // may be all that is left of those records, so it stays. But nothing can say
+    // it is whole, so nothing may say it was checked.
     let world = World::with_log();
     let (closed, _) = split_open(&world);
     let folder = world.base.join("dest");
@@ -792,9 +1052,49 @@ fn a_copy_with_no_row_and_no_segment_left_to_compare_is_kept() {
 
     let said = ok(&world.backup(&folder));
 
-    assert!(said.contains("1 no longer in the log"), "{said}");
-    assert_eq!(manifest_rows(&folder).len(), closed.len());
-    ok(&world.verify(&folder));
+    assert!(said.contains("not vouched for"), "{said}");
+    assert!(said.contains(&closed[0]), "{said}");
+    assert!(backup_log(&folder).join(&closed[0]).exists(), "it stays");
+    assert!(!manifest_rows(&folder).contains_key(&closed[0]));
+    let verify = world.verify(&folder);
+    assert_eq!(verify.status.code(), Some(1));
+    assert!(stderr(&verify).contains(&closed[0]), "{}", stderr(&verify));
+}
+
+#[test]
+fn a_stray_with_no_source_is_not_vouched_for() {
+    let world = World::with_log();
+    let folder = world.base.join("dest");
+    ok(&world.backup(&folder));
+    fs::write(
+        backup_log(&folder).join("segment-99999999.jsonl"),
+        b"not a record at all\n",
+    )
+    .expect("plant");
+    let _ = world.backup(&folder);
+    assert_eq!(world.verify(&folder).status.code(), Some(1));
+}
+
+#[test]
+fn verify_does_not_claim_a_run_will_check_a_stray() {
+    let world = World::with_log();
+    let folder = world.base.join("dest");
+    ok(&world.backup(&folder));
+    fs::write(
+        backup_log(&folder).join("segment-99999999.jsonl"),
+        b"not a record at all\n",
+    )
+    .expect("plant");
+
+    let verify = world.verify(&folder);
+
+    assert_eq!(verify.status.code(), Some(1));
+    assert!(
+        stderr(&verify).contains("nothing vouches for it"),
+        "{}",
+        stderr(&verify)
+    );
+    assert!(!stderr(&verify).contains("checks it and adds it"));
 }
 
 // ---- Verify ----
@@ -873,6 +1173,27 @@ fn a_damaged_copy_is_mended_from_the_log_once_it_is_deleted() {
     fs::remove_file(&flipped).expect("rm");
     assert!(ok(&world.backup(&folder)).contains("copied 1 segment(s)"));
     ok(&world.verify(&folder));
+}
+
+#[test]
+fn a_lost_copy_is_not_replaced_by_a_segment_that_changed() {
+    let world = World::with_log();
+    let (closed, _) = split_open(&world);
+    let folder = world.base.join("dest");
+    ok(&world.backup(&folder));
+    let copy = backup_log(&folder).join(&closed[0]);
+    fs::remove_file(&copy).expect("rm");
+    let source = world.log().join(&closed[0]);
+    let mut bytes = fs::read(&source).expect("read");
+    bytes[7] ^= 0x01;
+    fs::write(&source, &bytes).expect("same length, other bytes");
+
+    refused(&world.backup(&folder), "differs");
+
+    assert!(
+        !copy.exists(),
+        "the manifest's hash is the check on what comes back"
+    );
 }
 
 #[test]
@@ -1081,6 +1402,23 @@ fn a_run_that_fails_does_not_move_the_last_good_time() {
         .expect("truncate");
     refused(&world.backup(&folder), &closed[0]);
 
+    assert_eq!(fs::read(world.root.join("backup.json")).expect("r"), record);
+}
+
+#[test]
+fn a_run_whose_count_fails_does_not_move_the_last_good_time() {
+    let world = World::with_log();
+    let (_, open) = split_open(&world);
+    let folder = world.base.join("dest");
+    ok(&world.backup(&folder));
+    let record = fs::read(world.root.join("backup.json")).expect("record");
+    let open = world.log().join(open);
+    fs::set_permissions(&open, fs::Permissions::from_mode(0o000)).expect("chmod");
+
+    let out = world.backup(&folder);
+
+    fs::set_permissions(&open, fs::Permissions::from_mode(0o600)).expect("chmod");
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
     assert_eq!(fs::read(world.root.join("backup.json")).expect("r"), record);
 }
 
@@ -1334,6 +1672,20 @@ fn a_planted_symlink_inside_the_backup_does_not_lead_into_a_cloud_folder() {
 }
 
 #[test]
+fn a_planted_symlink_at_the_backups_log_does_not_lead_into_a_cloud_folder() {
+    let world = World::with_log();
+    let cloud = world.home.join("Dropbox");
+    fs::create_dir_all(&cloud).expect("dir");
+    let folder = world.base.join("dest");
+    fs::create_dir_all(folder.join("conbus-backup")).expect("dir");
+    symlink(&cloud, backup_log(&folder)).expect("symlink");
+
+    cloud_refused(&world.backup(&folder));
+
+    assert_eq!(fs::read_dir(&cloud).expect("read").count(), 0);
+}
+
+#[test]
 fn a_folder_merely_named_like_a_cloud_folder_is_not_refused() {
     let world = World::with_log();
     for folder in [
@@ -1519,6 +1871,55 @@ fn a_second_run_at_once_is_refused() {
 }
 
 #[test]
+fn a_running_backup_holds_the_lock_until_it_is_done() {
+    let world = World::with_log();
+    let (folder, _volume) = folder_for_a_real_copy(&world);
+    let caught = CaughtRun::start(&world, &folder);
+
+    let probe = File::open(world.log()).expect("open the log directory");
+    assert!(
+        matches!(probe.try_lock(), Err(fs::TryLockError::WouldBlock)),
+        "the lock must be held for the whole run, not just taken"
+    );
+
+    drop(probe);
+    ok(&caught.finish());
+    let probe = File::open(world.log()).expect("open the log directory");
+    probe.try_lock().expect("released once it is done");
+}
+
+#[test]
+fn records_written_during_a_run_count_as_newer() {
+    let world = World::with_log();
+    let (folder, _volume) = folder_for_a_real_copy(&world);
+    let caught = CaughtRun::start(&world, &folder);
+    let name = caught.name.clone();
+
+    // The log rolls while the run is busy with an older segment.
+    world.write_turns(9, SMALL_SEGMENT);
+    let out = caught.finish();
+
+    let said = ok(&out);
+    let rows = manifest_rows(&folder);
+    assert!(rows.contains_key(&name));
+    let newer: usize = segment_names(&world.log())
+        .iter()
+        .filter(|name| !rows.contains_key(*name))
+        .map(|name| {
+            fs::read_to_string(world.log().join(name))
+                .expect("read")
+                .lines()
+                .count()
+        })
+        .sum();
+    assert!(newer > 3, "the log has to have moved on: {newer}");
+    assert!(
+        said.contains(&format!("newer than the backup: {newer} record(s)")),
+        "{said}"
+    );
+}
+
+#[test]
 fn usage_mistakes_exit_two() {
     let world = World::with_log();
     for args in [
@@ -1559,7 +1960,7 @@ fn a_folder_with_a_space_in_its_name_works_all_the_way_through() {
 
     // And back again through the manual's restore, with its quoting.
     fs::remove_dir_all(world.log()).expect("rm");
-    restore(&folder, &world.root);
+    restore(&world, &folder);
     assert_eq!(segment_names(&world.log()), closed);
     let (after_log, _) = world.reads();
     assert!(before_log.starts_with(&after_log));
@@ -1593,6 +1994,16 @@ fn a_first_run_to_a_new_destination_says_what_a_backup_is_not() {
     let first = ok(&world.backup(&folder));
     assert!(warns(&first), "the first run says both: {first}");
     assert!(first.contains("full disk"), "{first}");
+    assert!(
+        first.contains("CONBUS_RETENTION=full"),
+        "tool bodies kept at `full` are plain text there too: {first}"
+    );
+    let (closed, _) = split_open(&world);
+    let copy = fs::read_to_string(backup_log(&folder).join(&closed[0])).expect("read");
+    assert!(
+        copy.contains("cargo test"),
+        "this fixture is written at full"
+    );
 
     let second = ok(&world.backup(&folder));
     assert!(!warns(&second), "once is enough for one folder: {second}");
@@ -1692,7 +2103,742 @@ fn segments_gone_from_the_log_stay_in_the_backup_and_it_says_so() {
     ok(&world.verify(&folder));
 }
 
+#[test]
+fn a_new_log_is_not_reported_as_nothing_newer() {
+    let world = World::with_log();
+    let folder = world.base.join("dest");
+    ok(&world.backup(&folder));
+    fs::remove_dir_all(world.log()).expect("the log is lost");
+    world.write_turns(1, 1024 * 1024); // 3 records in a new, short segment-00000000
+    let out = world.backup(&folder);
+    let said = stdout(&out);
+    assert!(
+        !out.status.success() || said.contains("newer than the backup: 3 record(s)"),
+        "{said}"
+    );
+}
+
+#[test]
+fn a_new_log_longer_than_the_old_segment_is_refused_too() {
+    let world = World::with_log();
+    let (closed, _) = split_open(&world);
+    let folder = world.base.join("dest");
+    ok(&world.backup(&folder));
+    let held = fingerprint(&folder);
+    fs::remove_dir_all(world.log()).expect("the log is lost");
+    // Other bytes from the first record on, and longer than the old first segment.
+    world.write_turns(40, 1024 * 1024);
+    let new = world.log().join(&closed[0]);
+    let mut bytes = fs::read(&new).expect("read");
+    bytes[7] ^= 0x01;
+    fs::write(&new, &bytes).expect("write");
+
+    let out = world.backup(&folder);
+
+    refused(&out, "differs");
+    refused(&out, &closed[0]);
+    assert_eq!(fingerprint(&folder), held);
+}
+
+#[test]
+fn a_restored_open_segment_cut_short_is_refused() {
+    let world = World::with_log();
+    let (closed, open) = split_open(&world);
+    let last = closed.last().expect("a closed segment");
+    let folder = world.base.join("dest");
+    ok(&world.backup(&folder));
+    fs::remove_file(world.log().join(open)).expect("the open segment goes");
+    File::options()
+        .write(true)
+        .open(world.log().join(last))
+        .expect("open")
+        .set_len(100)
+        .expect("truncate");
+
+    refused(&world.backup(&folder), last);
+}
+
+#[test]
+fn an_open_segment_that_is_not_its_copy_plus_more_is_refused() {
+    let world = World::with_log();
+    let (closed, open) = split_open(&world);
+    let last = closed.last().expect("a closed segment");
+    let folder = world.base.join("dest");
+    ok(&world.backup(&folder));
+    fs::remove_file(world.log().join(open)).expect("the open segment goes");
+    let source = world.log().join(last);
+    let mut bytes = fs::read(&source).expect("read");
+    bytes[7] ^= 0x01;
+    fs::write(&source, &bytes).expect("same length, other bytes");
+
+    refused(&world.backup(&folder), "differs");
+}
+
+#[test]
+fn a_second_root_with_one_short_segment_is_refused() {
+    let world = World::with_log();
+    let folder = world.base.join("dest");
+    ok(&world.backup(&folder));
+    let held = fingerprint(&folder);
+
+    let other = World::empty();
+    other.write_turns(1, 1024 * 1024);
+    refused(&other.backup(&folder), "differs");
+
+    assert_eq!(fingerprint(&folder), held);
+}
+
+#[test]
+fn a_copy_gone_from_both_places_is_not_counted_as_held() {
+    let world = World::with_log();
+    let (closed, _) = split_open(&world);
+    let folder = world.base.join("dest");
+    ok(&world.backup(&folder));
+    fs::remove_file(world.log().join(&closed[0])).expect("rm");
+    fs::remove_file(backup_log(&folder).join(&closed[0])).expect("rm");
+    let out = world.backup(&folder);
+    let said = stdout(&out);
+    assert!(!out.status.success() || said.contains(&closed[0]), "{said}");
+}
+
+#[test]
+fn doctor_counts_only_copies_that_are_there_and_says_what_is_lost() {
+    let world = World::with_log();
+    let (closed, _) = split_open(&world);
+    let folder = world.base.join("dest");
+    ok(&world.backup(&folder));
+    fs::remove_file(world.log().join(&closed[0])).expect("rm");
+    fs::remove_file(backup_log(&folder).join(&closed[0])).expect("rm");
+
+    let said = ok(&world.backup(&folder));
+
+    let there = closed.len() - 1;
+    assert!(
+        said.contains(&format!("holds {there} segment(s)")),
+        "{said}"
+    );
+    assert_eq!(world.record()["segments"].as_u64(), Some(there as u64));
+    let line = world.doctor_line();
+    assert!(
+        line.contains(&format!("({there} segments, 1 lost)")),
+        "{line}"
+    );
+    assert_eq!(
+        world.verify(&folder).status.code(),
+        Some(1),
+        "--verify keeps naming it"
+    );
+}
+
+// ---- Where a backup went, for someone removing conbus ----
+
+#[test]
+fn uninstall_names_the_backup() {
+    let world = World::with_log();
+    let folder = world.base.join("dest");
+    ok(&world.backup(&folder));
+    let said = ok(&world.conbus(&["uninstall", "--apply"]));
+    assert!(said.contains(folder.to_str().expect("utf-8")), "{said}");
+}
+
+#[test]
+fn uninstall_names_every_folder_a_backup_went_to() {
+    let world = World::with_log();
+    let (first, second) = (world.base.join("first"), world.base.join("second one"));
+    ok(&world.backup(&first));
+    ok(&world.backup(&second));
+
+    for args in [&["uninstall"][..], &["uninstall", "--apply"][..]] {
+        let said = ok(&world.conbus(args));
+        for folder in [&first, &second] {
+            let copy = folder.join("conbus-backup");
+            assert!(
+                said.contains(copy.to_str().expect("utf-8")),
+                "{args:?}: {said}"
+            );
+        }
+        assert!(said.contains("plain text"), "{said}");
+    }
+    let record = world.record();
+    let listed: Vec<&str> = record["destinations"]
+        .as_array()
+        .expect("destinations")
+        .iter()
+        .map(|entry| entry["path"].as_str().expect("path"))
+        .collect();
+    assert_eq!(
+        listed,
+        [
+            first.to_str().expect("utf-8"),
+            second.to_str().expect("utf-8")
+        ]
+    );
+}
+
+#[test]
+fn uninstall_says_when_it_cannot_read_where_backups_went() {
+    let world = World::with_log();
+    fs::write(world.root.join("backup.json"), b"{not json").expect("write");
+
+    let said = ok(&world.conbus(&["uninstall"]));
+
+    assert!(said.contains("backup.json"), "{said}");
+}
+
+#[test]
+fn a_first_copy_to_a_new_folder_is_on_record_before_it_starts() {
+    // Plain text can land there from the first file on, however the run ends.
+    let world = World::with_log();
+    let (folder, _volume) = folder_for_a_real_copy(&world);
+    let caught = CaughtRun::start(&world, &folder);
+
+    let record = world.record();
+    assert_eq!(
+        record["destinations"][0]["path"].as_str(),
+        folder.to_str(),
+        "{record}"
+    );
+    assert_eq!(record.get("last_ok"), None, "this run has not finished");
+    let said = ok(&world.conbus(&["uninstall"]));
+    assert!(said.contains(folder.to_str().expect("utf-8")), "{said}");
+
+    // `doctor` reads every segment, so it waits until the FIFO has gone.
+    caught.stop();
+    let line = world.doctor_line();
+    assert!(
+        line.starts_with("backup    none: this log has one copy"),
+        "{line}"
+    );
+    assert!(line.contains(folder.to_str().expect("utf-8")), "{line}");
+    assert!(line.contains("did not finish"), "{line}");
+
+    ok(&world.backup(&folder));
+    assert!(world.doctor_line().contains("last ok"));
+}
+
+// ---- A disk that is not there ----
+
+#[test]
+fn a_folder_that_held_a_backup_and_holds_none_now_is_refused() {
+    // What a mount folder looks like once its disk has gone, wherever that
+    // folder is. Copying now would put the whole log on the wrong disk.
+    let world = World::with_log();
+    let folder = world.base.join("dest");
+    ok(&world.backup(&folder));
+    fs::remove_dir_all(folder.join("conbus-backup")).expect("the disk is gone");
+
+    let out = world.backup(&folder);
+
+    refused(&out, "not mounted");
+    refused(&out, "backup.json");
+    assert!(!folder.join("conbus-backup").exists(), "nothing written");
+
+    // Removed on purpose: drop it from the record, as the refusal says.
+    let mut record = world.record();
+    record["destinations"]
+        .as_array_mut()
+        .expect("destinations")
+        .clear();
+    fs::write(world.root.join("backup.json"), record.to_string()).expect("write");
+    ok(&world.backup(&folder));
+    ok(&world.verify(&folder));
+}
+
+#[test]
+fn a_record_that_does_not_read_stops_a_run_rather_than_being_overwritten() {
+    // It is the only list of where plain text went.
+    let world = World::with_log();
+    let folder = world.base.join("dest");
+    let record = world.root.join("backup.json");
+    fs::write(&record, b"{not json").expect("write");
+
+    refused(&world.backup(&folder), "backup.json");
+
+    assert_eq!(fs::read(&record).expect("read"), b"{not json");
+    assert!(!folder.exists());
+}
+
+#[test]
+fn a_mount_holder_on_this_platform_is_refused_with_nothing_mounted() {
+    let world = World::with_log();
+    let holder = if cfg!(target_os = "macos") {
+        "/Volumes"
+    } else {
+        "/mnt"
+    };
+    let volume = PathBuf::from(format!(
+        "{holder}/conbus test absent {}",
+        std::process::id()
+    ));
+
+    let out = world.backup(&volume);
+
+    refused(&out, "not mounted");
+    assert!(
+        !volume.exists(),
+        "created {} on this disk",
+        volume.display()
+    );
+}
+
+// ---- Folders a sync can reach ----
+
+#[test]
+fn desktop_and_documents_are_refused_by_name() {
+    let world = World::with_log();
+    for folder in [
+        "Desktop",
+        "Documents",
+        "desktop",
+        "DOCUMENTS",
+        "Desktop/backups",
+        "Documents/a/b",
+    ] {
+        let to = world.home.join(folder);
+        let out = world.backup(&to);
+        refused(&out, "iCloud");
+        refused(&out, "conbus-backup");
+        assert!(!to.exists(), "{folder}");
+    }
+}
+
+#[test]
+fn desktop_and_documents_are_refused_without_looking_at_them() {
+    // A read of these two can stall or put a dialog on the screen, so a folder
+    // that cannot even be looked at still gets the same answer.
+    let world = World::with_log();
+    let documents = world.home.join("Documents");
+    fs::create_dir(&documents).expect("dir");
+    fs::set_permissions(&documents, fs::Permissions::from_mode(0o000)).expect("chmod");
+
+    let out = world.backup(&documents.join("backups"));
+
+    fs::set_permissions(&documents, fs::Permissions::from_mode(0o755)).expect("chmod");
+    refused(&out, "iCloud");
+}
+
+#[test]
+fn a_symlink_does_not_get_a_folder_into_documents() {
+    let world = World::with_log();
+    let documents = world.home.join("Documents");
+    fs::create_dir(&documents).expect("dir");
+    let link = world.base.join("link");
+    symlink(&documents, &link).expect("symlink");
+
+    refused(&world.backup(&link), "iCloud");
+    refused(&world.backup(&link.join("backups")), "iCloud");
+
+    assert_eq!(fs::read_dir(&documents).expect("read").count(), 0);
+}
+
+#[test]
+fn a_run_for_another_folder_does_not_look_at_desktop_or_documents() {
+    // Neither name may join what a run stats. Nothing outside the process can see
+    // a stat, so this holds the names to the list that is only compared.
+    let source = include_str!("../src/backup/destination.rs");
+    let stated = source
+        .split("const CLOUD_FOLDERS")
+        .nth(1)
+        .and_then(|rest| rest.split("];").next())
+        .expect("the list a run stats");
+    assert!(!stated.contains("Desktop"), "{stated}");
+    assert!(!stated.contains("\"Documents\""), "{stated}");
+}
+
+#[test]
+fn folders_merely_named_like_desktop_or_documents_are_not_refused() {
+    let world = World::with_log();
+    for folder in [
+        world.home.join("Documents-old"),
+        world.home.join("Desktops"),
+        world.base.join("Documents"),
+        world.base.join("Desktop").join("backups"),
+    ] {
+        fs::create_dir_all(folder.parent().expect("parent")).expect("dir");
+        ok(&world.backup(&folder));
+    }
+}
+
+#[test]
+fn a_dropbox_with_a_team_name_is_refused() {
+    let world = World::with_log();
+    for folder in [
+        "Dropbox (Personal)",
+        "Dropbox (Acme)/backups",
+        "dropbox (acme)",
+    ] {
+        let cloud = world.home.join(folder);
+        cloud_refused(&world.backup(&cloud));
+        assert!(!cloud.exists(), "{folder}");
+    }
+    let moved = world.base.join("moved");
+    fs::create_dir(&moved).expect("dir");
+    symlink(&moved, world.home.join("Dropbox (Acme)")).expect("symlink");
+    cloud_refused(&world.backup(&moved.join("backups")));
+
+    let neighbour = world.home.join("Dropboxes");
+    ok(&world.backup(&neighbour));
+}
+
 // ---- Restore: the manual's copy, and what the two reads say after it ----
+
+#[test]
+fn both_manuals_give_the_same_restore_with_one_block_per_platform() {
+    for (tool, other) in [("launchctl", "systemctl"), ("systemctl", "launchctl")] {
+        let english = restore_block(MANUAL, tool);
+        assert_eq!(english, restore_block(MANUAL_KO, tool), "{tool}");
+        assert!(!english.contains(other), "{english}");
+    }
+}
+
+#[test]
+fn no_line_of_a_restore_block_would_trip_an_interactive_shell() {
+    // zsh leaves comments off by default, so `#` and what follows become
+    // arguments, and a `!` is a history expansion.
+    for manual in [MANUAL, MANUAL_KO] {
+        for tool in ["launchctl", "systemctl"] {
+            for line in restore_block(manual, tool).lines() {
+                assert!(!line.contains(" #"), "{line}");
+                assert!(!line.trim_start().starts_with('#'), "{line}");
+                assert!(!line.contains('!'), "{line}");
+            }
+        }
+    }
+}
+
+#[test]
+fn the_restore_runs_in_an_interactive_zsh() {
+    let Some(zsh) = ["/bin/zsh", "/usr/bin/zsh"]
+        .into_iter()
+        .find(|path| Path::new(path).exists())
+    else {
+        eprintln!("no zsh here: skipped; a Mac always has one");
+        return;
+    };
+    use std::io::Write;
+    let world = World::with_log();
+    roll_with_nothing_written(&world);
+    let before = world.reads();
+    let folder = world.base.join("my disk");
+    ok(&world.backup(&folder));
+    fs::remove_dir_all(world.log()).expect("delete the log");
+
+    let script = restore_block(MANUAL_KO, "launchctl")
+        .replace(EXAMPLE_DISK, folder.to_str().expect("utf-8"));
+    let mut shell = restore_shell(&world, zsh);
+    let mut child = shell
+        .args(["-f", "-i"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("zsh");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(format!("{script}exit\n").as_bytes())
+        .expect("paste");
+    let out = child.wait_with_output().expect("wait");
+
+    let calls = calls_so_far(&world);
+    // SAFETY: getuid has no failure mode and touches no memory.
+    let uid = unsafe { libc::getuid() };
+    assert!(
+        calls.contains(&format!("launchctl bootout gui/{uid}/sh.conbus.daemon")),
+        "{calls:?}\n{}",
+        stderr(&out)
+    );
+    assert!(calls.iter().all(|call| !call.contains('#')), "{calls:?}");
+    assert!(
+        calls.contains(&"conbus install --apply".to_string()),
+        "{calls:?}"
+    );
+    assert_eq!(world.reads(), before);
+}
+
+#[test]
+fn the_linux_block_restores_too() {
+    let world = World::with_log();
+    roll_with_nothing_written(&world);
+    let before = world.reads();
+    let folder = world.base.join("dest");
+    ok(&world.backup(&folder));
+    fs::remove_dir_all(world.log()).expect("delete the log");
+
+    let restored = run_block(&world, &folder, &restore_block(MANUAL_KO, "systemctl"), &[]);
+
+    ok(&restored.out);
+    assert!(
+        restored
+            .calls
+            .contains(&"systemctl --user disable --now sh.conbus.daemon.service".to_string()),
+        "{:?}",
+        restored.calls
+    );
+    assert!(restored.started_the_recorder());
+    assert_eq!(world.reads(), before);
+}
+
+#[test]
+fn the_restore_really_starts_the_recorder_at_the_end() {
+    // `install --apply` itself, not its stand-in. CONBUS_SKIP_LAUNCHCTL keeps it
+    // from loading anything: it writes the service file a real load would use.
+    let world = World::with_log();
+    let folder = world.base.join("dest");
+    ok(&world.backup(&folder));
+    fs::remove_dir_all(world.log()).expect("delete the log");
+
+    let restored = run_block(
+        &world,
+        &folder,
+        &restore_block(MANUAL, "launchctl"),
+        &[("REAL_INSTALL", "1")],
+    );
+
+    ok(&restored.out);
+    let service = if cfg!(target_os = "macos") {
+        "Library/LaunchAgents/sh.conbus.daemon.plist"
+    } else {
+        ".config/systemd/user/sh.conbus.daemon.service"
+    };
+    assert!(
+        world.home.join(service).exists(),
+        "{}",
+        stdout(&restored.out)
+    );
+}
+
+#[test]
+fn a_recorder_that_is_not_loaded_does_not_stop_the_restore() {
+    // A new machine, or one already stopped: launchctl and systemctl both fail.
+    let world = World::with_log();
+    let folder = world.base.join("dest");
+    ok(&world.backup(&folder));
+    fs::remove_dir_all(world.log()).expect("delete the log");
+
+    let restored = run_block(
+        &world,
+        &folder,
+        &restore_block(MANUAL, "launchctl"),
+        &[("STOP_EXIT", "3")],
+    );
+
+    ok(&restored.out);
+    assert!(restored.started_the_recorder());
+}
+
+#[test]
+fn a_recorder_still_running_stops_the_restore_before_it_touches_anything() {
+    // A recorder left running follows a deleted log: it starts a new file at the
+    // same name, and `cp -n` would keep that over the real one.
+    let world = World::with_log();
+    let folder = world.base.join("dest");
+    ok(&world.backup(&folder));
+    fs::remove_dir_all(world.log()).expect("delete the log");
+    let _recorder =
+        std::os::unix::net::UnixListener::bind(world.root.join("conbus.sock")).expect("bind");
+
+    let restored = try_restore(&world, &folder);
+
+    assert!(!restored.out.status.success(), "{}", stdout(&restored.out));
+    assert!(!restored.started_the_recorder(), "{:?}", restored.calls);
+    assert!(segment_names(&world.log()).is_empty(), "nothing was copied");
+    assert!(
+        stdout(&restored.out).contains("listening"),
+        "the person has to see why it stopped: {}",
+        stdout(&restored.out)
+    );
+}
+
+#[test]
+fn a_log_doctor_cannot_finish_reading_does_not_stop_the_restore() {
+    // The state a restore is for. `doctor` prints what the block needs before it
+    // reads the log, then fails on a segment it cannot open.
+    let world = World::with_log();
+    let (closed, _) = split_open(&world);
+    let folder = world.base.join("dest");
+    ok(&world.backup(&folder));
+    let unreadable = world.log().join(&closed[0]);
+    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).expect("chmod");
+    assert_eq!(world.conbus(&["doctor"]).status.code(), Some(1));
+
+    restore(&world, &folder);
+
+    assert_eq!(mode(&unreadable), 0o600);
+}
+
+#[test]
+fn an_unplugged_disk_stops_the_restore_before_the_recorder_starts() {
+    let world = World::with_log();
+    let folder = world.base.join("dest");
+    ok(&world.backup(&folder));
+    fs::remove_dir_all(world.log()).expect("delete the log");
+
+    let restored = try_restore(&world, &world.base.join("not plugged in"));
+
+    assert!(!restored.out.status.success(), "{}", stdout(&restored.out));
+    assert!(!restored.started_the_recorder(), "{:?}", restored.calls);
+    assert!(segment_names(&world.log()).is_empty());
+}
+
+#[test]
+fn a_damaged_backup_stops_the_restore_before_it_copies_anything() {
+    let world = World::with_log();
+    let (closed, _) = split_open(&world);
+    let folder = world.base.join("dest");
+    ok(&world.backup(&folder));
+    let copy = backup_log(&folder).join(&closed[0]);
+    let mut bytes = fs::read(&copy).expect("read");
+    bytes[7] ^= 0x01;
+    fs::write(&copy, &bytes).expect("flip");
+    fs::remove_dir_all(world.log()).expect("delete the log");
+
+    let restored = try_restore(&world, &folder);
+
+    assert!(!restored.out.status.success(), "{}", stdout(&restored.out));
+    assert!(
+        stderr(&restored.out).contains(&closed[0]),
+        "it names the file"
+    );
+    assert!(!restored.started_the_recorder(), "{:?}", restored.calls);
+    assert!(segment_names(&world.log()).is_empty(), "nothing was copied");
+}
+
+#[test]
+fn a_damaged_copy_can_still_be_restored_the_way_the_manual_says() {
+    // It may be all there is, and a damaged line only reads as unreadable. The
+    // manual's way: the same block without its --verify line.
+    let world = World::with_log();
+    let (closed, _) = split_open(&world);
+    let folder = world.base.join("dest");
+    ok(&world.backup(&folder));
+    let copy = backup_log(&folder).join(&closed[0]);
+    let mut bytes = fs::read(&copy).expect("read");
+    bytes[0] = b'z';
+    fs::write(&copy, &bytes).expect("damage one line");
+    fs::remove_dir_all(world.log()).expect("delete the log");
+    let block: String = restore_block(MANUAL, "launchctl")
+        .lines()
+        .filter(|line| !line.contains("--verify"))
+        .map(|line| format!("{line}\n"))
+        .collect();
+
+    let restored = run_block(&world, &folder, &block, &[]);
+
+    ok(&restored.out);
+    assert!(restored.started_the_recorder());
+    let log = world.conbus(&["log", "--json"]);
+    assert!(stderr(&log).contains("unreadable"), "{}", stderr(&log));
+    assert!(ok(&log).lines().count() > 3, "the rest of the log survives");
+}
+
+#[test]
+fn a_wrong_segment_kept_by_cp_n_stops_the_restore_and_the_refusal_says_what_works() {
+    // A recorder started a new log before the restore. `cp -n` keeps its short
+    // segment-00000000 over the real one, so the block's last check has to catch
+    // it before a recorder starts on the result.
+    let world = World::with_log();
+    let (closed, _) = split_open(&world);
+    let closed_only = World::empty();
+    fs::create_dir(closed_only.log()).expect("log");
+    for name in &closed {
+        fs::copy(world.log().join(name), closed_only.log().join(name)).expect("copy");
+    }
+    let closed_reads = closed_only.reads();
+    let folder = world.base.join("dest");
+    ok(&world.backup(&folder));
+    fs::remove_dir_all(world.log()).expect("the log is lost");
+    world.write_turns(2, 1024 * 1024);
+
+    let restored = try_restore(&world, &folder);
+
+    assert!(!restored.out.status.success(), "{}", stdout(&restored.out));
+    assert!(!restored.started_the_recorder(), "{:?}", restored.calls);
+    let said = stderr(&restored.out);
+    assert!(said.contains("differs"), "{said}");
+    assert!(said.contains(&closed[0]), "{said}");
+    assert!(said.contains("delete that file from the log"), "{said}");
+
+    // What the refusal says to do, and only that.
+    fs::remove_file(world.log().join(&closed[0])).expect("rm");
+    restore(&world, &folder);
+    assert_eq!(world.reads(), closed_reads);
+}
+
+#[test]
+fn the_restore_finds_the_log_where_conbus_keeps_it() {
+    // Under XDG_STATE_HOME, not ~/.conbus. It lands where conbus reads.
+    let mut world = World::empty();
+    let state = world.base.join("state");
+    world.root = state.join("conbus");
+    world.xdg_state = Some(state);
+    fs::create_dir_all(&world.root).expect("root");
+    world.write_turns(12, SMALL_SEGMENT);
+    roll_with_nothing_written(&world);
+    let before = world.reads();
+    let folder = world.base.join("dest");
+    ok(&world.backup(&folder));
+    fs::remove_dir_all(world.log()).expect("delete the log");
+
+    restore(&world, &folder);
+
+    assert_eq!(world.reads(), before);
+    assert!(!world.home.join(".conbus").exists(), "nothing went there");
+}
+
+#[test]
+fn a_restored_segment_from_a_disk_with_no_modes_is_closed() {
+    // exFAT reports every file as 0700, and `cp` carries that over.
+    let world = World::with_log();
+    let (closed, _) = split_open(&world);
+    let folder = world.base.join("dest");
+    ok(&world.backup(&folder));
+    for name in &closed {
+        let copy = backup_log(&folder).join(name);
+        fs::set_permissions(&copy, fs::Permissions::from_mode(0o700)).expect("chmod");
+    }
+    fs::remove_dir_all(world.log()).expect("delete the log");
+
+    restore(&world, &folder);
+
+    for name in segment_names(&world.log()) {
+        assert_eq!(mode(&world.log().join(&name)), 0o600, "{name}");
+    }
+}
+
+#[test]
+fn a_stray_in_the_backup_stops_the_restore() {
+    // Restored, it would be the newest segment, and the recorder would write to it.
+    let world = World::with_log();
+    let folder = world.base.join("dest");
+    ok(&world.backup(&folder));
+    fs::write(
+        backup_log(&folder).join("segment-99999999.jsonl"),
+        b"not a record at all\n",
+    )
+    .expect("plant");
+    fs::remove_dir_all(world.log()).expect("delete the log");
+
+    let restored = try_restore(&world, &folder);
+
+    assert!(!restored.out.status.success(), "{}", stdout(&restored.out));
+    assert!(segment_names(&world.log()).is_empty());
+    assert!(!restored.started_the_recorder());
+}
+
+#[test]
+fn the_restore_takes_only_segments() {
+    let world = World::with_log();
+    let folder = world.base.join("dest");
+    ok(&world.backup(&folder));
+    fs::write(backup_log(&folder).join("notes.jsonl"), b"not a segment\n").expect("plant");
+    fs::remove_dir_all(world.log()).expect("delete the log");
+
+    restore(&world, &folder);
+
+    assert!(!world.log().join("notes.jsonl").exists());
+}
 
 /// The only state where nothing is newer than the backup: the recorder rolled
 /// to a new segment and has not written to it yet.
@@ -1721,7 +2867,7 @@ fn with_nothing_newer_a_deleted_log_restores_to_identical_reads() {
     );
 
     fs::remove_dir_all(world.log()).expect("delete the log");
-    restore(&folder, &world.root);
+    restore(&world, &folder);
 
     assert_eq!(world.reads(), before);
     assert_eq!(mode(&world.log()), 0o700);
@@ -1740,9 +2886,10 @@ fn losing_the_whole_root_restores_to_identical_reads_too() {
     ok(&world.backup(&folder));
 
     fs::remove_dir_all(&world.root).expect("delete the root");
-    restore(&folder, &world.root);
+    restore(&world, &folder);
 
     assert_eq!(world.reads(), before);
+    assert_eq!(mode(&world.root), 0o700, "closed from the moment it exists");
 }
 
 #[test]
@@ -1774,7 +2921,7 @@ fn deleting_the_log_loses_exactly_the_records_the_run_called_newer() {
     );
 
     fs::remove_dir_all(world.log()).expect("delete the log");
-    restore(&folder, &world.root);
+    restore(&world, &folder);
 
     let restored = world.reads();
     assert_eq!(restored, closed_reads);
@@ -1802,7 +2949,7 @@ fn a_partly_missing_log_restores_to_identical_reads() {
         "the loss shows before the restore"
     );
 
-    restore(&folder, &world.root);
+    restore(&world, &folder);
 
     assert_eq!(world.reads(), before);
     assert_eq!(
@@ -1814,9 +2961,8 @@ fn a_partly_missing_log_restores_to_identical_reads() {
 
 #[test]
 fn an_empty_segment_does_not_stand_in_for_a_real_one_in_a_restore() {
-    // A stray `rm` of every segment, then `doctor`, the natural first move. Its
-    // writable probe makes an empty segment-00000000.jsonl, and `cp -n` alone
-    // would keep that over the real one: a third of the log gone, with no word.
+    // An older `doctor` makes one in an empty log folder, and `cp -n` alone would
+    // keep it over the real one: a third of the log gone, with no word.
     let world = World::with_log();
     roll_with_nothing_written(&world);
     let before = world.reads();
@@ -1825,9 +2971,9 @@ fn an_empty_segment_does_not_stand_in_for_a_real_one_in_a_restore() {
     for name in segment_names(&world.log()) {
         fs::remove_file(world.log().join(name)).expect("rm");
     }
-    ok(&world.conbus(&["doctor"]));
+    File::create(world.log().join("segment-00000000.jsonl")).expect("an empty segment");
 
-    restore(&folder, &world.root);
+    restore(&world, &folder);
 
     assert_eq!(world.reads(), before);
 }
@@ -1858,7 +3004,7 @@ fn an_overlap_of_identical_segments_changes_nothing() {
     ok(&world.backup(&folder));
     let log_before = fingerprint(&world.log());
 
-    restore(&folder, &world.root);
+    restore(&world, &folder);
 
     assert_eq!(fingerprint(&world.log()), log_before);
     assert_eq!(world.reads(), before);
@@ -1873,11 +3019,11 @@ fn an_overlap_never_overwrites_records_the_backup_does_not_have() {
     let folder = world.base.join("dest");
     ok(&world.backup(&folder));
     fs::remove_dir_all(world.log()).expect("delete the log");
-    restore(&folder, &world.root);
+    restore(&world, &folder);
     world.write_turns(1, 1024 * 1024);
     let grown = world.reads();
 
-    restore(&folder, &world.root);
+    restore(&world, &folder);
 
     assert_eq!(world.reads(), grown);
 }
@@ -1903,7 +3049,7 @@ fn a_damaged_segment_is_replaced_by_deleting_it_and_restoring() {
     ok(&world.verify(&folder));
 
     fs::remove_file(&source).expect("rm");
-    restore(&folder, &world.root);
+    restore(&world, &folder);
 
     assert_eq!(world.reads(), before);
 }
@@ -1916,7 +3062,7 @@ fn recording_after_a_restore_continues_and_so_does_the_backup() {
     let folder = world.base.join("dest");
     ok(&world.backup(&folder));
     fs::remove_dir_all(world.log()).expect("delete the log");
-    restore(&folder, &world.root);
+    restore(&world, &folder);
 
     // The recorder's writer on the restored log: it resumes the sequence, and
     // the last restored segment takes the records, so it is longer than the
@@ -1980,7 +3126,7 @@ fn a_backup_of_a_restored_log_is_whole_again_after_a_second_loss() {
     let folder = world.base.join("dest");
     ok(&world.backup(&folder));
     fs::remove_dir_all(world.log()).expect("delete the log");
-    restore(&folder, &world.root);
+    restore(&world, &folder);
     world.write_turns(1, 1024 * 1024);
     world.write_turns(2, 64);
     roll_with_nothing_written(&world);
@@ -1988,90 +3134,93 @@ fn a_backup_of_a_restored_log_is_whole_again_after_a_second_loss() {
     ok(&world.backup(&folder));
 
     fs::remove_dir_all(world.log()).expect("delete the log again");
-    restore(&folder, &world.root);
+    restore(&world, &folder);
 
     assert_eq!(world.reads(), before);
 }
 
 // ---- Real separate volumes, on a Mac ----
 
+/// A real volume on a disk image, mounted under the test's own folder.
+#[cfg(target_os = "macos")]
+struct Image {
+    mount: PathBuf,
+    device: String,
+    attached: std::cell::Cell<bool>,
+}
+
+#[cfg(target_os = "macos")]
+impl Image {
+    fn attach(base: &Path, name: &str, filesystem: &str, size: &str) -> Self {
+        let image = base.join(format!("{name}.sparseimage"));
+        let created = Command::new("hdiutil")
+            .args(["create", "-quiet", "-type", "SPARSE", "-size", size])
+            .args(["-fs", filesystem, "-volname", "cbtest"])
+            .arg(base.join(name))
+            .status()
+            .expect("hdiutil create");
+        assert!(created.success(), "hdiutil create");
+        let mount = base.join(name);
+        fs::create_dir(&mount).expect("mountpoint");
+        let attached = Command::new("hdiutil")
+            .args(["attach", "-nobrowse", "-noverify", "-mountpoint"])
+            .arg(&mount)
+            .arg(&image)
+            .output()
+            .expect("hdiutil attach");
+        assert!(attached.status.success(), "hdiutil attach");
+        // The first line names the image's whole disk.
+        let device = stdout(&attached)
+            .split_whitespace()
+            .next()
+            .filter(|device| device.starts_with("/dev/disk"))
+            .expect("hdiutil names the device")
+            .to_string();
+        Image {
+            mount,
+            device,
+            attached: std::cell::Cell::new(true),
+        }
+    }
+
+    /// By device, not mount point: detaching a mount point can unmount it and
+    /// still fail to release the device, which then holds its deleted image's
+    /// space until a reboot. Once this succeeds the number may be reused, by a
+    /// real disk too, so it is never tried again.
+    fn detach(&self) {
+        for attempt in 0..40 {
+            if !self.attached.get() || !Path::new(&self.device).exists() {
+                break;
+            }
+            let mut detach = Command::new("hdiutil");
+            detach.args(["detach", "-quiet"]);
+            if attempt >= 20 {
+                detach.arg("-force");
+            }
+            if detach.arg(&self.device).status().is_ok_and(|s| s.success()) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+        self.attached.set(false);
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for Image {
+    fn drop(&mut self) {
+        self.detach();
+    }
+}
+
 #[cfg(target_os = "macos")]
 mod volumes {
     use super::*;
 
-    /// A real volume on a disk image, mounted under the test's own folder.
-    struct Image {
-        mount: PathBuf,
-        device: String,
-        attached: std::cell::Cell<bool>,
-    }
-
-    impl Image {
-        fn attach(base: &Path, filesystem: &str, size: &str) -> Self {
-            let image = base.join("disk.dmg");
-            let created = Command::new("hdiutil")
-                .args(["create", "-quiet", "-size", size, "-fs", filesystem])
-                .args(["-volname", "cbtest"])
-                .arg(&image)
-                .status()
-                .expect("hdiutil create");
-            assert!(created.success(), "hdiutil create");
-            let mount = base.join("mnt");
-            fs::create_dir(&mount).expect("mountpoint");
-            let attached = Command::new("hdiutil")
-                .args(["attach", "-nobrowse", "-noverify", "-mountpoint"])
-                .arg(&mount)
-                .arg(&image)
-                .output()
-                .expect("hdiutil attach");
-            assert!(attached.status.success(), "hdiutil attach");
-            // The first line names the image's whole disk.
-            let device = stdout(&attached)
-                .split_whitespace()
-                .next()
-                .filter(|device| device.starts_with("/dev/disk"))
-                .expect("hdiutil names the device")
-                .to_string();
-            Image {
-                mount,
-                device,
-                attached: std::cell::Cell::new(true),
-            }
-        }
-
-        /// By device, not mount point: detaching a mount point can unmount it and
-        /// still fail to release the device, which then holds its deleted image's
-        /// space until a reboot. Once this succeeds the number may be reused, by
-        /// a real disk too, so it is never tried again.
-        fn detach(&self) {
-            for attempt in 0..40 {
-                if !self.attached.get() || !Path::new(&self.device).exists() {
-                    break;
-                }
-                let mut detach = Command::new("hdiutil");
-                detach.args(["detach", "-quiet"]);
-                if attempt >= 20 {
-                    detach.arg("-force");
-                }
-                if detach.arg(&self.device).status().is_ok_and(|s| s.success()) {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(250));
-            }
-            self.attached.set(false);
-        }
-    }
-
-    impl Drop for Image {
-        fn drop(&mut self) {
-            self.detach();
-        }
-    }
-
     #[test]
     fn a_volume_too_small_for_the_copy_is_refused_before_anything_is_copied() {
         let world = World::with_log();
-        let image = Image::attach(&world.base, "HFS+", "16m");
+        let image = Image::attach(&world.base, "disk", "HFS+", "16m");
         let (closed, _) = split_open(&world);
         // Sparse, so no real disk is spent saying it would not fit.
         File::options()
@@ -2092,7 +3241,7 @@ mod volumes {
     fn another_volume_gets_a_real_copy_and_no_same_disk_warning() {
         let world = World::with_log();
         let (closed, _) = split_open(&world);
-        let image = Image::attach(&world.base, "HFS+", "16m");
+        let image = Image::attach(&world.base, "disk", "HFS+", "16m");
         let folder = image.mount.join("backups");
 
         let said = ok(&world.backup(&folder));
@@ -2109,7 +3258,7 @@ mod volumes {
     fn an_apfs_volume_that_is_not_the_logs_gets_a_real_copy_too() {
         // Both sides clone-capable, and a clone still cannot cross volumes.
         let world = World::with_log();
-        let image = Image::attach(&world.base, "APFS", "64m");
+        let image = Image::attach(&world.base, "disk", "APFS", "64m");
         let folder = image.mount.join("backups");
 
         let said = ok(&world.backup(&folder));
@@ -2120,28 +3269,12 @@ mod volumes {
     }
 
     #[test]
-    fn half_a_copy_never_has_the_segments_name() {
-        let world = World::with_log();
-        let image = Image::attach(&world.base, "HFS+", "16m");
-        a_copy_caught_halfway_is_not_a_segment(&world, &image.mount.join("backups"));
-    }
-
-    #[test]
-    fn a_write_the_os_refuses_leaves_no_half_file_and_no_record() {
-        let world = World::empty();
-        world.write_turns(40, LARGER_THAN_THE_LIMIT);
-        let image = Image::attach(&world.base, "HFS+", "16m");
-        let folder = image.mount.join("backups");
-        a_copy_that_cannot_finish_leaves_nothing_that_looks_finished(&world, &folder);
-    }
-
-    #[test]
     fn a_disk_that_went_away_leaving_its_folder_behind_is_refused() {
         // The mount folder stays once the disk is gone, as `/mnt/disk` does on
         // Linux and a stale `/Volumes/Name` can on a Mac. The folder is now on
         // the log's own disk, which is the one thing a backup there cannot be.
         let world = World::with_log();
-        let image = Image::attach(&world.base, "HFS+", "16m");
+        let image = Image::attach(&world.base, "disk", "HFS+", "16m");
         ok(&world.backup(&image.mount));
         image.detach();
         fs::create_dir_all(&image.mount).expect("the folder stays behind");
@@ -2149,5 +3282,127 @@ mod volumes {
         refused(&world.backup(&image.mount), "not mounted");
 
         assert_eq!(fs::read_dir(&image.mount).expect("read").count(), 0);
+    }
+
+    /// `df`'s available KiB, with nothing else writing to this volume.
+    fn free_kib(volume: &Path) -> u64 {
+        Command::new("sync").status().expect("sync");
+        let df = Command::new("df")
+            .arg("-Pk")
+            .arg(volume)
+            .output()
+            .expect("df");
+        stdout(&df)
+            .lines()
+            .nth(1)
+            .and_then(|line| line.split_whitespace().nth(3))
+            .and_then(|free| free.parse().ok())
+            .expect("df's Available column")
+    }
+
+    #[test]
+    fn a_clone_really_costs_almost_no_space() {
+        // On a volume of its own, because `df` on a shared one measures everyone.
+        let mut world = World::empty();
+        let image = Image::attach(&world.base, "disk", "APFS", "128m");
+        world.root = image.mount.join("root");
+        fs::create_dir_all(world.log()).expect("log");
+        let start = free_kib(&image.mount);
+        for index in 0..3 {
+            fs::write(
+                world.log().join(format!("segment-{index:08}.jsonl")),
+                vec![b'x'; 8 * 1024 * 1024],
+            )
+            .expect("segment");
+        }
+        fs::write(world.log().join("segment-00000003.jsonl"), b"{}\n").expect("open");
+        let before = free_kib(&image.mount);
+        assert!(start - before >= 24 * 1024, "df sees real writes here");
+
+        let said = ok(&world.backup(&image.mount.join("backups")));
+
+        assert!(said.contains("cloned 3 of 3"), "{said}");
+        let cost = before - free_kib(&image.mount);
+        assert!(cost < 2 * 1024, "24 MiB cloned cost {cost} KiB");
+    }
+
+    #[test]
+    fn a_second_volume_in_the_same_container_is_the_same_disk() {
+        // Large enough for APFS to allow a second volume, and sparse, so it costs
+        // next to nothing. Named once and mounted by hand: asking for a mount point
+        // up front takes root.
+        let mut world = World::empty();
+        let image = Image::attach(&world.base, "disk", "APFS", "1200m");
+        let source = Command::new("df").arg(&image.mount).output().expect("df");
+        let volume = stdout(&source)
+            .lines()
+            .nth(1)
+            .and_then(|line| line.split_whitespace().next())
+            .expect("the volume's device")
+            .to_string();
+        let container = volume.rsplit_once('s').expect("diskNsM").0.to_string();
+        let name = format!("cbsecond{}", std::process::id());
+        let added = Command::new("diskutil")
+            .args(["apfs", "addVolume", &container, "APFS", &name, "-nomount"])
+            .output()
+            .expect("diskutil");
+        assert!(added.status.success(), "{}", stderr(&added));
+        let second = world.base.join("second");
+        fs::create_dir(&second).expect("mountpoint");
+        let mounted = Command::new("diskutil")
+            .args(["mount", "-mountPoint"])
+            .arg(&second)
+            .arg(format!("{container}s2"))
+            .output()
+            .expect("diskutil");
+        assert!(mounted.status.success(), "{}", stderr(&mounted));
+        world.root = image.mount.join("root");
+        fs::create_dir_all(&world.root).expect("root");
+        world.write_turns(12, SMALL_SEGMENT);
+        let folder = second.join("backups");
+
+        let said = ok(&world.backup(&folder));
+
+        assert!(said.contains(SAME_DISK), "{said}");
+        assert!(
+            !said.contains("cloned"),
+            "a clone cannot cross volumes: {said}"
+        );
+        assert_eq!(world.record()["same_volume"].as_bool(), Some(false));
+        assert!(world.doctor_line().ends_with(SAME_DISK));
+    }
+
+    #[test]
+    fn a_disk_gone_from_a_mount_folder_on_a_third_volume_is_refused() {
+        // The log on its own volume, the mount folder elsewhere: nothing says
+        // `same disk` when the disk goes, and the copy would land on whatever
+        // holds the mount folder.
+        let mut world = World::empty();
+        let log_volume = Image::attach(&world.base, "logs", "HFS+", "16m");
+        world.root = log_volume.mount.join("root");
+        fs::create_dir_all(&world.root).expect("root");
+        world.write_turns(12, SMALL_SEGMENT);
+        let backup_disk = Image::attach(&world.base, "disk", "HFS+", "16m");
+        ok(&world.backup(&backup_disk.mount));
+        backup_disk.detach();
+        fs::create_dir_all(&backup_disk.mount).expect("the folder stays behind");
+
+        refused(&world.backup(&backup_disk.mount), "not mounted");
+
+        assert_eq!(fs::read_dir(&backup_disk.mount).expect("read").count(), 0);
+    }
+
+    #[test]
+    fn a_disk_in_rotation_that_is_not_plugged_in_is_refused() {
+        let world = World::with_log();
+        let rotated_out = Image::attach(&world.base, "disk", "HFS+", "16m");
+        ok(&world.backup(&rotated_out.mount));
+        ok(&world.backup(&world.base.join("the other one")));
+        rotated_out.detach();
+        fs::create_dir_all(&rotated_out.mount).expect("the folder stays behind");
+
+        refused(&world.backup(&rotated_out.mount), "not mounted");
+
+        assert_eq!(fs::read_dir(&rotated_out.mount).expect("read").count(), 0);
     }
 }

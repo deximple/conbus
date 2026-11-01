@@ -8,7 +8,7 @@ use std::path::Path;
 
 use sha2::{Digest, Sha256};
 
-use super::{Layout, MANIFEST, Row, file_name, named};
+use super::{Layout, MANIFEST, RECORD, Row, file_name, named};
 use crate::sync::hex;
 
 const CHUNK: usize = 1 << 20;
@@ -40,8 +40,17 @@ impl Digested {
 /// Copy one segment under a temporary name, read it back, and only then give it
 /// its real name. Says whether it was a clone.
 pub(super) fn copy_verified(job: &Job, log: &Path, clones: bool) -> io::Result<(Row, bool)> {
+    copy_with(job, log, clones, write_plain)
+}
+
+fn copy_with(
+    job: &Job,
+    log: &Path,
+    clones: bool,
+    write: impl Fn(&Path, &Path) -> io::Result<Digested>,
+) -> io::Result<(Row, bool)> {
     let temp = log.join(temp_name(&job.name));
-    let placed = place_and_check(job, &temp, clones).and_then(|placed| {
+    let placed = place_and_check(job, &temp, clones, write).and_then(|placed| {
         fs::rename(&temp, log.join(&job.name))?;
         Ok(placed)
     });
@@ -51,7 +60,12 @@ pub(super) fn copy_verified(job: &Job, log: &Path, clones: bool) -> io::Result<(
     placed.map_err(|err| io::Error::new(err.kind(), format!("{}: {err}", job.name)))
 }
 
-fn place_and_check(job: &Job, temp: &Path, clones: bool) -> io::Result<(Row, bool)> {
+fn place_and_check(
+    job: &Job,
+    temp: &Path,
+    clones: bool,
+    write: impl Fn(&Path, &Path) -> io::Result<Digested>,
+) -> io::Result<(Row, bool)> {
     let cloned = clones && clone_file(&job.source, temp)?;
     let written = if cloned {
         // A clone takes the source's mode, and a log from before 0.2.5 can
@@ -59,7 +73,7 @@ fn place_and_check(job: &Job, temp: &Path, clones: bool) -> io::Result<(Row, boo
         fs::set_permissions(temp, fs::Permissions::from_mode(0o600))?;
         digest_file(&job.source)?
     } else {
-        write_plain(&job.source, temp)?
+        write(&job.source, temp)?
     };
     check_read_back(temp, &written)?;
     Ok((written.into_row(&job.name), cloned))
@@ -108,26 +122,62 @@ fn c_path(path: &Path) -> io::Result<std::ffi::CString> {
         .map_err(|_| named(path)(io::ErrorKind::InvalidInput.into()))
 }
 
-/// Whether the volume holding `path` can make a clone: APFS, on a Mac.
+/// What the volume holding a path can do and where it is.
+#[derive(Default)]
+pub(super) struct Volume {
+    /// It can make a clone: APFS, on a Mac.
+    pub clones: bool,
+    /// It is not local, so a copy there leaves this machine.
+    pub network: bool,
+    /// The disk it is on, where the system says. Two volumes in one APFS container
+    /// share one, and fail together.
+    pub disk: Option<String>,
+}
+
 #[cfg(target_os = "macos")]
-pub(super) fn volume_clones(path: &Path) -> bool {
+pub(super) fn volume_of(path: &Path) -> Volume {
     let Ok(text) = c_path(path) else {
-        return false;
+        return Volume::default();
     };
     // SAFETY: a zeroed `statfs` is a valid value of a plain C struct, and `text`
     // lives across the call, which fills in `stat` or fails.
     let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
     if unsafe { libc::statfs(text.as_ptr(), &mut stat) } != 0 {
-        return false;
+        return Volume::default();
     }
-    // SAFETY: on success `f_fstypename` is a NUL-terminated name inside `stat`.
-    let kind = unsafe { std::ffi::CStr::from_ptr(stat.f_fstypename.as_ptr()) };
-    kind.to_bytes() == b"apfs"
+    // SAFETY: on success both are NUL-terminated names inside `stat`.
+    let (kind, source) = unsafe {
+        (
+            std::ffi::CStr::from_ptr(stat.f_fstypename.as_ptr()),
+            std::ffi::CStr::from_ptr(stat.f_mntfromname.as_ptr()),
+        )
+    };
+    Volume {
+        clones: kind.to_bytes() == b"apfs",
+        network: stat.f_flags & libc::MNT_LOCAL as u32 == 0,
+        disk: source
+            .to_str()
+            .ok()
+            .and_then(whole_disk)
+            .map(str::to_string),
+    }
+}
+
+/// The whole disk in a mount source, up to the `sN` suffix: `disk3` from
+/// `/dev/disk3s5` and from `/dev/disk3s1s1`. Nothing for what is not a local disk.
+#[cfg(target_os = "macos")]
+fn whole_disk(source: &str) -> Option<&str> {
+    let device = source.strip_prefix("/dev/")?;
+    let digits = device.strip_prefix("disk")?;
+    let end = digits
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(digits.len());
+    (end > 0).then(|| &device[.."disk".len() + end])
 }
 
 #[cfg(not(target_os = "macos"))]
-pub(super) fn volume_clones(_path: &Path) -> bool {
-    false
+pub(super) fn volume_of(_path: &Path) -> Volume {
+    Volume::default()
 }
 
 /// Hash everything `from` holds, handing each chunk to `each` on the way past.
@@ -231,12 +281,14 @@ fn temp_name(name: &str) -> String {
 fn is_leftover(name: &str) -> bool {
     name.strip_prefix('.')
         .filter(|rest| rest.ends_with(".tmp"))
-        .is_some_and(|rest| rest.starts_with("segment-") || rest.starts_with(MANIFEST))
+        .is_some_and(|rest| {
+            rest.starts_with("segment-") || rest.starts_with(MANIFEST) || rest.starts_with(RECORD)
+        })
 }
 
 /// The lock is held, so any temporary file here is from a run that died.
-pub(super) fn remove_leftovers(layout: &Layout) -> io::Result<()> {
-    for dir in [&layout.dir, &layout.log] {
+pub(super) fn remove_leftovers(layout: &Layout, root: &Path) -> io::Result<()> {
+    for dir in [root, layout.dir.as_path(), layout.log.as_path()] {
         for entry in fs::read_dir(dir).map_err(named(dir))? {
             let path = entry.map_err(named(dir))?.path();
             if is_leftover(&file_name(&path)) {
@@ -285,6 +337,52 @@ mod tests {
         ] {
             assert!(!is_leftover(name), "{name}");
         }
+    }
+
+    #[test]
+    fn a_copy_that_reads_back_wrong_never_gets_its_real_name() {
+        // A disk that takes the write and hands back something else. The hash
+        // says what went in; the read-back has to be what catches it.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let log = temp.path().join("log");
+        fs::create_dir(&log).expect("dir");
+        let source = temp.path().join("source");
+        fs::write(&source, b"what went in").expect("write");
+        let job = Job {
+            source: source.clone(),
+            name: "segment-00000000.jsonl".into(),
+            size: 12,
+        };
+
+        let err = copy_with(&job, &log, false, |source, temp| {
+            fs::write(temp, b"what came out")?;
+            digest_file(source)
+        })
+        .expect_err("a read-back that differs");
+
+        assert!(err.to_string().contains("did not read back"), "{err}");
+        assert_eq!(fs::read_dir(&log).expect("read").count(), 0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_disk_is_its_mount_source_up_to_the_slice() {
+        assert_eq!(whole_disk("/dev/disk3s5"), Some("disk3"));
+        assert_eq!(whole_disk("/dev/disk3s1s1"), Some("disk3"));
+        assert_eq!(whole_disk("/dev/disk14"), Some("disk14"));
+        assert_eq!(whole_disk("/dev/disk"), None);
+        assert_eq!(whole_disk("//me@nas/share"), None);
+        assert_eq!(whole_disk("map auto_home"), None);
+        assert_eq!(whole_disk("devfs"), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn what_is_not_local_reads_as_leaving_this_machine() {
+        // An automounter's map is the one non-local mount every Mac has.
+        assert!(volume_of(Path::new("/System/Volumes/Data/home")).network);
+        assert!(!volume_of(Path::new("/tmp")).network);
+        assert!(volume_of(Path::new("/tmp")).disk.is_some());
     }
 
     #[test]
