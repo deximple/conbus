@@ -464,3 +464,91 @@ fn a_prepare_child_that_outlives_its_daemon_does_not_write_beside_the_next_one()
         "(duplicate seq, gap turn records)"
     );
 }
+
+#[test]
+fn a_repair_that_never_returns_gives_up_and_the_daemon_serves() {
+    // The stand-in sleeps in `prepare` itself, so a parent that fell back to running
+    // the repair in-process would sleep there next and never serve.
+    let home = tempfile::tempdir().expect("tempdir");
+    let mut daemon = Daemon(
+        daemon_in(home.path())
+            .env("CONBUS_TEST_PAUSE_IN_PREPARE_MS", "60000")
+            .env("CONBUS_TEST_PREPARE_LIMIT_MS", "300")
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("daemon"),
+    );
+    let stderr = daemon.0.stderr.take().expect("stderr is piped");
+
+    let started = Instant::now();
+    wait_serving(home.path(), daemon.0.id());
+    let waited = started.elapsed();
+    hook(home.path(), &prompt("p0", "it records"));
+    let wrote = records(home.path()).len();
+    drop(daemon);
+
+    let said = std::io::read_to_string(stderr).expect("stderr");
+    assert!(
+        waited < Duration::from_secs(25),
+        "it served after {waited:?}"
+    );
+    assert_eq!(wrote, 1, "it is recording");
+    assert!(said.contains("gave up"), "{said}");
+    assert!(said.contains("backfill --gaps"), "{said}");
+    assert!(
+        !said.contains("running it in the daemon itself"),
+        "the parent would wedge on the same thing: {said}"
+    );
+}
+
+#[test]
+fn a_repair_that_never_returns_lets_go_of_the_root_after_its_daemon_is_gone() {
+    // With the daemon gone the child held the lock for good, and every next daemon
+    // gave up after five seconds. Bounded now, without anyone having to know.
+    let home = tempfile::tempdir().expect("tempdir");
+    let mut a = daemon_in(home.path())
+        .env("CONBUS_TEST_PAUSE_IN_PREPARE_MS", "60000")
+        .env("CONBUS_TEST_PREPARE_LIMIT_MS", "3000")
+        .spawn()
+        .expect("a");
+    let a_pid = a.id();
+    until_it_has_a_child(a_pid);
+    Command::new("/bin/kill")
+        .args(["-TERM", &a_pid.to_string()])
+        .status()
+        .expect("kill");
+    a.wait().expect("reap");
+    let started = Instant::now();
+
+    let lock = std::fs::File::open(home.path().join("daemon.lock")).expect("lock");
+    let claimed = matches!(lock.try_lock(), Err(std::fs::TryLockError::WouldBlock));
+    drop(lock);
+    let b = a_daemon_under_a_service_manager(home.path());
+    let waited = started.elapsed();
+    drop(b);
+
+    assert!(claimed, "the child still holds the claim while it runs");
+    assert!(
+        waited < Duration::from_secs(40),
+        "the root stayed locked for {waited:?}"
+    );
+}
+
+#[test]
+fn a_repair_that_finishes_is_not_touched_by_its_watchdog() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let mut daemon = Daemon(
+        daemon_in(home.path())
+            .env("CONBUS_TEST_PREPARE_LIMIT_MS", "60000")
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("daemon"),
+    );
+    let stderr = daemon.0.stderr.take().expect("stderr is piped");
+    wait_serving(home.path(), daemon.0.id());
+    drop(daemon);
+
+    let said = std::io::read_to_string(stderr).expect("stderr");
+    assert!(said.contains("ran in a separate process"), "{said}");
+    assert!(!said.contains("gave up"), "{said}");
+}

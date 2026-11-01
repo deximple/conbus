@@ -999,6 +999,16 @@ const CLAIM_POLL: Duration = Duration::from_millis(100);
 /// parent holds the claim and the child writes under it.
 const PREPARE_FOR: &str = "CONBUS_PREPARE_FOR";
 
+/// How long a `--prepare` child may run. It holds the root's claim, past its
+/// daemon if it has to, so a read that never returns would lock the root for good.
+/// Gap fill's budget stops a slow vendor in seconds, and this is for what no budget
+/// can stop. A fill killed partway is safe: every line is whole or healed, and the
+/// next fill finds what is already written.
+const PREPARE_LIMIT: Duration = Duration::from_secs(120);
+
+/// The exit code of a `--prepare` child that hit [`PREPARE_LIMIT`].
+const PREPARE_GAVE_UP: i32 = 75;
+
 /// Become the one recorder of this root, before anything in it is written.
 ///
 /// The socket cannot answer this. It is bound last, so that a hook arriving
@@ -1065,11 +1075,30 @@ pub fn prepare_command(paths: &Paths, retention: Retention) -> io::Result<()> {
     let under_parent = std::env::var(PREPARE_FOR)
         .is_ok_and(|pid| pid == std::os::unix::process::parent_id().to_string());
     let _claim = if under_parent {
+        give_up_after(prepare_limit());
         None
     } else {
         claim_recorder(paths)?
     };
     prepare(paths, retention)
+}
+
+/// The test knob shortens it, as a wedge cannot be waited out in a test.
+fn prepare_limit() -> Duration {
+    std::env::var("CONBUS_TEST_PREPARE_LIMIT_MS")
+        .ok()
+        .and_then(|ms| ms.parse().ok())
+        .map_or(PREPARE_LIMIT, Duration::from_millis)
+}
+
+/// End this process when `limit` is up, whatever the rest of it is stuck in. Its
+/// parent says so, if it still has one: a note from here could block on the same
+/// thing that stopped everything else.
+fn give_up_after(limit: Duration) {
+    std::thread::spawn(move || {
+        std::thread::sleep(limit);
+        std::process::exit(PREPARE_GAVE_UP);
+    });
 }
 
 /// Bind the control socket, refusing to steal one a live daemon still owns.
@@ -1167,6 +1196,12 @@ struct Restored {
 pub fn prepare(paths: &Paths, retention: Retention) -> io::Result<()> {
     // No core dump of a process holding every prompt on the machine.
     let _ = harden::harden();
+    // Stands in for a read that never returns.
+    if let Ok(ms) = std::env::var("CONBUS_TEST_PAUSE_IN_PREPARE_MS")
+        && let Ok(ms) = ms.parse::<u64>()
+    {
+        std::thread::sleep(Duration::from_millis(ms));
+    }
     let t0 = std::time::Instant::now();
     let mut scan =
         SegmentLog::scan_meta(paths.log_dir(), Some(&paths.cache_dir())).unwrap_or_else(|err| {
@@ -1285,6 +1320,16 @@ fn prepare_in_child(paths: &Paths, retention: Retention, claim: Option<&fs::File
             note!(
                 "start-up repair ran in a separate process in {} ms",
                 started.elapsed().as_millis()
+            );
+            return;
+        }
+        // Not run again here. Whatever stopped the child would stop this process
+        // next, with no watchdog, and it has hooks to serve.
+        Ok(status) if status.code() == Some(PREPARE_GAVE_UP) => {
+            note!(
+                "start-up repair gave up after {:?}; serving without it. What it did not fill \
+                 is still in the vendor's transcripts: `conbus backfill --gaps` reads them",
+                prepare_limit()
             );
             return;
         }
