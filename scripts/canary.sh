@@ -339,12 +339,17 @@ case $sub in
             check 0 blackout "no active blackout"
         fi
 
-        # The derived cache, built now by the installed binary, so the
-        # candidate's first reads do not pay first-build cost at cutover.
-        if index_out=$("$bin" log index 2>&1); then
-            check 0 cache "$index_out"
+        # The derived cache, built now by the candidate on the live root, so
+        # its first reads do not pay first-build cost at cutover. `log index`
+        # only writes cache/ — a rebuildable sidecar — next to the log.
+        if [ -n "$from" ]; then
+            if index_out=$("$from" log index 2>&1); then
+                check 0 cache "$index_out"
+            else
+                check 1 cache "candidate log index failed: $index_out"
+            fi
         else
-            check 1 cache "conbus log index failed: $index_out"
+            check 2 cache "no --from — the live cache is not prebuilt"
         fi
         exit "$fail"
         ;;
