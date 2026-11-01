@@ -11,6 +11,12 @@ the entry says so when it does.
 - Building from source needs Rust 1.99.1, pinned in `rust-toolchain.toml`;
   CI reads the same file.
 
+### Security
+
+- `conbus hook --inference-listen` refuses an address that is not loopback.
+  The listener authenticates nothing, and it used to bind whatever address it
+  was given.
+
 ## [0.2.9] — 2026-11-01
 
 `conbus sync`, the device side of the draft sync contract. There is still no

@@ -17,7 +17,9 @@ that other programs call on every agent turn.
   conbus never writes that trust record for you.
 - **The socket.** The daemon listens on a Unix socket in its data directory
   with mode `0600`. Nothing listens on a network port unless you start
-  `conbus hook --inference-listen`, which binds `127.0.0.1` by default.
+  `conbus hook --inference-listen`, which binds `127.0.0.1:8787` by default
+  and refuses any address that is not loopback, because it authenticates
+  nothing.
 - **Hooks never block you.** A hook that cannot reach the daemon still exits
   0 with well-formed JSON; the record is dropped and noted in
   `~/.conbus/drops.jsonl`. conbus's own background sessions are marked so the
