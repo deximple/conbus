@@ -178,6 +178,46 @@ pub struct Summary {
     /// True once the file stopped growing, so `count` is a floor.
     pub capped: bool,
     pub last: Option<(String, String)>,
+    /// Standing drops grouped to a reason family, most frequent first —
+    /// because "29 orphans" is a restart's footprint and "1 adapter gap" is a
+    /// vendor schema that moved, and a bare count cannot tell them apart.
+    pub reasons: Vec<(Reason, usize)>,
+}
+
+/// A reason family: the reason itself, and the one-line meaning `doctor`
+/// attaches so a person does not have to know the internals to read it.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Reason {
+    /// The first reason seen for the family, verbatim.
+    pub text: String,
+    /// What it means — a clause, not a sentence.
+    pub gloss: &'static str,
+}
+
+/// The families a drop reason falls into. Variable parts (event names,
+/// session ids, paths, errno strings) stay in `text`; the family is chosen
+/// on the stable prefix so thirty-one orphans read as one story.
+fn classify(reason: &str) -> &'static str {
+    if reason.starts_with("no conversation for this session")
+        || reason.starts_with("spooled hook still has no conversation")
+    {
+        // The binding dies with the daemon that minted it, and an event for a
+        // session whose prompt the recorder never saw cannot start one. A
+        // restart mid-turn looks exactly like this; Cursor's split hooks made
+        // 4,229 of them on 2026-09-08 before its tool-call proof existed.
+        "orphan — a session the recorder never bound (restart mid-turn, or a prompt that never arrived)"
+    } else if reason.starts_with("no mapping for hook event") {
+        // The vendor's schema moved ahead of this build's adapter.
+        "adapter gap — the vendor published an event this build does not know"
+    } else if reason.starts_with("no daemon on ") {
+        "daemon down — the record was spooled if the stamp allowed it"
+    } else if reason.starts_with("the daemon refused the record: protocol") {
+        "protocol — the hook is newer than the daemon; kept in the spool"
+    } else if reason.starts_with("spooled hook refused") {
+        "refused on drain — a spooled record the new daemon still rejects"
+    } else {
+        "other"
+    }
 }
 
 pub fn is_transient(reason: &str) -> bool {
@@ -196,10 +236,14 @@ pub fn summary(paths: &Paths) -> Summary {
             transient: 0,
             capped: false,
             last: None,
+            reasons: Vec::new(),
         };
     };
     let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
     let mut transient = 0;
+    // First-seen order per family gloss, so identical reasons merge and
+    // different ones under one family stay one row.
+    let mut families: Vec<(&'static str, String, usize)> = Vec::new();
     let last = lines.last().and_then(|line| {
         let value: serde_json::Value = serde_json::from_str(line).ok()?;
         let reason = value.get("reason")?.as_str()?.to_string();
@@ -214,19 +258,34 @@ pub fn summary(paths: &Paths) -> Summary {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
-        if value
-            .get("reason")
-            .and_then(|r| r.as_str())
-            .is_some_and(is_transient)
-        {
+        let Some(reason) = value.get("reason").and_then(|r| r.as_str()) else {
+            continue;
+        };
+        if is_transient(reason) {
             transient += 1;
+            continue;
+        }
+        let gloss = classify(reason);
+        match families
+            .iter_mut()
+            // One row per family — the first-seen text speaks for it; only
+            // the unclassified `other` family still splits on exact text.
+            .find(|(g, t, _)| *g == gloss && (*g != "other" || t == reason))
+        {
+            Some((_, _, n)) => *n += 1,
+            None => families.push((gloss, reason.to_string(), 1)),
         }
     }
+    families.sort_by_key(|a| std::cmp::Reverse(a.2));
     Summary {
         count: lines.len(),
         transient,
         capped: text.len() as u64 >= CAP_BYTES,
         last,
+        reasons: families
+            .into_iter()
+            .map(|(gloss, text, n)| (Reason { text, gloss }, n))
+            .collect(),
     }
 }
 
@@ -237,12 +296,26 @@ pub fn describe(summary: &Summary) -> String {
         (n, last) => {
             let at_least = if summary.capped { "at least " } else { "" };
             let standing = n.saturating_sub(summary.transient);
+            let breakdown = if summary.reasons.is_empty() {
+                String::new()
+            } else {
+                // Each standing family: `count× reason — gloss`. The first
+                // reason seen speaks for the family; its variable tail stays.
+                let parts: Vec<String> = summary
+                    .reasons
+                    .iter()
+                    .map(|(reason, n)| format!("{n}× {} — {}", reason.text, reason.gloss))
+                    .collect();
+                format!(" [{}]", parts.join("; "))
+            };
             match (last, summary.transient) {
                 (Some((ts, reason)), t) if t > 0 => format!(
-                    "{at_least}{n} recorded ({standing} standing, {t} transient connection; last {ts}: {reason})"
+                    "{at_least}{n} recorded ({standing} standing, {t} transient connection{breakdown}; last {ts}: {reason})"
                 ),
-                (Some((ts, reason)), _) => format!("{at_least}{n} recorded; last {ts}: {reason}"),
-                (None, _) => format!("{at_least}{n} recorded"),
+                (Some((ts, reason)), _) => {
+                    format!("{at_least}{n} recorded{breakdown}; last {ts}: {reason}")
+                }
+                (None, _) => format!("{at_least}{n} recorded{breakdown}"),
             }
         }
     }
@@ -391,6 +464,78 @@ mod tests {
             "{}",
             describe(&summary)
         );
+    }
+
+    #[test]
+    fn the_summary_splits_standing_drops_by_reason_with_a_meaning_each() {
+        let dir = home();
+        let paths = paths_at(dir.path());
+        for _ in 0..3 {
+            append(&paths, &Dropped::new("no conversation for this session"));
+        }
+        append(
+            &paths,
+            &Dropped::new("no mapping for hook event \"MadeUp\""),
+        );
+        append(
+            &paths,
+            &Dropped::new("could not send the record: Broken pipe (os error 32)"),
+        );
+
+        let summary = summary(&paths);
+        let rendered = describe(&summary);
+        // Every standing reason is named once, with its count, and a short
+        // meaning — the difference between "the bus restarted mid-turn" and
+        // "the vendor's schema moved" is the difference between noise and an
+        // adapter that needs an update.
+        assert!(rendered.contains("3×"), "{rendered}");
+        assert!(rendered.contains("orphan"), "{rendered}");
+        assert!(rendered.contains("1×"), "{rendered}");
+        assert!(rendered.contains("adapter"), "{rendered}");
+        // The transient one is still folded into its own count, not a reason.
+        assert!(rendered.contains("1 transient connection"), "{rendered}");
+    }
+
+    #[test]
+    fn orphans_with_different_tails_read_as_one_story() {
+        let dir = home();
+        let paths = paths_at(dir.path());
+        append(
+            &paths,
+            &Dropped::new("no conversation for this session deadbeef"),
+        );
+        append(
+            &paths,
+            &Dropped::new("no conversation for this session cafebabe"),
+        );
+
+        let summary = summary(&paths);
+        assert_eq!(summary.reasons.len(), 1, "{:?}", summary.reasons);
+        assert_eq!(summary.reasons[0].1, 2);
+        assert!(describe(&summary).contains("2×"));
+    }
+
+    #[test]
+    fn adapter_gaps_with_different_events_read_as_one_story() {
+        let dir = home();
+        let paths = paths_at(dir.path());
+        append(&paths, &Dropped::new("no mapping for hook event \"A\""));
+        append(&paths, &Dropped::new("no mapping for hook event \"B\""));
+
+        let summary = summary(&paths);
+        assert_eq!(summary.reasons.len(), 1, "{:?}", summary.reasons);
+        assert_eq!(summary.reasons[0].1, 2);
+    }
+
+    #[test]
+    fn unclassified_reasons_stay_separate_rows() {
+        let dir = home();
+        let paths = paths_at(dir.path());
+        append(&paths, &Dropped::new("something odd happened here"));
+        append(&paths, &Dropped::new("something else odd happened"));
+
+        let summary = summary(&paths);
+        assert_eq!(summary.reasons.len(), 2, "{:?}", summary.reasons);
     }
 
     #[test]
