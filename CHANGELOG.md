@@ -9,8 +9,10 @@ the entry says so when it does.
 ### Fixed
 
 - A Cursor tool call or completed turn from an unbound session no longer takes a
-  conversation reserved for a directed hop. Only the next prompt in that checkout
-  takes the seat, as the hop's own comment always said.
+  conversation reserved for a directed hop. Only a prompt takes the seat, as the
+  hop's own comment always said. Such a call also gives the seat up, including
+  across a restart, so a stranger's later prompt cannot take it instead: both
+  sessions hold fresh ids.
 
 ## [1.0.0-rc.3] — 2026-11-01
 
