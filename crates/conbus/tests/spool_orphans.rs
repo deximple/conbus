@@ -434,3 +434,163 @@ fn an_orphan_the_spool_will_not_take_says_why_without_blaming_a_restart() {
         "the old text had a run of spaces: {said}"
     );
 }
+
+/// A hook as a person's session runs it, and what it printed.
+fn reply_to(home: &Path, payload: &serde_json::Value) -> String {
+    let mut child = Command::new(bin())
+        .args(["hook", "--harness", "claude_code"])
+        .env("CONBUS_HOME", home)
+        .env("HOME", home)
+        .env("CONBUS_SKIP_LAUNCHCTL", "1")
+        .env("CLAUDE_CODE_ENTRYPOINT", "cli")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("hook");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(payload.to_string().as_bytes())
+        .expect("write");
+    String::from_utf8_lossy(&child.wait_with_output().expect("wait").stdout).into_owned()
+}
+
+fn first_prompt_of(session: &str) -> serde_json::Value {
+    serde_json::json!({
+        "session_id": session, "hook_event_name": "UserPromptSubmit",
+        "prompt": "a new session here", "prompt_id": "q0", "cwd": "/repo"
+    })
+}
+
+#[test]
+fn a_finished_conversation_is_not_briefed_as_mid_turn_because_of_a_late_tool_event() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let daemon = start(home.path());
+    let ended = |id: &str| {
+        serde_json::json!({"session_id": SESSION, "hook_event_name": "Stop", "prompt_id": id,
+            "last_assistant_message": "done", "stop_hook_active": false, "cwd": "/repo"})
+    };
+    reply_to(home.path(), &tool_call("tu"));
+    past_a_drain();
+    reply_to(home.path(), &prompt("p0"));
+    reply_to(home.path(), &ended("p0"));
+    reply_to(home.path(), &prompt("p1"));
+    reply_to(home.path(), &ended("p1"));
+    past_a_drain();
+    let tool = records(home.path())
+        .into_iter()
+        .find(|record| record["tool_use_id"] == "tu")
+        .expect("the tool call landed");
+    let last = records(home.path()).last().cloned().expect("a record");
+    let live = reply_to(
+        home.path(),
+        &first_prompt_of("bbbbbbbb-bb83-4df5-9a73-a6a12e138d85"),
+    );
+    stop(daemon);
+
+    // The fold a restart does has to say the same thing as the one the daemon kept.
+    let daemon = start(home.path());
+    let restored = reply_to(
+        home.path(),
+        &first_prompt_of("cccccccc-bb83-4df5-9a73-a6a12e138d85"),
+    );
+    stop(daemon);
+
+    assert_eq!(
+        tool["seq"], last["seq"],
+        "it did land behind the turn's end"
+    );
+    for (when, reply) in [("live", live), ("after a restart", restored)] {
+        assert!(reply.contains("conbus-record"), "{when}: briefed: {reply}");
+        assert!(
+            !reply.contains("mid-turn"),
+            "{when}: the next session is told it is still running: {reply}"
+        );
+        assert!(reply.contains("state         finished"), "{when}: {reply}");
+    }
+}
+
+#[test]
+fn every_kind_of_event_from_inside_a_turn_waits_for_the_prompt() {
+    // `tool_requested` is what the other tests use. Each of these is lost at the
+    // next tick if it is left off the list, and a tool record cannot come back
+    // through gap fill.
+    let session = |name: &str, more: serde_json::Value| {
+        let mut payload = serde_json::json!({
+            "session_id": SESSION, "hook_event_name": name, "cwd": "/repo"
+        });
+        for (key, value) in more.as_object().expect("an object") {
+            payload[key] = value.clone();
+        }
+        payload
+    };
+    let kinds = [
+        (
+            "tool_use",
+            session(
+                "PostToolUse",
+                serde_json::json!({"tool_name": "Bash", "tool_input": {"command": "true"},
+                    "tool_use_id": "tu", "tool_response": {"stdout": ""}}),
+            ),
+        ),
+        (
+            "tool_denied",
+            session(
+                "PermissionDenied",
+                serde_json::json!({"tool_name": "Bash", "tool_input": {"command": "true"},
+                    "tool_use_id": "td", "reason": "not this one"}),
+            ),
+        ),
+        (
+            "tool_batch_ended",
+            session("PostToolBatch", serde_json::json!({"tool_calls": []})),
+        ),
+        (
+            "permission_asked",
+            session(
+                "PermissionRequest",
+                serde_json::json!({"tool_name": "Bash", "tool_input": {"command": "true"}}),
+            ),
+        ),
+        (
+            "notified",
+            session(
+                "Notification",
+                serde_json::json!({"notification_type": "idle_prompt", "message": "waiting"}),
+            ),
+        ),
+    ];
+    let home = tempfile::tempdir().expect("tempdir");
+    let daemon = start(home.path());
+    for (_, payload) in &kinds {
+        hook(home.path(), payload);
+    }
+    assert_eq!(spooled(home.path()).len(), kinds.len(), "each one spooled");
+    past_a_drain();
+    let held_on = spooled(home.path()).len();
+    let said = drops(home.path());
+
+    hook(home.path(), &prompt("p0"));
+    until("they land", || spooled(home.path()).is_empty());
+    stop(daemon);
+
+    assert_eq!(held_on, kinds.len(), "gone at the tick: {said}");
+    assert_eq!(drops(home.path()), "", "nothing was lost");
+    let all = records(home.path());
+    let turn = all
+        .iter()
+        .find(|record| record["vendor_turn_id"] == "p0")
+        .expect("the prompt");
+    for (kind, _) in &kinds {
+        let found = all
+            .iter()
+            .find(|record| record["event"] == *kind)
+            .unwrap_or_else(|| panic!("{kind} never landed"));
+        assert_eq!(
+            found["bus_id"], turn["bus_id"],
+            "{kind}: the same conversation"
+        );
+    }
+}

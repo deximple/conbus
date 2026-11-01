@@ -17,6 +17,11 @@ the entry says so when it does.
   deleted at the next two-second tick. Whether it survived used to come down to
   timing. A turn's end or a session's end with no conversation still goes at once.
   The drop text no longer blames a restart: bindings come back from the log.
+- A record that waited on its way to the log no longer reopens a turn that ended
+  after it. A finished conversation was briefed to the next session as still
+  mid-turn, and a quota stop stopped reading as one, once a late tool event landed
+  behind the turn's end. The fold reads `spooled_at`, which the log already has, so
+  an old log needs no migration.
 - A newer hook's new event kind now waits in the spool for a daemon that can read
   it, as `docs/log-format.md` always said. It used to be refused as unreadable and
   dropped live, and deleted from the spool. It waits up to seven days and then goes
@@ -25,10 +30,12 @@ the entry says so when it does.
 - A log that refuses a write, as a full disk or a read-only segment does, no
   longer destroys the record. The daemon holds it in memory, up to 16 MiB, and the
   hook spools a copy if it can. The record lands once, in arrival order, when the
-  log takes writes again, and the outage leaves a drop line. A spooled entry the
-  log keeps refusing is kept for seven days, then goes with a drop line. A short
-  write no longer leaves a torn line. A spooled Inference frame still answers
-  `allow`.
+  log takes writes again, its spool copy goes with it, and the outage leaves a drop
+  line. A spooled entry goes with a drop line only once the file is seven days old
+  and the log has refused for seven days without one write working. Only a hook's
+  request is held: `conbus hop` and a lease are told the write failed, and it stays
+  failed, seat included. A short write no longer leaves a torn line. A spooled
+  Inference frame still answers `allow`.
 - A hook that connects to a daemon just as it closes now spools its record instead
   of dropping it. On macOS that failure shows up as `could not bound the daemon
   call`, which is a restart like any other.

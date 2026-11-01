@@ -263,32 +263,30 @@ fn with_no_room_for_a_spool_file_the_daemon_keeps_the_record_in_memory() {
 }
 
 #[test]
-fn a_refused_entry_goes_with_a_drop_line_once_its_life_is_over() {
+fn a_week_old_entry_is_not_destroyed_by_the_first_refusal() {
+    // Its age says how long the daemon was away, not how long the log has refused
+    // it. When a refused entry does go is `a_refused_entry_goes_only_when_...` in
+    // `daemon.rs`, which can age an outage.
     let home = tempfile::tempdir().expect("tempdir");
     let segment = a_log_with_one_turn(home.path());
-    prompt(home.path(), "p1", "refused for longer than anyone waits");
-    prompt(home.path(), "p2", "written just now");
-    chmod(&segment, 0o400);
-    let mut entries = spooled(home.path());
-    entries.sort();
-    assert_eq!(entries.len(), 2);
+    prompt(home.path(), "p1", "written before a long shutdown");
+    let entries = spooled(home.path());
     std::fs::File::options()
         .write(true)
         .open(&entries[0])
         .expect("open")
         .set_modified(SystemTime::now() - WEEK - Duration::from_secs(60))
         .expect("age it");
-
+    chmod(&segment, 0o400);
     let daemon = start(home.path());
     past_a_drain();
-    let left = spooled(home.path());
-    stop(daemon);
-    chmod(&segment, 0o600);
-
-    assert_eq!(left, vec![entries[1].clone()], "only the old one goes");
+    let left = spooled(home.path()).len();
     let said = drops(home.path());
-    assert!(said.contains("spooled hook refused"), "{said}");
-    assert!(said.contains("turn_started for session"), "{said}");
+    chmod(&segment, 0o600);
+    until("the spool drains", || spooled(home.path()).is_empty());
+    stop(daemon);
+    assert_eq!(left, 1, "gone after one refused try: {said}");
+    assert_eq!(turns(home.path(), "p1"), 1, "and it lands when it can");
 }
 
 #[test]
@@ -428,4 +426,85 @@ fn a_torn_final_line_costs_only_itself() {
             .count(),
         1
     );
+}
+
+/// `hooks` prompts during an outage, `at_once` of them running together: each is
+/// held by the daemon and spooled by the hook. Then the log comes back.
+fn an_outage_writes_each_record_once(hooks: usize, at_once: usize) {
+    let home = tempfile::tempdir().expect("tempdir");
+    let segment = a_log_with_one_turn(home.path());
+    chmod(&segment, 0o400);
+    let daemon = start(home.path());
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..at_once {
+            scope.spawn(|| {
+                loop {
+                    let n = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if n >= hooks {
+                        return;
+                    }
+                    prompt(home.path(), &format!("t{n}"), "held and spooled");
+                }
+            });
+        }
+    });
+    assert_eq!(spooled(home.path()).len(), hooks);
+    chmod(&segment, 0o600);
+    until("the spool drains", || spooled(home.path()).is_empty());
+    past_a_drain();
+    stop(daemon);
+    let mut ids: Vec<String> = records(home.path())
+        .iter()
+        .filter(|record| record["prompt"]["text"] == "held and spooled")
+        .filter_map(|record| record["vendor_turn_id"].as_str().map(String::from))
+        .collect();
+    let lines = ids.len();
+    ids.sort();
+    ids.dedup();
+    assert_eq!(lines, hooks, "{hooks} hooks, {lines} lines");
+    assert_eq!(ids.len(), hooks, "each hook once");
+}
+
+#[test]
+fn an_outage_one_past_the_dedupe_window_writes_each_record_once() {
+    an_outage_writes_each_record_once(4_097, 1);
+}
+
+#[test]
+fn an_outage_well_past_the_dedupe_window_writes_each_record_once() {
+    an_outage_writes_each_record_once(4_136, 1);
+}
+
+#[test]
+fn parallel_hooks_one_past_the_dedupe_window_write_each_record_once() {
+    an_outage_writes_each_record_once(4_097, 8);
+}
+
+#[test]
+fn parallel_hooks_well_past_the_dedupe_window_write_each_record_once() {
+    an_outage_writes_each_record_once(4_136, 8);
+}
+
+#[test]
+fn a_refused_entry_stops_the_pass_and_nothing_behind_it_is_read() {
+    // A full disk should not cost a read of every file on every tick. An entry
+    // that cannot be parsed shows whether it was read: reading it removes it and
+    // says so. This name sorts after any hook's, whose ids start with the time.
+    let home = tempfile::tempdir().expect("tempdir");
+    let segment = a_log_with_one_turn(home.path());
+    prompt(home.path(), "p1", "first in line, and the log refuses it");
+    let behind = home.path().join("spool/ffffffff-not-a-hooks-id.json");
+    std::fs::write(&behind, "not a request").expect("entry");
+    chmod(&segment, 0o400);
+
+    let daemon = start(home.path());
+    past_a_drain();
+    let still_there = behind.exists();
+    let said = drops(home.path());
+    chmod(&segment, 0o600);
+    stop(daemon);
+
+    assert!(still_there, "the pass went on past the refusal: {said}");
+    assert_eq!(said, "");
 }
