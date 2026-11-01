@@ -186,7 +186,7 @@ fn agent(harness: &str, rows: &[&Row], days: &[String]) -> Agent {
 }
 
 pub fn run(paths: &Paths, window: Window, within: Option<&Path>, json: bool) -> io::Result<()> {
-    let scan = SegmentLog::scan(paths.log_dir())?;
+    let scan = SegmentLog::scan_meta(paths.log_dir(), Some(&paths.cache_dir()))?;
     let ledger = Ledger::fold_between(&scan.records, &window.since, window.until.as_deref());
     let budget = Budget::starting_now();
     let repos = repositories(&ledger.rows, &budget);

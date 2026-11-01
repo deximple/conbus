@@ -23,7 +23,7 @@ use crate::wire::{self, Request, Response};
 const BOUND: Duration = Duration::from_secs(20);
 
 pub fn run(paths: &Paths, bus_id: Option<String>) -> io::Result<()> {
-    let scan = SegmentLog::scan(paths.log_dir())?;
+    let scan = SegmentLog::scan_meta(paths.log_dir(), Some(&paths.cache_dir()))?;
     let wanted = bus_id.ok_or_else(|| io::Error::other("pass --bus-id <id>"))?;
     let chapter_records: Vec<&Record> = scan
         .records
