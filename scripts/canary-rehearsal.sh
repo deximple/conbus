@@ -67,6 +67,9 @@ usage_rows() { # usage_rows <first-iso> <harness>...
 #   chatty    — like live, with far more output after the socket line than a pipe
 #               holds, so a reader that leaves at its first match costs the
 #               writer a SIGPIPE every time instead of once in a while
+#   eventgap  — hooks run, but a registered hook misses events
+#   untrusted — Codex will not spawn the hooks until a person approves them
+#   nohooks   — no vendor installed here, so nothing registered
 #   rotating  — like live, and it names drops.1.jsonl the way a build that
 #               rotates its drop log does
 #   elided    — its `install --apply` writes `tool bodies elided, not sealed` and
@@ -92,6 +95,9 @@ write_fake() {
             install_body='touch "$HOME/.install-called"; printf "{\"ts\":\"%s\",\"reason\":\"the daemon refused the record: this daemon speaks protocol v5; the hook speaks v6. Restart the daemon.\"}\n" "$(perl -MTime::HiRes=gettimeofday -MPOSIX=strftime -e "(\$s,\$u)=gettimeofday; printf \"%s.%03dZ\", strftime(\"%Y-%m-%dT%H:%M:%S\", gmtime(\$s)), int(\$u/1000)")" >> "$HOME/.conbus/drops.jsonl"' ;;
         sessions) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "hooks     claude_code  runs — x"'
             install_body='touch "$HOME/.install-called"; printf "{\"ts\":\"%s\",\"reason\":\"the hook payload names no session; an empty id would merge unrelated sessions into one conversation\"}\n" "$(perl -MTime::HiRes=gettimeofday -MPOSIX=strftime -e "(\$s,\$u)=gettimeofday; printf \"%s.%03dZ\", strftime(\"%Y-%m-%dT%H:%M:%S\", gmtime(\$s)), int(\$u/1000)")" >> "$HOME/.conbus/drops.jsonl"' ;;
+        eventgap) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "log       5 record(s), 1 conversation(s), 0 unreadable line(s)"; echo "hooks     claude_code  runs — x"; echo "events    claude_code  MISSING Stop, SessionEnd — run \`conbus install --apply\`"' ;;
+        untrusted) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "log       5 record(s), 1 conversation(s), 0 unreadable line(s)"; echo "hooks     codex        runs — x"; echo "codex     2 of 2 hook(s) Codex will not spawn:"; echo "          NOT TRUSTED: PreToolUse, PostToolUse"' ;;
+        nohooks) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "log       5 record(s), 1 conversation(s), 0 unreadable line(s)"; echo "hooks     cursor       not installed here"' ;;
         rotating) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "disk      log 1.0 MB — 1.0 GB free of 2.0 GB (50.0%)"; echo "log       5 record(s), 1 conversation(s), 0 unreadable line(s)"; echo "hooks     claude_code  runs — x"' ;;
         elided) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "hooks     claude_code  runs — x"'
             install_body='touch "$HOME/.install-called"; now=$(perl -MTime::HiRes=gettimeofday -MPOSIX=strftime -e "(\$s,\$u)=gettimeofday; printf \"%s.%03dZ\", strftime(\"%Y-%m-%dT%H:%M:%S\", gmtime(\$s)), int(\$u/1000)"); printf "{\"detail\":\"7 tool event(s)\",\"reason\":\"tool bodies elided, not sealed\",\"ts\":\"%s\"}\n{\"reason\":\"the log refused writes for a while\",\"ts\":\"%s\"}\n" "$now" "$now" >> "$HOME/.conbus/drops.jsonl"' ;;
@@ -101,7 +107,7 @@ write_fake() {
         stuck) doctor='sleep 3600' ;;
         stuckboot) doctor='printf "{\"build\":\"'"$tag"'\",\"pid\":$$,\"started\":\"2026-11-01T10:00:00.000Z\",\"serving\":\"2026-11-01T10:00:04.000Z\"}\n" > "$HOME/.conbus/daemon.build"; sleep 3600' ;;
         chatty) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "disk      log 1.0 MB — 1.0 GB free of 2.0 GB (50.0%)"; echo "hooks     claude_code  runs — x"; perl -e "print qq(note\n) x 60000"' ;;
-        flap) doctor='n=$(cat "$HOME/.flap" 2>/dev/null || echo 0); echo $((n + 1)) > "$HOME/.flap"; [ "$n" = 0 ] && sleep 3; echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "log       5 record(s), 1 conversation(s), 0 unreadable line(s)"' ;;
+        flap) doctor='n=$(cat "$HOME/.flap" 2>/dev/null || echo 0); echo $((n + 1)) > "$HOME/.flap"; [ "$n" = 0 ] && sleep 3; echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "log       5 record(s), 1 conversation(s), 0 unreadable line(s)"; echo "hooks     claude_code  runs — x"' ;;
     esac
     policy_body=':'
     [ "$persona" = polfail ] && policy_body='exit 1'
@@ -721,8 +727,9 @@ verdict_fixture() { # verdict_fixture [swapped-iso] [restarts-json]
         "$home/.conbus/policy.json" "$home/.usage-fail" "$home/.usage-fail-day" "$home/.usage-window"
     write_fake beef live "$install_dir/conbus"
     write_fake 01d notokens "$rollback_bin"
-    printf '{"swapped":"%s","prev_build":"01d","candidate_build":"beef","candidate_sha256":"x","restarts":%s}\n' \
-        "$fx_swapped" "$fx_restarts" >"$home/.conbus/canary.json"
+    printf '{"swapped":"%s","prev_build":"01d","candidate_build":"beef","candidate_sha256":"%s","restarts":%s}\n' \
+        "$fx_swapped" "$(shasum -a 256 "$install_dir/conbus" | awk '{ print $1 }')" "$fx_restarts" \
+        >"$home/.conbus/canary.json"
     printf '%s conbus daemon: beef: socket /x/sock log /x/log (10 record(s), 0 unreadable)\n' \
         "$(iso_after "$fx_swapped" 4)" >"$home/.conbus/daemon.log"
     printf '{"build":"beef","pid":%s,"started":"%s","serving":"%s","core_dumps_disabled":true,"memory_locked":true}\n' \
@@ -730,6 +737,14 @@ verdict_fixture() { # verdict_fixture [swapped-iso] [restarts-json]
     printf '{"ts":"%s","reason":"socket closed early"}\n' \
         "$(iso_after "$fx_swapped" -$((5 * DAY)))" >"$home/.conbus/drops.jsonl"
     usage_rows "$(iso_after "$fx_swapped" -$((14 * DAY)))" claude_code codex >"$home/.usage-rows"
+}
+
+# The candidate again under another persona, with the recorded hash kept true.
+install_persona() { # install_persona <persona>
+    write_fake beef "$1" "$install_dir/conbus"
+    sed -E "s/\"candidate_sha256\":\"[^\"]*\"/\"candidate_sha256\":\"$(shasum -a 256 "$install_dir/conbus" | awk '{ print $1 }')\"/" \
+        "$home/.conbus/canary.json" >"$home/.conbus/canary.json.new"
+    mv -f "$home/.conbus/canary.json.new" "$home/.conbus/canary.json"
 }
 
 expect_no_grep() { # expect_no_grep <pattern> <file> <what>
@@ -759,8 +774,8 @@ code=0
 run verdict >"$tmp/verdict.out" 2>&1 || code=$?
 if [ "$code" != 0 ]; then cat "$tmp/verdict.out" >&2; fi
 expect 0 "$code" "verdict exits 0 on a completed clean window"
-for name in restarts unreadable drops harness-activity twins-repeated usage-parity \
-    rss-budget time-budget serving-budget policy sync operator-feel; do
+for name in build hooks restarts unreadable drops tool-bodies harness-activity twins-repeated \
+    usage-parity rss-budget time-budget serving-budget policy sync operator-feel; do
     grep -qE "^(PASS|FAIL|UNCHECKED) $name " "$tmp/verdict.out"
     expect 0 $? "verdict prints a $name line"
 done
@@ -1074,7 +1089,7 @@ expect_grep '^UNCHECKED drops.*does not rotate: nothing after' "$tmp/verdict-cap
 # The same file under a build that rotates is not blind: the next drop renames it.
 write_fake beef rotating "$tmp/stage/conbus-rotating"
 verdict_fixture
-write_fake beef rotating "$install_dir/conbus"
+install_persona rotating
 fill_to_cap "$(iso_ago $((30 * DAY)))"
 code=0
 run verdict >"$tmp/verdict-capped-rotating.out" 2>&1 || code=$?
@@ -1557,7 +1572,7 @@ rm -f "$home/.conbus/sync.json"
 # A policy file that cannot be a policy decides nothing: zero counted
 # denials over it is not a pass.
 verdict_fixture
-write_fake beef polfail "$install_dir/conbus"
+install_persona polfail
 echo 'this is not a policy' >"$home/.conbus/policy.json"
 code=0
 run verdict >"$tmp/verdict-polfail.out" 2>&1 || code=$?
@@ -1569,7 +1584,7 @@ rm -f "$home/.conbus/policy.json"
 # time-budget: one slow doctor is a spike, not a wedge. It gets two more reads
 # and the median judges, so the verdict passes and doctor ran 3x.
 verdict_fixture
-write_fake beef flap "$install_dir/conbus"
+install_persona flap
 rm -f "$home/.flap"
 code=0
 DOCTOR_MS=2000 run verdict >"$tmp/verdict-median.out" 2>&1 || code=$?
@@ -1582,6 +1597,98 @@ code=0
 DOCTOR_MS=2000 run verdict >"$tmp/verdict-oneread.out" 2>&1 || code=$?
 expect 0 "$code" "a fast doctor passes on its first read"
 expect 4 "$(cat "$home/.flap")" "and is read only once"
+
+# --- the build and the hooks ---------------------------------------------------
+
+# The canary was rolled back, and a verdict that reads only the swap time would
+# go on judging the build that replaced it.
+verdict_fixture
+sed -E 's/,"restarts":\[\]/,"restarts":[],"rolled_back":"2026-11-01T01:00:00.000Z"/' \
+    "$home/.conbus/canary.json" >"$home/.conbus/canary.json.new"
+mv -f "$home/.conbus/canary.json.new" "$home/.conbus/canary.json"
+code=0
+run verdict >"$tmp/verdict-rolledback.out" 2>&1 || code=$?
+expect 1 "$code" "a window that was rolled back cannot pass"
+expect_grep '^FAIL build.*rolled back at 2026-11-01' "$tmp/verdict-rolledback.out" "it says so"
+
+# Installed: another build, then the same version with other bytes.
+verdict_fixture
+write_fake aaaa live "$install_dir/conbus"
+code=0
+run verdict >"$tmp/verdict-otherbuild.out" 2>&1 || code=$?
+expect 1 "$code" "an installed binary that is not the candidate fails"
+expect_grep '^FAIL build.*installed binary is build aaaa' "$tmp/verdict-otherbuild.out" "the build is named"
+verdict_fixture
+printf '# touched\n' >>"$install_dir/conbus"
+code=0
+run verdict >"$tmp/verdict-otherbytes.out" 2>&1 || code=$?
+expect 1 "$code" "the candidate's version with other bytes fails"
+expect_grep "^FAIL build.*sha256 is not the candidate" "$tmp/verdict-otherbytes.out" "the hash is named"
+
+# Running: a stamp from another build, and doctor saying the same.
+verdict_fixture
+printf '{"build":"aaaa","pid":%s,"started":"%s","serving":"%s"}\n' "$$" \
+    "$(iso_after "$fx_swapped" 1)" "$(iso_after "$fx_swapped" 4)" >"$home/.conbus/daemon.build"
+code=0
+run verdict >"$tmp/verdict-otherstamp.out" 2>&1 || code=$?
+expect 1 "$code" "a daemon stamped with another build fails"
+expect_grep "^FAIL build.*stamp names build aaaa" "$tmp/verdict-otherstamp.out" "the running build is named"
+verdict_fixture
+install_persona differs
+code=0
+run verdict >"$tmp/verdict-differs.out" 2>&1 || code=$?
+expect 1 "$code" "doctor's DIFFERS fails"
+expect_grep "^FAIL build.*DIFFERS" "$tmp/verdict-differs.out" "doctor's line is quoted"
+verdict_fixture
+printf '{"swapped":"%s","restarts":[]}\n' "$fx_swapped" >"$home/.conbus/canary.json"
+code=0
+run verdict >"$tmp/verdict-nocandidate.out" 2>&1 || code=$?
+expect 4 "$code" "a window that names no candidate cannot pass"
+expect_grep "^UNCHECKED build" "$tmp/verdict-nocandidate.out" "and build says so"
+
+verdict_fixture
+sed -E 's/"candidate_sha256":"[^"]*",//' "$home/.conbus/canary.json" >"$home/.conbus/canary.json.new"
+mv -f "$home/.conbus/canary.json.new" "$home/.conbus/canary.json"
+code=0
+run verdict >"$tmp/verdict-nosha.out" 2>&1 || code=$?
+expect 4 "$code" "a window with no recorded hash cannot pass"
+expect_grep "^UNCHECKED build.*no candidate sha256" "$tmp/verdict-nosha.out" "and build says so"
+
+# Hooks: broken, missing an event, or waiting on a person's trust in Codex.
+verdict_fixture
+install_persona hookfail
+code=0
+run verdict >"$tmp/verdict-hookfail.out" 2>&1 || code=$?
+expect 1 "$code" "a hook that stopped running fails"
+expect_grep "^FAIL hooks.*codex MISSING" "$tmp/verdict-hookfail.out" "the hook is named"
+verdict_fixture
+install_persona eventgap
+code=0
+run verdict >"$tmp/verdict-eventgap.out" 2>&1 || code=$?
+expect 1 "$code" "a registered hook missing an event fails"
+expect_grep "^FAIL hooks.*MISSING Stop" "$tmp/verdict-eventgap.out" "the event is named"
+verdict_fixture
+install_persona untrusted
+code=0
+run verdict >"$tmp/verdict-untrusted.out" 2>&1 || code=$?
+expect 1 "$code" "a hook Codex will not spawn fails"
+expect_grep "^FAIL hooks.*NOT TRUSTED" "$tmp/verdict-untrusted.out" "the trust state is quoted"
+verdict_fixture
+install_persona nohooks
+code=0
+run verdict >"$tmp/verdict-nohooks.out" 2>&1 || code=$?
+expect 4 "$code" "no hook registered at all is not a pass"
+expect_grep "^UNCHECKED hooks" "$tmp/verdict-nohooks.out" "and hooks says so"
+# Doctor never answers: every item that reads it stays open, and the time budget
+# is what fails. The verdict still reaches its summary.
+verdict_fixture
+install_persona stuck
+code=0
+CONBUS_CANARY_DOCTOR_LIMIT=1 run verdict >"$tmp/verdict-stuck.out" 2>&1 || code=$?
+expect 1 "$code" "a wedged doctor fails the time budget"
+expect_grep "^UNCHECKED hooks.*did not answer" "$tmp/verdict-stuck.out" "hooks cannot be judged without it"
+expect_grep "^UNCHECKED build.*could not be confirmed: doctor did not answer" "$tmp/verdict-stuck.out" "nor can the running build"
+expect_grep "verdict: FAIL" "$tmp/verdict-stuck.out" "and the summary still prints"
 
 # Inside the window the verdict is "incomplete", not a pass.
 verdict_fixture "$(date -u +%Y-%m-%dT00:00:00.000Z)"
