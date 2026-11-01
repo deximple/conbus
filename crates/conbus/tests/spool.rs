@@ -204,3 +204,165 @@ fn a_newer_protocol_entry_stays_spooled() {
         "a newer protocol stays for a daemon that speaks it"
     );
 }
+
+/// The storm: 1,000 hooks across 16 threads, with the daemon TERMed and
+/// restarted mid-burst. Every event must reach the log — spooled during the
+/// gap or answered live — and a re-delivered hook_id counts once.
+#[test]
+fn a_thousand_hooks_survive_a_daemon_restart() {
+    const HOOKS: u64 = 1000;
+    const SESSIONS: u64 = 5;
+
+    let home = tempfile::tempdir().expect("tempdir");
+    let daemon = std::sync::Mutex::new(
+        Command::new(bin())
+            .arg("daemon")
+            .env("CONBUS_HOME", home.path())
+            .env("HOME", home.path())
+            .env("CONBUS_SKIP_LAUNCHCTL", "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("daemon"),
+    );
+    // Mint the sessions first so the storm's events land in live
+    // conversations rather than all orphans.
+    wait_for_socket(home.path());
+    for s in 0..SESSIONS {
+        let (code, _) = run_hook(
+            home.path(),
+            &serde_json::json!({
+                "session_id": format!("s-storm-{s}"),
+                "hook_event_name": "UserPromptSubmit",
+                "prompt": "minting the session",
+                "prompt_id": format!("mint-{s}")
+            })
+            .to_string(),
+        );
+        assert_eq!(code, 0);
+    }
+
+    // The storm: every hook invocation is its own process, the way a vendor
+    // fires it.
+    let sent = std::sync::atomic::AtomicU64::new(0);
+    let failures = std::sync::Mutex::new(Vec::<String>::new());
+    let killed = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        for _ in 0..16 {
+            scope.spawn(|| {
+                loop {
+                    let n = sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if n >= HOOKS {
+                        return;
+                    }
+                    // Mid-burst: kill the daemon once and restart it.
+                    if n == 300 && !killed.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        let mut handle = daemon.lock().expect("daemon");
+                        let _ = handle.kill();
+                        let _ = handle.wait();
+                        if let Ok(new_daemon) = Command::new(bin())
+                            .arg("daemon")
+                            .env("CONBUS_HOME", home.path())
+                            .env("HOME", home.path())
+                            .env("CONBUS_SKIP_LAUNCHCTL", "1")
+                            .stdout(Stdio::null())
+                            .stderr(Stdio::null())
+                            .spawn()
+                        {
+                            *handle = new_daemon;
+                        }
+                    }
+                    let session = n % SESSIONS;
+                    let payload = serde_json::json!({
+                        "session_id": format!("s-storm-{session}"),
+                        "hook_event_name": "PreToolUse",
+                        "tool_name": "Bash",
+                        "tool_input": {"command": format!("echo storm-{n}")},
+                        "tool_use_id": format!("storm-{n}")
+                    })
+                    .to_string();
+                    let (code, stdout) = run_hook(home.path(), &payload);
+                    let object = serde_json::from_str::<serde_json::Value>(stdout.trim());
+                    if code != 0 || object.is_err() || !object.expect("checked").is_object() {
+                        failures
+                            .lock()
+                            .expect("failures")
+                            .push(format!("hook {n}: exit {code} out {stdout:?}"));
+                    }
+                }
+            });
+        }
+    });
+    assert!(
+        failures.lock().expect("failures").is_empty(),
+        "hooks that did not answer cleanly: {:?}",
+        failures.lock().expect("failures")
+    );
+
+    // The new daemon drains the spool before it serves and on its idle tick.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline && !spool_files(home.path()).is_empty() {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        spool_files(home.path()).is_empty(),
+        "the spool never drained"
+    );
+
+    // Every hook id is distinct, and every storm event is in the log.
+    let output = Command::new(bin())
+        .arg("log")
+        .arg("--json")
+        .arg("--grep")
+        .arg("storm-")
+        .env("CONBUS_HOME", home.path())
+        .env("CONBUS_SKIP_LAUNCHCTL", "1")
+        .output()
+        .expect("log");
+    let mut hook_ids = std::collections::HashSet::new();
+    let mut markers = std::collections::HashSet::new();
+    let mut dup_hook_ids = 0u64;
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let record: serde_json::Value = serde_json::from_str(line).expect("record");
+        if let Some(h) = record.get("hook_id").and_then(|h| h.as_str()) {
+            if !hook_ids.insert(h.to_string()) {
+                dup_hook_ids += 1;
+            }
+        }
+        if let Some(id) = record
+            .get("tool_use_id")
+            .and_then(|t| t.as_str())
+            .map(String::from)
+            .or_else(|| {
+                record
+                    .get("input")
+                    .and_then(|i| serde_json::to_string(i).ok())
+                    .filter(|t| t.contains("storm-"))
+            })
+        {
+            markers.insert(id);
+        }
+    }
+    if let Ok(mut handle) = daemon.lock() {
+        let _ = handle.kill();
+        let _ = handle.wait();
+    }
+    assert_eq!(
+        hook_ids.len() as u64,
+        HOOKS,
+        "every hook's id must reach the log exactly once ({dup_hook_ids} re-deliveries)"
+    );
+    assert_eq!(markers.len() as u64, HOOKS, "every storm event was written");
+}
+
+fn wait_for_socket(home: &Path) {
+    let socket = home.join("conbus.sock");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if std::os::unix::net::UnixStream::connect(&socket).is_ok() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!("the daemon never answered its socket");
+}
