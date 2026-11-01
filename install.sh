@@ -64,7 +64,7 @@ fetch() {
 }
 
 say "downloading $asset ($version) from $base"
-fetch "$asset" || die "could not download $asset. If the repository is private, run 'gh auth login' first."
+fetch "$asset" || die "could not download $asset"
 fetch "$asset.sha256" || die "could not download $asset.sha256"
 (cd "$tmp" && checksum "$asset.sha256" >/dev/null 2>&1) ||
   die "the download does not match its checksum; nothing was installed"
