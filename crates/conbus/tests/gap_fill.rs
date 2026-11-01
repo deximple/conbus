@@ -786,3 +786,94 @@ fn a_running_turn_no_hook_reported_is_filled_and_ended_by_its_own_stop() {
     assert_eq!(done[0]["assistant_message"]["text"], "the answer");
     assert!(done[0]["hook_id"].is_string(), "{}", show(&all));
 }
+
+/// A log with two segments, whose older one this process can no longer read and
+/// no sidecar answers for.
+fn an_older_segment_goes_unreadable(home: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let (older, newer) = (
+        home.join("log/segment-00000000.jsonl"),
+        home.join("log/segment-00000001.jsonl"),
+    );
+    let text = std::fs::read_to_string(&older).expect("the older segment");
+    let mut later: Value =
+        serde_json::from_str(text.lines().last().expect("a line")).expect("json");
+    later["seq"] = json!(1000);
+    std::fs::write(&newer, later.to_string() + "\n").expect("the newer segment");
+    let _ = std::fs::remove_dir_all(home.join("cache/meta"));
+    std::fs::set_permissions(&older, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+    older
+}
+
+#[test]
+fn a_read_error_at_start_does_not_ingest_a_chat_export_again() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let export = json!([{"uuid": "11111111-2222-4333-8444-555555555555", "name": "n",
+        "created_at": T0, "chat_messages": [
+            {"uuid": "m1", "sender": "human", "text": "a chat prompt", "created_at": T0},
+            {"uuid": "m2", "sender": "assistant", "text": "a chat reply", "created_at": T0}]}]);
+    std::fs::create_dir_all(home.join("chat-export")).expect("dir");
+    std::fs::write(
+        home.join("chat-export/conversations.json"),
+        export.to_string(),
+    )
+    .expect("write");
+    stop(start(home));
+    let count = |home: &Path| {
+        log_lines(home)
+            .iter()
+            .filter(|record| record["prompt"]["text"] == "a chat prompt")
+            .count()
+    };
+    assert_eq!(count(home), 1);
+
+    let older = an_older_segment_goes_unreadable(home);
+    stop(start(home));
+    std::fs::set_permissions(&older, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+
+    assert_eq!(count(home), 1, "the whole export was appended again");
+
+    // Readable again, the next start has the right answer too.
+    stop(start(home));
+    assert_eq!(
+        count(home),
+        1,
+        "the export was appended once it could be read"
+    );
+}
+
+#[test]
+fn a_fill_the_log_refused_keeps_its_range() {
+    // A full disk at start: the fill stops part way and says so. The range it
+    // did not finish must not be lost to the records the daemon goes on to serve.
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let daemon = start(home);
+    hook(home, &prompt(S, "p0", "before"));
+    stop(daemon);
+    transcript(
+        home,
+        S,
+        &[user(S, "p0", "before"), user(S, "p1", "missed"), reply(S, "a1")],
+    );
+    let segment = home.join("log/segment-00000000.jsonl");
+    // A read-only segment stands in for ENOSPC.
+    std::fs::set_permissions(&segment, std::fs::Permissions::from_mode(0o400)).expect("chmod");
+    stop(start(home));
+    std::fs::set_permissions(&segment, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    let marker = home.join("cache/gap-since");
+    assert!(marker.exists(), "nothing remembers the range");
+
+    stop(start(home));
+
+    assert!(
+        log_lines(home)
+            .iter()
+            .any(|record| record["vendor_turn_id"] == "p1"),
+        "the range was not filled"
+    );
+    assert!(!marker.exists(), "a finished fill clears the marker");
+}

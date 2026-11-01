@@ -411,13 +411,8 @@ fn append_gaps_at_start_in(
     // rather than losing it to a newer `newest`. A fill that finishes
     // deletes the marker; a garbled one is ignored and said so.
     let marker = paths.cache_dir().join("gap-since");
-    let remembered = std::fs::read_to_string(&marker)
-        .ok()
-        .and_then(|text| text.trim().parse::<conbus_core::clock::Timestamp>().ok())
-        .and_then(|ts| {
-            conbus_core::clock::Timestamp::from_unix_seconds(0).map(|epoch| ts.seconds_since(epoch))
-        });
-    if std::fs::read_to_string(&marker).is_ok() && remembered.is_none() {
+    let remembered = read_since(&marker);
+    if marker.exists() && remembered.is_none() {
         timing.gap_marker_garbled = true;
     }
     let since = newest_unix(held)
@@ -457,35 +452,71 @@ fn append_gaps_at_start_in(
     }
     if timing.budget_exhausted {
         // The cut-short range outlives this start: next start resumes it.
-        let write = since
-            .map(|fresh| remembered.map_or(fresh, |old| old.min(fresh)))
-            .and_then(conbus_core::clock::Timestamp::from_unix_seconds);
-        if let Some(when) = write {
-            let temp = paths
-                .cache_dir()
-                .join(format!(".gap-since.{}.tmp", std::process::id()));
-            let _ = std::fs::create_dir_all(paths.cache_dir());
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                let mut options = std::fs::OpenOptions::new();
-                options.write(true).create_new(true).mode(0o600);
-                if options
-                    .open(&temp)
-                    .and_then(|mut f| {
-                        std::io::Write::write_all(&mut f, when.to_string().as_bytes())
-                    })
-                    .and_then(|_| std::fs::rename(&temp, &marker))
-                    .is_err()
-                {
-                    let _ = std::fs::remove_file(&temp);
-                }
-            }
+        if let Some(since) = since {
+            write_since(paths, &marker, since);
         }
     } else {
         let _ = std::fs::remove_file(&marker);
     }
     Ok((n, timing))
+}
+
+/// The time a marker under `cache/` holds, as unix seconds.
+fn read_since(marker: &Path) -> Option<i64> {
+    let when = fs::read_to_string(marker)
+        .ok()?
+        .trim()
+        .parse::<Timestamp>()
+        .ok()?;
+    Some(when.seconds_since(Timestamp::from_unix_seconds(0)?))
+}
+
+/// Hold a deferred range in a marker, whole or not at all. It costs a repeat of
+/// the range at worst, so a failure here is not worth more than that.
+fn write_since(paths: &Paths, marker: &Path, since: i64) {
+    let Some(when) = Timestamp::from_unix_seconds(since) else {
+        return;
+    };
+    let temp = paths
+        .cache_dir()
+        .join(format!(".gap-since.{}.tmp", std::process::id()));
+    let _ = fs::create_dir_all(paths.cache_dir());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true).mode(0o600);
+        if options
+            .open(&temp)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, when.to_string().as_bytes()))
+            .and_then(|_| fs::rename(&temp, marker))
+            .is_err()
+        {
+            let _ = fs::remove_file(&temp);
+        }
+    }
+}
+
+/// Keep the range for the next start, when this one could not fill at all.
+///
+/// The log could not be read, so its newest record is not known. The newest
+/// segment's write time is as good, and needs no read of the segment. Without
+/// this the hooks served after this start would move the next start's range past
+/// whatever this downtime missed.
+pub fn defer_fill(paths: &Paths) {
+    let Some(written) = SegmentLog::current_segment(&paths.log_dir())
+        .ok()
+        .and_then(|segment| modified_unix(&segment))
+    else {
+        return;
+    };
+    let marker = paths.cache_dir().join("gap-since");
+    let fresh = written - GAP_MARGIN_SECS;
+    write_since(
+        paths,
+        &marker,
+        read_since(&marker).map_or(fresh, |old| old.min(fresh)),
+    );
 }
 
 /// How long before the log's newest record a file may have last changed and
@@ -495,7 +526,7 @@ const GAP_MARGIN_SECS: i64 = 15 * 60;
 
 /// The newest record's time, as unix seconds.
 fn newest_unix(held: &[Record]) -> Option<i64> {
-    let epoch = conbus_core::clock::Timestamp::from_unix_seconds(0)?;
+    let epoch = Timestamp::from_unix_seconds(0)?;
     held.iter()
         .map(|record| record.ts)
         .max()
@@ -2588,6 +2619,90 @@ mod tests {
         .expect("third fill");
         assert_eq!(third, 0, "resumed turns are appended exactly once");
         assert_eq!(records_on_disk(&machine), after);
+    }
+
+    /// Set a file's modification time, in unix seconds.
+    fn touched_at(file: &Path, seconds: i64) {
+        fs::File::options()
+            .write(true)
+            .open(file)
+            .expect("open")
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds as u64))
+            .expect("mtime");
+    }
+
+    #[test]
+    fn a_fill_skipped_for_a_read_error_keeps_its_range() {
+        // The log could not be read, so nothing was compared and nothing filled.
+        // Newer records must not then push the missed range out of reach.
+        let machine = machine();
+        let home = tempfile::tempdir().expect("tempdir");
+        claude_transcript(home.path(), SESSION);
+        let now = conbus_core::clock::Timestamp::now();
+        live_at(&machine, now, SESSION);
+
+        defer_fill(&machine.paths);
+
+        let marker = machine.paths.cache_dir().join("gap-since");
+        assert!(marker.exists(), "the skipped range is remembered");
+        let epoch = conbus_core::clock::Timestamp::from_unix_seconds(0).expect("epoch");
+        let later = now.seconds_since(epoch) + GAP_MARGIN_SECS + 3600;
+        live_at(
+            &machine,
+            conbus_core::clock::Timestamp::from_unix_seconds(later).expect("ts"),
+            "live-b",
+        );
+        let mut log =
+            SegmentLog::open(machine.paths.log_dir(), Retention::default()).expect("open");
+        let (appended, _) = append_gaps_at_start_in(
+            &machine.paths,
+            &held(&machine),
+            &mut log,
+            std::time::Duration::from_secs(60),
+            Some(home.path()),
+        )
+        .expect("the next start");
+
+        assert!(appended > 0, "the range is filled once the log can be read");
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn a_read_error_does_not_move_a_range_already_deferred_forward() {
+        let machine = machine();
+        live_at(&machine, conbus_core::clock::Timestamp::now(), SESSION);
+        fs::create_dir_all(machine.paths.cache_dir()).expect("cache");
+        let marker = machine.paths.cache_dir().join("gap-since");
+        fs::write(&marker, "2026-10-01T00:00:00.000Z").expect("marker");
+
+        defer_fill(&machine.paths);
+
+        assert_eq!(
+            fs::read_to_string(&marker).expect("marker"),
+            "2026-10-01T00:00:00.000Z"
+        );
+    }
+
+    #[test]
+    fn a_read_error_defers_from_the_newest_segments_write_time() {
+        let machine = machine();
+        live_at(&machine, conbus_core::clock::Timestamp::now(), SESSION);
+        let segment = SegmentLog::current_segment(&machine.paths.log_dir()).expect("segment");
+        touched_at(&segment, 1_800_000_000);
+
+        defer_fill(&machine.paths);
+
+        let marker = machine.paths.cache_dir().join("gap-since");
+        let written: conbus_core::clock::Timestamp = fs::read_to_string(&marker)
+            .expect("marker")
+            .parse()
+            .expect("a time");
+        let epoch = conbus_core::clock::Timestamp::from_unix_seconds(0).expect("epoch");
+        assert_eq!(
+            written.seconds_since(epoch),
+            1_800_000_000 - GAP_MARGIN_SECS,
+            "the same margin the fill keeps"
+        );
     }
 
     #[test]
