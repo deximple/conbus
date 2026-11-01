@@ -366,3 +366,49 @@ fn wait_for_socket(home: &Path) {
     }
     panic!("the daemon never answered its socket");
 }
+
+#[test]
+fn a_link_in_the_spool_is_not_followed() {
+    // Only a regular file a hook wrote is a spooled request. A link is dropped
+    // unread, so the daemon never reads whatever it points at.
+    let home = tempfile::tempdir().expect("tempdir");
+    stamp(home.path(), "full");
+    let (code, _) = run_hook(home.path(), &prompt("behind a link"));
+    assert_eq!(code, 0);
+    let spooled = spool_files(home.path()).pop().expect("one entry");
+    let elsewhere = home.path().join("elsewhere.json");
+    std::fs::rename(&spooled, &elsewhere).expect("move");
+    std::os::unix::fs::symlink(&elsewhere, &spooled).expect("link");
+
+    let mut daemon = Command::new(bin())
+        .arg("daemon")
+        .env("CONBUS_HOME", home.path())
+        .env("HOME", home.path())
+        .env("CONBUS_SKIP_LAUNCHCTL", "1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn daemon");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline && !spool_files(home.path()).is_empty() {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let drained = spool_files(home.path()).is_empty();
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+    assert!(drained, "the link was not taken out of the spool");
+    let log = Command::new(bin())
+        .args(["log", "--json"])
+        .env("CONBUS_HOME", home.path())
+        .env("CONBUS_SKIP_LAUNCHCTL", "1")
+        .output()
+        .expect("log");
+    assert!(
+        !String::from_utf8_lossy(&log.stdout).contains("behind a link"),
+        "the daemon followed a link out of the spool"
+    );
+    assert!(
+        elsewhere.exists(),
+        "the link's target is not the spool's to delete"
+    );
+}

@@ -372,6 +372,24 @@ three.
 
 ## Still open
 
+Measured at 1.0 (2026-11-01, a 10 GB real log; `docs/plan-1.0.md`):
+
+- Start to serving is 11 s against a 5 s target: `prepare`'s meta scan is
+  5.3 s of it. Hooks in that window spool and are not lost. The next step is a
+  restore checkpoint under `cache/` (registry, chapters, split and alias
+  summaries, and per-conversation turn ids and prompt digests so gap filling
+  stays exact).
+- `doctor` is 3.35 s with vendors off PATH against 3 s; the serial briefing
+  replay is about 2.3 s.
+- The daemon holds about 445 MB at serving.
+- Linux: install, the systemd unit and fixture hooks are checked; real vendor
+  sessions on Linux are not.
+- cursor-agent in print mode fires no prompt or turn-end hook, so it leaves no
+  turn records. OpenCode 2.x publishes turn ends, tool calls and tokens that
+  the plugin does not forward yet.
+- `hook --inference-listen` authenticates nothing; it binds loopback only and
+  relies on the terminator running on the same machine.
+
 - `MessageDisplay` is not mirrored — the only official channel carrying every
   assistant message rather than the last one. High volume, and it collides
   with the "conversation only" default, so it is a retention decision first.
@@ -470,108 +488,18 @@ three.
 
 ## Next task
 
-Run `docs/self-improve.md` from current evidence, not from this file's memory.
-The Grok echo fix is confirmed live (0.2.1: in the hour before the deploy 439
-of 887 Grok records were twins; after it, 0 of 37).
+1.0 is cut from `docs/plan-1.0.md`; its progress table at the end says what
+landed, what was measured and what was cut. What is left needs a person:
 
-The SaaS plan's agent side (`docs/saas-strategy.md`, 90 days). Week 1 shipped
-in 0.2.4 except its dated item: Cursor reads a limit only from its one-line
-error and counts one stop per turn (#37, #38); OpenCode's plugin sends a prompt
-once and never the agent's reply, and `install --apply` replaces an older
-plugin (#39); `usage` counts recovered turns, leaves out probes and copies
-recorded twice, and takes `--day` (#38). Week 2 shipped early, in 0.2.5: the
-log is readable by its owner only and both halves of the release binary are
-signed (#41 — both found while fact-checking the packet); a one-page
-`docs/security-packet.md` and RFD 0003 as a draft (#41); `install --managed`
-and `docs/fleet.md` for fleets that set `allowManagedHooksOnly` (#42); and
-`usage --otlp`, the pipe, to a collector on the same Mac (#43). 0.2.6 adds
-release tooling and checks, and the recorder does what 0.2.5 did:
-- the pipe checked against a real OpenTelemetry Collector and Grafana Alloy
-  (#46, #47);
-- `scripts/sign-release.sh` (#48);
-- tests that stay out of the person's recorder (#45).
+1. **Canary.** Run `scripts/canary.sh preflight`, then `start`, on this Mac
+   with the release candidate, outside the blackout hours, and leave it seven
+   days; `status` and `verdict` read it, `rollback` puts 0.2.x back. `v1.0.0`
+   is tagged only on a passing verdict (`docs/plan-1.0.md` §7).
+2. **RFD 0002 and 0003** stay drafts until the operator accepts them; no sync
+   service exists.
+3. Then back to `docs/self-improve.md`, from live evidence rather than this
+   file's memory.
 
-v0.2.6 was then signed with the Developer ID and notarized: Apple's first
-review took about three hours. Its package on the release was replaced, and it
-was deployed on 2026-09-24. On that deploy:
-- the recorder started on the first try (`runs = 1`);
-- it answered 5 s after it started;
-- two hooks were dropped, in the 0.1 s before it bound its socket.
-
-0.2.7 (2026-09-28) follows the dogfood verdict:
-- **Memory.** The recorder no longer holds the log in memory (#54, #55). Its
-  start-up gap fill and split repair run in a child, `daemon --prepare`, and
-  it folds its state from a streaming read. On a copy of the operator's log
-  its footprint went from 946 MB to 235 MB.
-- **Hops.** A hop's `gh` and `git` calls give up after 5 s, and every
-  automatic hop writes its route and time to `daemon.log` (#56).
-
-v0.2.7 was notarized a few minutes after its tag, and deployed on the
-operator's Mac:
-- the recorder's footprint went from 757 MB to 243 MB, peak included, with
-  108 MB live;
-- its start took 5.0 s, of which the child's repair was 4.4 s (7 gap records);
-- it started on the first try (`runs = 1`);
-- five hooks were dropped while it started: the socket is bound first, and a
-  hook gets no reply until the repair and the fold finish.
-
-0.2.9 (2026-11-01) ships the sync client — `conbus sync --join [--apply]`,
-`sync`, `sync --off` from `docs/sync-client-plan.md`. Not yet verified on a
-live Mac: a real `--join --apply` writes the keychain item, `--off` removes
-it, and a trusted HTTPS endpoint has checked the signature — all three need a
-service that does not exist. One fix missed the tag: an unjoined `sync` no
-longer scans the log (#68, merged after v0.2.9 was cut; it rides the next
-release). The package on the release is CI-built and unsigned until
-`scripts/sign-release.sh` replaces it.
-
-Next, each its own PR with a failing test first:
-
-1. ~~Score the dogfood window with `conbus verdict` when it closes
-   (2026-09-28) and record the result against Option 2 in
-   `docs/saas-hypothesis.md`.~~ **Done 2026-09-28:** the window closed with 0
-   organic routing hops and 1 failover hop — "routing hop < 3/week — no
-   routing wedge" — so Option 2 stays closed; the output is quoted in
-   `docs/saas-hypothesis.md` under "Fall back".
-2. Loose ends from week 2, none needed until a pilot asks:
-   - `doctor` reads only per-user registrations, so on a managed Mac its
-     `hooks` line describes a file the lock ignores; and `install --apply`
-     writes per-user copies that sit unused under the locks.
-   - `install --managed` could warn when someone other than root can replace
-     the binary it names.
-   - `usage --otlp` was checked against the OpenTelemetry Collector 0.161.0
-     on 2026-09-24: every point it kept equalled the `--shareable` row.
-     `tests/otlp_collector.rs` repeats that with `CONBUS_OTELCOL` set;
-     rerun it before a pilot relies on the pipe. Grafana Alloy 1.19.2
-     passed the same check that day. So did the Datadog Agent 7.83.2, with
-     the operator entering the key: Datadog kept a closed day sent 2.4 h
-     after it ended, with every value equal, and dropped one sent 26 h
-     after. Send each day within a couple of hours of 00:00 UTC; RFD 0002
-     has the table. The pipe also counts any 2xx as sent where OTLP says
-     200.
-   - `--inference-listen` authenticates nothing. It now refuses any
-     non-loopback address, so whatever authenticates has to sit in front of
-     it on the same machine.
-3. After V1 (2026-11-04): the screen or the pipe, whichever the interviews'
-   "where should this show up?" answers. Nothing is hosted before the gates,
-   and no sync code is written before RFD 0002 and RFD 0003 are accepted.
-   **Superseded 2026-10-14** by the evidence ladder (E1–E3, then V2) in
-   `docs/saas-strategy.md`; the sync rule still holds.
-4. The unlock of 2026-10-14 (`docs/saas-hypothesis.md`, "Revision"), each its
-   own PR: tokens from Cursor's hook into the rows and the pipe (RFD 0002
-   amended); `conbus policy` and local `PreToolUse` decisions; a Linux build
-   with a systemd user unit; Claude Code profiles switched by hand
-   (`CLAUDE_CONFIG_DIR`); the landing page and waitlist under `site/`; a
-   Copilot CLI adapter once the operator has installed it and a live payload
-   is captured.
-
-Waiting on the operator: the weekly hour budget. A model digest is `conbus
-summary --bus-id`; hop-path model calls stay zero.
-
-After 0.1.0, watch two things on a live machine. Drops with the
-`NO_SESSION` reason and a `preToolUse`/`postToolUse` detail are Cursor worker
-sessions; one captured payload decides whether they can be keyed at all. And
-the runaway guard's per-conversation half (`pending_hop`) was exercised by a
-real quota stop on 2026-09-27: 13 more `rate_limit` stops in the next fifteen
-minutes, main thread and subagents, and no second decision. Its unattended half
-was, on 2026-09-16, when 200 SDK sessions hit `rate_limit` and none was
-routed.
+The narrative of the 0.2.x releases that used to live here (deploys, the first
+organic hop, the SaaS weeks) is in this file's git history and in
+`CHANGELOG.md`.
