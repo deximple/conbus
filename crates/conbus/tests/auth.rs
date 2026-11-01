@@ -11,6 +11,8 @@ fn conbus(root: &std::path::Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_conbus"));
     command
         .env("CONBUS_HOME", root)
+        .env("HOME", root)
+        .env("CONBUS_SKIP_LAUNCHCTL", "1")
         .env("CONBUS_AGY_BIN", NOT_THERE)
         .env("CONBUS_CODEX_BIN", NOT_THERE)
         .env("CONBUS_GH", NOT_THERE);
@@ -102,7 +104,7 @@ fn auth_url_names_the_page_without_echoing_its_query() {
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     assert!(output.status.success());
-    assert!(stdout.contains("Google OAuth"), "the pattern: {stdout}");
+    assert!(stdout.contains("Google sign-in"), "the page: {stdout}");
     for secret in ["SECRETID", "EMAILSCOPE"] {
         assert!(
             !stdout.contains(secret),
@@ -169,6 +171,222 @@ fn which(name: &str) -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+/// `this` as `conbus auth --url` answers it: the label alone.
+fn page_label(root: &std::path::Path, url: &str) -> String {
+    let output = conbus(root)
+        .args(["auth", "--url", url])
+        .output()
+        .expect("run auth --url");
+    assert!(
+        output.status.success(),
+        "{url}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    stdout
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix("this"))
+        .unwrap_or_else(|| panic!("{url}: no `this` line in {stdout}"))
+        .trim()
+        .to_string()
+}
+
+/// Addresses that name a vendor anywhere but in their scheme and host. Each
+/// one is a page the vendor does not serve.
+const NOT_THE_VENDOR: &[&str] = &[
+    "https://evil.example/phish?next=auth.openai.com",
+    "https://auth.openai.com.evil.example/authorize",
+    "https://evil.example/claude.ai/login",
+    "https://notcursor.com/login",
+    "https://netflix.ai/",
+    "https://evil.example/?a=github.com/login",
+    "https://evil.example/?x=chrome-extension://mmlmfjhmonkocbjadbfplnigmagldckm/",
+    "https://accounts.google.com.evil.example/o/oauth2/auth",
+    "https://auth.openai.com@evil.example/",
+    "https://auth.openai.com:443@evil.example/",
+    "https://evil.example#auth.openai.com",
+    "https://evil.example\\@auth.openai.com/",
+    "https://auth.openai.com%2f.evil.example/",
+    "https://evilx.ai/",
+    "https://x.ai.evil.example/",
+    "https://.x.ai/",
+    "http://auth.openai.com/",
+    "ftp://github.com/",
+    "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/connect.html",
+    "chrome-extension://auth.openai.com/",
+    "https://mmlmfjhmonkocbjadbfplnigmagldckm/connect.html",
+    "auth.openai.com/authorize",
+    "not an address at all",
+    "",
+];
+
+/// Addresses the vendors do serve, and the word each label must carry.
+const THE_VENDOR: &[(&str, &str)] = &[
+    (
+        "chrome-extension://mmlmfjhmonkocbjadbfplnigmagldckm/connect.html",
+        "Playwright MCP Bridge",
+    ),
+    (
+        "https://accounts.google.com/o/oauth2/v2/auth?client_id=x",
+        "Google",
+    ),
+    ("https://auth.openai.com/authorize", "OpenAI"),
+    ("HTTPS://AUTH.OPENAI.COM/", "OpenAI"),
+    ("https://claude.ai/login", "claude.ai"),
+    ("https://console.anthropic.com/", "Anthropic Console"),
+    ("https://cursor.com/loginDeepControl", "cursor.com"),
+    ("https://www.cursor.com/", "cursor.com"),
+    ("https://accounts.x.ai/sign-in", "x.ai"),
+    ("https://x.ai/", "x.ai"),
+    ("https://github.com/login/device", "github.com"),
+    // The query names another vendor. The host is what counts.
+    (
+        "https://github.com/login/oauth/authorize?redirect_uri=https%3A%2F%2Fcursor.com%2Fcb",
+        "github.com",
+    ),
+];
+
+#[test]
+fn a_page_is_named_by_its_scheme_and_host_and_nothing_else() {
+    let root = tempfile::tempdir().expect("tempdir");
+    for url in NOT_THE_VENDOR {
+        assert_eq!(
+            page_label(root.path(), url),
+            "unknown page",
+            "{url} is not the vendor's"
+        );
+    }
+    for (url, word) in THE_VENDOR {
+        let label = page_label(root.path(), url);
+        assert!(label.contains(word), "{url} read as {label}");
+    }
+}
+
+#[test]
+fn a_broken_percent_sign_is_not_a_crash() {
+    // The decoder used to slice a `str` at a byte offset, so a multibyte
+    // character straight after `%` panicked with exit 101.
+    let root = tempfile::tempdir().expect("tempdir");
+    for url in [
+        "https://x.example/?a=%a\u{e9}",
+        "https://x.example/?token=SECRET-TOKEN-VALUE%a\u{e9}",
+        "https://x.example/?client=SECRET-CLIENT%a\u{e9}",
+        "https://x.example/?redirect_uri=%E0%A4%A",
+        "https://x.example/?%a\u{e9}=1",
+    ] {
+        let output = conbus(root.path())
+            .args(["auth", "--url", url])
+            .output()
+            .expect("run auth --url");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(0), "{url}: {stderr}");
+        assert!(stdout.contains("unknown page"), "{url}: {stdout}");
+        assert!(
+            !stdout.contains("SECRET") && !stderr.contains("SECRET"),
+            "{url} echoed a query value: {stdout} {stderr}"
+        );
+    }
+}
+
+/// node, or a failure that says why: a missing interpreter must not read as a
+/// page script that behaves.
+fn node() -> &'static str {
+    match Command::new("node").arg("--version").output() {
+        Ok(out) if out.status.success() => "node",
+        Ok(out) => panic!("`node --version` exited {}", out.status),
+        Err(err) => panic!(
+            "node is not on PATH ({err}). These tests run the --html page's script in node \
+             rather than skipping it"
+        ),
+    }
+}
+
+/// Run the page's own script against `urls`, as a browser would on a paste, and
+/// return what it wrote for each. A script that throws fails the run.
+fn page_script_says(page: &std::path::Path, urls: &[&str]) -> Vec<String> {
+    const DRIVER: &str = r#"
+const fs = require("fs");
+const html = fs.readFileSync(process.argv[1], "utf8");
+const script = html.match(/<script>([\s\S]*?)<\/script>/)[1];
+const verdict = { textContent: "" };
+const input = { value: "" };
+globalThis.document = { getElementById: (id) => (id === "url" ? input : verdict) };
+(0, eval)(script);
+const said = JSON.parse(process.argv[2]).map((url) => {
+  input.value = url;
+  verdict.textContent = "(unset)";
+  look();
+  return verdict.textContent;
+});
+console.log(JSON.stringify(said));
+"#;
+    let urls_json = serde_json::to_string(urls).expect("json");
+    let output = Command::new(node())
+        .args(["-e", DRIVER])
+        .arg(page)
+        .arg(urls_json)
+        .output()
+        .expect("run node");
+    assert!(
+        output.status.success(),
+        "the page's script threw: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("what the script wrote")
+}
+
+/// A page written with every vendor a stand-in, for the tests that only care
+/// about its script.
+fn a_page() -> (tempfile::TempDir, std::path::PathBuf) {
+    let root = tempfile::tempdir().expect("tempdir");
+    let page = root.path().join("auth.html");
+    let output = conbus(root.path())
+        .args(["auth", "--html", page.to_str().expect("utf8")])
+        .output()
+        .expect("run auth --html");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    (root, page)
+}
+
+#[test]
+fn the_pages_script_names_pages_the_way_the_command_does() {
+    let (_root, page) = a_page();
+
+    for (url, said) in NOT_THE_VENDOR
+        .iter()
+        .zip(page_script_says(&page, NOT_THE_VENDOR))
+    {
+        assert!(
+            said.starts_with("this      unknown page"),
+            "{url} is not the vendor's: {said}"
+        );
+    }
+    let vendor_urls: Vec<&str> = THE_VENDOR.iter().map(|(url, _)| *url).collect();
+    for ((url, word), said) in THE_VENDOR.iter().zip(page_script_says(&page, &vendor_urls)) {
+        let first = said.lines().next().unwrap_or_default();
+        assert!(first.contains(word), "{url} read as {first}");
+    }
+}
+
+#[test]
+fn a_bad_percent_in_the_pages_script_does_not_lose_the_verdict() {
+    let (_root, page) = a_page();
+
+    let said = page_script_says(
+        &page,
+        &["https://accounts.google.com/o/oauth2/auth?redirect_uri=%E0%A4%A&token=SECRET2"],
+    );
+
+    assert!(said[0].contains("Google"), "the verdict: {}", said[0]);
+    assert!(!said[0].contains("SECRET2"), "{}", said[0]);
 }
 
 #[test]

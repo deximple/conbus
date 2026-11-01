@@ -15,28 +15,9 @@ use std::time::Duration;
 
 use conbus_core::paths::Paths;
 
-/// The page patterns a pasted URL resolves against, in one place — `auth`
-/// and the `--html` page's own script share this table's contents.
-const PAGE_PATTERNS: &[(&str, &str)] = &[
-    (
-        "chrome-extension://mmlmfjhmonkocbjadbfplnigmagldckm/",
-        "Playwright MCP Bridge connect page (a Chrome extension)",
-    ),
-    (
-        "accounts.google.com/o/oauth2",
-        "Google OAuth consent (agy and other Google-backed tools)",
-    ),
-    ("auth.openai.com", "OpenAI sign-in (Codex)"),
-    ("claude.ai", "Anthropic sign-in (Claude Code)"),
-    (
-        "console.anthropic.com",
-        "Anthropic Console sign-in (Claude Code)",
-    ),
-    ("cursor.com", "Cursor sign-in"),
-    ("accounts.x.ai", "xAI sign-in (Grok)"),
-    ("x.ai", "xAI sign-in (Grok)"),
-    ("github.com/login", "GitHub sign-in (gh)"),
-];
+mod url;
+
+use url::{Address, BRIDGE_SCHEME, PAGES, UNKNOWN_PAGE};
 
 /// Query parameters that may carry the listen port the page connects back to.
 const PORT_PARAMS: &[&str] = &["mcpRelayUrl", "redirect_uri", "redirect_url", "callback"];
@@ -178,60 +159,10 @@ fn gh_status() -> (String, &'static str) {
     }
 }
 
-/// Just enough URL decoding to read `client` JSON and embedded `ws://…`
-/// relay addresses — query values are never echoed back.
-fn percent_decode(value: &str) -> String {
-    let bytes = value.as_bytes();
-    let mut out = String::with_capacity(value.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%'
-            && i + 2 < bytes.len()
-            && let Ok(code) = u8::from_str_radix(&value[i + 1..i + 3], 16)
-        {
-            out.push(code as char);
-            i += 3;
-            continue;
-        }
-        out.push(bytes[i] as char);
-        i += 1;
-    }
-    out
-}
-
-/// `?a=b&c=d` → decoded pairs. Order kept; duplicates kept.
-fn query_pairs(url: &str) -> Vec<(String, String)> {
-    let Some((_, query)) = url.split_once('?') else {
-        return Vec::new();
-    };
-    query
-        .split('&')
-        .filter_map(|pair| {
-            let (k, v) = pair.split_once('=')?;
-            Some((percent_decode(k), percent_decode(v)))
-        })
-        .collect()
-}
-
-/// Which known page this is, or `unknown page`. The whole URL is the hay
-/// because the chrome-extension pattern owns its scheme.
-fn page_kind(url: &str) -> &'static str {
-    let hay = url.to_ascii_lowercase();
-    for (needle, kind) in PAGE_PATTERNS {
-        if hay.contains(&needle.to_ascii_lowercase()) {
-            return kind;
-        }
-    }
-    "unknown page"
-}
-
 /// The listen port the page will reach back to, when a known parameter
 /// carries one.
-fn page_port(url: &str) -> Option<u16> {
-    for (name, value) in query_pairs(url) {
-        if !PORT_PARAMS.contains(&name.as_str()) {
-            continue;
-        }
+fn page_port(address: &Address<'_>) -> Option<u16> {
+    for value in address.values(PORT_PARAMS) {
         // First `:` after the last `/` of the scheme — `ws://host:PORT/x`
         // and `http://localhost:PORT/callback` both land the port before
         // the next `/` or end.
@@ -319,25 +250,31 @@ fn token_origin(token: &str) -> String {
 /// `conbus auth --url <URL>`: whose page, who asked, whether conbus did.
 fn describe_url(url: &str) -> String {
     let mut out = String::new();
-    let kind = page_kind(url);
+    let address = Address::parse(url.trim());
+    let page = address.as_ref().and_then(Address::page);
+    let kind = page.map_or(UNKNOWN_PAGE, |page| page.label);
     out.push_str(&format!("this      {kind}\n"));
 
     // `client` may be a JSON blob whose `name` is the only safe value to
     // echo — the rest of the query stays unprinted.
-    let pairs = query_pairs(url);
-    if let Some(client) = pairs.iter().find(|(k, _)| k == "client") {
-        let name = serde_json::from_str::<serde_json::Value>(&client.1)
+    let value_of = |name: &str| {
+        address
+            .as_ref()
+            .and_then(|address| address.values(&[name]).into_iter().next())
+    };
+    if let Some(client) = value_of("client") {
+        let name = serde_json::from_str::<serde_json::Value>(&client)
             .ok()
             .and_then(|v| v.get("name").and_then(|n| n.as_str()).map(str::to_string))
             .unwrap_or_else(|| "a client it does not name".into());
         out.push_str(&format!("asked by  {name}\n"));
     }
 
-    if let Some((_, token)) = pairs.iter().find(|(k, _)| k == "token") {
-        out.push_str(&format!("token     {}\n", token_origin(token)));
+    if let Some(token) = value_of("token") {
+        out.push_str(&format!("token     {}\n", token_origin(&token)));
     }
 
-    let port = page_port(url);
+    let port = address.as_ref().and_then(page_port);
     let ancestry = port.and_then(port_ancestry);
     match (port, &ancestry) {
         (Some(_), Some((chain, _))) if !chain.is_empty() => {
@@ -372,7 +309,7 @@ fn describe_url(url: &str) -> String {
         }
     }
 
-    if kind.starts_with("Playwright MCP Bridge") {
+    if page.is_some_and(|page| page.scheme == BRIDGE_SCHEME) {
         out.push_str(
             "cause     the token in that file differs from the extension's token in the Chrome profile this opened in\n",
         );
@@ -386,14 +323,12 @@ fn describe_url(url: &str) -> String {
 /// `conbus auth --html [PATH]`: one self-contained page — banner, the same
 /// table, and a paste box that classifies a URL entirely offline.
 fn write_html(path: &std::path::Path, rows: &[Row]) -> io::Result<()> {
-    let mut pattern_js = String::new();
-    for (needle, kind) in PAGE_PATTERNS {
-        pattern_js.push_str(&format!(
-            "[\"{}\", \"{}\"],",
-            needle.replace('"', "\\\"").to_ascii_lowercase(),
-            kind.replace('"', "\\\"")
-        ));
-    }
+    let pages_json = serde_json::Value::Array(
+        PAGES
+            .iter()
+            .map(|page| serde_json::json!([page.scheme, page.host, page.subdomains, page.label]))
+            .collect(),
+    );
     let mut table = String::new();
     let mut broken = false;
     for row in rows {
@@ -448,20 +383,33 @@ input[type=text] {{ width: 34em; max-width: 90%; font: inherit; padding: .4em; }
 <button onclick="look()">whose is it</button>
 <div id="verdict"></div>
 <script>
-var PATTERNS = [{pattern_js}];
+var PAGES = {pages_json};
 var PORT_PARAMS = ["mcpRelayUrl","redirect_uri","redirect_url","callback"];
+function parsed(text) {{
+  try {{ return new URL(text); }} catch (e) {{ return null; }}
+}}
+function pageOf(address) {{
+  if (!address) return "unknown page";
+  var scheme = address.protocol.slice(0, -1).toLowerCase();
+  var host = address.hostname.toLowerCase();
+  for (var i = 0; i < PAGES.length; i++) {{
+    var page = PAGES[i];
+    if (scheme !== page[0]) continue;
+    if (host === page[1]) return page[3];
+    var dotted = "." + page[1];
+    if (page[2] && host.length > dotted.length && host.slice(-dotted.length) === dotted) return page[3];
+  }}
+  return "unknown page";
+}}
 function look() {{
-  var url = document.getElementById("url").value.trim();
-  var low = url.toLowerCase(), kind = "unknown page", i;
-  for (i = 0; i < PATTERNS.length; i++)
-    if (low.indexOf(PATTERNS[i][0]) >= 0) {{ kind = PATTERNS[i][1]; break; }}
-  var port = "", q = url.indexOf("?") >= 0 ? url.slice(url.indexOf("?") + 1).split("&") : [];
-  for (i = 0; i < q.length; i++) {{
-    var kv = q[i].split("=");
-    if (PORT_PARAMS.indexOf(kv[0]) >= 0) {{
-      var m = decodeURIComponent(kv[1] || "").match(/^[^:]*:\/\/[^:/]+:(\d+)/);
+  var address = parsed(document.getElementById("url").value.trim());
+  var kind = pageOf(address), port = "";
+  if (address) {{
+    PORT_PARAMS.forEach(function (name) {{
+      var value = address.searchParams.get(name);
+      var m = value && value.match(/^[^:]*:\/\/[^:/]+:(\d+)/);
       if (m) port = m[1];
-    }}
+    }});
   }}
   var out = "this      " + kind + "\n";
   out += port ? "process   lsof -nP -iTCP:" + port + " -sTCP:LISTEN -t   # then: ps -o ppid=,comm= -p <pid>\n"
