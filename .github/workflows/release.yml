@@ -105,11 +105,15 @@ jobs:
             exit 1
           fi
 
+      # The suite runs against the target that ships, so a musl-only fault fails
+      # here rather than on someone's machine.
       - name: Test
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --locked --target ${{ matrix.target }}
 
       - name: Build
-        run: cargo build --release --locked -p conbus --target ${{ matrix.target }}
+        run: |
+          cargo build --release --locked -p conbus --target ${{ matrix.target }}
+          target/${{ matrix.target }}/release/conbus --version
 
       - name: Package
         run: sh scripts/package.sh dist-linux ${{ matrix.target }}

@@ -516,7 +516,9 @@ from Claude.ai (Settings → Privacy → Export data) and drop the zip (or
 `conbus backfill --chat-export PATH` reads one from anywhere and, with
 `--apply` and the recorder stopped, writes it. Organisations using Claude's
 Inference hooks can point them at `conbus hook --inference-listen`
-(`127.0.0.1:8787` by default) to record chats as they happen.
+(`127.0.0.1:8787` by default) to record chats as they happen. It takes
+loopback addresses only: it authenticates nothing, so the HTTPS terminator in
+front of it runs on the same machine.
 
 ---
 

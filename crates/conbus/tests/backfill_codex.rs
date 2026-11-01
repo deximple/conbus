@@ -2,6 +2,7 @@
 //! that serves the thread APIs the real one answered on 2026-09-03.
 
 use std::process::Command;
+mod support;
 
 const FAKE_APP_SERVER: &str = r#"#!/usr/bin/env python3
 import json, sys
@@ -37,9 +38,7 @@ for line in sys.stdin:
 fn fake_app_server() -> (tempfile::TempDir, std::path::PathBuf) {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("codex");
-    std::fs::write(&path, FAKE_APP_SERVER).expect("write");
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    support::write_executable(&path, FAKE_APP_SERVER);
     (dir, path)
 }
 

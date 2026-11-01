@@ -133,6 +133,11 @@ scope; its prerequisites are listed at the end.
   - The URL, headers and body go in through a config on stdin
     (`curl --config -`), so other accounts see nothing of a send in the
     process list.
+  - `-q` is curl's first argument, so no `.curlrc` is read: one line there
+    (`insecure`, `location`, a proxy) would undo the rules above. The
+    arguments pin them instead — `--proto =https`, `--tlsv1.2`,
+    `--max-redirs 0` — and the body goes as `data-binary`, byte for byte the
+    bytes that were signed.
   - The signature is not a secret: it is good for its own body only, which
     the service already has. Keeping it off the command line still follows
     the rule D1 sets for secrets.

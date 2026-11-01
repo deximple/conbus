@@ -92,10 +92,10 @@ Anything that leaves goes through a program the person already runs:
   `conbus hook --inference-listen`, is off unless started. It takes Anthropic
   Inference-hook frames over plain HTTP on `127.0.0.1:8787`, always answers
   allow, and discards the actor's email. **It does not authenticate
-  requests**: anything that can reach the port can add records. Loopback is
-  the default but not enforced: `--inference-listen ADDR` binds whatever
-  address it is given. Keep it on loopback, and authenticate at the
-  organisation's HTTPS terminator.
+  requests**: anything that can reach the port can add records. It refuses
+  any address that is not loopback, a name included when anything it
+  resolves to is routable, so the organisation's HTTPS terminator — where
+  authentication belongs — has to run on the same machine.
 
 ## What it runs
 

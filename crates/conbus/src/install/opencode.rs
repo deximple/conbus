@@ -18,15 +18,77 @@ pub fn opencode_plugin_path(home: &Path) -> PathBuf {
         .join("conbus.js")
 }
 
-/// The plugin, with one slot for the binary it runs.
+/// The plugin for OpenCode 1.x, with one slot for the binary it runs.
 const PLUGIN: &str = include_str!("opencode_plugin.js");
+/// The plugin for OpenCode 2.x, the same slot, the same payloads.
+const PLUGIN_V2: &str = include_str!("opencode_plugin_v2.js");
 /// The slot, spelled as the JavaScript string literal that fills it.
 const BINARY_SLOT: &str = r#""@CONBUS_BIN@""#;
 
-/// Plugin that forwards official bus events to `conbus hook --harness opencode`.
+/// The plugin module OpenCode loads changed shape at 2.0, and each major
+/// refuses the other's: 1.x calls every export as a plugin function, 2.x wants
+/// one default export with an `id` and a `setup`. OpenCode 2.x on this
+/// machine logged "Plugin must export a default definition with an id and an
+/// effect or setup function" for the 1.x plugin from its first day, and the
+/// log stopped hearing from OpenCode without a word anywhere else.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PluginApi {
+    V1,
+    V2,
+}
+
+/// The plugin API of the OpenCode on this machine, from `opencode --version`.
+/// One that cannot be asked, or answers something unreadable, is taken as the
+/// current major.
+pub fn opencode_plugin_api() -> PluginApi {
+    let mut command = std::process::Command::new("opencode");
+    command.arg("--version");
+    crate::code::output_within(command, std::time::Duration::from_secs(2))
+        .map(|out| parse_api(&String::from_utf8_lossy(&out.stdout)))
+        .unwrap_or(PluginApi::V2)
+}
+
+/// `opencode v2.2.3` and `1.18.31` both say their major.
+fn parse_api(version: &str) -> PluginApi {
+    let major = version.split_whitespace().find_map(|word| {
+        word.trim_start_matches('v')
+            .split('.')
+            .next()?
+            .parse::<u32>()
+            .ok()
+    });
+    match major {
+        Some(1) => PluginApi::V1,
+        _ => PluginApi::V2,
+    }
+}
+
+/// Plugin that forwards official bus events to `conbus hook --harness opencode`,
+/// in the shape the OpenCode on this machine loads.
 pub fn opencode_plugin_source(binary: &Path) -> String {
+    opencode_plugin_source_for(binary, opencode_plugin_api())
+}
+
+/// As [`opencode_plugin_source`], for a named plugin API.
+pub fn opencode_plugin_source_for(binary: &Path, api: PluginApi) -> String {
     let spelled = serde_json::Value::String(binary.display().to_string()).to_string();
-    PLUGIN.replace(BINARY_SLOT, &spelled)
+    match api {
+        PluginApi::V1 => PLUGIN,
+        PluginApi::V2 => PLUGIN_V2,
+    }
+    .replace(BINARY_SLOT, &spelled)
+}
+
+/// Which API the plugin in place was written for, if one is there.
+pub fn opencode_plugin_api_in_place(home: &Path) -> Option<PluginApi> {
+    let text = std::fs::read_to_string(opencode_plugin_path(home)).ok()?;
+    if text.contains("export default {") {
+        Some(PluginApi::V2)
+    } else if text.contains("export const ") {
+        Some(PluginApi::V1)
+    } else {
+        None
+    }
 }
 
 /// Whether a conbus plugin is in place, whichever build wrote it.
@@ -60,7 +122,6 @@ mod tests {
     use super::*;
 
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
     use std::process::{Child, Command, Output, Stdio};
     use std::time::{Duration, Instant};
 
@@ -140,8 +201,47 @@ for (const event of JSON.parse(readFileSync(script, "utf8"))) {
 await Promise.all(calls);
 "#;
 
+    /// OpenCode 2.x's loader and bus, as far as a plugin can tell: one default
+    /// export with an `id` and a `setup(ctx)`, any other export refused, and
+    /// events from `ctx.event.subscribe()`. The plugin's sends are not awaited
+    /// by anything; node stays up until every hook it spawned has exited.
+    const DRIVER_V2: &str = r#"import { readFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const [plugin, script] = process.argv.slice(2);
+const loaded = await import(pathToFileURL(plugin).href);
+for (const name of Object.keys(loaded)) {
+  if (name !== "default") throw new TypeError(`export ${name} is not a 2.x plugin`);
+}
+const definition = loaded.default;
+if (typeof definition?.id !== "string" || typeof definition?.setup !== "function") {
+  throw new TypeError("not a 2.x plugin definition");
+}
+const events = JSON.parse(readFileSync(script, "utf8"));
+const ctx = {
+  location: { directory: "/repo" },
+  event: {
+    subscribe: ({ signal }) => ({
+      async *[Symbol.asyncIterator]() {
+        for (const event of events) {
+          if (signal?.aborted) return;
+          yield event;
+        }
+      },
+    }),
+  },
+};
+const dispose = definition.setup(ctx);
+await new Promise((resolve) => setTimeout(resolve, 200));
+if (typeof dispose === "function") dispose();
+"#;
+
     fn current(bin: &Path) -> String {
-        opencode_plugin_source(bin)
+        opencode_plugin_source_for(bin, PluginApi::V1)
+    }
+
+    fn current_v2(bin: &Path) -> String {
+        opencode_plugin_source_for(bin, PluginApi::V2)
     }
 
     fn older(bin: &Path) -> String {
@@ -179,8 +279,7 @@ await Promise.all(calls);
         let dir = captured.display().to_string();
         assert!(!dir.contains('\''), "{dir}");
         let script = format!("#!/bin/sh\n{}\n", body.replace("{captured}", &dir));
-        fs::write(path, script).expect("stub");
-        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("chmod");
+        crate::test_support::write_executable(path, &script);
     }
 
     fn settle(mut child: Child, limit: Duration) -> Output {
@@ -208,6 +307,16 @@ await Promise.all(calls);
 
     /// Run a plugin under node against a hook stub, failing if node does.
     fn drive(plugin: fn(&Path) -> String, events: &[Value], stub: &str) -> Vec<Value> {
+        drive_with(DRIVER, plugin, events, stub)
+    }
+
+    /// As `drive`, under the loader a plugin API calls for.
+    fn drive_with(
+        driver: &str,
+        plugin: fn(&Path) -> String,
+        events: &[Value],
+        stub: &str,
+    ) -> Vec<Value> {
         let dir = tempfile::tempdir().expect("tempdir");
         let captured = dir.path().join("captured");
         fs::create_dir(&captured).expect("captured");
@@ -221,7 +330,7 @@ await Promise.all(calls);
         // OpenCode loads `conbus.js` as an ES module; node has to be told.
         fs::write(dir.path().join("package.json"), r#"{"type":"module"}"#).expect("package");
         fs::write(dir.path().join("conbus.js"), source).expect("plugin");
-        fs::write(dir.path().join("driver.mjs"), DRIVER).expect("driver");
+        fs::write(dir.path().join("driver.mjs"), driver).expect("driver");
         let script = Value::Array(events.to_vec()).to_string();
         fs::write(dir.path().join("events.json"), script).expect("events");
 
@@ -637,5 +746,106 @@ await Promise.all(calls);
         for payload in &payloads {
             read(payload);
         }
+    }
+
+    /// An OpenCode 2.x bus event, the shape `ctx.event.subscribe()` yields.
+    fn bus(kind: &str, data: Value) -> Value {
+        json!({
+            "id": format!("evt_{kind}"), "created": 1, "type": kind,
+            "location": { "directory": "/repo" }, "data": data
+        })
+    }
+
+    fn enqueued(inbox: &str, kind: &str, text: &str) -> Value {
+        bus(
+            "session.inbox.enqueued",
+            json!({ "sessionID": SESSION, "inboxID": inbox, "item": {
+                "type": kind, "payload": { "text": text, "files": [] }, "delivery": "steer"
+            } }),
+        )
+    }
+
+    #[test]
+    fn opencode_2_gets_a_plugin_it_loads() {
+        // 2.x refuses the 1.x module outright, and each major is told apart
+        // by what `opencode --version` prints.
+        assert_eq!(parse_api("opencode v2.2.3\n"), PluginApi::V2);
+        assert_eq!(parse_api("1.18.31"), PluginApi::V1);
+        assert_eq!(parse_api("v1.0.0"), PluginApi::V1);
+        assert_eq!(parse_api(""), PluginApi::V2);
+        assert_eq!(parse_api("something else"), PluginApi::V2);
+
+        let bin = Path::new("/opt/conbus/bin/conbus");
+        let v2 = opencode_plugin_source_for(bin, PluginApi::V2);
+        assert!(v2.contains("export default {"), "{v2}");
+        assert!(!v2.contains("export const"), "{v2}");
+        assert!(v2.contains("\"/opt/conbus/bin/conbus\""), "{v2}");
+        assert_ne!(v2, opencode_plugin_source_for(bin, PluginApi::V1));
+
+        let home = tempfile::tempdir().expect("home");
+        let path = opencode_plugin_path(home.path());
+        fs::create_dir_all(path.parent().expect("plugins")).expect("plugins");
+        fs::write(&path, &v2).expect("write");
+        assert!(opencode_plugin_registered(home.path()));
+        assert_eq!(
+            opencode_plugin_api_in_place(home.path()),
+            Some(PluginApi::V2)
+        );
+        fs::write(&path, opencode_plugin_source_for(bin, PluginApi::V1)).expect("write");
+        assert_eq!(
+            opencode_plugin_api_in_place(home.path()),
+            Some(PluginApi::V1)
+        );
+    }
+
+    #[test]
+    fn opencode_2_sends_a_prompt_once_and_the_failure_as_before() {
+        // The events and fields are OpenCode 2.2.3's, as a live run published
+        // them: a person's prompt is an inbox item of type `user`, delivered to
+        // the plugin once and sometimes again; a failed execution is the error.
+        let failure = json!({ "name": "APIError", "data": { "message": "rate limited" } });
+        let sent = drive_with(
+            DRIVER_V2,
+            current_v2,
+            &[
+                bus("session.execution.started", json!({ "sessionID": SESSION })),
+                enqueued("msg_1", "user", PROMPT),
+                bus(
+                    "session.inbox.delivered",
+                    json!({ "sessionID": SESSION, "inboxID": "msg_1" }),
+                ),
+                enqueued("msg_1", "user", PROMPT),
+                enqueued("msg_2", "synthetic", "a note OpenCode wrote itself"),
+                bus(
+                    "session.text.ended",
+                    json!({ "sessionID": SESSION, "assistantMessageID": "msg_3", "text": REPLY }),
+                ),
+                bus(
+                    "session.execution.failed",
+                    json!({ "sessionID": SESSION, "error": failure }),
+                ),
+            ],
+            KEEPS,
+        );
+        assert_eq!(turns(&sent), vec![turn("msg_1", PROMPT)], "{sent:?}");
+        let errors: Vec<&Value> = sent
+            .iter()
+            .filter(|p| p["hook_event_name"] == "session.error")
+            .collect();
+        assert_eq!(errors.len(), 1, "{sent:?}");
+        assert_eq!(errors[0]["error"], failure);
+        assert_eq!(errors[0]["cwd"], "/repo");
+        assert_eq!(sent.len(), 2, "nothing else is sent: {sent:?}");
+    }
+
+    #[test]
+    fn opencode_2_survives_a_hook_that_hangs_up() {
+        let sent = drive_with(
+            DRIVER_V2,
+            current_v2,
+            &[enqueued("msg_1", "user", PROMPT)],
+            HANGS_UP,
+        );
+        assert!(sent.is_empty());
     }
 }

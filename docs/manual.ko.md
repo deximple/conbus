@@ -472,7 +472,8 @@ conbus install --apply     # 레코더를 다시 켭니다
 `conbus backfill --chat-export PATH`는 어디에 있는 파일이든 읽고, `--apply`를 붙이고
 레코더를 멈춘 상태에서는 기록합니다. Claude의 Inference hooks를 쓰는 조직은 그것을
 `conbus hook --inference-listen`(기본 `127.0.0.1:8787`)에 연결해 대화를 실시간으로
-기록할 수 있습니다.
+기록할 수 있습니다. 이 리스너는 인증을 하지 않으므로 루프백 주소만 받습니다. 앞에 두는
+HTTPS 종단도 같은 기계에서 돌려야 합니다.
 
 ---
 

@@ -152,7 +152,7 @@ fn first_text(blocks: &[Block]) -> Option<String> {
 /// The org's HTTPS terminator points here (`127.0.0.1:8787` behind TLS).
 /// No new crate — one request at a time, same record path as stdin.
 pub fn serve(addr: &str, harness: &str) -> std::io::Result<()> {
-    let listener = std::net::TcpListener::bind(addr)?;
+    let listener = std::net::TcpListener::bind(&loopback_only(addr)?[..])?;
     let paths = Paths::resolve().ok();
     eprintln!(
         "conbus hook: inference listen {} — POST official prompt frames, always allow",
@@ -174,6 +174,29 @@ pub fn serve(addr: &str, harness: &str) -> std::io::Result<()> {
         let _ = handle_http(&mut stream, harness, paths.as_ref());
     }
     Ok(())
+}
+
+/// Every address `addr` names, or a refusal if any of them is not loopback.
+///
+/// The listener authenticates nothing, and every frame it accepts is written to
+/// the log, so it must only ever be reachable from this machine: the HTTPS
+/// terminator that fronts it runs here too. A name is resolved first, and all of
+/// what it resolves to is checked, so `localhost` passes and a name that also
+/// points at a routable address does not.
+fn loopback_only(addr: &str) -> std::io::Result<Vec<std::net::SocketAddr>> {
+    use std::net::ToSocketAddrs;
+    let resolved: Vec<std::net::SocketAddr> = addr.to_socket_addrs()?.collect();
+    if resolved.is_empty() || resolved.iter().any(|a| !a.ip().is_loopback()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "--inference-listen takes a loopback address such as 127.0.0.1:8787, not {addr}: \
+                 it authenticates nothing, so the HTTPS terminator in front of it must run on \
+                 this machine"
+            ),
+        ));
+    }
+    Ok(resolved)
 }
 
 /// How long one Inference connection may say nothing before it is dropped.
@@ -493,5 +516,26 @@ mod tests {
         );
         drop(stream);
         quiet.join().expect("client");
+    }
+
+    #[test]
+    fn the_listener_takes_loopback_addresses_only() {
+        // It authenticates nothing: every frame it is handed lands in the log.
+        // Bound to a routable address, anyone on the network could write
+        // conversations into it, so the terminator has to sit on this machine.
+        for addr in ["127.0.0.1:0", "[::1]:0", "localhost:0"] {
+            let checked = loopback_only(addr).unwrap_or_else(|err| panic!("{addr}: {err}"));
+            assert!(checked.iter().all(|a| a.ip().is_loopback()), "{addr}");
+        }
+        for addr in [
+            "0.0.0.0:8787",
+            "[::]:8787",
+            "192.168.1.5:8787",
+            "8.8.8.8:443",
+        ] {
+            let err = loopback_only(addr).expect_err(addr);
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{addr}");
+            assert!(err.to_string().contains("loopback"), "{addr}: {err}");
+        }
     }
 }
