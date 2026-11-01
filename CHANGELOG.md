@@ -6,6 +6,12 @@ the entry says so when it does.
 
 ## [Unreleased]
 
+### Fixed
+
+- `docs/stability.md` said `spool/` and `cache/` can be deleted without losing a
+  record. A spool file can be the only copy of its record, and `cache/gap-since`
+  holds a range still to fill; only `cache/meta/` is safe to delete.
+
 ## [1.0.0-rc.3] — 2026-11-01
 
 ### Fixed

@@ -40,6 +40,12 @@ marks each one `(experimental)`.
   field means, or changing an exit code is breaking, and happens in 2.0 only.
 - An experimental surface that graduates moves into the stable table in the
   release that starts promising it.
-- `cache/` and `spool/` under the data root are not part of the promise. Both
-  are derived or in transit, can be deleted at any time without losing a
-  record, and their format can change in any release.
+- `cache/` and `spool/` under the data root are not part of the promise, and
+  their format can change in any release. They are not equally safe to delete:
+  - `cache/meta/` is derived from the log. Deleting it loses nothing; the next
+    read rebuilds it.
+  - `cache/gap-since` is not derived. It holds a gap-fill range a start ran out
+    of time for, and deleting it means that range is not resumed at the next
+    start. No record already written is lost.
+  - `spool/` holds hooks in transit, and a file there can be the only copy of
+    its record. Deleting one loses that record.
