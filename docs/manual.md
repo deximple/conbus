@@ -125,7 +125,7 @@ installing one.
 | Claude Code | `~/.claude/settings.json` | 13 events, and the StatusLine (wrapped, so your own status line still shows) |
 | Codex | `$CODEX_HOME/hooks.json` (default `~/.codex`) | 7 events |
 | Cursor | `~/.cursor/hooks.json` | `sessionStart`, `beforeSubmitPrompt`, `stop`, `sessionEnd`, `afterAgentResponse` |
-| grok | `~/.grok/hooks/conbus.json` | 9 events |
+| grok | `~/.grok/hooks/conbus.json` | 10 events |
 | opencode | `~/.config/opencode/plugins/conbus.js` | a plugin that forwards session and message events |
 
 It also places the binary at `~/.local/bin/conbus` if it is not there yet, and
