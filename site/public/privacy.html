@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>What this site stores — conbus</title>
+<style>
+  body { margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+         color: #1a1f24; line-height: 1.55; background: #fbfdfc; }
+  main { max-width: 46rem; margin: 0 auto; padding: 0 1.25rem 4rem; }
+  h1 { font-size: 1.6rem; margin: 3rem 0 1rem; }
+  h2 { font-size: 1.15rem; margin: 2rem 0 0.5rem; }
+  code { background: #eef2f0; padding: 0.1em 0.35em; border-radius: 4px; font-size: 0.92em; }
+  a { color: #0b6e4f; }
+</style>
+</head>
+<body>
+<main>
+  <h1>What this site stores</h1>
+
+  <p>This page exists to say exactly what the waitlist keeps. There is no
+  analytics, no tracking, no cookies and no third-party anything.</p>
+
+  <h2>If you join the waitlist</h2>
+  <p>One row per signup holds:</p>
+  <ul>
+    <li>the <strong>day</strong> you signed up (UTC day only — no time of day)</li>
+    <li>your <strong>email</strong></li>
+    <li>your answers: <strong>team size</strong>, the <strong>vendors</strong>
+      you checked, whether you run agents <strong>unattended</strong>, and the
+      optional <strong>incident note</strong> you wrote</li>
+    <li>which <strong>price variant</strong> the page showed you and whether you
+      came from the hero or the pricing section</li>
+    <li>that you consented to be contacted</li>
+  </ul>
+  <p>Why: to count real interest by team profile and to write back when a
+  pilot exists. The variant is a fake-door test — it says which price was
+  shown, nothing else.</p>
+
+  <h2>If you click "Request a pilot"</h2>
+  <p>One counter goes up: the UTC day and the variant shown. Nothing else is
+  recorded — no page views, no session, no identity.</p>
+
+  <h2>What is never stored</h2>
+  <ul>
+    <li>No timestamp more precise than the UTC day</li>
+    <li>No IP address</li>
+    <li>No user agent, referrer or browser fingerprint</li>
+    <li>No cookies or other identifiers on your machine</li>
+  </ul>
+
+  <h2>Retention and deletion</h2>
+  <p>Rows are kept until the operator deletes them, and at most 12 months.
+  To have your signup removed, ask at
+  <a id="contact" href="#">the contact address shown with this site</a> and it
+  is gone.</p>
+
+  <p><a href="index.html">← Back</a></p>
+</main>
+<script>
+// Fills in the contact address from the Worker's own config — the address is
+// public once asked for, and keeping it out of the static HTML means scrapers
+// get nothing.
+fetch("/api/contact")
+  .then(function (res) { return res.json(); })
+  .then(function (data) {
+    if (data && data.email) {
+      var a = document.getElementById("contact");
+      a.textContent = data.email;
+      a.href = "mailto:" + data.email;
+    }
+  })
+  .catch(function () {});
+</script>
+</body>
+</html>

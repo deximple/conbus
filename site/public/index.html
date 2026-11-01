@@ -1,0 +1,260 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>conbus — the flight recorder for coding agents</title>
+<meta name="description" content="See where your agents stop, fail, or wait on a person — across vendors — without a prompt leaving the machine.">
+<style>
+  :root { color-scheme: light; --ink: #1a1f24; --dim: #4a5560; --line: #d8dee3; --accent: #0b6e4f; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+         color: var(--ink); line-height: 1.55; background: #fbfdfc; }
+  main { max-width: 46rem; margin: 0 auto; padding: 0 1.25rem 4rem; }
+  h1 { font-size: 2rem; line-height: 1.2; margin: 3.5rem 0 0.5rem; }
+  h2 { font-size: 1.25rem; margin: 3rem 0 0.75rem; }
+  p { margin: 0.5rem 0; }
+  .lede { font-size: 1.15rem; color: var(--dim); }
+  ul { padding-left: 1.25rem; }
+  code { background: #eef2f0; padding: 0.1em 0.35em; border-radius: 4px; font-size: 0.92em; }
+  .cta { display: inline-block; margin-top: 1.25rem; padding: 0.7rem 1.4rem; border-radius: 8px;
+         background: var(--accent); color: #fff; text-decoration: none; font-weight: 600; }
+  .cta:hover { background: #095a41; }
+  table { border-collapse: collapse; width: 100%; margin-top: 0.75rem; }
+  th, td { border: 1px solid var(--line); padding: 0.6rem 0.75rem; text-align: left; vertical-align: top; }
+  th { background: #f2f6f4; }
+  form { border: 1px solid var(--line); border-radius: 10px; padding: 1.25rem; margin-top: 0.75rem; background: #fff; }
+  label { display: block; font-weight: 600; margin-top: 1rem; }
+  label.first { margin-top: 0; }
+  .hint { font-weight: 400; color: var(--dim); font-size: 0.9rem; }
+  input[type=text], input[type=email], select, textarea {
+    width: 100%; padding: 0.5rem; margin-top: 0.3rem; border: 1px solid var(--line);
+    border-radius: 6px; font: inherit; background: #fff; }
+  textarea { min-height: 5.5rem; }
+  fieldset { border: 0; padding: 0; margin: 1rem 0 0; }
+  legend { font-weight: 600; padding: 0; }
+  .opt { display: inline-flex; gap: 0.4rem; align-items: center; font-weight: 400;
+         margin: 0.35rem 1rem 0.35rem 0; }
+  .opt input { margin: 0; }
+  .consent { display: flex; gap: 0.5rem; align-items: flex-start; font-weight: 400; }
+  .consent input { margin-top: 0.35rem; }
+  .hp { position: absolute; left: -10000px; width: 1px; height: 1px; overflow: hidden; }
+  button { margin-top: 1.25rem; padding: 0.7rem 1.4rem; border: 0; border-radius: 8px;
+           background: var(--accent); color: #fff; font: inherit; font-weight: 600; cursor: pointer; }
+  button:hover { background: #095a41; }
+  .error { color: #9c2b2e; margin-top: 0.75rem; }
+  .thanks { border: 1px solid var(--accent); border-radius: 10px; padding: 1.25rem;
+            margin-top: 0.75rem; background: #f0f7f4; }
+  footer { margin-top: 3.5rem; color: var(--dim); font-size: 0.9rem; }
+  footer a { color: var(--dim); }
+</style>
+</head>
+<body>
+<main>
+  <h1>conbus is the flight recorder for coding agents</h1>
+  <p class="lede">See where your agents stop, fail, or wait on a person — across
+  vendors — without a prompt leaving the machine.</p>
+  <p><a class="cta" href="#waitlist" data-source="hero">Join the waitlist</a></p>
+
+  <h2>What it records</h2>
+  <p>A local recorder hooks each agent and keeps one append-only log per
+  machine. From it you get, per day and per harness:</p>
+  <ul>
+    <li>where runs <strong>stopped</strong>, filed by cause — a limit, the
+      account, the vendor, a request, or a person</li>
+    <li><strong>tool failures</strong> and interrupts</li>
+    <li><strong>permission waits</strong> — where an agent sat idle for a
+      person's answer</li>
+    <li><strong>attended vs unattended</strong> runs — the unattended ones are
+      the ones that fail silently</li>
+  </ul>
+  <p class="hint">Works with Claude Code, Codex, Cursor, grok and opencode.</p>
+
+  <h2>Into the monitoring your team already runs</h2>
+  <p>The recorder can emit its normalised counts as OpenTelemetry into a
+  collector on your own machines — Datadog, Grafana, whatever you run. conbus
+  holds no keys and sees no dashboards.</p>
+
+  <h2>Local policy, before the tool runs (experimental)</h2>
+  <p>A <code>policy.json</code> on the machine turns into deny/ask decisions
+  through each vendor's own hook mechanism — evaluated in the hook process, so
+  a down recorder cannot lift a deny. No rule ever comes from a server.</p>
+
+  <h2>macOS and Linux</h2>
+  <p>One binary. On macOS it registers as a launch agent; on Linux and CI, a
+  systemd user unit or a foreground process.</p>
+
+  <h2>Privacy: counts only</h2>
+  <p>Nothing shareable can carry a prompt, a path, a command, or an error text.
+  <code>conbus usage --shareable</code> prints the exact rows a sync would send
+  — read the payload before it could ever leave.</p>
+
+  <h2>Pricing</h2>
+  <table>
+    <tr><th>Tier</th><th>What</th><th>Price</th></tr>
+    <tr>
+      <td><strong>Free</strong></td>
+      <td>The recorder and every local report — usage, doctor, briefings, hops. Open source.</td>
+      <td>$0, always</td>
+    </tr>
+    <tr>
+      <td><strong>Team</strong></td>
+      <td>Your own week in counts, forwarded to whoever owns the plan; team
+        totals by harness and day.</td>
+      <td><span id="team-price">—</span></td>
+    </tr>
+  </table>
+  <p><a class="cta" id="pilot" href="#waitlist">Request a pilot</a></p>
+
+  <h2 id="waitlist">Join the waitlist</h2>
+  <p>Tell us who you run and where it hurts. We write back when there is
+  something to pilot.</p>
+
+  <form id="form" novalidate>
+    <label class="first" for="email">Work email</label>
+    <input type="email" id="email" name="email" required autocomplete="email">
+
+    <label for="team_size">Team size</label>
+    <select id="team_size" name="team_size" required>
+      <option value="">Choose…</option>
+      <option value="1">Just me</option>
+      <option value="2-9">2–9</option>
+      <option value="10-50">10–50</option>
+      <option value="51-200">51–200</option>
+      <option value="201+">201+</option>
+    </select>
+
+    <fieldset>
+      <legend>Which coding agents does the team pay for?</legend>
+      <label class="opt"><input type="checkbox" name="vendors" value="claude_code">Claude Code</label>
+      <label class="opt"><input type="checkbox" name="vendors" value="codex">Codex</label>
+      <label class="opt"><input type="checkbox" name="vendors" value="cursor">Cursor</label>
+      <label class="opt"><input type="checkbox" name="vendors" value="copilot">Copilot</label>
+      <label class="opt"><input type="checkbox" name="vendors" value="gemini">Gemini</label>
+      <label class="opt"><input type="checkbox" name="vendors" value="other">Other</label>
+    </fieldset>
+
+    <fieldset>
+      <legend>Do you let agents run unattended?</legend>
+      <label class="opt"><input type="radio" name="unattended" value="yes">Yes</label>
+      <label class="opt"><input type="radio" name="unattended" value="sometimes">Sometimes</label>
+      <label class="opt"><input type="radio" name="unattended" value="no">No</label>
+    </fieldset>
+
+    <label for="incident">The last time an agent run stopped or failed and it
+      cost you something: when, what happened, what you did
+      <span class="hint">(optional)</span></label>
+    <textarea id="incident" name="incident" maxlength="2000"></textarea>
+
+    <div class="hp" aria-hidden="true">
+      <label>Website <input type="text" name="website" tabindex="-1" autocomplete="off"></label>
+    </div>
+
+    <input type="hidden" name="variant" id="variant" value="">
+    <input type="hidden" name="source" id="source" value="hero">
+
+    <label class="consent"><input type="checkbox" id="consent" required>
+      <span>I agree to be contacted about the waitlist and pilots. This page
+      stores only what this form sends — no cookies, no analytics.</span></label>
+
+    <button type="submit">Join the waitlist</button>
+    <p class="error" id="form-error" hidden></p>
+  </form>
+
+  <div class="thanks" id="thanks" hidden>
+    <strong>You're on the list.</strong> We'll write when there is something to
+    pilot.
+  </div>
+
+  <footer>
+    <p>conbus — a local conversation bus for coding agents.
+    <a href="privacy.html">What this page stores</a>.</p>
+  </footer>
+</main>
+
+<script>
+// One Team price per visitor, kept in localStorage — no cookies, no
+// analytics. The variant is reported only when someone requests a pilot.
+(function () {
+  var VARIANTS = {
+    m8: "$8 / member / month",
+    m15: "$15 / member / month",
+    o249: "$249 / organisation / month"
+  };
+  var key = "conbus_team_variant";
+  var variant = null;
+  try {
+    variant = localStorage.getItem(key);
+    if (!VARIANTS.hasOwnProperty(variant)) {
+      var names = Object.keys(VARIANTS);
+      variant = names[Math.floor(Math.random() * names.length)];
+      localStorage.setItem(key, variant);
+    }
+  } catch (e) {
+    variant = "m8";
+  }
+  document.getElementById("team-price").textContent = VARIANTS[variant];
+  document.getElementById("variant").value = variant;
+
+  document.getElementById("pilot").addEventListener("click", function () {
+    document.getElementById("source").value = "pricing";
+    try {
+      fetch("/api/click", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ variant: variant })
+      });
+    } catch (e) { /* the scroll matters; the click does not */ }
+  });
+
+  document.querySelector('a[data-source="hero"]').addEventListener("click", function () {
+    document.getElementById("source").value = "hero";
+  });
+
+  document.getElementById("form").addEventListener("submit", function (event) {
+    event.preventDefault();
+    var form = event.target;
+    var error = document.getElementById("form-error");
+    error.hidden = true;
+
+    var vendors = Array.prototype.slice
+      .call(form.querySelectorAll('input[name="vendors"]:checked'))
+      .map(function (box) { return box.value; });
+    var unattended = form.querySelector('input[name="unattended"]:checked');
+
+    var payload = {
+      email: form.email.value.trim(),
+      team_size: form.team_size.value,
+      vendors: vendors,
+      unattended: unattended ? unattended.value : "",
+      incident: form.incident.value.trim(),
+      variant: document.getElementById("variant").value,
+      source: document.getElementById("source").value,
+      consent: document.getElementById("consent").checked,
+      website: form.website.value
+    };
+
+    fetch("/api/waitlist", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload)
+    })
+      .then(function (res) { return res.json(); })
+      .then(function (data) {
+        if (data && data.ok) {
+          form.hidden = true;
+          document.getElementById("thanks").hidden = false;
+        } else {
+          error.textContent = (data && data.error) || "Something went wrong — try again.";
+          error.hidden = false;
+        }
+      })
+      .catch(function () {
+        error.textContent = "Something went wrong — try again.";
+        error.hidden = false;
+      });
+  });
+})();
+</script>
+</body>
+</html>

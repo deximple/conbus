@@ -1,0 +1,33 @@
+# The landing page and waitlist Worker under site/. Runs only when site/
+# changes; it is never deployed from CI (site/README.md).
+name: site
+
+on:
+  pull_request:
+    paths: ["site/**", ".github/workflows/site.yml"]
+  push:
+    branches: [main]
+    paths: ["site/**", ".github/workflows/site.yml"]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: site
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install
+        run: npm ci
+
+      - name: Test
+        run: npm test

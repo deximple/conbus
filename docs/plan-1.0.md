@@ -390,7 +390,7 @@ Copilot CLI 어댑터(설치·실 payload 필요), Gemini CLI 어댑터, 프롬�
 | M3 | | | | |
 | M4 | | | | |
 | M5 | | | | |
-| M6 | | | | |
+| M6 | 완료 | #98 #103 | `check-docs.sh` 초록(0.2.9, 명령 19개). site 테스트 6/6(vitest) | `check-docs.sh`가 첫 실행에서 실제 누락 4건을 잡았다(README·한국어 매뉴얼에 `policy`, 두 매뉴얼에 `sync`). 한국어 매뉴얼은 Linux 미지원이라고 적혀 있던 것을 고치고 정책·프로필·sync 절을 넣었다. 랜딩은 `site/` 하나로 합치고 `docs/www/`를 지웠다. site는 `site/**` 경로 필터 CI로만 돌고 배포하지 않았다 |
 | M7 | | | | |
 | S1–S5 | | | | |
 | Canary | | | | |

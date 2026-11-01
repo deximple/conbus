@@ -136,7 +136,7 @@ These are not engineering steps and no agent takes them on its own.
     re-run finds the ticket by code hash and does not submit again.
   - Until the signed package replaces the workflow's, a copy downloaded in a
     browser needs `xattr -d com.apple.quarantine conbus`.
-- **The name.** `conbus.sh` is the public name (`docs/www/README.md`). DNS and
+- **The name.** `conbus.sh` is the public name (`site/README.md`). DNS and
   hosting for the landing page are not set up.
 - **Scope.** conbus is a local tool; there is no hosted service
   (`docs/saas-hypothesis.md`). Revisit that file before adding one.
