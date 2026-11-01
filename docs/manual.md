@@ -569,6 +569,7 @@ folder's facts visible in another.
 | `takeover.json` | a hop waiting for `conbus run`, while one is |
 | `facts.jsonl`, `links.jsonl` | section 10 |
 | `policy.json` | your `PreToolUse` rules, if you wrote any (section 15) |
+| `backup.json` | the last good `conbus backup`: where, when, how much |
 | `chat-export/` | Claude.ai exports you dropped in |
 
 Only your account can read any of it: the folder is `0700` and the log's
@@ -626,6 +627,10 @@ like any other context:
 a collector on this Mac that you name, and only when you run it (section 5).
 Where they go from there is that collector's configuration.
 
+`conbus backup --to FOLDER` writes a plain-text copy of the log's closed segments
+to the folder you name, only when you run it, and refuses cloud-synced folders
+([below](#backing-it-up-experimental)).
+
 To read quota, conbus runs the agents' own CLIs (section 8); deciding a hop asks
 `gh` about the folder's pull request.
 
@@ -635,10 +640,134 @@ Vendor credentials and tokens. The agents' session files, except when
 `backfill` runs and when the recorder fills gaps at start. Your `~/Downloads`
 folder.
 
+### Backing it up (experimental)
+
+Until you make another, the log is the only copy. A dead disk, a lost Mac or a
+stray `rm` loses all of it. `conbus doctor` says where you stand:
+
+```text
+backup    none: this log has one copy
+```
+
+```bash
+conbus backup --to "/Volumes/My Disk"
+conbus backup --verify --to "/Volumes/My Disk"
+```
+
+You run it, or your own scheduler does. Nothing in conbus ever will: a copy made
+behind your back would outlive you deleting `~/.conbus` to remove your prompts.
+
+- **What it copies.** Closed segments not yet there, into
+  `<folder>/conbus-backup/log/`, and a `manifest.json` with each one's name, size
+  and SHA-256. A rerun copies only what is new. The segment still being written
+  is left until it rolls over at 8 MiB, so every run says how many records are
+  newer than the backup. A log under 8 MiB has nothing closed yet: the run says
+  so, and it still has one copy.
+- **How it copies.** Each segment goes under a temporary name, is read back and
+  compared, and only then gets its real name, so an interrupted run leaves no half
+  file that looks complete. The next run removes what it left. On the log's own
+  APFS volume the copy is a clone, which costs almost no space, and the run says
+  so. Elsewhere it is a real copy.
+- **`--verify`** rereads the whole backup and exits 1, naming each file that
+  differs, is missing, or is not in the manifest. A normal run does not read what
+  is already there, so it will not notice a copy gone bad. To mend one, delete it
+  from the backup and run `conbus backup`: if the log still has that segment, the
+  copy comes back, checked against the manifest. A segment that has left the log
+  stays in the backup, because a backup deletes nothing.
+- **The last good run** is in `~/.conbus/backup.json`, and `doctor` reads only
+  that, so it stays fast and says nothing about whether the disk is plugged in now:
+
+  ```text
+  backup    last ok 3h ago to /Volumes/My Disk (1,460 segments)
+  ```
+
+**What it refuses**, exiting 1. No flag overrides any of these.
+
+- A folder inside the data root, or one that holds it.
+- A cloud-synced folder: `~/Library/Mobile Documents`, `~/Library/CloudStorage`,
+  `~/Dropbox`, `~/Google Drive`, `~/OneDrive*`, including through a symlink. The
+  log holds prompts and replies in plain text, and conbus promises they do not
+  leave this machine. Encrypted cloud backup is not offered yet. conbus knows only
+  these names. It cannot see iCloud's Desktop & Documents setting, another sync
+  tool or a network share, so choosing one of those sends your prompts wherever
+  that goes.
+- A folder whose parent does not exist, or a `/Volumes/<name>` with no disk
+  mounted. An unplugged disk fails, instead of creating a look-alike folder on the
+  internal disk. So does a folder that was on another disk at the last backup and
+  is on the log's own disk now, which is what a mount folder looks like once its
+  disk has gone.
+- A volume without room for the copy, checked before anything is copied.
+- A log that is not the one in the backup: a segment whose size says it is not the
+  copy. Nothing is copied and nothing is overwritten. That is another log's backup,
+  a damaged segment, or a new log started after a lost one.
+
+**What a backup is not.**
+
+- **Private.** Prompts and replies are plain text at the destination. File modes
+  protect nothing on an external disk, because macOS ignores ownership there and
+  exFAT has no modes, so an unencrypted external disk exposes them to whoever holds
+  it. Encrypt the disk.
+- **A way to open sealed tool bodies elsewhere.** Under `encrypted_tools` they are
+  sealed with a key in your login Keychain (`log-kek`), which a backup does not
+  copy. On another machine those bodies stay unreadable; the rest of the log reads
+  normally.
+- **A second disk, unless it is one.** On the log's own volume `doctor` adds
+  `same disk: protects against deletion, not a failed disk`, because a clone shares
+  its blocks with the original. The check compares volumes: a second volume or
+  partition on the same physical disk is not flagged, and fails with it.
+- **Protection against a full disk.** A disk that fills up still loses new records.
+- **Everything.** It holds the log only: not `policy.json`, `facts.jsonl`,
+  `links.jsonl` or the rest of the root.
+
+**Restoring.** There is no restore command. Stop the recorder, copy the segments
+back, start it again. On a new machine, do this before the first
+`conbus install --apply`.
+
+```bash
+launchctl bootout gui/$(id -u)/sh.conbus.daemon            # macOS
+systemctl --user disable --now sh.conbus.daemon.service   # Linux
+
+conbus backup --verify --to "/Volumes/My Disk"
+mkdir -p -m 700 ~/.conbus/log
+cp -n "/Volumes/My Disk/conbus-backup/log/"*.jsonl ~/.conbus/log/
+chmod 600 ~/.conbus/log/*.jsonl
+rm -rf ~/.conbus/cache/meta
+
+conbus install --apply     # starts the recorder again
+```
+
+`cp -n` may exit non-zero, or warn, when it skips a file; that is not a failure
+here. `cache/meta` goes because it trusts a segment by name and length, and it is
+rebuilt on the next read.
+
+- **What comes back.** Everything that was closed when the backup ran. `conbus log
+  --json` and `conbus usage --json` read exactly as they did over those records.
+- **What does not.** The records that run called newer than the backup. After
+  losing the whole log they are gone, which is up to one segment, plus whatever
+  was written since that run. When the recorder starts, its gap fill (section 9)
+  may bring some of those turns back from the agents' own transcripts, marked as
+  recovered.
+- **Over a partly missing log.** The same commands. Only the missing segments are
+  copied, and with the open segment still there, both reads come out exactly as
+  they were before the loss.
+- **An overlap.** A segment in both places is left as the log has it. No record can
+  appear twice, because a segment has one name. Keeping the log's copy matters:
+  after a restore the newest restored segment is the open one again and grows, and
+  a plain `cp` would cut off what it gained. To replace a segment you know is
+  damaged, delete it from the log first.
+- **Afterwards.** The next `conbus backup` to that folder carries on. A restored
+  segment that grew replaces its shorter copy once it closes, because the old copy
+  is exactly how the new one starts.
+- **Not over a new log.** If a recorder has already started a new log there, stop
+  it and move that `log/` aside first. Two logs reuse the same segment names and
+  sequence numbers, and conbus cannot merge them.
+
 ### Deleting it
 
 `rm -rf ~/.conbus` removes everything conbus recorded. `uninstall` never does
-this for you.
+this for you. Neither touches a backup, which is in the folder you named. Delete
+`<folder>/conbus-backup` first, while `conbus doctor` can still tell you where it
+is.
 
 ---
 
@@ -846,6 +975,8 @@ or `conbus run claude_code --profile NAME`.
 | `conbus go [HARNESS] [--from ID]` | `hop --apply` for the current conversation |
 | `conbus run [HARNESS] [--profile NAME]` | Start an agent in this terminal; hops start the next one here. `--profile` runs `claude_code` under `$HOME/.claude-NAME` |
 | `conbus backfill [--apply] [--gaps] [--chat-export PATH]` | Recover history |
+| `conbus backup --to FOLDER` | Copy closed log segments to a folder you name, and read them back (experimental; section 11) |
+| `conbus backup --verify --to FOLDER` | Recheck the whole backup; names any file that differs or is missing, and exits 1 (experimental) |
 | `conbus summary --bus-id ID` | Ask the other leg's agent for a digest of a conversation |
 | `conbus usage [--days N] [--since DAY] [--day DAY] [--json] [--shareable] [--otlp URL]` | What the agents did, counted; `--otlp` sends the `--shareable` rows to a collector on this Mac (section 5) |
 | `conbus progress [--days N] [--since DAY] [--day DAY] [--workspace DIR] [--json]` | The same counts per folder, with the agents that worked there, the handovers between them and the commits `HEAD` gained (section 5) |
@@ -901,3 +1032,5 @@ all, inconclusive. Until 28 days have passed it says so and scores nothing.
   notarized.
 - Cursor, grok and opencode do not report remaining quota, so conbus cannot
   plan a hop ahead of their limits.
+- A backup leaves out the segment still being written, up to 8 MiB of the newest
+  records (section 11).

@@ -156,6 +156,11 @@ is treated like `conbus go cursor`.
   joins this machine. `conbus sync --off` forgets the credential and leaves
   the log where it is.
 
+  `conbus backup --to FOLDER` (experimental) writes a plain-text copy of the
+  log's closed segments to a folder you name, only when you run it. It refuses
+  cloud-synced folders. [Manual, section 11](docs/manual.md#backing-it-up-experimental)
+  has what a backup is not, and how to restore one.
+
   To read quota, conbus asks the vendor CLIs you already use (`codex
   app-server`, `agy`); deciding a hop asks `gh` for the checkout's pull request.
 - **What conbus never reads.** Vendor auth tokens and credentials. Vendor
@@ -172,7 +177,8 @@ conbus uninstall --apply  # remove it
 Every hook entry that runs conbus comes out of every vendor file — nothing
 else does — the StatusLine goes back to yours, and the plugin, launchd agent
 and binary are deleted. **Your log is kept**; uninstall prints where it is,
-and `rm -rf ~/.conbus` removes it if you want it gone.
+and `rm -rf ~/.conbus` removes it if you want it gone. A backup you made stays
+in the folder you named until you delete it; `conbus doctor` names that folder.
 
 ## Limits
 
@@ -204,6 +210,7 @@ and `rm -rf ~/.conbus` removes it if you want it gone.
 | `conbus go [HARNESS]` | Hop the current conversation |
 | `conbus run [HARNESS]` | Start a leg in this terminal; hops exec the next one |
 | `conbus backfill [--apply]` | Recover history from before conbus was installed |
+| `conbus backup --to FOLDER` · `conbus backup --verify --to FOLDER` | Copy closed log segments to a folder you name, or recheck that copy (experimental; you run it, nothing in conbus does) |
 | `conbus summary --bus-id ID` | A model digest from the other vendor (experimental) |
 | `conbus verdict` | Score a four-week trial; an open window is not a verdict (experimental) |
 | `conbus sync [--join INVITE [--apply]] [--off]` | Send closed days' counts to the origin a joined invite names; no host exists yet |

@@ -1302,6 +1302,7 @@ pub fn doctor(paths: &Paths) -> io::Result<()> {
     if let Some(line) = disk_line(paths) {
         println!("{line}");
     }
+    println!("{}", crate::backup::describe(paths));
 
     match std::env::var_os("HOME").map(PathBuf::from) {
         Some(home) => {
@@ -1519,7 +1520,7 @@ fn cursor_line(records: &[Record]) -> String {
 }
 
 /// Free and total bytes on the volume holding `dir`, from statvfs.
-fn statvfs(dir: &std::path::Path) -> Option<(u64, u64)> {
+pub(crate) fn statvfs(dir: &std::path::Path) -> Option<(u64, u64)> {
     let text = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()).ok()?;
     let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
     if unsafe { libc::statvfs(text.as_ptr(), &mut stat) } != 0 {
@@ -1569,7 +1570,7 @@ fn disk_line(paths: &Paths) -> Option<String> {
     Some(disk_text(log_bytes(paths), free, total))
 }
 
-fn gib(bytes: u64) -> String {
+pub(crate) fn gib(bytes: u64) -> String {
     const GIB: f64 = 1_073_741_824.0;
     const MIB: f64 = 1_048_576.0;
     if bytes as f64 >= GIB {

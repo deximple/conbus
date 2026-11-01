@@ -31,6 +31,7 @@ marks each one `(experimental)`.
 - `summary`
 - `verdict`
 - `hook --inference-listen`
+- `backup`, with the manifest it writes at the destination and its record in the data root
 
 ## What counts as breaking
 
