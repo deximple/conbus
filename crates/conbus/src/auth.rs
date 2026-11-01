@@ -12,7 +12,7 @@
 //! vendor's own sign-in flow. Exit 0 regardless of vendor state — recording
 //! does not depend on any of it.
 
-use std::io;
+use std::io::{self, BufRead, Read};
 use std::time::Duration;
 
 use conbus_core::paths::Paths;
@@ -174,6 +174,39 @@ fn shown(text: &str) -> String {
 /// character, no line break, no bidirectional override.
 fn printable(c: char) -> bool {
     matches!(c, ' '..='~') || (!c.is_ascii() && c.is_alphanumeric())
+}
+
+/// More than any address a browser keeps, and a limit on what a mistaken pipe
+/// can make this read.
+const STDIN_MAX_BYTES: u64 = 1024 * 1024;
+
+/// `--url -`: the first line that is not blank. It stops at that line, so a URL
+/// pasted at a terminal needs only Return. Off the command line, a token reaches
+/// no shell history and no recorded tool call.
+fn url_from_stdin() -> io::Result<String> {
+    let mut reader = io::stdin().lock().take(STDIN_MAX_BYTES);
+    loop {
+        let mut line = Vec::new();
+        if reader.read_until(b'\n', &mut line)? == 0 {
+            return Err(io::Error::other(
+                "no URL on stdin; try pbpaste | conbus auth --url -",
+            ));
+        }
+        let text = String::from_utf8_lossy(&line);
+        if !text.trim().is_empty() {
+            return Ok(text.trim().to_string());
+        }
+    }
+}
+
+/// The command line has already gone where it goes. All that is left is to say
+/// so, and not to print what it held.
+fn warn_about_history(url: &str) {
+    if url.contains(['?', '#']) {
+        eprintln!(
+            "conbus auth: this URL's query is now in your shell history, and in the record of any agent that ran this; next time use: pbpaste | conbus auth --url -"
+        );
+    }
 }
 
 /// `conbus auth --url <URL>`: whose page, who asked, whether conbus did.
@@ -338,7 +371,13 @@ function look() {{
 /// `conbus auth [--url URL] [--html [PATH]] [--open]`.
 pub fn run(paths: &Paths, url: Option<&str>, html: Option<String>, open: bool) -> io::Result<()> {
     if let Some(url) = url {
-        print!("{}", describe_url(url));
+        let answer = if url == "-" {
+            describe_url(&url_from_stdin()?)
+        } else {
+            warn_about_history(url);
+            describe_url(url)
+        };
+        print!("{answer}");
         return Ok(());
     }
     let rows = probe_rows();

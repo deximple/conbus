@@ -410,7 +410,8 @@ fn usage_error(
             i += 1;
         } else if values.contains(&arg) {
             match args.get(i + 1) {
-                Some(next) if !next.starts_with('-') => i += 2,
+                // A lone `-` is a value: stdin, for the flags that read it.
+                Some(next) if next == "-" || !next.starts_with('-') => i += 2,
                 _ => return Some(format!("{arg} needs an argument")),
             }
         } else if optional.contains(&arg) {
@@ -1058,6 +1059,22 @@ mod tests {
         };
 
         assert_eq!(filter.tail, None);
+    }
+
+    #[test]
+    fn auth_url_takes_an_address_or_a_dash_for_stdin() {
+        for value in ["https://x.example/", "-"] {
+            match parse(["auth", "--url", value], None) {
+                Command::Auth { url, .. } => assert_eq!(url.as_deref(), Some(value)),
+                other => panic!("{other:?}"),
+            }
+        }
+        for args in [&["auth", "--url"][..], &["auth", "--url", "--open"]] {
+            assert!(
+                matches!(parse(args, None), Command::UsageError(_)),
+                "{args:?}"
+            );
+        }
     }
 
     #[test]
