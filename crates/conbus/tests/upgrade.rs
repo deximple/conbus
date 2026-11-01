@@ -15,6 +15,9 @@ fn conbus(home: &Path, conbus_home: &Path, args: &[&str]) -> std::process::Outpu
         .env("HOME", home)
         .env("CONBUS_HOME", conbus_home)
         .env("CONBUS_SKIP_LAUNCHCTL", "1")
+        // Pin XDG to the fake home: a CI image that exports XDG_CONFIG_HOME
+        // would otherwise land the Linux unit outside the tempdir.
+        .env("XDG_CONFIG_HOME", home.join(".config"))
         .output()
         .expect("run conbus")
 }
