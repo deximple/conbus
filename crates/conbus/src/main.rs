@@ -281,9 +281,13 @@ fn main() -> ExitCode {
             print!("{}", cli::USAGE);
             ExitCode::SUCCESS
         }
+        Command::UsageError(err) => {
+            eprintln!("conbus: {err}\n\n{}", cli::USAGE);
+            ExitCode::from(2)
+        }
         Command::Unknown(name) => {
             eprintln!("conbus: unknown command {name:?}\n\n{}", cli::USAGE);
-            ExitCode::FAILURE
+            ExitCode::from(2)
         }
     }
 }

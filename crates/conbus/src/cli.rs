@@ -136,6 +136,10 @@ pub enum Command {
     /// Say which build this binary is.
     Version,
     Help,
+    /// The command name was right but the flags were not — the message says
+    /// which and why. Distinct from `Unknown` only in the text it prints;
+    /// both are usage errors and both exit 2.
+    UsageError(String),
     Unknown(String),
 }
 
@@ -193,6 +197,64 @@ where
     // the subcommand is usage, not a catalog slug or a bus id.
     if args.iter().skip(1).any(|a| a == "--help" || a == "-h") {
         return Command::Help;
+    }
+    // Every flag a command takes, in two sets: bare switches and flags that
+    // take a value (or may take one). An argument that starts with `-` and
+    // is in neither is a usage error, as is a value flag with nothing to
+    // take. `hook` is absent deliberately: its contract is "exits 0 always",
+    // so a stray flag there is still just a payload to answer.
+    let (flags, values, optional, positionals): (&[&str], &[&str], &[&str], usize) =
+        match first.as_str() {
+            "daemon" => (&["--prepare"], &[], &[], 0),
+            "install" => (&["--apply", "--managed"], &["--profile"], &[], 0),
+            "uninstall" => (&["--apply"], &["--profile"], &[], 0),
+            "backfill" => (&["--apply", "--gaps"], &["--chat-export"], &[], 0),
+            "log" => (
+                &["--json", "--reveal"],
+                &["--bus-id", "--since", "--tail", "--grep"],
+                &[],
+                usize::MAX,
+            ),
+            "doctor" | "status" | "quota" | "verdict" => (&[], &[], &[], 0),
+            "policy" => (&[], &["--harness", "--tool", "--input"], &[], usize::MAX),
+            "hop" => (&["--apply", "--demo"], &["--from", "--to"], &[], usize::MAX),
+            "go" => (&[], &["--from", "--to"], &[], usize::MAX),
+            "summary" => (&[], &["--bus-id"], &[], 0),
+            "sync" => (&["--apply", "--off"], &["--join"], &[], 0),
+            "usage" => (
+                &["--json", "--shareable"],
+                &["--days", "--since", "--day"],
+                &["--otlp"],
+                0,
+            ),
+            "progress" => (
+                &["--json"],
+                &["--days", "--since", "--day", "--workspace"],
+                &[],
+                0,
+            ),
+            "run" => (&[], &["--profile"], &[], usize::MAX),
+            "arena" => (
+                &[],
+                &[
+                    "--workspace",
+                    "--type",
+                    "--claim",
+                    "--anchor",
+                    "--from",
+                    "--to",
+                    "--bus-id",
+                    "--seq",
+                ],
+                &[],
+                usize::MAX,
+            ),
+            _ => (&[], &[], &[], usize::MAX),
+        };
+    if first.as_str() != "hook"
+        && let Some(err) = usage_error(&args[1..], flags, values, optional, positionals)
+    {
+        return Command::UsageError(err);
     }
     match first.as_str() {
         "daemon" => Command::Daemon {
@@ -310,6 +372,45 @@ where
         "help" | "--help" | "-h" => Command::Help,
         other => Command::Unknown(other.to_string()),
     }
+}
+
+/// Walk a command's arguments against its flag table; the first violation is
+/// the usage error. `optional` flags may take a value but do not demand one
+/// (`--otlp` alone still means "the default collector").
+fn usage_error(
+    args: &[String],
+    flags: &[&str],
+    values: &[&str],
+    optional: &[&str],
+    positionals: usize,
+) -> Option<String> {
+    let mut positionals_seen = 0usize;
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if flags.contains(&arg) {
+            i += 1;
+        } else if values.contains(&arg) {
+            match args.get(i + 1) {
+                Some(next) if !next.starts_with('-') => i += 2,
+                _ => return Some(format!("{arg} needs an argument")),
+            }
+        } else if optional.contains(&arg) {
+            i += 1;
+            if args.get(i).is_some_and(|next| !next.starts_with('-')) {
+                i += 1;
+            }
+        } else if arg.starts_with('-') {
+            return Some(format!("unknown flag {arg}"));
+        } else {
+            positionals_seen += 1;
+            if positionals_seen > positionals {
+                return Some(format!("unexpected argument {arg:?}"));
+            }
+            i += 1;
+        }
+    }
+    None
 }
 
 fn flag_value(args: &[String], flag: &str) -> Option<String> {
