@@ -6,6 +6,12 @@ the entry says so when it does.
 
 ## [Unreleased]
 
+### Fixed
+
+- `install` and `doctor` now ask the binary `CONBUS_OPENCODE_BIN` names which
+  OpenCode this is, as every other use of that binary does, and `cargo test` no
+  longer runs the real `opencode` when it is on `PATH`.
+
 ## [1.0.0-rc.3] — 2026-11-01
 
 ### Fixed

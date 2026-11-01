@@ -11,12 +11,19 @@ use std::process::Command;
 
 use serde_json::{Value, json};
 
+mod support;
+
+/// A vendor binary that is not there, so `install` and `doctor` do not run the real
+/// `opencode` on every `cargo test`.
+const NOT_THERE: &str = "/nonexistent/conbus-test-vendor";
+
 fn conbus(binary: &Path, home: &Path, args: &[&str]) -> String {
     let out = Command::new(binary)
         .args(args)
         .env("HOME", home)
         // Never the runner's or the developer's launchd.
         .env("CONBUS_SKIP_LAUNCHCTL", "1")
+        .env("CONBUS_OPENCODE_BIN", NOT_THERE)
         .env_remove("CONBUS_HOME")
         .env_remove("XDG_STATE_HOME")
         .env_remove("XDG_CONFIG_HOME")
@@ -244,12 +251,52 @@ fn install_offers_to_replace_the_opencode_plugin_an_older_conbus_wrote() {
     );
 }
 
+#[test]
+fn install_writes_the_plugin_the_opencode_on_this_machine_loads() {
+    // `CONBUS_OPENCODE_BIN` names it, as it does for every other use of that
+    // binary. Asking one that is not there takes the current major.
+    let machine = Machine::new();
+    let built = PathBuf::from(env!("CARGO_BIN_EXE_conbus"));
+    std::fs::create_dir_all(machine.at(".config/opencode")).expect("opencode");
+    conbus(&built, &machine.home, &["install", "--apply"]);
+    let plugin = machine.at(".config/opencode/plugins/conbus.js");
+    let not_there = std::fs::read_to_string(&plugin).expect("the plugin");
+    assert!(not_there.contains("export default {"), "{not_there}");
+
+    let stand_in = machine.at("opencode-1");
+    support::write_executable(&stand_in, "#!/bin/sh\necho 1.18.31\n");
+    // Its first exec can outlast the two seconds `install` gives it on a loaded Mac.
+    assert!(
+        Command::new(&stand_in)
+            .status()
+            .expect("stand-in")
+            .success()
+    );
+    let out = Command::new(&built)
+        .args(["install", "--apply"])
+        .env("HOME", &machine.home)
+        .env("CONBUS_SKIP_LAUNCHCTL", "1")
+        .env("CONBUS_OPENCODE_BIN", &stand_in)
+        .env_remove("CONBUS_HOME")
+        .env_remove("XDG_STATE_HOME")
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("CODEX_HOME")
+        .output()
+        .expect("run conbus");
+    assert!(out.status.success(), "{out:?}");
+
+    let one = std::fs::read_to_string(&plugin).expect("the plugin");
+    assert!(one.contains("export const "), "{one}");
+    assert!(!one.contains("export default {"), "{one}");
+}
+
 /// Like `conbus`, but the exit status is the answer — for the refusal paths.
 fn conbus_status(binary: &Path, home: &Path, args: &[&str]) -> (bool, String, String) {
     let out = Command::new(binary)
         .args(args)
         .env("HOME", home)
         .env("CONBUS_SKIP_LAUNCHCTL", "1")
+        .env("CONBUS_OPENCODE_BIN", NOT_THERE)
         .env_remove("CONBUS_HOME")
         .env_remove("XDG_STATE_HOME")
         .env_remove("XDG_CONFIG_HOME")

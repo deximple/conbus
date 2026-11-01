@@ -37,11 +37,22 @@ pub enum PluginApi {
     V2,
 }
 
-/// The plugin API of the OpenCode on this machine, from `opencode --version`.
-/// One that cannot be asked, or answers something unreadable, is taken as the
-/// current major.
+/// The plugin API of the OpenCode on this machine, from `opencode --version`, or
+/// the binary `CONBUS_OPENCODE_BIN` names. One that cannot be asked, or answers
+/// something unreadable, is taken as the current major.
+///
+/// This crate's own tests never ask. `cargo test` must not run a vendor CLI that
+/// happens to be on `PATH`, and they share one process, where `set_var` is unsound
+/// while another thread reads the environment. Tests of the built binary name a
+/// binary instead.
 pub fn opencode_plugin_api() -> PluginApi {
-    let mut command = std::process::Command::new("opencode");
+    if cfg!(test) {
+        return PluginApi::V2;
+    }
+    let binary = std::env::var_os("CONBUS_OPENCODE_BIN")
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "opencode".into());
+    let mut command = std::process::Command::new(binary);
     command.arg("--version");
     crate::code::output_within(command, std::time::Duration::from_secs(2))
         .map(|out| parse_api(&String::from_utf8_lossy(&out.stdout)))
