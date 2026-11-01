@@ -5,11 +5,13 @@
 //! `thread/start` — never into one the user minted.
 
 use std::ffi::OsString;
-use std::io::{self, BufRead, BufReader, Lines, Write};
+use std::io::{self, BufRead, BufReader, Write};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Which binary answers. `CONBUS_CODEX_BIN` overrides `PATH`, for tests and
 /// for a Codex the daemon's launchd `PATH` (`/usr/bin:/bin:…`) cannot see.
@@ -73,10 +75,26 @@ pub fn is_refusal(err: &io::Error) -> bool {
 }
 
 pub struct AppServer {
-    child: Arc<Mutex<Child>>,
+    /// `None` once reaped, when its id can belong to someone else.
+    child: Arc<Mutex<Option<Child>>>,
     stdin: ChildStdin,
-    lines: Lines<BufReader<ChildStdout>>,
+    /// What the server wrote, read by a thread of its own: a read blocks for as long
+    /// as anything holds the other end open, which need not be the server.
+    lines: Receiver<io::Result<String>>,
+    deadline: Instant,
+    /// Dropped with the server, which is what stops the watchdog.
+    _stop_watchdog: Sender<()>,
     next_id: u64,
+}
+
+/// Kill the server and whatever it started. An npm `codex` is a node script spawning
+/// the native binary with stdout inherited, so the process we started is not the one
+/// that wedges. Started in a group of its own, all of them go together.
+fn kill_group(child: &Child) {
+    let group = child.id() as libc::pid_t;
+    // SAFETY: `killpg` takes no pointers. The caller holds the unreaped child, whose
+    // id leads this group and so cannot have been reused.
+    unsafe { libc::killpg(group, libc::SIGKILL) };
 }
 
 impl AppServer {
@@ -84,8 +102,9 @@ impl AppServer {
     ///
     /// `deadline` bounds the whole conversation, not one call: what stalls an
     /// app-server is the MCP servers it tries to start, not any question of
-    /// ours, and a watchdog that stops the process unblocks whatever read is
-    /// waiting on it.
+    /// ours. At the deadline a watchdog kills the server's process group, and a read
+    /// gives up whatever is still holding its pipe open. Something that started a
+    /// session of its own leaves the group, so it can outlive this, but not hold it up.
     pub fn start(deadline: Duration) -> io::Result<Self> {
         Self::start_with(&codex_binary(), deadline)
     }
@@ -98,12 +117,14 @@ impl AppServer {
     /// 2026-09-08.
     pub fn start_with(binary: &std::ffi::OsStr, deadline: Duration) -> io::Result<Self> {
         let binary = binary.to_os_string();
+        let until = Instant::now() + deadline;
         let mut child = Command::new(&binary)
             .arg("app-server")
             .env("PATH", path_for_vendor())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
+            .process_group(0)
             .spawn()
             .map_err(|err| {
                 io::Error::other(format!(
@@ -119,18 +140,32 @@ impl AppServer {
             .stdout
             .take()
             .ok_or_else(|| io::Error::other("no stdout"))?;
-        let child = Arc::new(Mutex::new(child));
+        let child = Arc::new(Mutex::new(Some(child)));
         let watched = Arc::clone(&child);
+        let (stop_watchdog, stopped) = mpsc::channel::<()>();
         std::thread::spawn(move || {
-            std::thread::sleep(deadline);
-            if let Ok(mut child) = watched.lock() {
-                let _ = child.kill();
+            if stopped.recv_timeout(deadline) == Err(RecvTimeoutError::Timeout)
+                && let Ok(child) = watched.lock()
+                && let Some(child) = child.as_ref()
+            {
+                kill_group(child);
+            }
+        });
+        // Bounded, so that a server talking to nobody waits as it would on the pipe.
+        let (line_out, lines) = mpsc::sync_channel(64);
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                if line_out.send(line).is_err() {
+                    break;
+                }
             }
         });
         let mut server = AppServer {
             child,
             stdin,
-            lines: BufReader::new(stdout).lines(),
+            lines,
+            deadline: until,
+            _stop_watchdog: stop_watchdog,
             next_id: 0,
         };
         server.call(
@@ -163,8 +198,22 @@ impl AppServer {
             serde_json::json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
         writeln!(self.stdin, "{line}")?;
         self.stdin.flush()?;
-        for line in self.lines.by_ref() {
-            let line = line?;
+        loop {
+            let left = self.deadline.saturating_duration_since(Instant::now());
+            let line = match self.lines.recv_timeout(left) {
+                Ok(line) => line?,
+                Err(RecvTimeoutError::Timeout) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!("codex app-server did not answer {method} inside its limit"),
+                    ));
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(io::Error::other(format!(
+                        "codex app-server closed without answering {method}"
+                    )));
+                }
+            };
             let Ok(message) = serde_json::from_str::<serde_json::Value>(&line) else {
                 continue;
             };
@@ -176,16 +225,15 @@ impl AppServer {
             }
             return Ok(message["result"].clone());
         }
-        Err(io::Error::other(format!(
-            "codex app-server closed without answering {method}"
-        )))
     }
 }
 
 impl Drop for AppServer {
     fn drop(&mut self) {
-        if let Ok(mut child) = self.child.lock() {
-            let _ = child.kill();
+        if let Ok(mut child) = self.child.lock()
+            && let Some(mut child) = child.take()
+        {
+            kill_group(&child);
             let _ = child.wait();
         }
     }
@@ -207,6 +255,40 @@ mod tests {
             "the install layout is both binaries in one directory"
         );
         assert_eq!(executable(&dir.path().join("missing")), None);
+    }
+
+    #[test]
+    fn a_server_that_stops_reading_cannot_hold_a_long_write_past_the_deadline() {
+        // A digest for a warm thread can be bigger than the pipe. A wedged server
+        // reads none of it, and the write blocks until the server is gone.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = r#"#!/usr/bin/env python3
+import json, sys, time
+msg = json.loads(sys.stdin.readline())
+print(json.dumps({"jsonrpc":"2.0","id":msg.get("id"),"result":{}}), flush=True)
+time.sleep(60)
+"#;
+        let fake = dir.path().join("codex");
+        crate::test_support::write_executable(&fake, script);
+        // Its first exec can take seconds on a loaded machine, and the deadline is
+        // what this test waits out.
+        let _ = Command::new(&fake)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        let mut server =
+            AppServer::start_with(fake.as_os_str(), Duration::from_secs(3)).expect("started");
+        let (answer, answered) = mpsc::channel();
+        std::thread::spawn(move || {
+            let big = "x".repeat(4 * 1024 * 1024);
+            let _ = answer.send(server.call("thread/inject_items", serde_json::json!(big)));
+        });
+
+        let said = answered
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the write was still blocked long past its deadline");
+
+        assert!(said.is_err(), "{said:?}");
     }
 
     #[test]

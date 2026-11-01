@@ -2093,3 +2093,86 @@ fn a_stalled_thread_is_left_alone_when_the_list_comes_from_thread_list() {
     let said = std::fs::read_to_string(&notes).unwrap_or_default();
     assert!(said.contains("it stalled at an earlier start"), "{said}");
 }
+
+/// One live thread with a rollout, for a stand-in to stall on.
+fn a_thread_to_ask(home: &Path) {
+    let daemon = start(home);
+    codex_thread_live(home, THREAD, "t0", "before");
+    stop(daemon);
+    rollout_of(home, THREAD, 0);
+}
+
+fn alive(pid: i32) -> bool {
+    // SAFETY: `kill` takes no pointers, and signal 0 is only a question.
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+fn pid_in(path: &Path) -> i32 {
+    std::fs::read_to_string(path)
+        .expect("the stand-in ran")
+        .trim()
+        .parse()
+        .expect("a pid")
+}
+
+#[test]
+fn a_wedged_app_server_behind_a_wrapper_does_not_hold_the_start_past_its_limit() {
+    // The shape of an npm `codex`: a wrapper spawning the real binary with stdout
+    // inherited. The wrapper dies and its child holds the read open for its whole life.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let (stub, fake) = stand_in(
+        "#!/bin/sh\n[ \"$1\" = warm ] && exit 0\nsleep 25 &\necho $! > \"$(dirname \"$0\")/child\"\nwait\n",
+    );
+    let warmed = Command::new(&fake).arg("warm").status().expect("warm");
+    assert!(warmed.success());
+    a_thread_to_ask(home);
+
+    let took = timed_start(home, &fake, "1000", &home.join("notes"));
+
+    assert!(
+        took < Duration::from_secs(20),
+        "a 1 s limit held the start for {took:?}"
+    );
+    // No process is left behind: the wrapper's child went with it.
+    let child = pid_in(&stub.path().join("child"));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while alive(child) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(!alive(child), "the wrapper's child was left behind");
+}
+
+#[test]
+fn something_outside_the_servers_group_does_not_hold_the_start_either() {
+    // Nothing can reach what started a session of its own, and it holds stdout open
+    // just the same, so the read cannot wait for the pipe to close.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let (_stub, fake) = stand_in(
+        r#"#!/usr/bin/env python3
+import os, sys, time
+if len(sys.argv) > 1 and sys.argv[1] == "warm":
+    sys.exit(0)
+if os.fork() == 0:
+    os.setsid()
+    time.sleep(15)
+    os._exit(0)
+time.sleep(60)
+"#,
+    );
+    let warmed = Command::new(&fake).arg("warm").status().expect("warm");
+    assert!(warmed.success());
+    a_thread_to_ask(home);
+
+    let took = timed_start(home, &fake, "1000", &home.join("notes"));
+
+    assert!(
+        took < Duration::from_secs(13),
+        "a 1 s limit held the start for {took:?}"
+    );
+    assert!(
+        home.join("cache/gap-since-codex").exists(),
+        "the range is held"
+    );
+}
