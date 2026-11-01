@@ -87,8 +87,12 @@ Anything that leaves goes through a program the person already runs:
   them as context. `CONBUS_BRIEFING=off` stops briefings. Hops and summaries
   happen only when triggered.
 - **Vendor CLIs and `gh`.** Quota comes from `agy models` and `agy -p /usage`,
-  `codex app-server` and Claude Code's status line. To decide a hop, conbus
-  asks `git` and `gh` about the folder's pull request. Each of these tools
+  `codex app-server` and Claude Code's status line. `agy` runs only inside
+  `conbus quota` — a command the person runs: nothing unattended calls it, and
+  `doctor`, `status` and hop show the cached reading instead. To decide a hop,
+  conbus asks `git` and `gh` about the folder's pull request. `conbus auth`
+  answers "whose sign-in page is this" and may run `gh auth status`,
+  `agy models` (never `-p`), `lsof` and `ps` to do so. Each of these tools
   uses its own login, which conbus never reads.
 - **Listeners.** The first is the Unix socket above. The second,
   `conbus hook --inference-listen`, is off unless started. It takes Anthropic
@@ -106,8 +110,10 @@ Anything that leaves goes through a program the person already runs:
 | `launchctl` (macOS), `systemctl --user` (Linux) | `install` and `uninstall` load and unload the recorder's service |
 | `security` | only with `encrypted_tools` on macOS: to create and read the sealing key |
 | `/bin/sh -c` | to forward the person's own status-line command; `doctor` uses it to check that a registered hook command starts |
-| `codex app-server`, `claude`, `agy`, and the CLI `conbus run` or `warm` starts | quota reads, hops, `summary`, `run`, `warm` |
-| `open`, `osascript`, `cursor -n` | opening the window where a hop lands |
+| `codex app-server`, `claude`, and the CLI `conbus run` or `warm` starts | quota reads, hops, `summary`, `run`, `warm` |
+| `agy` | only `conbus quota` and `conbus auth` — both commands a person runs; `auth` never runs `agy -p` |
+| `lsof`, `ps` | `conbus auth --url`: name the process behind a sign-in page's callback port |
+| `open`, `osascript`, `cursor -n` | opening the window where a hop lands; `conbus auth --open` opens the report page, on that flag only |
 | `git`, `gh` | deciding a hop |
 | `/usr/bin/unzip` | reading a Claude.ai export dropped in `chat-export/` |
 

@@ -6,6 +6,32 @@ the entry says so when it does.
 
 ## [Unreleased]
 
+### Added
+
+- `conbus auth` (experimental): which vendor needs a sign-in — conbus itself
+  never does, and recording needs none. `conbus auth --url URL` names whose
+  page opened, the process holding its callback port, and whether anything
+  conbus sits in that ancestry; `conbus auth --html` writes the same as one
+  self-contained page. Query values are never echoed.
+
+### Fixed
+
+- A drop log that reached its 4 MiB cap silently recorded nothing: a full
+  `drops.jsonl` is now rotated to `drops.1.jsonl` and a fresh file takes new
+  drops, so a capped log can no longer blind drop accounting. Summaries read
+  both generations and mark counts as floors once rotation has happened, and
+  `the hook payload names no session` now names the payload's field names
+  (never values) so the cause of a flood is visible. `scripts/canary.sh`
+  reads both generations, compares drop reasons by timestamp instead of line
+  offsets, and reports a capped non-rotating log as `UNCHECKED` rather than
+  passing.
+- `doctor`, `status` and `hop` no longer run `agy` at all: only `conbus
+  quota` — a command a person ran — asks the vendor, and caches the reading.
+  `doctor` and `status` show that cache with its age, mark readings over 90
+  minutes as not counted, and say `no reading yet` with none. A hop reads
+  the cache only. `scripts/check-no-browser.sh` now fails if an unattended
+  run creates the vendor's own directory at all.
+
 ## [1.0.0-rc.3] — 2026-11-01
 
 ### Fixed

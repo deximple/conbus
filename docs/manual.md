@@ -469,7 +469,7 @@ conbus quota
 | Leg | Where the number comes from |
 | --- | --- |
 | Codex | Codex's own app-server (`account/rateLimits/read`), for the whole account, including Codex.app |
-| agy | `agy -p /usage`, once `agy models` shows a login |
+| agy | `agy -p /usage`, run only by `conbus quota` and only once `agy models` shows a login; `doctor` and `status` show the cached reading |
 | Claude Code | the `rate_limits` Claude Code gives its StatusLine command |
 | Cursor, grok, opencode | nothing yet: their hooks carry no remaining-quota field |
 
@@ -479,12 +479,14 @@ and SDK sessions never run a StatusLine, so a reading can be days old; after
 it is and when the StatusLine last ran. conbus does not read Claude's
 credentials to ask for the number another way.
 
-**agy is read only when it is signed in.** With no login, `agy -p` opens a
-browser tab, and no time limit prevents that, so conbus runs `agy models` first.
-If that reports no login, `quota`, `doctor` and `status` say `AUTH_REQUIRED`; if
-it fails another way or runs out of time, they say `SKIP`. Either way `agy -p`
-does not run and there is no reading, and a hop goes on without one. To sign in,
-run `agy` in a terminal.
+**agy is asked only by `conbus quota`, and only when it is signed in.** With no
+login, `agy -p` opens a browser tab, and no time limit prevents that — so
+nothing conbus runs on its own ever calls `agy`. `conbus quota` is a command a
+person ran: it runs `agy models` first, asks `agy -p /usage` only on a login,
+and caches the reading. `doctor` and `status` show that cache with its age —
+past 90 minutes it is still shown but not counted; with none they say `no
+reading yet`. A hop reads the cache only and goes on without a reading. To sign
+in, run `agy` in a terminal.
 
 ---
 
