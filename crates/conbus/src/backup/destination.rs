@@ -28,10 +28,10 @@ const CLOUD_FOLDERS: &[&[&str]] = &[
 const ONEDRIVE: &str = "OneDrive";
 
 /// What a run needs free beyond the bytes themselves. A clone still costs an
-/// inode and its extent records: 1,468 clones of the real log moved `df` by about
-/// 28 MiB, against noise of the same size. A copy can round each file up to a
-/// large exFAT cluster. The manifest is rewritten whole. And on the log's own
-/// disk the recorder needs room for what it writes next.
+/// inode and its extent records: under 1 KiB each on an APFS volume with nothing
+/// else writing, so this is margin. A copy can round each file up to a large
+/// exFAT cluster. The manifest is rewritten whole. And on the log's own disk the
+/// recorder needs room for what it writes next.
 const CLONE_COST: u64 = 64 * 1024;
 const COPY_SLACK: u64 = 256 * 1024;
 const MANIFEST_ROW: u64 = 256;
