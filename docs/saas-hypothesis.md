@@ -65,6 +65,31 @@ something, and money that has moved. Until then the product is the local tool,
 and the README keeps its sentence — "conbus is a local tool. There is no hosted
 bus, account or price." — because it describes what exists.
 
+**Revision, 2026-10-14 — what was unlocked.** The operator works alone, and
+twelve live interviews by 2026-11-04 are not going to happen. The constraints
+were sorted into two kinds. The legal and structural ones stay: no vendor
+token, no changed binary, no pooling across people, no trademark, no write
+into a thread the person opened. The design choices that only narrowed the
+market were opened:
+
+- **Validation without interviews.** The problem gate is now an asynchronous
+  evidence ladder (`docs/saas-strategy.md`, "Gates"). The money gate does not
+  change: only money that moves counts.
+- **A landing page and a waitlist may be hosted now.** The bus, the log and
+  the usage rows still may not, until the money gate passes.
+- **Linux**, so unattended runs on CI and servers are in reach.
+- **Policy**: local `PreToolUse` decisions, off by default, which turns the
+  recorder from a mirror into a control. That reaches a governance buyer
+  without capturing content.
+- **Tokens** where a vendor's hook carries them, as counts, into the rows and
+  the pipe (RFD 0002, amended).
+- **A person's own accounts** may each be a profile, switched by hand only.
+  Anthropic documents `CLAUDE_CONFIG_DIR` "for running multiple accounts side
+  by side"; its consumer terms forbid sharing credentials with others and
+  circumventing protective measures, so no limit signal ever switches one.
+- **Enterprise content capture** is allowed as a self-hosted, opt-in tier in
+  the documents only. Nothing is built for it until a buyer asks.
+
 ## Fall back
 
 - To **Choice 1** if a gate fails, if the value gate has not passed by

@@ -554,6 +554,15 @@ Next, each its own PR with a failing test first:
 3. After V1 (2026-11-04): the screen or the pipe, whichever the interviews'
    "where should this show up?" answers. Nothing is hosted before the gates,
    and no sync code is written before RFD 0002 and RFD 0003 are accepted.
+   **Superseded 2026-10-14** by the evidence ladder (E1–E3, then V2) in
+   `docs/saas-strategy.md`; the sync rule still holds.
+4. The unlock of 2026-10-14 (`docs/saas-hypothesis.md`, "Revision"), each its
+   own PR: tokens from Cursor's hook into the rows and the pipe (RFD 0002
+   amended); `conbus policy` and local `PreToolUse` decisions; a Linux build
+   with a systemd user unit; Claude Code profiles switched by hand
+   (`CLAUDE_CONFIG_DIR`); the landing page and waitlist under `site/`; a
+   Copilot CLI adapter once the operator has installed it and a live payload
+   is captured.
 
 Waiting on the operator: the weekly hour budget. A model digest is `conbus
 summary --bus-id`; hop-path model calls stay zero.

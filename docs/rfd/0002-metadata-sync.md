@@ -55,6 +55,7 @@ workspace.
 | `briefings`, `hops` | count | Briefings handed over; `routed` records |
 | `repeated` | count | Second deliveries of a report already counted — a data-quality signal |
 | `recovered` | count | Records counted in this row that gap fill or backfill recovered rather than a hook saw — a data-quality signal |
+| `tokens_input`, `tokens_output`, `tokens_cache_read`, `tokens_cache_write` | count | Token sums a vendor's own hook reported for a turn, today Cursor's `afterAgentResponse` only; zero where a harness reports none. Amendment of 2026-10-14 |
 
 The envelope around one device-day adds `device` (a random id minted when the
 machine joins), `schema` (this RFD's version, `1`), `day_closed` (the UTC day
@@ -210,6 +211,17 @@ never-sent list applies, and every field is in the table below.
 | `hops` | `conbus.hops` | Sum | `{hop}` | |
 | `repeated` | `conbus.repeated` | Sum | `{record}` | |
 | `recovered` | `conbus.recovered` | Sum | `{record}` | |
+| `tokens_input` | `conbus.tokens` | Sum | `{token}` | `type` = `input` |
+| `tokens_output` | `conbus.tokens` | Sum | `{token}` | `type` = `output` |
+| `tokens_cache_read` | `conbus.tokens` | Sum | `{token}` | `type` = `cacheRead` |
+| `tokens_cache_write` | `conbus.tokens` | Sum | `{token}` | `type` = `cacheCreation` |
+
+`type` takes the four values Claude Code's own `claude_code.token.usage`
+counter uses (`input`, `output`, `cacheRead`, `cacheCreation`; `input`
+excludes cache tokens), so one dashboard query can sum both. Claude Code and Codex token and
+cost counters are not carried here: Claude Code exports them itself
+(`CLAUDE_CODE_ENABLE_TELEMETRY=1` and an OTLP endpoint, with its prompt and
+tool-detail gates left off), into the same collector.
 
 Checked against a real collector on 2026-09-24: the OpenTelemetry Collector
 0.161.0 (core distribution, darwin arm64), with its OTLP/HTTP receiver on
@@ -299,9 +311,10 @@ the person's.
   `other`. Needs a pilot to show whether `other` is too coarse.
 - **Harness versions.** Useful for "this vendor release broke hooks", and a
   fingerprint at small team sizes. Needs a threshold rule.
-- **Cost and tokens.** Not in the log today. If the recorder later receives a
-  vendor's OpenTelemetry locally, per-row token and cost sums are counts too, and
-  would be added here by amendment — never per request, never with the prompt.
+- **Cost and tokens.** Tokens from a vendor's hook were added by the amendment
+  of 2026-10-14 (the table above), as day sums — never per request, never with
+  the prompt. Cost in dollars is still deferred: no hook carries it, and Claude
+  Code's own telemetry already does.
 - **Quota readings.** A percentage used and a reset time per account window are
   counts; which account they belong to is not. Needs a design that never keys a
   reading to a credential. "Blocked time" waits for this.
