@@ -103,7 +103,7 @@ Anything that leaves goes through a program the person already runs:
   port and, as the URL's claim, a `client` name that is short and printable. An
   address on the command line is in shell history, so `conbus auth --url -` reads it
   from stdin, and the command warns otherwise. `--html` writes a `0600` page with a
-  policy that lets it load nothing and reach nothing; vendor text in it is escaped.
+  policy that lets it load nothing and connect nowhere; vendor text in it is escaped.
 - **Listeners.** The first is the Unix socket above. The second,
   `conbus hook --inference-listen`, is off unless started. It takes Anthropic
   Inference-hook frames over plain HTTP on `127.0.0.1:8787`, always answers
