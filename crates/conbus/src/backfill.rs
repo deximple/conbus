@@ -381,6 +381,60 @@ pub struct GapTiming {
     pub codex_unknown_files: u64,
 }
 
+/// What a start brings to a fill that the manual `backfill` path, with no socket
+/// to free, does not need: a deadline, somewhere to say how it went, and how far
+/// an earlier cut got.
+struct StartFill<'a> {
+    timing: &'a mut GapTiming,
+    deadline: Instant,
+    read: &'a mut ReadSoFar,
+}
+
+/// The sources a range has read, each with the state it was read in, kept in
+/// `cache/gap-read` while a range is held.
+///
+/// A budget cut used to freeze the range and nothing else, so sources in a fixed
+/// order meant the next start read the same prefix, ran out at the same place,
+/// and never reached what came after. An entry stays true whatever range it was
+/// noted in: everything missing from a source in that state has been written.
+#[derive(Default)]
+struct ReadSoFar(HashMap<String, i64>);
+
+impl ReadSoFar {
+    fn load(path: &Path) -> Self {
+        let text = fs::read_to_string(path).unwrap_or_default();
+        ReadSoFar(
+            text.lines()
+                .filter_map(|line| {
+                    let (state, source) = line.split_once('\t')?;
+                    Some((source.to_string(), state.parse().ok()?))
+                })
+                .collect(),
+        )
+    }
+
+    fn save(&self, paths: &Paths, path: &Path) {
+        let mut text = String::new();
+        for (source, state) in &self.0 {
+            text.push_str(&format!("{state}\t{source}\n"));
+        }
+        write_cache_file(paths, path, &text);
+    }
+
+    fn knows(&self, source: &str) -> bool {
+        self.0.contains_key(source)
+    }
+
+    /// Whether this source has been read in exactly this state.
+    fn is_current(&self, source: &str, state: i64) -> bool {
+        self.0.get(source) == Some(&state)
+    }
+
+    fn note(&mut self, source: &str, state: i64) {
+        self.0.insert(source.to_string(), state);
+    }
+}
+
 /// How long a start may spend filling gaps before it stops and serves.
 /// Overridable for tests; the point is that a wedged vendor call or a giant
 /// transcript never holds the socket closed past a bound.
@@ -441,6 +495,8 @@ fn append_gaps_at_start_in(
         .map(|newest| newest - GAP_MARGIN_SECS)
         .map(|fresh| remembered.map_or(fresh, |old| old.min(fresh)));
     let codex_since = since.map(|since| codex_remembered.map_or(since, |old| old.min(since)));
+    let read_marker = paths.cache_dir().join("gap-read");
+    let mut read = ReadSoFar::load(&read_marker);
     if let Some(since) = since {
         write_since(paths, &marker, since);
     }
@@ -455,18 +511,21 @@ fn append_gaps_at_start_in(
             let walk = Instant::now();
             let files = session_files(&transcripts)?;
             timing.claude_walk_ms = elapsed_ms(walk);
-            let read = Instant::now();
+            let started = Instant::now();
             n += append_gaps_files(
                 &files,
                 held,
                 Some(&mut *log),
                 since,
                 &mut spool,
-                &mut Some(&mut timing),
-                Some(deadline),
+                Some(StartFill {
+                    timing: &mut timing,
+                    deadline,
+                    read: &mut read,
+                }),
             )?
             .gap_records;
-            timing.claude_read_ms = elapsed_ms(read);
+            timing.claude_read_ms = elapsed_ms(started);
         }
     }
     // Codex.app burns the same account and never hits CLI hooks. Official
@@ -484,8 +543,11 @@ fn append_gaps_at_start_in(
             Some(&mut *log),
             codex_since,
             &mut spool,
-            &mut timing,
-            deadline,
+            StartFill {
+                timing: &mut timing,
+                deadline,
+                read: &mut read,
+            },
             server_limit,
         )?
         .records;
@@ -501,6 +563,11 @@ fn append_gaps_at_start_in(
     if timing.codex_deferred.is_none() {
         let _ = std::fs::remove_file(&codex_marker);
     }
+    if timing.budget_exhausted || timing.codex_deferred.is_some() {
+        read.save(paths, &read_marker);
+    } else {
+        let _ = std::fs::remove_file(&read_marker);
+    }
     Ok((n, timing))
 }
 
@@ -514,15 +581,19 @@ fn read_since(marker: &Path) -> Option<i64> {
     Some(when.seconds_since(Timestamp::from_unix_seconds(0)?))
 }
 
-/// Hold a deferred range in a marker, whole or not at all. It costs a repeat of
-/// the range at worst, so a failure here is not worth more than that.
+/// Hold a deferred range in a marker. It costs a repeat of the range at worst, so
+/// a failure here is not worth more than that.
 fn write_since(paths: &Paths, marker: &Path, since: i64) {
-    let Some(when) = Timestamp::from_unix_seconds(since) else {
-        return;
-    };
+    if let Some(when) = Timestamp::from_unix_seconds(since) {
+        write_cache_file(paths, marker, &when.to_string());
+    }
+}
+
+/// Write a file under `cache/`, whole or not at all.
+fn write_cache_file(paths: &Paths, target: &Path, text: &str) {
     let temp = paths
         .cache_dir()
-        .join(format!(".gap-since.{}.tmp", std::process::id()));
+        .join(format!(".gap.{}.tmp", std::process::id()));
     let _ = fs::create_dir_all(paths.cache_dir());
     #[cfg(unix)]
     {
@@ -531,8 +602,8 @@ fn write_since(paths: &Paths, marker: &Path, since: i64) {
         options.write(true).create_new(true).mode(0o600);
         if options
             .open(&temp)
-            .and_then(|mut f| std::io::Write::write_all(&mut f, when.to_string().as_bytes()))
-            .and_then(|_| fs::rename(&temp, marker))
+            .and_then(|mut f| std::io::Write::write_all(&mut f, text.as_bytes()))
+            .and_then(|_| fs::rename(&temp, target))
             .is_err()
         {
             let _ = fs::remove_file(&temp);
@@ -733,6 +804,12 @@ fn ingest_chat_exports_filtered(
     Ok(filled)
 }
 
+/// The state of a thread with no rollout on disk to give it one.
+const NO_STATE: i64 = i64::MIN;
+
+/// The state of a thread the app-server stopped answering on. Never current.
+const FAILED: i64 = i64::MIN + 1;
+
 /// What the Codex pass found, whether or not it wrote any of it.
 #[derive(Default, Debug)]
 struct CodexFill {
@@ -756,10 +833,14 @@ fn fill_live_codex_gaps(
     mut log: Option<&mut SegmentLog>,
     since: Option<i64>,
     spool: &mut Spool,
-    timing: &mut GapTiming,
-    deadline: Instant,
+    start: StartFill<'_>,
     server_limit: std::time::Duration,
 ) -> io::Result<CodexFill> {
+    let StartFill {
+        timing,
+        deadline,
+        read,
+    } = start;
     let mut fill = CodexFill::default();
     let known = known_from(held.iter());
     if known.live_codex.is_empty() {
@@ -777,6 +858,9 @@ fn fill_live_codex_gaps(
     timing.codex_walk_ms = elapsed_ms(walk);
     timing.codex_unknown_files = unknown;
     timing.codex_layout_unknown = recent.is_none() && unknown > 0;
+    if let Some(recent) = recent.as_mut() {
+        unread_first(recent, read);
+    }
     if recent.as_ref().is_some_and(|recent| recent.is_empty()) {
         return Ok(fill);
     }
@@ -805,24 +889,36 @@ fn fill_live_codex_gaps(
         let list = Instant::now();
         recent = since
             .and_then(|since| threads_updated_since(&mut server, since, timing))
-            .map(|set| set.into_iter().collect());
+            .map(|set| set.into_iter().map(|id| (id, NO_STATE)).collect());
         timing.thread_list_ms = elapsed_ms(list);
     }
-    let sessions: Vec<BusId> = match recent {
+    let mut sessions: Vec<(BusId, i64)> = match recent {
         Some(asked) => asked,
-        None => known.live_codex.iter().copied().collect(),
+        None => known
+            .live_codex
+            .iter()
+            .map(|session| (*session, NO_STATE))
+            .collect(),
     };
-    let names: Vec<(String, BusId)> = sessions
+    unread_first(&mut sessions, read);
+    let names: Vec<(String, BusId, i64)> = sessions
         .iter()
-        .filter_map(|session| Some((session.to_string(), *known.live_codex_bus.get(session)?)))
+        .filter_map(|(session, state)| {
+            Some((
+                session.to_string(),
+                *known.live_codex_bus.get(session)?,
+                *state,
+            ))
+        })
         .collect();
     let targets: Vec<(&str, BusId)> = names
         .iter()
-        .map(|(name, bus)| (name.as_str(), *bus))
+        .map(|(name, bus, _)| (name.as_str(), *bus))
         .collect();
     let grouped = records_of(held, &targets);
     let turns_at = Instant::now();
-    for &(name, bus_id) in &targets {
+    for (name, bus_id, state) in &names {
+        let (name, bus_id) = (name.as_str(), *bus_id);
         if Instant::now() >= deadline {
             timing.budget_exhausted = true;
             timing.codex_deferred = Some("the start's budget ran out".to_string());
@@ -840,7 +936,9 @@ fn fill_live_codex_gaps(
                     fill.refused += 1;
                     continue;
                 }
-                // Nothing behind it will answer either.
+                // Nothing behind it will answer either. It goes behind the threads
+                // not yet asked next time, or it stops them being reached at all.
+                read.note(name, FAILED);
                 timing.codex_deferred = Some(why);
                 break;
             }
@@ -867,9 +965,17 @@ fn fill_live_codex_gaps(
                 None => fill.records += 1,
             }
         }
+        read.note(name, *state);
     }
     timing.list_turns_ms = elapsed_ms(turns_at);
     Ok(fill)
+}
+
+/// What a held range has read in this state is done. What it has not read at all
+/// goes first, or the threads a budget reaches are the same ones each start.
+fn unread_first(threads: &mut Vec<(BusId, i64)>, read: &ReadSoFar) {
+    threads.retain(|(thread, state)| !read.is_current(&thread.to_string(), *state));
+    threads.sort_by_key(|(thread, _)| read.knows(&thread.to_string()));
 }
 
 /// Threads `thread/list` says were updated at or after `since`, or `None`
@@ -926,7 +1032,7 @@ fn codex_threads_touched_since(
     sessions: &HashSet<BusId>,
     since: Option<i64>,
     unknown: &mut u64,
-) -> Option<Vec<BusId>> {
+) -> Option<Vec<(BusId, i64)>> {
     let since = since.unwrap_or(i64::MIN);
     let home = std::env::var_os("CODEX_HOME")
         .map(PathBuf::from)
@@ -939,7 +1045,7 @@ fn codex_threads_touched_since_in(
     sessions: &HashSet<BusId>,
     since: i64,
     unknown: &mut u64,
-) -> Option<Vec<BusId>> {
+) -> Option<Vec<(BusId, i64)>> {
     let mut touched = HashMap::new();
     let sessions_dir = codex_home.join("sessions");
     for dir in [sessions_dir.clone(), codex_home.join("archived_sessions")] {
@@ -954,14 +1060,14 @@ fn codex_threads_touched_since_in(
     if touched.is_empty() && !sessions_dir.is_dir() {
         return None;
     }
-    let mut asked: Vec<BusId> = sessions
+    let mut asked: Vec<(BusId, i64)> = sessions
         .iter()
-        .filter(|session| touched.get(*session).is_some_and(|mtime| *mtime >= since))
-        .copied()
+        .filter_map(|session| Some((*session, *touched.get(session)?)))
+        .filter(|(_, mtime)| *mtime >= since)
         .collect();
     // Most recently touched first: a bounded start fills the threads most
     // likely to hold missed turns before older ones.
-    asked.sort_by_key(|session| std::cmp::Reverse(touched[session]));
+    asked.sort_by_key(|(_, mtime)| std::cmp::Reverse(*mtime));
     Some(asked)
 }
 
@@ -1039,8 +1145,11 @@ pub fn fill_gaps(
             log.as_mut(),
             None,
             &mut Spool::new(paths.spool_dir()),
-            &mut timing,
-            Instant::now() + CODEX_DEADLINE,
+            StartFill {
+                timing: &mut timing,
+                deadline: Instant::now() + CODEX_DEADLINE,
+                read: &mut ReadSoFar::default(),
+            },
             CODEX_DEADLINE,
         )?;
         outcome.gap_codex_threads = fill.threads;
@@ -1304,23 +1413,19 @@ fn append_gaps(
         log,
         since,
         &mut Spool::new(spool.to_path_buf()),
-        &mut None,
         None,
     )
 }
 
 /// The per-file loop of `append_gaps`, lifted out of the walk so the start
 /// path can time each half separately and stop when its budget runs out.
-/// `timing` and `deadline` are the start path's; the manual `backfill` path
-/// passes none of either — an explicit backfill has no socket to free.
 fn append_gaps_files(
     files: &[PathBuf],
     held: &[Record],
     mut log: Option<&mut SegmentLog>,
     since: Option<i64>,
     spool: &mut Spool,
-    timing: &mut Option<&mut GapTiming>,
-    deadline: Option<Instant>,
+    mut start: Option<StartFill<'_>>,
 ) -> io::Result<Outcome> {
     let known = known_from(held.iter());
     let mut outcome = Outcome::default();
@@ -1344,22 +1449,31 @@ fn append_gaps_files(
     let mut sessions = HashSet::new();
     to_read.retain(|(_, stem, _)| sessions.insert(*stem));
     to_read.sort_by_key(|(file, ..)| *file);
+    // What a cut range has read at this length is done, and what it has not read
+    // at all goes first, or a file that keeps growing uses every budget up.
+    if let Some(read) = start.as_ref().map(|start| &*start.read) {
+        to_read.retain(|(file, ..)| {
+            !fs::metadata(file)
+                .is_ok_and(|meta| read.is_current(&file.to_string_lossy(), meta.len() as i64))
+        });
+        to_read.sort_by_key(|(file, ..)| read.knows(&file.to_string_lossy()));
+    }
     let targets: Vec<(&str, BusId)> = to_read.iter().map(|&(_, stem, bus)| (stem, bus)).collect();
     let grouped = records_of(held, &targets);
     for (file, stem, live_bus) in to_read {
-        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-            if let Some(t) = timing.as_deref_mut() {
-                t.budget_exhausted = true;
-            }
+        if let Some(start) = start.as_mut()
+            && Instant::now() >= start.deadline
+        {
+            start.timing.budget_exhausted = true;
             break;
         }
         let Ok(text) = fs::read_to_string(file) else {
             *outcome.unread.entry("unreadable file".into()).or_default() += 1;
             continue;
         };
-        if let Some(t) = timing.as_deref_mut() {
-            t.claude_files += 1;
-            t.claude_bytes += text.len() as u64;
+        if let Some(start) = start.as_mut() {
+            start.timing.claude_files += 1;
+            start.timing.claude_bytes += text.len() as u64;
         }
         let recovered = parse_claude_transcript(&text, stem, live_bus);
         for (reason, count) in &recovered.skipped {
@@ -1372,19 +1486,21 @@ fn append_gaps_files(
             live_bus,
             recovered,
         );
-        if missing.is_empty() {
-            continue;
-        }
-        outcome.gap_sessions += 1;
-        outcome.gap_turns += missing
-            .iter()
-            .filter(|e| matches!(e.event, Event::TurnStarted { .. }))
-            .count() as u64;
-        outcome.gap_records += missing.len() as u64;
-        if let Some(log) = log.as_deref_mut() {
-            for entry in missing {
-                log.append(entry)?;
+        if !missing.is_empty() {
+            outcome.gap_sessions += 1;
+            outcome.gap_turns += missing
+                .iter()
+                .filter(|e| matches!(e.event, Event::TurnStarted { .. }))
+                .count() as u64;
+            outcome.gap_records += missing.len() as u64;
+            if let Some(log) = log.as_deref_mut() {
+                for entry in missing {
+                    log.append(entry)?;
+                }
             }
+        }
+        if let Some(start) = start.as_mut() {
+            start.read.note(&file.to_string_lossy(), text.len() as i64);
         }
     }
     Ok(outcome)
@@ -2776,13 +2892,13 @@ mod tests {
         let asked = codex_threads_touched_since_in(home.path(), &bound, 1_500, &mut unknown)
             .expect("sessions dir read");
         // Asked about in most-recently-touched order.
-        assert_eq!(asked, vec![gone, fresh]);
+        assert_eq!(asked, vec![(gone, 3_000), (fresh, 2_000)]);
         // A thread with no file anywhere cannot be hydrated by the
         // app-server — it is out rather than asked.
         bound.insert(BusId::mint());
         let asked = codex_threads_touched_since_in(home.path(), &bound, 1_500, &mut unknown)
             .expect("sessions dir read");
-        assert_eq!(asked, vec![gone, fresh]);
+        assert_eq!(asked, vec![(gone, 3_000), (fresh, 2_000)]);
     }
 
     /// A transcript the log missed while `home/.claude/projects` holds it.
@@ -2990,6 +3106,167 @@ mod tests {
             written.seconds_since(epoch),
             1_800_000_000 - GAP_MARGIN_SECS,
             "the same margin the fill keeps"
+        );
+    }
+
+    /// A transcript of one user line `filler` lines of assistant text long, for
+    /// a read that takes longer than a tiny budget.
+    fn a_big_transcript(project: &Path, session: &str, filler: usize) {
+        let padding = "x".repeat(1024);
+        let mut big = format!(
+            "{{\"type\":\"user\",\"sessionId\":\"{session}\",\"timestamp\":\"2026-11-01T00:00:00.000Z\",\
+             \"promptId\":\"seen\",\"message\":{{\"role\":\"user\",\"content\":\"a live prompt the transcript does not hold\"}}}}\n"
+        );
+        for _ in 0..filler {
+            big.push_str(&format!(
+                "{{\"type\":\"assistant\",\"sessionId\":\"{session}\",\"timestamp\":\"2026-11-01T00:00:01.000Z\",\
+                 \"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"{padding}\"}}]}}}}\n"
+            ));
+        }
+        fs::write(project.join(format!("{session}.jsonl")), big).expect("big");
+    }
+
+    fn a_missed_turn(project: &Path, session: &str, words: &str) {
+        fs::write(
+            project.join(format!("{session}.jsonl")),
+            format!(
+                "{{\"type\":\"user\",\"sessionId\":\"{session}\",\"timestamp\":\"2026-11-01T00:00:00.000Z\",\
+                 \"promptId\":\"missed\",\"message\":{{\"role\":\"user\",\"content\":\"{words}\"}}}}\n"
+            ),
+        )
+        .expect("small");
+    }
+
+    fn holds_prompt(machine: &Machine, words: &str) -> bool {
+        held(machine).iter().any(|record| {
+            matches!(&record.event, Event::TurnStarted { prompt, .. }
+                if prompt_text(prompt).as_deref() == Some(words))
+        })
+    }
+
+    #[test]
+    fn a_budget_the_first_file_uses_up_does_not_starve_the_last_for_ever() {
+        let machine = machine();
+        let home = tempfile::tempdir().expect("tempdir");
+        let first = "aaaaaaaa-0000-4000-8000-000000000001";
+        let last = "ffffffff-0000-4000-8000-000000000002";
+        let project = home.path().join(".claude/projects/-repo");
+        fs::create_dir_all(&project).expect("dir");
+        a_big_transcript(&project, first, 60_000);
+        a_missed_turn(&project, last, "the turn nobody reaches");
+        let now = conbus_core::clock::Timestamp::now();
+        live_at(&machine, now, first);
+        live_at(&machine, now, last);
+        let mut log =
+            SegmentLog::open(machine.paths.log_dir(), Retention::default()).expect("open");
+        let budget = std::time::Duration::from_millis(100);
+
+        for _ in 0..4 {
+            let records = held(&machine);
+            let _ = append_gaps_at_start_in(
+                &machine.paths,
+                &records,
+                &mut log,
+                budget,
+                Some(home.path()),
+            )
+            .expect("fill");
+        }
+
+        assert!(
+            holds_prompt(&machine, "the turn nobody reaches"),
+            "four starts in, the last file has never been read"
+        );
+        assert!(
+            !machine.paths.cache_dir().join("gap-since").exists(),
+            "the range is done"
+        );
+        assert!(
+            !machine.paths.cache_dir().join("gap-read").exists(),
+            "and so is the record of how far it got"
+        );
+    }
+
+    #[test]
+    fn a_file_that_grew_after_it_was_read_is_read_again_behind_the_unread_ones() {
+        let machine = machine();
+        let home = tempfile::tempdir().expect("tempdir");
+        let first = "aaaaaaaa-0000-4000-8000-000000000001";
+        let last = "ffffffff-0000-4000-8000-000000000002";
+        let project = home.path().join(".claude/projects/-repo");
+        fs::create_dir_all(&project).expect("dir");
+        a_big_transcript(&project, first, 60_000);
+        a_missed_turn(&project, last, "the turn nobody reaches");
+        let now = conbus_core::clock::Timestamp::now();
+        live_at(&machine, now, first);
+        live_at(&machine, now, last);
+        let mut log =
+            SegmentLog::open(machine.paths.log_dir(), Retention::default()).expect("open");
+        let budget = std::time::Duration::from_millis(100);
+        let records = held(&machine);
+        let (_, timing) = append_gaps_at_start_in(
+            &machine.paths,
+            &records,
+            &mut log,
+            budget,
+            Some(home.path()),
+        )
+        .expect("the cut");
+        assert!(timing.budget_exhausted, "the big file used the budget up");
+        assert!(!holds_prompt(&machine, "the turn nobody reaches"));
+
+        // The big file changes before every start, and a read of it would use that
+        // budget up as well. So a start that read it first would never reach the
+        // other file, and a slow machine only costs another try.
+        let grow = || {
+            let mut grown = fs::OpenOptions::new()
+                .append(true)
+                .open(project.join(format!("{first}.jsonl")))
+                .expect("open");
+            std::io::Write::write_all(
+                &mut grown,
+                format!(
+                    "{{\"type\":\"user\",\"sessionId\":\"{first}\",\"timestamp\":\"2026-11-01T00:01:00.000Z\",\
+                     \"promptId\":\"{}\",\"message\":{{\"role\":\"user\",\"content\":\"it grew\"}}}}\n",
+                    BusId::mint()
+                )
+                .as_bytes(),
+            )
+            .expect("grow");
+        };
+        for _ in 0..6 {
+            grow();
+            let records = held(&machine);
+            let _ = append_gaps_at_start_in(
+                &machine.paths,
+                &records,
+                &mut log,
+                budget,
+                Some(home.path()),
+            )
+            .expect("the next start");
+            if holds_prompt(&machine, "the turn nobody reaches") {
+                break;
+            }
+        }
+        assert!(
+            holds_prompt(&machine, "the turn nobody reaches"),
+            "what the range has not read at all goes first"
+        );
+
+        // Given the time, the change is read in the end.
+        let records = held(&machine);
+        let _ = append_gaps_at_start_in(
+            &machine.paths,
+            &records,
+            &mut log,
+            std::time::Duration::from_secs(60),
+            Some(home.path()),
+        )
+        .expect("the one after");
+        assert!(
+            holds_prompt(&machine, "it grew"),
+            "a change is read in the end"
         );
     }
 
