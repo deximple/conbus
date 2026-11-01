@@ -1220,25 +1220,18 @@ pub fn doctor(paths: &Paths) -> io::Result<()> {
         .unwrap_or(0);
     let probe_t = std::thread::spawn(move || {
         let started = std::time::Instant::now();
-        let probe = |read: &dyn Fn() -> std::io::Result<crate::quota::Quota>| {
-            let started = std::time::Instant::now();
-            match read() {
-                Ok(quota) => crate::quota::describe(&quota, now_probe),
-                Err(err) if crate::quota::agy_not_asked(&err) => format!("unavailable — {err}"),
-                // A probe that ran its whole deadline out says so;
-                // one that failed fast names why.
-                Err(err) if started.elapsed() >= std::time::Duration::from_secs(2) => {
-                    let _ = err;
-                    "did not answer within 2s".to_string()
-                }
-                Err(err) => format!("unavailable — {err}"),
+        let read = || crate::quota::read_with(std::time::Duration::from_secs(2));
+        let line = match read() {
+            Ok(quota) => crate::quota::describe(&quota, now_probe),
+            // A probe that ran its whole deadline out says so;
+            // one that failed fast names why.
+            Err(err) if started.elapsed() >= std::time::Duration::from_secs(2) => {
+                let _ = err;
+                "did not answer within 2s".to_string()
             }
+            Err(err) => format!("unavailable — {err}"),
         };
-        (
-            probe(&|| crate::quota::read_with(std::time::Duration::from_secs(2))),
-            probe(&|| crate::quota::read_agy_with(std::time::Duration::from_secs(2))),
-            started.elapsed(),
-        )
+        (line, started.elapsed())
     });
     println!("build     {}", crate::build_info::describe());
     println!(
@@ -1444,7 +1437,7 @@ pub fn doctor(paths: &Paths) -> io::Result<()> {
                 route,
             )
         });
-    let (codex_quota, agy_quota, probe_elapsed) = probe_t.join().expect("probes");
+    let (codex_quota, probe_elapsed) = probe_t.join().expect("probes");
     doctor_mark("probe quota", probe_elapsed);
     report_twins(twins_summary);
     report_nameless(nameless_sessions);
@@ -1470,7 +1463,9 @@ pub fn doctor(paths: &Paths) -> io::Result<()> {
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     println!("quota     codex {codex_quota}");
-    println!("quota     agy {agy_quota}");
+    // agy is the cache only: `conbus quota` fills it. An unattended probe
+    // here is what opened a vendor OAuth tab on a logged-out account.
+    println!("quota     agy {}", crate::quota::describe_agy(paths, now));
     println!(
         "quota     claude {}",
         crate::quota::describe_claude(paths, now)
@@ -1626,10 +1621,7 @@ pub fn status(paths: &Paths) -> io::Result<()> {
         Ok(quota) => println!("quota     codex {}", crate::quota::describe(&quota, now)),
         Err(err) => println!("quota     codex unavailable — {err}"),
     }
-    match crate::quota::read_agy() {
-        Ok(quota) => println!("quota     agy {}", crate::quota::describe(&quota, now)),
-        Err(err) => println!("quota     agy unavailable — {err}"),
-    }
+    println!("quota     agy {}", crate::quota::describe_agy(paths, now));
     println!(
         "quota     claude {}",
         crate::quota::describe_claude(paths, now)
