@@ -681,6 +681,7 @@ systemctl --user disable --now sh.conbus.daemon.service   # Linux
 
 conbus backup --verify --to "/Volumes/My Disk"
 mkdir -p -m 700 ~/.conbus/log
+find ~/.conbus/log -name 'segment-*.jsonl' -empty -delete
 cp -n "/Volumes/My Disk/conbus-backup/log/"*.jsonl ~/.conbus/log/
 chmod 600 ~/.conbus/log/*.jsonl
 rm -rf ~/.conbus/cache/meta
@@ -688,9 +689,11 @@ rm -rf ~/.conbus/cache/meta
 conbus install --apply     # 레코더를 다시 켭니다
 ```
 
-`cp -n`은 파일을 건너뛸 때 0이 아닌 값으로 끝나거나 경고를 낼 수 있습니다. 여기서는
-실패가 아닙니다. `cache/meta`를 지우는 이유는 이 캐시가 세그먼트를 이름과 길이만 보고
-믿기 때문이며, 다음 읽기에서 다시 만들어집니다.
+`find`는 빈 세그먼트를 지웁니다. 빈 세그먼트에는 레코드가 없습니다. `conbus doctor`는
+빈 로그 폴더에 빈 세그먼트를 하나 만들고, `cp -n`은 진짜 파일 대신 그것을 그대로
+둡니다. `cp -n`은 파일을 건너뛸 때 0이 아닌 값으로 끝나거나 경고를 낼 수 있습니다.
+여기서는 실패가 아닙니다. `cache/meta`를 지우는 이유는 이 캐시가 세그먼트를 이름과
+길이만 보고 믿기 때문이며, 다음 읽기에서 다시 만들어집니다.
 
 - **돌아오는 것.** 백업할 때 닫혀 있던 모든 것. 그 레코드에 대해 `conbus log --json`과
   `conbus usage --json`은 예전과 똑같이 읽힙니다.
@@ -705,8 +708,9 @@ conbus install --apply     # 레코더를 다시 켭니다
   중요합니다. 복원한 뒤에는 복원된 가장 새로운 세그먼트가 다시 열린 세그먼트가 되어
   자라는데, 그냥 `cp`를 쓰면 그동안 늘어난 부분이 잘립니다. 망가진 것을 아는 세그먼트를
   바꾸려면 먼저 로그에서 지우세요.
-- **그 뒤에는.** 그 폴더로 다음 `conbus backup`을 그대로 이어 갈 수 있습니다. 복원된
-  뒤 자란 세그먼트는 닫히고 나면 짧은 사본을 대신합니다. 옛 사본이 새 파일의 앞부분과
+- **그 뒤에는.** 그 폴더로 `conbus backup`을 실행하세요. 거기서 이어 가며, 닫힌
+  세그먼트의 크기가 사본과 다르면 거부하므로 복원이 잘못된 경우도 잡아냅니다. 복원된 뒤
+  자란 세그먼트는 닫히고 나면 짧은 사본을 대신합니다. 옛 사본이 새 파일의 앞부분과
   정확히 같기 때문입니다.
 - **새 로그 위에는 복원하지 마세요.** 레코더가 이미 새 로그를 시작했다면, 멈추고 그
   `log/`를 먼저 옆으로 옮기세요. 두 로그는 같은 세그먼트 이름과 일련번호를 다시 쓰며,

@@ -318,6 +318,7 @@ fn restore(folder: &Path, root: &Path) {
         .args([
             "-c",
             r#"mkdir -p -m 700 "$2/log"
+               find "$2/log" -name 'segment-*.jsonl' -empty -delete
                cp -n "$1"/conbus-backup/log/*.jsonl "$2/log/"
                chmod 600 "$2"/log/*.jsonl
                rm -rf "$2/cache/meta""#,
@@ -1506,7 +1507,15 @@ fn a_second_run_at_once_is_refused() {
     assert!(!folder.exists());
 
     drop(held);
-    ok(&world.backup(&folder));
+    // Another test thread forking right now keeps a copy of that descriptor until
+    // its child execs, and the lock with it. Only a test shares a process that way.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut again = world.backup(&folder);
+    while !again.status.success() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        again = world.backup(&folder);
+    }
+    ok(&again);
 }
 
 #[test]
@@ -1804,6 +1813,42 @@ fn a_partly_missing_log_restores_to_identical_reads() {
 }
 
 #[test]
+fn an_empty_segment_does_not_stand_in_for_a_real_one_in_a_restore() {
+    // A stray `rm` of every segment, then `doctor`, the natural first move. Its
+    // writable probe makes an empty segment-00000000.jsonl, and `cp -n` alone
+    // would keep that over the real one: a third of the log gone, with no word.
+    let world = World::with_log();
+    roll_with_nothing_written(&world);
+    let before = world.reads();
+    let folder = world.base.join("dest");
+    ok(&world.backup(&folder));
+    for name in segment_names(&world.log()) {
+        fs::remove_file(world.log().join(name)).expect("rm");
+    }
+    ok(&world.conbus(&["doctor"]));
+
+    restore(&folder, &world.root);
+
+    assert_eq!(world.reads(), before);
+}
+
+#[test]
+fn a_run_after_a_restore_that_went_wrong_says_so() {
+    // The safety net the manual names: a segment that did not come back fully
+    // is refused by the next run rather than passed over.
+    let world = World::with_log();
+    let (closed, _) = split_open(&world);
+    let folder = world.base.join("dest");
+    ok(&world.backup(&folder));
+    File::create(world.log().join(&closed[0])).expect("an empty segment");
+
+    let out = world.backup(&folder);
+
+    refused(&out, "differs");
+    refused(&out, &closed[0]);
+}
+
+#[test]
 fn an_overlap_of_identical_segments_changes_nothing() {
     // Every closed segment is in both places, with no records doubled: a
     // segment has one name, so a restore can only put back what is missing.
@@ -1957,6 +2002,8 @@ mod volumes {
     /// A real volume on a disk image, mounted under the test's own folder.
     struct Image {
         mount: PathBuf,
+        device: String,
+        attached: std::cell::Cell<bool>,
     }
 
     impl Image {
@@ -1972,20 +2019,46 @@ mod volumes {
             let mount = base.join("mnt");
             fs::create_dir(&mount).expect("mountpoint");
             let attached = Command::new("hdiutil")
-                .args(["attach", "-quiet", "-nobrowse", "-noverify", "-mountpoint"])
+                .args(["attach", "-nobrowse", "-noverify", "-mountpoint"])
                 .arg(&mount)
                 .arg(&image)
-                .status()
+                .output()
                 .expect("hdiutil attach");
-            assert!(attached.success(), "hdiutil attach");
-            Image { mount }
+            assert!(attached.status.success(), "hdiutil attach");
+            // The first line names the image's whole disk.
+            let device = stdout(&attached)
+                .split_whitespace()
+                .next()
+                .filter(|device| device.starts_with("/dev/disk"))
+                .expect("hdiutil names the device")
+                .to_string();
+            Image {
+                mount,
+                device,
+                attached: std::cell::Cell::new(true),
+            }
         }
 
+        /// By device, not mount point: detaching a mount point can unmount it and
+        /// still fail to release the device, which then holds its deleted image's
+        /// space until a reboot. Once this succeeds the number may be reused, by
+        /// a real disk too, so it is never tried again.
         fn detach(&self) {
-            let _ = Command::new("hdiutil")
-                .args(["detach", "-quiet"])
-                .arg(&self.mount)
-                .status();
+            for attempt in 0..40 {
+                if !self.attached.get() || !Path::new(&self.device).exists() {
+                    break;
+                }
+                let mut detach = Command::new("hdiutil");
+                detach.args(["detach", "-quiet"]);
+                if attempt >= 20 {
+                    detach.arg("-force");
+                }
+                if detach.arg(&self.device).status().is_ok_and(|s| s.success()) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            self.attached.set(false);
         }
     }
 

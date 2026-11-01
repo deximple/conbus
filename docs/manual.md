@@ -730,6 +730,7 @@ systemctl --user disable --now sh.conbus.daemon.service   # Linux
 
 conbus backup --verify --to "/Volumes/My Disk"
 mkdir -p -m 700 ~/.conbus/log
+find ~/.conbus/log -name 'segment-*.jsonl' -empty -delete
 cp -n "/Volumes/My Disk/conbus-backup/log/"*.jsonl ~/.conbus/log/
 chmod 600 ~/.conbus/log/*.jsonl
 rm -rf ~/.conbus/cache/meta
@@ -737,9 +738,11 @@ rm -rf ~/.conbus/cache/meta
 conbus install --apply     # starts the recorder again
 ```
 
-`cp -n` may exit non-zero, or warn, when it skips a file; that is not a failure
-here. `cache/meta` goes because it trusts a segment by name and length, and it is
-rebuilt on the next read.
+The `find` removes empty segments, which hold no records: `conbus doctor` makes one
+in an empty log folder, and `cp -n` would keep it in place of the real one. `cp -n`
+may exit non-zero, or warn, when it skips a file; that is not a failure here.
+`cache/meta` goes because it trusts a segment by name and length, and it is rebuilt
+on the next read.
 
 - **What comes back.** Everything that was closed when the backup ran. `conbus log
   --json` and `conbus usage --json` read exactly as they did over those records.
@@ -756,9 +759,10 @@ rebuilt on the next read.
   after a restore the newest restored segment is the open one again and grows, and
   a plain `cp` would cut off what it gained. To replace a segment you know is
   damaged, delete it from the log first.
-- **Afterwards.** The next `conbus backup` to that folder carries on. A restored
-  segment that grew replaces its shorter copy once it closes, because the old copy
-  is exactly how the new one starts.
+- **Afterwards.** Run `conbus backup` to that folder. It carries on from there, and
+  it refuses if a closed segment is not the size of its copy, so it also catches a
+  restore that went wrong. A restored segment that grew replaces its shorter copy
+  once it closes, because the old copy is exactly how the new one starts.
 - **Not over a new log.** If a recorder has already started a new log there, stop
   it and move that `log/` aside first. Two logs reuse the same segment names and
   sequence numbers, and conbus cannot merge them.
