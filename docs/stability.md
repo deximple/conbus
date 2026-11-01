@@ -44,8 +44,12 @@ marks each one `(experimental)`.
   their format can change in any release. They are not equally safe to delete:
   - `cache/meta/` is derived from the log. Deleting it loses nothing; the next
     read rebuilds it.
-  - `cache/gap-since` is not derived. It holds a gap-fill range a start ran out
-    of time for, and deleting it means that range is not resumed at the next
-    start. No record already written is lost.
+  - `cache/gap-since`, `cache/gap-since-codex` and `cache/gap-read` are not
+    derived. They hold the gap-fill ranges a start could not finish, for
+    transcripts and for Codex threads, and how far each got. Deleting them means
+    those ranges are not resumed at the next start; `conbus backfill --gaps` still
+    fills them by hand. No record already written is lost.
+  - `cache/chat-export-read` says which chat exports a start has read. Deleting
+    it means each is read once more, which writes nothing.
   - `spool/` holds hooks in transit, and a file there can be the only copy of
     its record. Deleting one loses that record.
