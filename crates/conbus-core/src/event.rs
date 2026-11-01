@@ -283,6 +283,12 @@ pub struct Source {
     /// log does not support. Names the source, e.g. `claude_transcript`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backfilled_from: Option<String>,
+    /// The Claude Code profile the record came from, when the hook ran under a
+    /// `CLAUDE_CONFIG_DIR` other than the default. Claude Code only — the
+    /// other harnesses have no side-by-side account mechanism — and it never
+    /// leaves the machine: no shared row or OTLP point carries it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
 }
 
 /// How a turn ended.

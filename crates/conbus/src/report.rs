@@ -257,11 +257,33 @@ fn summarise(record: &Record) -> String {
 /// Reports by default. `--apply` writes, and keeps a copy of whatever was there
 /// first: these are the user's own settings files and they usually already hold
 /// their own hooks.
-pub fn install(apply: bool) -> io::Result<()> {
+pub fn install(apply: bool, profile: Option<&str>) -> io::Result<()> {
     let current = std::env::current_exe()?;
     let home = std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
         .ok_or_else(|| io::Error::other("no HOME to install into"))?;
+    // A profile is `$HOME/.claude-NAME`, and it only exists once the vendor's
+    // own login has created it — conbus never creates one, and never opens
+    // anything inside it but `settings.json`.
+    let profile_dir = match profile {
+        None => None,
+        Some(name) if !crate::profile::valid(name) => {
+            return Err(io::Error::other(format!(
+                "a profile name is [a-z0-9-]; {name:?} is not one"
+            )));
+        }
+        Some(name) => {
+            let dir = crate::profile::dir(&home, name);
+            if !dir.is_dir() {
+                return Err(io::Error::other(format!(
+                    "{} is not a profile yet — {}",
+                    dir.display(),
+                    crate::profile::login_hint(&home, name)
+                )));
+            }
+            Some(dir)
+        }
+    };
     let dest = crate::install::installed_binary(&home);
     println!(
         "{:<12} {} → {}",
@@ -289,10 +311,23 @@ pub fn install(apply: bool) -> io::Result<()> {
     }
     let binary = dest;
 
-    for target in crate::install::targets(&binary, &home) {
+    // `--profile` is exactly the Claude Code registration, pointed at the
+    // profile's own settings.json. The other vendors' files are the
+    // machine's, not the account's, so a profiled install does not touch
+    // them.
+    let targets = match &profile_dir {
+        Some(dir) => vec![crate::install::Target {
+            harness: "claude_code",
+            settings: dir.join("settings.json"),
+            events: &crate::install::CLAUDE_EVENTS,
+            command: crate::install::hook_command(&binary, "claude_code"),
+        }],
+        None => crate::install::targets(&binary, &home),
+    };
+    for target in targets {
         let harness = target.harness;
         let settings = target.settings.clone();
-        if !crate::install::vendor_present(harness, &home) {
+        if profile_dir.is_none() && !crate::install::vendor_present(harness, &home) {
             print_absent(harness, &home);
             continue;
         }
@@ -331,52 +366,57 @@ pub fn install(apply: bool) -> io::Result<()> {
         }
     }
 
-    let plugin = crate::install::opencode_plugin_path(&home);
-    if !crate::install::vendor_present("opencode", &home) {
-        print_absent("opencode", &home);
-    } else if crate::install::opencode_plugin_current(&binary, &home) {
-        println!(
-            "{:<12} {} — already registered",
-            "opencode",
-            plugin.display()
-        );
-    } else {
-        let doing = if crate::install::opencode_plugin_registered(&home) {
-            "not the plugin this build writes — would replace it"
+    // A profiled install registers the profile's Claude Code and nothing
+    // else — the other vendors' registrations are the machine's business,
+    // and the shared daemon section below still runs.
+    if profile_dir.is_none() {
+        let plugin = crate::install::opencode_plugin_path(&home);
+        if !crate::install::vendor_present("opencode", &home) {
+            print_absent("opencode", &home);
+        } else if crate::install::opencode_plugin_current(&binary, &home) {
+            println!(
+                "{:<12} {} — already registered",
+                "opencode",
+                plugin.display()
+            );
         } else {
-            "would register session.created, message.updated, message.part.updated, session.error"
-        };
-        println!("{:<12} {} — {doing}", "opencode", plugin.display());
-        if apply {
-            crate::install::apply_opencode_plugin(&binary, &home)?;
-            println!(
-                "{:<12} written (official plugin bus, not remaining JSON)",
-                ""
-            );
+            let doing = if crate::install::opencode_plugin_registered(&home) {
+                "not the plugin this build writes — would replace it"
+            } else {
+                "would register session.created, message.updated, message.part.updated, session.error"
+            };
+            println!("{:<12} {} — {doing}", "opencode", plugin.display());
+            if apply {
+                crate::install::apply_opencode_plugin(&binary, &home)?;
+                println!(
+                    "{:<12} written (official plugin bus, not remaining JSON)",
+                    ""
+                );
+            }
         }
-    }
 
-    let cursor_hooks = crate::install::cursor_hooks_path(&home);
-    if !crate::install::vendor_present("cursor", &home) {
-        print_absent("cursor", &home);
-    } else if crate::install::cursor_hooks_registered(&home) {
-        println!(
-            "{:<12} {} — already registered",
-            "cursor",
-            cursor_hooks.display()
-        );
-    } else {
-        println!(
-            "{:<12} {} — would register sessionStart, beforeSubmitPrompt, stop, sessionEnd, afterAgentResponse",
-            "cursor",
-            cursor_hooks.display()
-        );
-        if apply {
-            crate::install::apply_cursor_hooks(&binary, &home)?;
+        let cursor_hooks = crate::install::cursor_hooks_path(&home);
+        if !crate::install::vendor_present("cursor", &home) {
+            print_absent("cursor", &home);
+        } else if crate::install::cursor_hooks_registered(&home) {
             println!(
-                "{:<12} written (native hooks.json; Claude settings do not carry this event)",
-                ""
+                "{:<12} {} — already registered",
+                "cursor",
+                cursor_hooks.display()
             );
+        } else {
+            println!(
+                "{:<12} {} — would register sessionStart, beforeSubmitPrompt, stop, sessionEnd, afterAgentResponse",
+                "cursor",
+                cursor_hooks.display()
+            );
+            if apply {
+                crate::install::apply_cursor_hooks(&binary, &home)?;
+                println!(
+                    "{:<12} written (native hooks.json; Claude settings do not carry this event)",
+                    ""
+                );
+            }
         }
     }
 
@@ -917,6 +957,32 @@ fn report_hooks(home: &Path) {
     report_codex_trust(home);
 }
 
+/// The `$HOME/.claude-*` profile directories whose `settings.json` runs the
+/// recorder — the profiles a person registered by hand. A profile without
+/// conbus hooks is the vendor's business, not a finding.
+fn report_profiles(home: &Path) {
+    let Ok(entries) = std::fs::read_dir(home) else {
+        return;
+    };
+    let mut registered: Vec<String> = entries
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            let name = name.strip_prefix(".claude-")?.to_string();
+            let settings = std::fs::read_to_string(entry.path().join("settings.json")).ok()?;
+            let settings: serde_json::Value = serde_json::from_str(&settings).ok()?;
+            (!registered_hooks(&settings).is_empty()).then_some(name)
+        })
+        .collect();
+    registered.sort_unstable();
+    if registered.is_empty() {
+        println!("profiles  none — no $HOME/.claude-*/settings.json carries conbus hooks");
+    } else {
+        println!("profiles  {}", registered.join(", "));
+    }
+}
+
 /// Vendor sessions the log holds twice — once as the recorder mirrored them
 /// and once as backfill reconstructed them — and where each one's binding
 /// lands.
@@ -1146,7 +1212,10 @@ pub fn doctor(paths: &Paths) -> io::Result<()> {
     println!("writable  {}", describe_appendable(&appendable(paths)));
 
     match std::env::var_os("HOME").map(PathBuf::from) {
-        Some(home) => report_hooks(&home),
+        Some(home) => {
+            report_hooks(&home);
+            report_profiles(&home);
+        }
         None => println!("hooks     no HOME to read registrations from"),
     }
     // Chat LAM hard-disables hooks. The official export is the identity-
@@ -1627,6 +1696,7 @@ mod tests {
                 workspace: None,
                 entrypoint: None,
                 backfilled_from: None,
+                profile: None,
             },
             event,
         }
@@ -1960,6 +2030,7 @@ mod tests {
                 entrypoint: None,
                 backfilled_from: backfilled
                     .then(|| conbus_core::backfill::CLAUDE_TRANSCRIPT.to_string()),
+                profile: None,
             },
             ..tool(None, None)
         }

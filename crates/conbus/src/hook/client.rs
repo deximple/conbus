@@ -288,6 +288,12 @@ pub fn run_in(
         // prompt can carry the same pack if that event later grows a field.
         brief: briefing_enabled() && !inference,
         provenance: declared_provenance(),
+        // The account profile the vendor put this hook under. Read from the
+        // child's own environment like `entrypoint` — the payload says
+        // nothing about it, and only Claude Code has profiles at all.
+        profile: (key.harness.as_str() == Harness::CLAUDE_CODE)
+            .then(crate::profile::current)
+            .flatten(),
         event: observed.event,
     };
     let result = match send_once(harness, &socket, &request, &hook_event_name) {

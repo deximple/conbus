@@ -295,6 +295,7 @@ mod tests {
                 workspace: Some("/w".into()),
                 entrypoint: entrypoint.map(Entrypoint::new),
                 backfilled_from: None,
+                profile: None,
             },
             event,
         }

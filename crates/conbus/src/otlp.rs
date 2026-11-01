@@ -510,6 +510,7 @@ mod tests {
             workspace: Some("/Users/someone/secret-project".into()),
             entrypoint: Some(Entrypoint::new("sdk-cli")),
             backfilled_from: None,
+            profile: None,
         };
         let ledger = Ledger::fold(
             &[

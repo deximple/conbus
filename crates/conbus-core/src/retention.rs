@@ -228,6 +228,7 @@ mod tests {
                 workspace: None,
                 entrypoint: None,
                 backfilled_from: None,
+                profile: None,
             },
             vendor_turn_id: None,
             vendor_agent_id: None,

@@ -75,6 +75,7 @@ Named so that a reviewer can check the list rather than infer it:
 - tool names and MCP server names (deferred, below);
 - `bus_id`, vendor session, turn, tool-use and agent ids;
 - the raw entrypoint, harness versions (deferred), hostnames, usernames;
+- the Claude Code profile a record came from (`profile`);
 - anything read from a vendor's auth files — conbus reads none.
 
 The service does not store the client's IP address, and keeps no send time

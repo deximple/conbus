@@ -6,6 +6,7 @@
 //! thread the user opened — Codex is resumed only by a `warm:` id we minted.
 
 use std::io;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
@@ -51,12 +52,39 @@ impl Bins {
     }
 }
 
-pub fn run(paths: &Paths, harness: &str) -> io::Result<()> {
-    run_with(paths, harness, &Bins::Env)
+pub fn run(paths: &Paths, harness: &str, profile: Option<&str>) -> io::Result<()> {
+    run_with(
+        paths,
+        harness,
+        profile.map(profile_dir).transpose()?,
+        &Bins::Env,
+    )
 }
 
-fn run_with(paths: &Paths, harness: &str, bins: &Bins) -> io::Result<()> {
+/// `$HOME/.claude-NAME`, checked: the directory only exists once the vendor's
+/// own login has created it, and conbus never creates it for them.
+fn profile_dir(name: &str) -> io::Result<PathBuf> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| io::Error::other("no HOME to resolve a profile under"))?;
+    let dir = crate::profile::dir(&home, name);
+    if !crate::profile::valid(name) || !dir.is_dir() {
+        return Err(io::Error::other(format!(
+            "no profile {name:?} at {} — {}",
+            dir.display(),
+            crate::profile::login_hint(&home, name)
+        )));
+    }
+    Ok(dir)
+}
+
+fn run_with(paths: &Paths, harness: &str, profile: Option<PathBuf>, bins: &Bins) -> io::Result<()> {
     let requested = normalize(harness)?;
+    if profile.is_some() && requested != Harness::CLAUDE_CODE {
+        return Err(io::Error::other(
+            "--profile is a Claude Code thing; no other harness has profiles",
+        ));
+    }
     let mut pending = match takeover::take(paths)? {
         Taken::Fresh { takeover, age } => {
             // Said out loud: the person asked for one leg and is about to get
@@ -85,7 +113,7 @@ fn run_with(paths: &Paths, harness: &str, bins: &Bins) -> io::Result<()> {
         None => requested,
     };
     loop {
-        spawn(paths, &current, pending.as_ref(), bins)?;
+        spawn(paths, &current, pending.as_ref(), bins, profile.as_deref())?;
         match takeover::take(paths)? {
             Taken::Fresh { takeover, .. } => {
                 println!(
@@ -135,8 +163,14 @@ fn normalize(name: &str) -> io::Result<String> {
         })
 }
 
-fn spawn(paths: &Paths, harness: &str, takeover: Option<&Takeover>, bins: &Bins) -> io::Result<()> {
-    let mut child = vendor(harness, takeover, bins)?;
+fn spawn(
+    paths: &Paths,
+    harness: &str,
+    takeover: Option<&Takeover>,
+    bins: &Bins,
+    profile: Option<&Path>,
+) -> io::Result<()> {
+    let mut child = vendor(harness, takeover, bins, profile)?;
     loop {
         if let Some(status) = child.try_wait()? {
             return if status.success() {
@@ -158,6 +192,7 @@ fn vendor(
     harness: &str,
     takeover: Option<&Takeover>,
     bins: &Bins,
+    profile: Option<&Path>,
 ) -> io::Result<std::process::Child> {
     let mut cmd = Command::new(bins.get(harness));
     match harness {
@@ -167,8 +202,24 @@ fn vendor(
             }
         }
         Harness::CLAUDE_CODE => {
+            // The profile is the run's, not the takeover's: hop out and back
+            // and the Claude that answers is still this account's.
+            if let Some(dir) = profile {
+                cmd.env("CLAUDE_CONFIG_DIR", dir);
+            }
             if let Some(thread) = takeover.and_then(|t| t.thread.as_deref()) {
-                cmd.args(["--resume", thread]);
+                if profile.is_none() {
+                    cmd.args(["--resume", thread]);
+                } else {
+                    // That session was written under the default profile's
+                    // directory; a profiled claude cannot see it. The fresh
+                    // session is briefed from the checkout by the hooks.
+                    println!(
+                        "conbus run: not resuming {thread} — it lives in the \
+                         default profile; this session starts fresh and the \
+                         hooks brief it from the checkout"
+                    );
+                }
             }
         }
         Harness::CURSOR => {
@@ -265,6 +316,7 @@ mod tests {
         run_with(
             &paths,
             "claude_code",
+            None,
             &bins(&[("claude_code", &claude), ("codex", &codex)]),
         )
         .expect("run");
@@ -304,6 +356,7 @@ mod tests {
         run_with(
             &paths,
             "claude_code",
+            None,
             &bins(&[("claude_code", &claude), ("codex", &codex)]),
         )
         .expect("run");
@@ -343,7 +396,7 @@ mod tests {
         )
         .expect("takeover");
 
-        run_with(&paths, "codex", &bins(&[("claude_code", &claude)])).expect("run");
+        run_with(&paths, "codex", None, &bins(&[("claude_code", &claude)])).expect("run");
 
         let text = fs::read_to_string(&marker).expect("claude ran");
         assert!(
@@ -382,7 +435,8 @@ mod tests {
                     )
                     .expect("takeover");
 
-                    run_with(&paths, "codex", &bins(&[("claude_code", &claude)])).expect("run");
+                    run_with(&paths, "codex", None, &bins(&[("claude_code", &claude)]))
+                        .expect("run");
 
                     fs::read_to_string(&marker).expect("claude ran")
                 })
@@ -401,6 +455,135 @@ mod tests {
         assert!(
             seen[1].contains("beta --resume sess_beta"),
             "the second run was answered by the wrong binary: {seen:?}"
+        );
+    }
+
+    #[test]
+    fn a_profiled_run_hands_the_vendor_its_config_dir() {
+        // `conbus run claude_code --profile work` runs `claude` with
+        // CLAUDE_CONFIG_DIR pointing at the profile — the vendor's own
+        // documented side-by-side mechanism, so its hooks and statusLine
+        // inherit it too.
+        let (root, paths) = machine();
+        let profile = root.path().join(".claude-work");
+        fs::create_dir_all(&profile).expect("profile dir");
+        let marker = root.path().join("claude-env");
+        let claude = stub(
+            root.path(),
+            "claude",
+            &format!(
+                "echo \"${{CLAUDE_CONFIG_DIR:-unset}}\" > {}",
+                marker.display()
+            ),
+        );
+
+        run_with(
+            &paths,
+            "claude_code",
+            Some(profile.clone()),
+            &bins(&[("claude_code", &claude)]),
+        )
+        .expect("run");
+
+        let text = fs::read_to_string(&marker).expect("claude ran");
+        assert_eq!(text.trim(), profile.display().to_string());
+    }
+
+    #[test]
+    fn a_profiled_run_does_not_resume_the_default_profile_session() {
+        // A takeover can carry `warm-claude:<session>` — a session that lives
+        // in the default profile's directory, which a profiled claude cannot
+        // see. Resuming it would fail or, worse, mix accounts: the profiled
+        // leg starts fresh and the hooks brief it from the checkout.
+        let (root, paths) = machine();
+        let profile = root.path().join(".claude-work");
+        fs::create_dir_all(&profile).expect("profile dir");
+        let marker = root.path().join("claude-args");
+        let claude = stub(
+            root.path(),
+            "claude",
+            &format!("echo \"$*\" > {}", marker.display()),
+        );
+        takeover::write(
+            &paths,
+            &Takeover {
+                next: "claude_code".into(),
+                thread: Some("sess_default_profile".into()),
+                bus_id: "01a072d2-2e0f-7b72-8afb-b4045e646cde".into(),
+                cwd: None,
+            },
+        )
+        .expect("takeover");
+
+        run_with(
+            &paths,
+            "claude_code",
+            Some(profile),
+            &bins(&[("claude_code", &claude)]),
+        )
+        .expect("run");
+
+        let text = fs::read_to_string(&marker).expect("claude ran");
+        assert!(
+            !text.contains("--resume"),
+            "the default profile's session must not be resumed: {text:?}"
+        );
+    }
+
+    #[test]
+    fn a_profiled_run_only_starts_claude() {
+        // `--profile` on any other leg is refused: no other vendor has a
+        // side-by-side account directory for it to mean.
+        let (root, paths) = machine();
+        let profile = root.path().join(".claude-work");
+        fs::create_dir_all(&profile).expect("profile dir");
+        let err = run_with(&paths, "codex", Some(profile), &bins(&[]))
+            .expect_err("non-claude leg refuses a profile");
+        assert!(err.to_string().contains("Claude Code"), "{err}");
+    }
+
+    #[test]
+    fn a_profile_stays_the_runs_across_a_hop_back() {
+        // claude → codex → claude inside one `conbus run --profile`: each
+        // claude leg answers the same account.
+        let (root, paths) = machine();
+        let profile = root.path().join(".claude-work");
+        fs::create_dir_all(&profile).expect("profile dir");
+        let env_marker = root.path().join("claude-env");
+        let sent = root.path().join("hopped-out");
+        let now = conbus_core::clock::Timestamp::now();
+        let takeover = |next: &str| {
+            format!(
+                "printf '%s\\n' '{{\"next\":\"{next}\",\"bus_id\":\"01a072d2-2e0f-7b72-8afb-b4045e646cde\",\"written_at\":\"{now}\"}}' > {}",
+                paths.takeover().display(),
+            )
+        };
+        let claude = stub(
+            root.path(),
+            "claude",
+            &format!(
+                "echo \"${{CLAUDE_CONFIG_DIR:-unset}}\" >> {}\n[ -f {} ] || {{ touch {}; {}; }}",
+                env_marker.display(),
+                sent.display(),
+                sent.display(),
+                takeover("codex"),
+            ),
+        );
+        let codex = stub(root.path(), "codex", &takeover("claude_code"));
+
+        run_with(
+            &paths,
+            "claude_code",
+            Some(profile.clone()),
+            &bins(&[("claude_code", &claude), ("codex", &codex)]),
+        )
+        .expect("run");
+
+        let text = fs::read_to_string(&env_marker).expect("claude ran");
+        assert_eq!(
+            text.lines().collect::<Vec<_>>(),
+            vec![profile.display().to_string(); 2],
+            "hop out and back must keep the profile env on both claude legs"
         );
     }
 }

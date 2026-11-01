@@ -30,11 +30,16 @@ pub enum Command {
         /// and write nothing. Wins over `--apply`: managed settings belong to
         /// the organisation's device tooling, never to conbus.
         managed: bool,
+        /// Register Claude Code inside `$HOME/.claude-NAME` instead of the
+        /// default profile. Claude Code only — no other harness has profiles.
+        profile: Option<String>,
     },
     /// Take back everything `install --apply` wrote. Reports by default; the
     /// log is never removed.
     Uninstall {
         apply: bool,
+        /// Unregister Claude Code inside `$HOME/.claude-NAME` only.
+        profile: Option<String>,
     },
     /// Recover history from before the recorder was installed.
     ///
@@ -102,6 +107,10 @@ pub enum Command {
     /// Same TTY: start a vendor, and exec the next one when a hop lands.
     Run {
         harness: String,
+        /// Claude Code only: run under `$HOME/.claude-NAME` by passing the
+        /// vendor its `CLAUDE_CONFIG_DIR`. Manual switching only — nothing
+        /// automatic ever moves a conversation between profiles.
+        profile: Option<String>,
     },
     /// Confirm a fact or link two workspaces so the next pack can see it.
     Arena {
@@ -200,9 +209,11 @@ where
         "install" => Command::Install {
             apply: args.iter().any(|a| a == "--apply"),
             managed: args.iter().any(|a| a == "--managed"),
+            profile: flag_value(&args, "--profile"),
         },
         "uninstall" => Command::Uninstall {
             apply: args.iter().any(|a| a == "--apply"),
+            profile: flag_value(&args, "--profile"),
         },
         "backfill" => Command::Backfill {
             apply: args.iter().any(|a| a == "--apply"),
@@ -273,7 +284,12 @@ where
             json: args.iter().any(|a| a == "--json"),
         },
         "run" => Command::Run {
-            harness: args.get(1).cloned().unwrap_or_else(|| "claude_code".into()),
+            harness: args
+                .get(1)
+                .filter(|a| !a.starts_with('-'))
+                .cloned()
+                .unwrap_or_else(|| "claude_code".into()),
+            profile: flag_value(&args, "--profile"),
         },
         "arena" => Command::Arena {
             action: args.get(1).cloned().unwrap_or_else(|| "fact".into()),
@@ -378,7 +394,8 @@ USAGE:
                                   and the commits HEAD gained (default 7 days);
                                   --json prints one folder per line
     conbus run [claude_code|codex|cursor|agy|opencode|grok]
-                                  same TTY: start a vendor; hop execs the next
+                                  same TTY: start a vendor; hop execs the next;
+                                  --profile NAME (claude_code) is experimental
     conbus arena fact --workspace DIR --claim TEXT --anchor PATH
     conbus arena link --from DIR --to DIR
                                   accept a fact or link workspaces for the pack
@@ -704,7 +721,8 @@ mod tests {
         assert_eq!(
             parse(["run", "codex"], None),
             Command::Run {
-                harness: "codex".into()
+                harness: "codex".into(),
+                profile: None
             }
         );
         assert_eq!(
@@ -791,14 +809,16 @@ mod tests {
             parse(["install"], None),
             Command::Install {
                 apply: false,
-                managed: false
+                managed: false,
+                profile: None
             }
         );
         assert_eq!(
             parse(["install", "--apply"], None),
             Command::Install {
                 apply: true,
-                managed: false
+                managed: false,
+                profile: None
             }
         );
     }
@@ -812,14 +832,16 @@ mod tests {
             parse(["install", "--managed"], None),
             Command::Install {
                 apply: false,
-                managed: true
+                managed: true,
+                profile: None
             }
         );
         assert_eq!(
             parse(["install", "--managed", "--apply"], None),
             Command::Install {
                 apply: true,
-                managed: true
+                managed: true,
+                profile: None
             }
         );
         assert_eq!(
@@ -832,11 +854,17 @@ mod tests {
     fn uninstall_reports_unless_told_to_apply() {
         assert_eq!(
             parse(["uninstall"], None),
-            Command::Uninstall { apply: false }
+            Command::Uninstall {
+                apply: false,
+                profile: None
+            }
         );
         assert_eq!(
             parse(["uninstall", "--apply"], None),
-            Command::Uninstall { apply: true }
+            Command::Uninstall {
+                apply: true,
+                profile: None
+            }
         );
     }
 

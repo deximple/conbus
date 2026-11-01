@@ -821,6 +821,7 @@ mod tests {
             workspace: None,
             entrypoint: None,
             backfilled_from: None,
+            profile: None,
         }
     }
 
@@ -2108,6 +2109,23 @@ mod tests {
                 "vendor_errors",
             ]
         );
+    }
+
+    #[test]
+    fn a_profiled_record_shares_a_row_with_no_profile_on_it() {
+        // RFD 0002, "Never sent": which of the person's own Claude accounts a
+        // record came from is a local fact. The row carries the harness, not
+        // the profile — not as a key, and not in the label.
+        let mut profiled = claude_in(Some("/w"), Some("cli"));
+        profiled.profile = Some("work".into());
+        let ledger = Ledger::fold(&[at(&on_day("09:00:00"), ONE, profiled, prompt("a"))], DAY);
+
+        let shared = ledger.shareable();
+        assert_eq!(shared.len(), 1, "{shared:?}");
+        assert_eq!(shared[0].harness, "claude_code");
+        let text = serde_json::to_string(&shared[0]).expect("json");
+        assert!(!text.contains("profile"), "{text}");
+        assert!(!text.contains("work"), "{text}");
     }
 
     #[test]

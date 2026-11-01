@@ -84,6 +84,7 @@ fn two_agents_in_one_repository(home: &Path, main: &str, worktree: &str) {
         workspace: Some(workspace.into()),
         entrypoint: Some(Entrypoint::new("cli")),
         backfilled_from: None,
+        profile: None,
     };
     let legs = [
         (

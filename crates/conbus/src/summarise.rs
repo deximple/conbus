@@ -159,6 +159,7 @@ fn persist(
             covered_turns,
             digest: Body::kept(digest),
         },
+        profile: None,
     };
     match hop::submit(paths, &request) {
         Ok(Response::Recorded { .. } | Response::Briefed { .. } | Response::Deferred) => Ok(()),
@@ -216,6 +217,7 @@ mod tests {
                 workspace: None,
                 entrypoint: None,
                 backfilled_from: None,
+                profile: None,
             },
             event: Event::Summarised {
                 backend: "codex".into(),

@@ -186,6 +186,7 @@ fn a_day_of_work(home: &Path) {
         workspace: Some("/Users/someone/project".into()),
         entrypoint: Some(Entrypoint::new(entrypoint)),
         backfilled_from: None,
+        profile: None,
     };
     let claude = [
         Event::TurnStarted {

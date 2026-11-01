@@ -97,6 +97,7 @@ mod tests {
             workspace: Some("/Applications/conbus".into()),
             entrypoint: Some(crate::event::Entrypoint::new(crate::event::Entrypoint::CLI)),
             backfilled_from: None,
+            profile: None,
         }
     }
 
