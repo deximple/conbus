@@ -549,36 +549,130 @@ say_spool() {
     say "spool: $n file(s) — the old build does not drain them; they wait for the next daemon"
 }
 
-# The distinct drop reasons across the live file and its rotated
-# generation — a flood that rotated the log mid-window put its reason in
-# drops.1, and reading drops.jsonl alone would miss it.
+# What a drop line means. The classes come from what the hook and the daemon
+# write (crates/conbus/src/hook/client.rs, daemon.rs, drops.rs) and from what
+# this log's real history shows each of them to be:
+#   lost        a record that did not land. A build that spools only writes these
+#               when the spool refused too. Fails at any count, known or not.
+#               Includes an orphaned tool or prompt event: real content with no
+#               conversation to go in.
+#   gap         the adapter has no mapping for an event (`no mapping`, `no
+#               adapter`): the vendor moved. Fails at any count, named by event.
+#   ghost       the end of a session or a turn, or a notification, for a session
+#               with no binding. It carries no content of its own: 693 of the 729
+#               orphan lines in the three weeks before the swap, 8 of them within two
+#               minutes of a daemon start, and 350 of the 405 sessions behind those
+#               729 never reached the log.
+#   sessionless the payload named no session. The plan counts this as the vendor's,
+#               not a lost record.
+#   payload     the hook could not parse what it was given; it cannot say whether
+#               that was a record. 64 lines in eight weeks.
+#   held        `the log refused writes for a while` (#155): an outage's one line,
+#               written once a write worked, when every record waited and landed.
+#               The same line with `and records may be lost` is lost.
+#   elided      `tool bodies elided, not sealed` (#158): the record landed, its
+#               tool body did not. Judged on its own, as a share of tool calls.
+#   other       none of the above: new since the swap fails, known needs a person.
+drop_awk_lib='
+function drop_parse(line) {
+    d_ts = ""; d_reason = ""; d_detail = ""
+    if (match(line, /"ts":"[^"]*"/)) d_ts = substr(line, RSTART + 6, RLENGTH - 7)
+    if (match(line, /"reason":"([^"\\]|\\.)*"/)) d_reason = substr(line, RSTART + 10, RLENGTH - 11)
+    if (match(line, /"detail":"([^"\\]|\\.)*"/)) d_detail = substr(line, RSTART + 10, RLENGTH - 11)
+}
+function drop_event(detail,    event) {
+    event = detail
+    sub(/ for session .*/, "", event)
+    sub(/ as .*/, "", event)
+    return event
+}
+function starts(text, prefix) { return index(text, prefix) == 1 }
+function drop_class(r, d) {
+    if (r == "tool bodies elided, not sealed") return "elided"
+    if (r == "the log refused writes for a while") return "held"
+    if (starts(r, "the log refused writes for a while")) return "lost"
+    if (starts(r, "no mapping for hook event") || starts(r, "no adapter for harness")) return "gap"
+    if (index(r, "names no session")) return "sessionless"
+    if (starts(r, "no conversation for this session") || starts(r, "spooled hook still has no conversation")) {
+        if (drop_event(d) ~ /^([Ss]ession_?[Ee]nd(ed)?|([Ss]ubagent)?[Ss]top|turn_ended|[Nn]otification|notified)$/)
+            return "ghost"
+        return "lost"
+    }
+    if (starts(r, "no daemon on ") || starts(r, "could not send the record:") ||
+        starts(r, "no reply from the daemon:") || starts(r, "unreadable reply ") ||
+        starts(r, "could not bound the daemon call:") || starts(r, "the daemon refused the record:") ||
+        starts(r, "spooled hook refused") || starts(r, "spool entry ") ||
+        starts(r, "no home directory to resolve") || starts(r, "the socket path "))
+        return "lost"
+    if (starts(r, "could not read the hook payload") || r ~ / at line [0-9]+ column [0-9]+$/) return "payload"
+    return "other"
+}
+# The two reasons a normal swap window produces. Between the mv and the new
+# daemon serving, a firing hook either reaches the old daemon, which refuses a
+# protocol it does not speak and cannot be spooled past (an old stamp names no
+# retention), or finds nobody listening. A same-version refusal is not one.
+function drop_swap_reason(r,    old_v, new_v) {
+    if (starts(r, "no daemon on ")) return index(r, ": Connection refused") > 0
+    if (!match(r, /^the daemon refused the record: this daemon speaks protocol v[0-9]+; the hook speaks v[0-9]+/)) return 0
+    old_v = r; sub(/^.*speaks protocol v/, "", old_v); sub(/;.*/, "", old_v)
+    new_v = r; sub(/^.*the hook speaks v/, "", new_v); sub(/[^0-9].*/, "", new_v)
+    return old_v != new_v
+}
+function drop_gap_name(r,    rest, event, as) {
+    rest = r
+    sub(/^[^"]*"/, "", rest)
+    event = rest
+    sub(/\\".*/, "", event)
+    if (starts(r, "no adapter")) return "harness " event
+    as = ""
+    if (match(rest, /\(as [a-z_]+/)) as = " as " substr(rest, RSTART + 4, RLENGTH - 4)
+    return event as
+}
+'
+
+# The distinct drop reasons across the live file and its rotated generation — a
+# flood that rotated the log mid-window put its reason in drops.1, and reading
+# drops.jsonl alone would miss it. Whole reasons, escaped quotes and all: stopping
+# at the first \" made every `no mapping for hook event \"X\"` one reason.
 drop_reasons() {
     for f in "$drops_rotated" "$drops_log"; do
         # `continue`, not `&&`: a missing last file would end the loop non-zero
         # and take the whole script down under pipefail, without a word.
-        [ -f "$f" ] || continue
-        sed -n 's/.*"reason":"\([^"]*\)".*/\1/p' "$f"
+        [ -r "$f" ] || continue
+        LC_ALL=C awk "$drop_awk_lib"'{ drop_parse($0); if (d_reason != "") print d_reason }' "$f"
     done | LC_ALL=C sort -u
 }
 
-# Drop lines with a timestamp later than $1, from both generations. A
-# rotation can rename the file mid-window, so "after this moment" is a
-# timestamp cut, not a line count.
-drop_lines_after() {
-    for f in "$drops_rotated" "$drops_log"; do
-        [ -f "$f" ] || continue
-        awk -v s="$1" '
-            match($0, /"ts":"[^"]*"/) &&
-                substr($0, RSTART + 6, RLENGTH - 7) > s { print }
-        ' "$f"
-    done
+# "<class><tab><reason>" for each drop line later than <ts>, from both
+# generations: a rotation can rename the file mid-window, so "after this moment"
+# is a timestamp cut, not a line count. `swap` marks a reason a swap window makes.
+drop_classes_after() { # drop_classes_after <ts>
+    dca_after=$1
+    shift
+    if [ -r "$drops_rotated" ]; then set -- "$@" "$drops_rotated"; fi
+    if [ -r "$drops_log" ]; then set -- "$@" "$drops_log"; fi
+    [ $# -gt 0 ] || return 0
+    LC_ALL=C awk -v s="$dca_after" "$drop_awk_lib"'
+        {
+            drop_parse($0)
+            if (d_ts > s && d_reason != "")
+                printf "%s\t%s\n", (drop_swap_reason(d_reason) ? "swap" : drop_class(d_reason, d_detail)), d_reason
+        }' "$@"
 }
 
-# True when drops.jsonl reached the cap on a build that does not rotate:
-# it stopped recording and nothing after that point is observable.
-drops_blind() {
-    [ -f "$drops_log" ] || return 1
-    [ "$(wc -c <"$drops_log" | tr -d ' ')" -ge "$drops_cap_bytes" ]
+# True when this binary renames a full drop log aside. It names that file, and a
+# build that does not rotate has no reason to.
+build_rotates() { # build_rotates <binary>
+    LC_ALL=C grep -aq 'drops\.1\.jsonl' "$1" 2>/dev/null
+}
+
+# True when drops.jsonl reached the cap under a build that does not rotate: it
+# stopped recording, and nothing after that point is observable. On a build that
+# rotates, a file at the cap only means the next drop renames it.
+drops_blind() { # drops_blind <binary that will be writing>
+    [ -r "$drops_log" ] || return 1
+    [ "$(wc -c <"$drops_log" | tr -d ' ')" -ge "$drops_cap_bytes" ] || return 1
+    ! build_rotates "$1"
 }
 
 # Reasons in the second file/list that the first did not have.
@@ -590,24 +684,177 @@ new_drop_reasons() {
     rm -f "$tmp"
 }
 
-# The drop reasons a normal swap window legitimately produces. Between the
-# mv and the new daemon serving, a firing hook either reaches the old
-# daemon — which answers a protocol refusal it cannot spool past, since an
-# old build's stamp names no retention — or finds nobody listening at all.
-# Both vanish when the new daemon is up; the boot's gap fill recovers some.
-# A same-version "refusal" or any other reason is not a swap artifact.
-expected_swap_reason() {
-    case $1 in
-        "the daemon refused the record: this daemon speaks protocol v"*"; the hook speaks v"*)
-            rest=${1#*"this daemon speaks protocol v"}
-            old_v=${rest%%;*}
-            new_v=${rest##*"the hook speaks v"}
-            new_v=${new_v%%.*}
-            is_uint "$old_v" && is_uint "$new_v" && [ "$old_v" != "$new_v" ]
-            ;;
-        "no daemon on "*": Connection refused"*) return 0 ;;
-        *) return 1 ;;
-    esac
+# The value of `<name> <value>` in rows an item built.
+row_value() { # row_value <rows> <name>
+    printf '%s\n' "$1" | sed -n "s/^$2 //p"
+}
+
+# One fact per line for verdict to judge: `<name> <number>`, and `item <class> <n>
+# <what>` for what a person needs to read. Every comparison is on the text in C
+# locale, so one invalid byte cannot lose a line.
+drop_table() { # drop_table <since> <end of the swap window> <file>...
+    dt_since=$1 dt_end=$2
+    shift 2
+    LC_ALL=C awk -v s="$dt_since" -v swap_end="$dt_end" -v rotated="$drops_rotated" "$drop_awk_lib"'
+        {
+            drop_parse($0)
+            if (FILENAME == rotated && FNR == 1 && d_ts != "") first_rotated = d_ts
+            if (d_ts == "" || d_reason == "") { bad++; next }
+            if (d_ts > last) last = d_ts
+            if (!(d_ts > s)) {
+                if (!(d_reason in before)) { before[d_reason] = 1; baseline++ }
+                next
+            }
+            lines++
+            c = drop_class(d_reason, d_detail)
+            if (c == "lost" && drop_swap_reason(d_reason) && !(d_ts > swap_end)) { swap++; next }
+            if (c == "elided") {
+                if (d_detail ~ /^[0-9]+ tool event\(s\)$/) elided += d_detail + 0
+                else elided_bad++
+                next
+            }
+            if (c == "gap") key = drop_gap_name(d_reason)
+            else if (c == "ghost" || c == "sessionless" || c == "held") { key = d_detail; sub(/ \(fields:.*/, "", key); sub(/ for session .*/, "", key) }
+            else if (c == "lost" && index(d_detail, " for session ")) key = drop_event(d_detail) ": " d_reason
+            else key = d_reason
+            if (key == "") key = "(no detail)"
+            if (c == "other") {
+                other_key[key] = 1
+                n_other[key]++
+                next
+            }
+            total[c]++
+            n[c SUBSEP key]++
+        }
+        END {
+            for (key in other_key) {
+                c = (key in before) ? "known" : "new"
+                total[c] += n_other[key]
+                n[c SUBSEP key] = n_other[key]
+            }
+            printf "lines %d\nswap %d\nbad %d\nlast %s\nfirst_rotated %s\nelided %d\nelided_bad %d\nbaseline %d\n",
+                lines, swap, bad, last, first_rotated, elided, elided_bad, baseline
+            for (c in total) printf "total_%s %d\n", c, total[c]
+            for (entry in n) {
+                split(entry, part, SUBSEP)
+                printf "item %s %d× %s\n", part[1], n[entry], substr(part[2], 1, 150)
+            }
+        }' "$@"
+}
+
+# 3. Drops, judged by what each line means. Whether a reason's text is new says
+# nothing about whether a record was lost, and a week of no-daemon lines used to
+# pass because the words had been seen before.
+verdict_drops() {
+    dt_rows=""
+    dt_problem=""
+    set --
+    for f in "$drops_rotated" "$drops_log"; do
+        [ -f "$f" ] || continue
+        if [ -r "$f" ]; then
+            set -- "$@" "$f"
+        else
+            dt_problem="$dt_problem $f"
+        fi
+    done
+    dt_end=$(perl -MPOSIX=strftime -e 'print strftime("%Y-%m-%dT%H:%M:%S.000Z", gmtime($ARGV[0] + 60))' \
+        "$(ts_epoch "${recorded_swap:-$since}")")
+    if [ $# -gt 0 ]; then
+        dt_rc=0
+        dt_rows=$(drop_table "$since" "$dt_end" "$@") || dt_rc=$?
+        [ "$dt_rc" -eq 0 ] || dt_problem="$dt_problem (reading them exited $dt_rc)"
+    fi
+    restart_drops=$(state_restart_drop_total)
+    n_lost=$(row_value "$dt_rows" total_lost)
+    n_gap=$(row_value "$dt_rows" total_gap)
+    n_new=$(row_value "$dt_rows" total_new)
+    n_known=$(row_value "$dt_rows" total_known)
+    n_ghost=$(row_value "$dt_rows" total_ghost)
+    n_sessionless=$(row_value "$dt_rows" total_sessionless)
+    n_payload=$(row_value "$dt_rows" total_payload)
+    n_held=$(row_value "$dt_rows" total_held)
+    n_bad=$(row_value "$dt_rows" bad)
+    n_lines=$(row_value "$dt_rows" lines)
+    first_rotated=$(row_value "$dt_rows" first_rotated)
+    last_drop=$(row_value "$dt_rows" last)
+    elided_total=$(row_value "$dt_rows" elided)
+    elided_bad=$(row_value "$dt_rows" elided_bad)
+    dt_baseline=$(row_value "$dt_rows" baseline)
+    swap_exempted=$(row_value "$dt_rows" swap)
+    swap_exempted=${swap_exempted:-0}
+
+    # What cannot be read leaves the item open; what can be read still counts. A
+    # log that went blind on day 5 still shows what days 1 to 4 lost.
+    open=""
+    [ -z "$dt_problem" ] || open="$open; cannot read:$dt_problem"
+    if [ "${n_bad:-0}" -gt 0 ]; then
+        open="$open; ${n_bad} line(s) have no readable time or reason"
+    fi
+    if drops_blind "$bin"; then
+        open="$open; $drops_log reached the cap on a build that does not rotate: nothing after ${last_drop:-its last line} was recorded"
+    fi
+    # The rotated generation keeps the file as it was, so its first line predates
+    # the swap unless a second rotation threw that part away.
+    discarded=0
+    if [ -n "$first_rotated" ] && [ "$first_rotated" \> "$since" ]; then
+        discarded=1
+        open="$open; the oldest drop line left is at $first_rotated, after the swap: anything dropped before it was rotated away"
+    fi
+    if [ "${n_known:-0}" -gt 0 ]; then
+        open="$open; ${n_known} line(s) with a known reason no rule covers need a person to say what they mean"
+    fi
+    for noisy in "ghost:$n_ghost" "sessionless:$n_sessionless" "payload:$n_payload"; do
+        if [ "${noisy#*:}" != "" ] && [ "${noisy#*:}" -gt "$noise_limit" ]; then
+            open="$open; ${noisy#*:} ${noisy%%:*} line(s) are over the limit of $noise_limit (CONBUS_CANARY_NOISE_MAX): too many to call background"
+        fi
+    done
+
+    # A reason never seen needs a baseline to call it new. With the baseline
+    # rotated away it is a question, not a fault.
+    n_unseen=${n_new:-0}
+    if [ "$n_unseen" -gt 0 ] && [ "${dt_baseline:-0}" -eq 0 ] && [ "$discarded" = 1 ]; then
+        open="$open; $n_unseen line(s) with a reason no rule covers, and the baseline that would say whether it is new was rotated away"
+        n_unseen=0
+    fi
+
+    faults=""
+    [ "${n_lost:-0}" -eq 0 ] || faults="$faults, ${n_lost} lost record(s)"
+    [ "${n_gap:-0}" -eq 0 ] || faults="$faults, ${n_gap} adapter gap(s)"
+    [ "$n_unseen" -eq 0 ] || faults="$faults, $n_unseen line(s) with a reason not seen before the swap"
+    [ "$restart_drops" -eq 0 ] || faults="$faults, $restart_drops drop(s) during planned restarts"
+
+    shown=$((${n_ghost:-0} + ${n_sessionless:-0} + ${n_payload:-0} + ${n_held:-0}))
+    tally="${n_lines:-0} line(s) since $since: $swap_exempted expected swap-window, $shown not lost, $restart_drops on planned restarts"
+    if [ -n "$faults" ]; then
+        line FAIL drops "${faults#, } ($tally)${open:+$open}"
+    elif [ -n "$open" ]; then
+        line UNCHECKED drops "${open#; } ($tally)"
+    else
+        line PASS drops "0 lost records ($tally)"
+    fi
+
+    # What was decided, so a person can argue with it.
+    group() { # group <class> <heading>
+        group_rows=$(row_value "$dt_rows" "item $1" | sort)
+        [ -n "$group_rows" ] || return 0
+        printf '  %s\n' "$2"
+        printf '%s\n' "$group_rows" | sed 's/^/    /'
+    }
+    group lost "lost records — fail at any count, known reason or not:"
+    group gap "adapter gaps — fail at any count; the vendor moved ahead of this build:"
+    group new "reasons not seen before the swap — fail:"
+    group known "known reasons no rule covers — not a pass until a person reads them:"
+    group ghost "end of a session or turn with no binding — not lost, shown only:"
+    group sessionless "payload named no session — the vendor's, not lost, shown only:"
+    group payload "payload the hook could not parse — cannot prove a loss, shown only:"
+    group held "the log refused writes and every record waited and landed — not lost, shown only:"
+    printf '  rule: a lost record or adapter gap fails at any count; a reason new since the swap fails; the three shown kinds stop a pass only above %s lines each; the swap window exempts its two reasons for 60 s\n' "$noise_limit"
+    if [ -r "$daemon_log" ]; then
+        refused_hooks=$(awk -v s="$since" '$1 ~ /^[0-9]/ && $1 > s && /refusing a hook speaking protocol/ { n++ } END { print n + 0 }' "$daemon_log")
+        if [ "$refused_hooks" -gt 0 ]; then
+            printf '  note: daemon.log names %s refused hook(s) since the window began, and %s expected swap-window drop line(s) exist here; a refusal with no line was spooled, or its line never landed\n' "$refused_hooks" "$swap_exempted"
+        fi
+    fi
 }
 
 # YYYY-MM-DD -> the next YYYY-MM-DD, on macOS or GNU date.
@@ -714,7 +961,7 @@ do_preflight() {
     # A drop log at the cap on a build that does not rotate has been blind
     # since it filled — swapping over it would carry the blind spot into
     # the new window's verdict. Move it aside first.
-    if drops_blind; then
+    if drops_blind "${from:-$bin}"; then
         check 1 drops-cap \
             "$drops_log is at the 4 MiB cap and blind — rotate it aside before a swap"
     else
@@ -905,6 +1152,10 @@ case $sub in
         # an item other than operator-feel could not be judged. Every read that
         # can fail is taken with its status in hand, because `x=$(a | b)` under
         # `set -e` ends the script on the spot and prints no summary at all.
+        # Bytes, not characters, for everything this reads: on macOS sed, cut and
+        # tr exit non-zero on one invalid byte under a UTF-8 locale, and `set -e`
+        # would end the verdict on the line a bad byte sits on.
+        export LC_ALL=C
         fails=0
         unchecked=""
         line() { # line <PASS|FAIL|UNCHECKED> <name> <detail>
@@ -959,6 +1210,8 @@ case $sub in
         say "window: since $since"
 
         [ -x "$bin" ] || die "no installed conbus at $bin — verdict needs its reads"
+        noise_limit=${CONBUS_CANARY_NOISE_MAX:-2000}
+        is_uint "$noise_limit" || refuse "CONBUS_CANARY_NOISE_MAX='$noise_limit' is not a number"
 
         # 1. Unplanned recorder restarts: daemon start lines after since,
         #    minus the swap's own boot and each planned restart — each of
@@ -1010,84 +1263,6 @@ case $sub in
             *) line FAIL unreadable "$unreadable unreadable line(s)" ;;
         esac
 
-        # 3. New drop reasons since the swap (a known reason repeating is
-        #    not new), plus every planned restart's recorded new_drops.
-        #    A swap-window reason — the old daemon's protocol refusal or a
-        #    dropped connection mid-restart — is exempt only inside 60
-        #    seconds after the swap; the same reason later is a fault.
-        #    A log at the cap on a build that does not rotate recorded
-        #    nothing after it filled: drops is UNCHECKED, never a pass —
-        #    the live file sat blind like that for seven days in October.
-        if [ -f "$drops_log" ] && [ ! -r "$drops_log" ]; then
-            line UNCHECKED drops "$drops_log cannot be read"
-        elif drops_blind; then
-            line UNCHECKED drops \
-                "$drops_log hit the cap and stopped recording — drops after that point are not observable"
-        elif [ -f "$drops_log" ]; then
-            new_reasons=$(for f in "$drops_rotated" "$drops_log"; do
-                [ -f "$f" ] && cat "$f"
-            done | awk -v s="$since" '
-                {
-                    ts = ""; r = ""
-                    if (match($0, /"ts":"[^"]*"/)) ts = substr($0, RSTART + 6, RLENGTH - 7)
-                    if (match($0, /"reason":"[^"]*"/)) r = substr($0, RSTART + 10, RLENGTH - 11)
-                    if (r == "") next
-                    if (ts > s) { after[r] = 1; n++ } else { before[r] = 1 }
-                }
-                END { print n + 0; for (r in after) if (!(r in before)) print r }
-            ')
-            drop_count=$(sed -n '1p' <<<"$new_reasons")
-            new_reasons=$(echo "$new_reasons" | tail -n +2 | LC_ALL=C sort)
-            s_epoch=$(ts_epoch "$since")
-            swap_exempted=0
-            real_new=""
-            while IFS= read -r r; do
-                [ -z "$r" ] && continue
-                if expected_swap_reason "$r" && is_uint "${s_epoch:-}"; then
-                    late=0 n_here=0
-                    while IFS= read -r dl; do
-                        t=${dl#*'"ts":"'}; t=${t%%'"'*}
-                        [ "$t" \> "$since" ] || continue
-                        n_here=$((n_here + 1))
-                        e=$(ts_epoch "$t")
-                        if ! is_uint "${e:-}" || [ "$e" -gt $((s_epoch + 60)) ]; then
-                            late=1
-                        fi
-                    done <<< "$(for f in "$drops_rotated" "$drops_log"; do
-                        [ -f "$f" ] && grep -F "\"reason\":\"$r\"" "$f"
-                    done || true)"
-                    if [ "$late" = 1 ]; then
-                        real_new="$real_new ${r} (persisted >60s after the swap)"
-                    else
-                        swap_exempted=$((swap_exempted + n_here))
-                    fi
-                else
-                    real_new="$real_new $r"
-                fi
-            done <<< "$new_reasons"
-            restart_drops=$(state_restart_drop_total)
-            if [ -z "$real_new" ] && [ "$restart_drops" -eq 0 ]; then
-                line PASS drops \
-                    "0 new drop reason(s) ($drop_count drop(s)${swap_exempted:+, $swap_exempted expected swap-window}, $restart_drops on planned restarts)"
-            elif [ -n "$real_new" ]; then
-                line FAIL drops \
-                    "new drop reason(s) since $since:$real_new"
-            else
-                line FAIL drops "$restart_drops drop(s) during planned restarts"
-            fi
-        else
-            restart_drops=$(state_restart_drop_total)
-            if [ "$restart_drops" -eq 0 ]; then
-                line PASS drops "no $drops_log — nothing dropped"
-            else
-                line FAIL drops "$restart_drops drop(s) during planned restarts"
-            fi
-        fi
-
-        # 4. Per-harness activity: usage --json rows give every (day,
-        #    harness) with records. A harness that misses a day some other
-        #    harness recorded on cannot be told idle from lost — UNCHECKED
-        #    with the gap named.
         # A read that failed and a log with no rows are different facts, and
         # neither is evidence of activity.
         usage_err=$(mktemp "${TMPDIR:-/tmp}/canary-usage.XXXXXX")
@@ -1102,6 +1277,50 @@ case $sub in
             say "note: usage --json reported: $(sed -n '1p' "$usage_err" | cut -c1-160)"
         fi
         rm -f "$usage_err"
+        # The same read cut at the swap itself, because the swap day's rows hold
+        # whatever ran before it. A row without tool_calls is a count not read.
+        window_problem=$usage_problem
+        window_tool_calls=0
+        if [ -z "$window_problem" ]; then
+            window_rc=0
+            window_json=$("$bin" usage --json --since "$since" 2>/dev/null) || window_rc=$?
+            if [ "$window_rc" -ne 0 ]; then
+                window_problem="usage --json --since $since failed (exit $window_rc)"
+            else
+                window_tool_calls=$(echo "$window_json" | awk '
+                    NF == 0 { next }
+                    match($0, /"tool_calls":[0-9]+/) { total += substr($0, RSTART + 13, RLENGTH - 13); next }
+                    { missing++ }
+                    END { print (missing ? "missing" : total + 0) }')
+                if [ "$window_tool_calls" = missing ]; then
+                    window_tool_calls=0
+                    window_problem="usage rows name no tool_calls"
+                fi
+            fi
+        fi
+
+        # 3. Drops, then what the same lines say about tool bodies. Both read the
+        #    usage rows taken above.
+        verdict_drops
+
+        if [ -n "$window_problem" ]; then
+            line UNCHECKED tool-bodies \
+                "${elided_total:-0} tool event(s) elided, not sealed; no tool-call count to weigh them against: $window_problem"
+        elif [ "${elided_bad:-0}" -gt 0 ]; then
+            line UNCHECKED tool-bodies \
+                "$elided_bad elided line(s) do not read '<N> tool event(s)' — the count is not known"
+        elif [ $((${elided_total:-0} * 100)) -gt "$window_tool_calls" ]; then
+            line FAIL tool-bodies \
+                "${elided_total:-0} tool event(s) elided, not sealed — more than 1% of $window_tool_calls tool call(s); a spool elides tens per restart, a Keychain that will not answer elides them all"
+        else
+            line PASS tool-bodies \
+                "${elided_total:-0} tool event(s) elided, not sealed — within 1% of $window_tool_calls tool call(s)"
+        fi
+
+        # 4. Per-harness activity: usage --json rows give every (day,
+        #    harness) with records. A harness that misses a day some other
+        #    harness recorded on cannot be told idle from lost — UNCHECKED
+        #    with the gap named.
         if [ -n "$usage_problem" ]; then
             line UNCHECKED harness-activity "$usage_problem"
         else
@@ -1411,23 +1630,25 @@ case $sub in
         else
             say "restart: no new serving stamp inside ${serving_limit}s — check 'canary.sh status'"
         fi
-        # new_drops is the number of drop lines the restart added — the
-        # plan's "유실 0", not a new-reason count. A sessionless refusal is
-        # the vendor's payload, not a lost record: excluded, shown aside.
-        # A timestamp cut: a rotation can rename the file mid-restart, so
-        # line numbers no longer mark "since".
-        new_drops=0 sessionless=0
-        while IFS= read -r l; do
-            [ -z "$l" ] && continue
-            case $l in
-                *'"reason":"the hook payload names no session'*)
-                    sessionless=$((sessionless + 1)) ;;
+        # new_drops is the number of drop lines the restart added that lost a
+        # record — the plan's "유실 0", not a new-reason count. A sessionless
+        # refusal is the vendor's payload, the end of a session the log never
+        # had loses nothing, and an elided tool body is a record that landed:
+        # excluded, shown aside. A timestamp cut: a rotation can rename the file
+        # mid-restart, so line numbers no longer mark "since".
+        new_drops=0 sessionless=0 not_lost=0
+        while IFS=$'\t' read -r cls _; do
+            case $cls in
+                '') ;;
+                sessionless) sessionless=$((sessionless + 1)) ;;
+                ghost | payload | elided | held) not_lost=$((not_lost + 1)) ;;
                 *) new_drops=$((new_drops + 1)) ;;
             esac
-        done <<< "$(drop_lines_after "$before_ts")"
+        done <<<"$(drop_classes_after "$before_ts")"
         state_add_restart "$ts" "$serving_ms" "$new_drops"
         extra=""
         [ "$sessionless" -gt 0 ] && extra=" ($sessionless sessionless refusal(s) not counted)"
+        [ "$not_lost" -gt 0 ] && extra="$extra ($not_lost line(s) that lost no record not counted)"
         say "recorded planned restart at $ts: serving ${serving_ms} ms, $new_drops drop(s)$extra"
         ;;
 
@@ -1513,16 +1734,21 @@ case $sub in
 
         swap_window_drops=0
         if [ -z "$fail_reason" ]; then
-            while IFS= read -r l; do
-                [ -z "$l" ] && continue
-                r=${l#*'"reason":"'}; r=${r%%'"'*}
-                if expected_swap_reason "$r"; then
-                    swap_window_drops=$((swap_window_drops + 1))
-                elif ! grep -qxF "$r" "$before_drops"; then
-                    fail_reason="new drop reason(s) since the swap: $r"
-                    break
-                fi
-            done <<< "$(drop_lines_after "$before_ts")"
+            while IFS=$'\t' read -r cls r; do
+                case $cls in
+                    '') ;;
+                    swap) swap_window_drops=$((swap_window_drops + 1)) ;;
+                    # A spool drained at the first boot writes these; none is a
+                    # lost record, and none should undo a healthy swap.
+                    ghost | sessionless | payload | elided | held) ;;
+                    *)
+                        if ! LC_ALL=C grep -qxF "$r" "$before_drops"; then
+                            fail_reason="new drop reason(s) since the swap: $r"
+                            break
+                        fi
+                        ;;
+                esac
+            done <<<"$(drop_classes_after "$before_ts")"
         fi
         if [ "$swap_window_drops" -gt 0 ]; then
             say "start: $swap_window_drops swap-window drop(s) — the old daemon" \

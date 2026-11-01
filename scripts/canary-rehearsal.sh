@@ -67,6 +67,10 @@ usage_rows() { # usage_rows <first-iso> <harness>...
 #   chatty    — like live, with far more output after the socket line than a pipe
 #               holds, so a reader that leaves at its first match costs the
 #               writer a SIGPIPE every time instead of once in a while
+#   rotating  — like live, and it names drops.1.jsonl the way a build that
+#               rotates its drop log does
+#   elided    — its `install --apply` writes `tool bodies elided, not sealed` and
+#               `the log refused writes for a while`, like a spool drained at boot
 #   flap      — doctor sleeps on its first call, then answers fast: a
 #               single-shot time budget flakes where a median does not
 #   polfail   — `policy check` exits 1: a file that cannot be a policy
@@ -88,6 +92,9 @@ write_fake() {
             install_body='touch "$HOME/.install-called"; printf "{\"ts\":\"%s\",\"reason\":\"the daemon refused the record: this daemon speaks protocol v5; the hook speaks v6. Restart the daemon.\"}\n" "$(perl -MTime::HiRes=gettimeofday -MPOSIX=strftime -e "(\$s,\$u)=gettimeofday; printf \"%s.%03dZ\", strftime(\"%Y-%m-%dT%H:%M:%S\", gmtime(\$s)), int(\$u/1000)")" >> "$HOME/.conbus/drops.jsonl"' ;;
         sessions) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "hooks     claude_code  runs — x"'
             install_body='touch "$HOME/.install-called"; printf "{\"ts\":\"%s\",\"reason\":\"the hook payload names no session; an empty id would merge unrelated sessions into one conversation\"}\n" "$(perl -MTime::HiRes=gettimeofday -MPOSIX=strftime -e "(\$s,\$u)=gettimeofday; printf \"%s.%03dZ\", strftime(\"%Y-%m-%dT%H:%M:%S\", gmtime(\$s)), int(\$u/1000)")" >> "$HOME/.conbus/drops.jsonl"' ;;
+        rotating) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "disk      log 1.0 MB — 1.0 GB free of 2.0 GB (50.0%)"; echo "log       5 record(s), 1 conversation(s), 0 unreadable line(s)"; echo "hooks     claude_code  runs — x"' ;;
+        elided) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "hooks     claude_code  runs — x"'
+            install_body='touch "$HOME/.install-called"; now=$(perl -MTime::HiRes=gettimeofday -MPOSIX=strftime -e "(\$s,\$u)=gettimeofday; printf \"%s.%03dZ\", strftime(\"%Y-%m-%dT%H:%M:%S\", gmtime(\$s)), int(\$u/1000)"); printf "{\"detail\":\"7 tool event(s)\",\"reason\":\"tool bodies elided, not sealed\",\"ts\":\"%s\"}\n{\"reason\":\"the log refused writes for a while\",\"ts\":\"%s\"}\n" "$now" "$now" >> "$HOME/.conbus/drops.jsonl"' ;;
         knowndrop) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "hooks     claude_code  runs — x"'
             install_body='touch "$HOME/.install-called"; printf "{\"ts\":\"%s\",\"reason\":\"socket closed early\"}\n" "$(perl -MTime::HiRes=gettimeofday -MPOSIX=strftime -e "(\$s,\$u)=gettimeofday; printf \"%s.%03dZ\", strftime(\"%Y-%m-%dT%H:%M:%S\", gmtime(\$s)), int(\$u/1000)")" >> "$HOME/.conbus/drops.jsonl"' ;;
         notokens) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "hooks     claude_code  runs — x"' ;;
@@ -105,8 +112,11 @@ write_fake() {
     if [ "$persona" = notokens ]; then
         usage_filter="sed -E 's/\"tokens_[a-z_]*\":[0-9]*,?//g; s/,}/}/g'"
     fi
+    rotates_note=""
+    [ "$persona" = rotating ] && rotates_note="# renames a full log to drops.1.jsonl"
     cat >"$path" <<EOF
 #!/bin/sh
+$rotates_note
 case "\$1" in doctor|quota|status) echo "\${CONBUS_AGY_BIN:-unset}" >>"$tmp/agy-bin.seen" ;; esac
 case "\$1" in
     --version) echo "conbus 0.0.0-$tag ($tag)" ;;
@@ -121,6 +131,9 @@ case "\$1" in
                 grep "\"day\":\"\$4\"" "\$HOME/.usage-rows" 2>/dev/null | $usage_filter
                 ;;
             "--json --since")
+                case "\$4" in
+                    *T*) [ -f "\$HOME/.usage-window" ] && { cat "\$HOME/.usage-window"; exit 0; } ;;
+                esac
                 awk -v s="\${4%%T*}" 'match(\$0, /"day":"[^"]*"/) && substr(\$0, RSTART + 7, 10) >= s' \
                     "\$HOME/.usage-rows" 2>/dev/null | $usage_filter
                 ;;
@@ -232,7 +245,7 @@ expect_absent() {
 }
 
 expect_grep() { # expect_grep <pattern> <file> <what>
-    if ! grep -q "$1" "$2"; then
+    if ! LC_ALL=C grep -aq "$1" "$2"; then
         echo "rehearsal: FAIL: $3 — no '$1' in $2:" >&2
         cat "$2" >&2
         exit 1
@@ -548,6 +561,22 @@ expect_grep "swap-window drop" "$tmp/start-swapdrop.out" "the expected drop is a
 expect_grep '"swap_window_drops":1' "$home/.conbus/canary.json" \
     "canary.json records swap_window_drops"
 
+# A spool drained at the first boot elides its tool bodies, and an outage the daemon
+# outlasted says so once writes work again. The records landed; neither line may
+# undo a healthy swap.
+write_fake beef elided "$tmp/stage/conbus-elided"
+write_fake 01d old "$install_dir/conbus"
+rm -f "$rollback_bin" "$home/.install-called" "$home/.conbus/canary.json"
+cat >"$home/.conbus/drops.jsonl" <<'EOF'
+{"ts":"2026-10-30T09:00:00.000Z","reason":"socket closed early"}
+EOF
+daemon_boot beef 4251
+code=0
+run_real start --from "$tmp/stage/conbus-elided" >"$tmp/start-elided.out" 2>&1 || code=$?
+if [ "$code" != 0 ]; then cat "$tmp/start-elided.out" >&2; fi
+expect 0 "$code" "lines that lost no record do not roll a swap back"
+expect "conbus 0.0.0-beef (beef)" "$("$install_dir/conbus" --version)" "the candidate stays"
+
 # A drop reason that is NOT a swap artifact still rolls back under the
 # real path — the tolerance is narrow by design.
 write_fake 01d old "$install_dir/conbus"
@@ -689,7 +718,7 @@ verdict_fixture() { # verdict_fixture [swapped-iso] [restarts-json]
         boot_job=""
     fi
     rm -f "$home/.conbus/drops.1.jsonl" "$home/.conbus/sync.json" \
-        "$home/.conbus/policy.json" "$home/.usage-fail" "$home/.usage-fail-day"
+        "$home/.conbus/policy.json" "$home/.usage-fail" "$home/.usage-fail-day" "$home/.usage-window"
     write_fake beef live "$install_dir/conbus"
     write_fake 01d notokens "$rollback_bin"
     printf '{"swapped":"%s","prev_build":"01d","candidate_build":"beef","candidate_sha256":"x","restarts":%s}\n' \
@@ -861,6 +890,313 @@ expect 1 "$code" "a new drop reason in the rotated generation is caught"
 expect_grep 'a fault after the rotation' "$tmp/verdict-rotated.out" \
     "the post-rotation reason is named"
 rm -f "$home/.conbus/drops.1.jsonl"
+
+# --- what a drop line means ---------------------------------------------------
+
+drop_line() { # drop_line <seconds ago> <reason, JSON-escaped> [detail]
+    if [ -n "${3:-}" ]; then
+        printf '{"detail":"%s","reason":"%s","ts":"%s"}\n' "$3" "$2" "$(iso_ago "$1")"
+    else
+        printf '{"reason":"%s","ts":"%s"}\n' "$2" "$(iso_ago "$1")"
+    fi >>"$home/.conbus/drops.jsonl"
+}
+
+# A lost record fails whether or not its words have been seen before. The swap
+# window aside, a week of these used to read `0 new drop reason(s)`.
+for lost_reason in \
+    'no daemon on /x/sock: Connection refused (os error 61)' \
+    'no reply from the daemon: Resource temporarily unavailable (os error 35)' \
+    'could not send the record: Broken pipe (os error 32)' \
+    'could not bound the daemon call: Invalid argument (os error 22)' \
+    'unreadable reply \"\": EOF while parsing a value at line 1 column 0' \
+    'the daemon refused the record: 2 record(s) written, 1 lost: No space left on device (os error 28)' \
+    'spooled hook refused: 1 record(s) written, 1 lost: No space left on device (os error 28)'; do
+    verdict_fixture
+    drop_line $((8 * DAY)) "$lost_reason"
+    drop_line 3600 "$lost_reason"
+    code=0
+    run verdict >"$tmp/verdict-lost.out" 2>&1 || code=$?
+    expect 1 "$code" "a known reason that lost a record fails: ${lost_reason%%:*}"
+    expect_grep '^FAIL drops — 1 lost record' "$tmp/verdict-lost.out" "and is counted as lost"
+    expect_grep 'fail at any count' "$tmp/verdict-lost.out" "and the rule is printed beside it"
+done
+
+# The swap window keeps its exemption for its two reasons, known or not, and
+# only for 60 seconds.
+verdict_fixture "$(iso_ago 120)"
+drop_line $((3 * DAY)) 'no daemon on /x/sock: Connection refused (os error 61)'
+drop_line 100 'no daemon on /x/sock: Connection refused (os error 61)'
+code=0
+run verdict >"$tmp/verdict-swap-nd.out" 2>&1 || code=$?
+expect 3 "$code" "a no-daemon line inside 60 s of the swap is exempt"
+expect_grep '^PASS drops.*1 expected swap-window' "$tmp/verdict-swap-nd.out" "and counted"
+drop_line 30 'no daemon on /x/sock: Connection refused (os error 61)'
+code=0
+run verdict >"$tmp/verdict-swap-nd90.out" 2>&1 || code=$?
+expect 1 "$code" "the same known reason 90 s after the swap fails"
+
+# Every event name a vendor renames into is its own gap. The reason's escaped
+# quote used to end the parse, so all of them read as one known prefix.
+verdict_fixture
+drop_line $((8 * DAY)) 'no mapping for hook event \"KnownOld\" (as claude_code, fields: cwd,hook_event_name)'
+drop_line 3600 'no mapping for hook event \"StopV2\" (as claude_code, fields: cwd,hook_event_name)'
+code=0
+run verdict >"$tmp/verdict-renamed.out" 2>&1 || code=$?
+expect 1 "$code" "a renamed event fails"
+expect_grep 'StopV2 as claude_code' "$tmp/verdict-renamed.out" "the new event and harness are named"
+verdict_fixture
+drop_line $((8 * DAY)) 'no mapping for hook event \"KnownOld\" (as claude_code, fields: cwd,hook_event_name)'
+drop_line 3600 'no mapping for hook event \"KnownOld\" (as claude_code, fields: cwd,hook_event_name)'
+code=0
+run verdict >"$tmp/verdict-renamed-known.out" 2>&1 || code=$?
+expect 1 "$code" "an event already unmapped before the swap still lost its record"
+
+# Sessions the log never had: their end is not a lost record, whatever its
+# spelling. These are most of the real orphan lines, and one would have rolled a
+# swap back or failed a week. A tool event in one is real content, and fails.
+verdict_fixture
+for ghost in 'SessionEnd for session 01a06300' 'sessionEnd for session 01a06301' 'Stop for session 01a06302'; do
+    drop_line 3600 'no conversation for this session; the daemon has no binding for it (a restart mid-turn looks exactly like this)' "$ghost"
+done
+drop_line 3600 'spooled hook still has no conversation (orphan)' 'session_ended for session 01a06303'
+code=0
+run verdict >"$tmp/verdict-ghost.out" 2>&1 || code=$?
+expect 0 "$code" "the end of a session the log never had is not a loss"
+expect_grep '^PASS drops.*4 not lost' "$tmp/verdict-ghost.out" "and it is shown, not dropped from view"
+expect_grep '1× session_ended' "$tmp/verdict-ghost.out" "by event"
+expect_grep '^  rule: a lost record or adapter gap fails at any count' "$tmp/verdict-ghost.out" "and the standard is printed for a person to argue with"
+expect_no_grep '01a0630' "$tmp/verdict-ghost.out" "without a session id"
+verdict_fixture
+drop_line 3600 'spooled hook still has no conversation (orphan)' 'tool_use for session 01a06304'
+code=0
+run verdict >"$tmp/verdict-orphan.out" 2>&1 || code=$?
+expect 1 "$code" "a tool event with no conversation is a lost record"
+expect_grep '^FAIL drops — 1 lost record' "$tmp/verdict-orphan.out" "and is counted as one"
+expect_grep '1× tool_use: spooled hook' "$tmp/verdict-orphan.out" "by event"
+expect_no_grep '01a0630' "$tmp/verdict-orphan.out" "without a session id"
+
+# A payload that names no session is the vendor's, per the plan: shown, and it
+# stops a pass only as a flood. Same for a payload the hook could not parse.
+verdict_fixture
+drop_line 3600 'the hook payload names no session; an empty id would merge unrelated sessions into one conversation' 'preToolUse as cursor (fields: cwd,tool_name)'
+drop_line 3600 'EOF while parsing a value at line 1 column 0'
+code=0
+run verdict >"$tmp/verdict-sessionless.out" 2>&1 || code=$?
+expect 0 "$code" "a sessionless line or an unparseable payload alone does not fail"
+expect_grep '1× preToolUse as cursor' "$tmp/verdict-sessionless.out" "the sessionless line is shown"
+expect_no_grep 'fields: cwd' "$tmp/verdict-sessionless.out" "without its field list"
+for _ in 1 2 3; do
+    drop_line 3600 'the hook payload names no session; an empty id would merge unrelated sessions into one conversation' 'preToolUse as cursor (fields: cwd,tool_name)'
+done
+code=0
+CONBUS_CANARY_NOISE_MAX=3 run verdict >"$tmp/verdict-flood.out" 2>&1 || code=$?
+expect 4 "$code" "a flood of sessionless lines is not a pass"
+expect_grep '^UNCHECKED drops.*over the limit of 3' "$tmp/verdict-flood.out" "the limit it crossed is named"
+expect_grep 'canary:   drops — ' "$tmp/verdict-flood.out" "and listed as what is open"
+code=0
+CONBUS_CANARY_NOISE_MAX=lots run verdict >/dev/null 2>&1 || code=$?
+expect 2 "$code" "a limit that is not a number is refused"
+
+# A full disk that the daemon outlasted (#155). Every record waited and landed, so
+# that line is no loss. The same outage with records it could not keep is one.
+verdict_fixture
+drop_line 3600 'the log refused writes for a while' '3 record(s) waited in memory and landed, 0 could not be kept there, since 2026-11-01T00:00:00.000Z: No space left on device (os error 28)'
+code=0
+run verdict >"$tmp/verdict-held.out" 2>&1 || code=$?
+expect 0 "$code" "an outage in which every record landed is not a loss"
+expect_grep '^PASS drops.*1 not lost' "$tmp/verdict-held.out" "it is counted as not lost"
+expect_grep 'every record waited and landed' "$tmp/verdict-held.out" "and shown"
+verdict_fixture
+drop_line 3600 'the log refused writes for a while and records may be lost' '3 record(s) waited in memory and landed, 2 could not be kept there, since 2026-11-01T00:00:00.000Z: No space left on device (os error 28)'
+code=0
+run verdict >"$tmp/verdict-held-lost.out" 2>&1 || code=$?
+expect 1 "$code" "an outage that could not keep its records fails"
+expect_grep '^FAIL drops — 1 lost record' "$tmp/verdict-held-lost.out" "as a lost record"
+
+# The same words, seen before and covered by no rule, need a person.
+verdict_fixture
+drop_line $((8 * DAY)) 'a reason no rule covers'
+drop_line 3600 'a reason no rule covers'
+code=0
+run verdict >"$tmp/verdict-known.out" 2>&1 || code=$?
+expect 4 "$code" "a known reason no rule covers is not a pass"
+expect_grep '^UNCHECKED drops.*no rule covers' "$tmp/verdict-known.out" "and says why"
+
+# A line that cannot be read is not a line without a problem, and one bad byte
+# must not cost the read of the line it sits on.
+verdict_fixture
+printf '{"reason":"no daem\n' >>"$home/.conbus/drops.jsonl"
+code=0
+run verdict >"$tmp/verdict-torn.out" 2>&1 || code=$?
+expect 4 "$code" "a torn drop line is not a pass"
+expect_grep '^UNCHECKED drops.*no readable time or reason' "$tmp/verdict-torn.out" "the torn line is counted"
+verdict_fixture
+printf '{"reason":"no daemon on /x/\377/sock: Connection refused (os error 61)","ts":"%s"}\n' "$(iso_ago 3600)" \
+    >>"$home/.conbus/drops.jsonl"
+code=0
+LC_ALL=en_US.UTF-8 run verdict >"$tmp/verdict-badbyte.out" 2>&1 || code=$?
+expect 1 "$code" "an invalid byte does not hide the lost record on its line"
+expect_grep '^FAIL drops — 1 lost record' "$tmp/verdict-badbyte.out" "the line is counted, under a UTF-8 locale too"
+expect_grep 'verdict: FAIL' "$tmp/verdict-badbyte.out" "and the verdict reaches its summary"
+
+# A capped log still shows what it recorded before it filled. A new reason on
+# day 2 plus a cap on day 5 used to read as a pass, and main said FAIL.
+fill_to_cap() { # fill_to_cap <ts> — plain perl: `yes | head` dies on SIGPIPE under pipefail
+    perl -e '
+        my ($file, $ts) = @ARGV;
+        my $line = "{\"reason\":\"the hook payload names no session; an empty id would merge unrelated sessions into one conversation\",\"ts\":\"$ts\"}\n";
+        my $n = int((4 * 1024 * 1024 - (-s $file)) / length($line)) + 1;
+        open(my $fh, ">>", $file) or die; print $fh $line x $n; close $fh;' "$home/.conbus/drops.jsonl" "$1"
+}
+verdict_fixture
+drop_line 3600 'a brand new fault after the swap'
+fill_to_cap "$(iso_ago 1800)"
+code=0
+run verdict >"$tmp/verdict-capped-new.out" 2>&1 || code=$?
+expect 1 "$code" "a capped log does not hide a new reason written before the cap"
+expect_grep 'a brand new fault after the swap' "$tmp/verdict-capped-new.out" "the reason is named"
+verdict_fixture "" "[{\"ts\":\"$(iso_ago $((5 * DAY)))\",\"serving_ms\":4000,\"new_drops\":7}]"
+printf '%s conbus daemon: beef: socket /x/sock log /x/log (10 record(s), 0 unreadable)\n' \
+    "$(iso_ago $((5 * DAY - 4)))" >>"$home/.conbus/daemon.log"
+fill_to_cap "$(iso_ago 1800)"
+code=0
+run verdict >"$tmp/verdict-capped-restart.out" 2>&1 || code=$?
+expect 1 "$code" "a capped log does not hide drops on a planned restart"
+expect_grep '^FAIL drops.*7 drop(s) during planned restarts' "$tmp/verdict-capped-restart.out" "they are named"
+verdict_fixture
+fill_to_cap "$(iso_ago $((30 * DAY)))"
+code=0
+run verdict >"$tmp/verdict-capped-blind.out" 2>&1 || code=$?
+expect 4 "$code" "a capped log with nothing to show is still not a pass"
+expect_grep '^UNCHECKED drops.*does not rotate: nothing after' "$tmp/verdict-capped-blind.out" \
+    "it says when the log went blind"
+
+# The same file under a build that rotates is not blind: the next drop renames it.
+write_fake beef rotating "$tmp/stage/conbus-rotating"
+verdict_fixture
+write_fake beef rotating "$install_dir/conbus"
+fill_to_cap "$(iso_ago $((30 * DAY)))"
+code=0
+run verdict >"$tmp/verdict-capped-rotating.out" 2>&1 || code=$?
+expect 0 "$code" "a full log on a build that rotates is not blind"
+expect_grep '^PASS drops' "$tmp/verdict-capped-rotating.out" "and drops can pass on it"
+write_fake beef live "$install_dir/conbus"
+code=0
+run preflight --from "$tmp/stage/conbus-rotating" >"$tmp/preflight-rotating.out" 2>&1 || code=$?
+expect_grep '^PASS drops-cap' "$tmp/preflight-rotating.out" "preflight lets a rotating candidate swap over it"
+
+# Just rotated, no live file yet: the new reason is only in drops.1.
+verdict_fixture
+mv "$home/.conbus/drops.jsonl" "$home/.conbus/drops.1.jsonl"
+printf '{"reason":"a fault in the old generation","ts":"%s"}\n' "$(iso_ago 3600)" >>"$home/.conbus/drops.1.jsonl"
+code=0
+run verdict >"$tmp/verdict-rotated-only.out" 2>&1 || code=$?
+expect 1 "$code" "a new reason only in drops.1 fails with no live file"
+expect_grep 'a fault in the old generation' "$tmp/verdict-rotated-only.out" "the reason is named"
+
+# One rotation keeps the baseline, and a clean window still passes across it.
+verdict_fixture
+mv "$home/.conbus/drops.jsonl" "$home/.conbus/drops.1.jsonl"
+drop_line 3600 'spooled hook still has no conversation (orphan)' 'session_ended for session 01a06305'
+code=0
+run verdict >"$tmp/verdict-one-rotation.out" 2>&1 || code=$?
+expect 0 "$code" "one rotation loses nothing"
+
+# Two rotations threw the baseline and part of the window away. Known kinds are
+# still known, which ends the false FAIL, and the hole in the evidence is named.
+verdict_fixture
+printf '{"reason":"the hook payload names no session; an empty id would merge unrelated sessions into one conversation","ts":"%s"}\n' \
+    "$(iso_ago $((3 * DAY)))" >"$home/.conbus/drops.1.jsonl"
+rm -f "$home/.conbus/drops.jsonl"
+drop_line 3600 'the hook payload names no session; an empty id would merge unrelated sessions into one conversation'
+code=0
+run verdict >"$tmp/verdict-two-rotations.out" 2>&1 || code=$?
+expect 4 "$code" "two rotations leave a hole, not a pass and not a fail"
+expect_grep '^UNCHECKED drops.*anything dropped before it was rotated away' "$tmp/verdict-two-rotations.out" "the hole is named"
+expect_no_grep '^FAIL drops' "$tmp/verdict-two-rotations.out" "a known kind does not read as new"
+printf '{"reason":"a reason no rule covers","ts":"%s"}\n' "$(iso_ago $((3 * DAY)))" >"$home/.conbus/drops.1.jsonl"
+code=0
+run verdict >"$tmp/verdict-two-rotations-other.out" 2>&1 || code=$?
+expect 4 "$code" "with the baseline gone, an unknown reason is a question"
+expect_grep 'the baseline that would say whether it is new was rotated away' "$tmp/verdict-two-rotations-other.out" "and the missing baseline is said"
+
+# tool bodies elided (#158): the record landed, so it is no drop and no new
+# reason. Its count is judged alone, against the tool calls in the window.
+elided_line() { # elided_line <N>
+    drop_line 3600 'tool bodies elided, not sealed' "$1 tool event(s)"
+}
+verdict_fixture
+elided_line 3
+elided_line 2
+code=0
+run verdict >"$tmp/verdict-elided-low.out" 2>&1 || code=$?
+expect 0 "$code" "elided bodies below 1% of tool calls pass"
+expect_grep '^PASS tool-bodies — 5 tool event(s)' "$tmp/verdict-elided-low.out" "their sum is on its own line"
+expect_grep '^PASS drops — 0 lost' "$tmp/verdict-elided-low.out" "and the line is not a drop"
+expect_no_grep 'new drop\|not seen before' "$tmp/verdict-elided-low.out" "and not a new reason"
+verdict_fixture
+elided_line 100000
+code=0
+run verdict >"$tmp/verdict-elided-high.out" 2>&1 || code=$?
+expect 1 "$code" "elided bodies above 1% of tool calls fail"
+expect_grep '^FAIL tool-bodies — 100000 tool event(s)' "$tmp/verdict-elided-high.out" "the item that failed says so"
+expect_grep '^PASS drops' "$tmp/verdict-elided-high.out" "and it is tool-bodies that fails, not drops"
+# 1% exactly is within it, one more is not. One day holds all the tool calls.
+verdict_fixture
+sed -E 's/"tool_calls":[0-9]+/"tool_calls":0/' "$home/.usage-rows" >"$home/.usage-rows.new"
+printf '{"day":"%s","harness":"codex","turns":3,"tool_calls":100,"tool_denials":0,"repeated":0,"recovered":0,"tokens_input":1}\n' \
+    "$(iso_ago $((2 * DAY)) | cut -c1-10)" >>"$home/.usage-rows.new"
+mv -f "$home/.usage-rows.new" "$home/.usage-rows"
+elided_line 1
+code=0
+run verdict >"$tmp/verdict-elided-1pct.out" 2>&1 || code=$?
+expect_grep '^PASS tool-bodies — 1 tool event' "$tmp/verdict-elided-1pct.out" "exactly 1% is within the limit"
+elided_line 1
+code=0
+run verdict >"$tmp/verdict-elided-over.out" 2>&1 || code=$?
+expect_grep '^FAIL tool-bodies — 2 tool event' "$tmp/verdict-elided-over.out" "more than 1% is not"
+# Both generations count, and a count that cannot be read cannot pass.
+verdict_fixture
+cat "$home/.conbus/drops.jsonl" >"$home/.conbus/drops.1.jsonl"
+printf '{"detail":"4 tool event(s)","reason":"tool bodies elided, not sealed","ts":"%s"}\n' "$(iso_ago 3600)" >>"$home/.conbus/drops.1.jsonl"
+elided_line 2
+code=0
+run verdict >"$tmp/verdict-elided-both.out" 2>&1 || code=$?
+expect_grep '^PASS tool-bodies — 6 tool event' "$tmp/verdict-elided-both.out" "the sum spans both generations"
+verdict_fixture
+elided_line 3
+touch "$home/.usage-fail"
+code=0
+run verdict >"$tmp/verdict-elided-nousage.out" 2>&1 || code=$?
+rm -f "$home/.usage-fail"
+expect 4 "$code" "no tool-call count is not a pass"
+expect_grep '^UNCHECKED tool-bodies — 3 tool event' "$tmp/verdict-elided-nousage.out" "tool-bodies says why"
+# The count that matters is the window's. A busy month before the swap must not
+# dilute a week in which every tool body was elided.
+verdict_fixture
+awk -v s="$(iso_after "$fx_swapped" 0 | cut -c1-10)" 'match($0, /"day":"[^"]*"/) && substr($0, RSTART + 7, 10) >= s' \
+    "$home/.usage-rows" | sed -E 's/"tool_calls":[0-9]+/"tool_calls":0/' >"$home/.usage-window"
+printf '{"day":"%s","harness":"codex","turns":3,"tool_calls":100,"tool_denials":0,"repeated":0,"recovered":0}\n' \
+    "$(iso_ago $((2 * DAY)) | cut -c1-10)" >>"$home/.usage-window"
+elided_line 2
+code=0
+run verdict >"$tmp/verdict-elided-window.out" 2>&1 || code=$?
+expect_grep '^FAIL tool-bodies — 2 tool event.*of 100 tool call' "$tmp/verdict-elided-window.out" "the limit is 1% of the tool calls since the swap"
+rm -f "$home/.usage-window"
+# A row that names no tool_calls is a count not read, not a count of zero.
+verdict_fixture
+sed -E 's/"tool_calls":[0-9]+,//' "$home/.usage-rows" >"$home/.usage-rows.new"
+mv -f "$home/.usage-rows.new" "$home/.usage-rows"
+code=0
+run verdict >"$tmp/verdict-elided-nocount.out" 2>&1 || code=$?
+expect 4 "$code" "usage rows with no tool_calls are not a pass"
+expect_grep '^UNCHECKED tool-bodies.*name no tool_calls' "$tmp/verdict-elided-nocount.out" "and tool-bodies says why"
+verdict_fixture
+drop_line 3600 'tool bodies elided, not sealed' 'many'
+code=0
+run verdict >"$tmp/verdict-elided-garbled.out" 2>&1 || code=$?
+expect 4 "$code" "a detail that does not carry a count is not a pass"
+expect_grep '^UNCHECKED tool-bodies' "$tmp/verdict-elided-garbled.out" "and says the count is not known"
 
 # C0 — verdict items that could pass over a blind input say UNCHECKED.
 # A daemon.log whose every start line predates the swap cannot prove
@@ -1128,6 +1464,19 @@ run_real restart >"$tmp/restart-sessions.out" 2>&1 || code=$?
 expect 0 "${code:-0}" "planned restart with a sessionless refusal"
 expect_grep 'sessionless' "$tmp/restart-sessions.out" "the sessionless refusal is shown aside"
 expect_grep '"new_drops":0' "$home/.conbus/canary.json" "it is not counted as a loss"
+
+# Tool bodies elided on a planned restart: the records landed, so new_drops
+# stays 0 however many tool calls were in flight.
+cat >"$home/.conbus/canary.json" <<EOF
+{"swapped":"$past","prev_build":"01d","candidate_build":"beef","candidate_sha256":"x","restarts":[]}
+EOF
+write_fake beef elided "$install_dir/conbus"
+daemon_boot beef 5012
+code=0
+run_real restart >"$tmp/restart-elided.out" 2>&1 || code=$?
+expect 0 "${code:-0}" "planned restart with elided tool bodies"
+expect_grep '"new_drops":0' "$home/.conbus/canary.json" "elided bodies are not counted in new_drops"
+expect_grep '2 line(s) that lost no record not counted' "$tmp/restart-elided.out" "they are shown aside"
 
 # rollback reports the spool it leaves behind.
 mkdir -p "$home/.conbus/spool"
