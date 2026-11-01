@@ -266,8 +266,8 @@ AGENTS.md의 "SQLite는 파생" 항목에 사이드카와 스풀을 추가해 �
 **M7.0 `devin/m7.0-scripts`** (0:30)
 
 - `scripts/shadow-replay.sh OLD NEW CLONE`: S1 비교를 재현 가능하게.
-- `scripts/canary.sh {preflight,status,verdict,start,restart,rollback}`: 7절대로. **진짜 `HOME`이고 `CONBUS_SKIP_LAUNCHCTL`이 없을 때만 실제로 교체한다.** 그 외에는 `CONBUS_CANARY_REHEARSAL=1`을 요구하고 launchctl을 건너뛴다. 금지 시간대는 `CONBUS_CANARY_BLACKOUT` 환경 변수로 받는다(값은 저장소에 넣지 않는다). 형식은 `HH:MM-HH:MM`(매일, 자정 넘김 허용), `[요일] HH:MM-HH:MM [Zone]`(`Mon-Fri 09:00-15:30 Asia/Seoul` 같은), `<epoch>-<epoch>` 셋 중 하나다. 어느 것으로도 파싱되지 않는 값은 금지 시간대로 간주해 닫힌다(안전 쪽 실패).
-- 임시 `HOME` + `CONBUS_SKIP_LAUNCHCTL=1`로 예행 연습한다.
+- `scripts/canary.sh {preflight,status,verdict,start,restart,rollback}`: 7절대로. **진짜 교체는 진짜 `HOME` + `CONBUS_SKIP_LAUNCHCTL` 없음 + `CONBUS_CANARY_REHEARSAL` 없음이 모두 맞을 때만** 일어난다. `CONBUS_CANARY_REHEARSAL=1`이 있으면 무조건 리허설인데, 그것도 진짜 `HOME`에서는 어떤 파일도 건드리기 전에 거부한다(리허설은 임시 `HOME`에서만). 금지 시간대는 `CONBUS_CANARY_BLACKOUT` 환경 변수로 받는다(값은 저장소에 넣지 않는다). 형식은 `HH:MM-HH:MM`(매일, 자정 넘김 허용), `[요일] HH:MM-HH:MM [Zone]`(`Mon-Fri 09:00-15:30 Asia/Seoul` 같은), `<epoch>-<epoch>` 셋 중 하나다. 어느 것으로도 파싱되지 않는 값은 금지 시간대로 간주해 닫힌다(안전 쪽 실패).
+- 임시 `HOME`에서 예행 연습한다. 리허설 스크립트의 가짜 바이너리는 `install --apply`에도 답하므로 실제 모드 분기까지 시험한다.
 
 **RC**
 
@@ -302,15 +302,17 @@ AGENTS.md의 "SQLite는 파생" 항목에 사이드카와 스풀을 추가해 �
 
 1. `preflight`: S1~S5 증거 존재, 서명본 sha 대조, `TeamIdentifier`, 롤백 복사본, plist 백업, 금지 시간대 확인. **새 바이너리로 라이브 루트에 사이드카를 미리 빌드한다**(`cache/`만 쓴다). 안 그러면 첫 시작이 수 분 걸려 아래 확인이 매번 실패한다.
 2. `mv -f conbus.new conbus && conbus install --apply` (kickstart 아님, HANDOFF 참고).
-3. 자동 확인: build = daemon build, `CONBUS_CANARY_SERVING_LIMIT`(기본 30초) 안에 새 pid가 serving, 훅 왕복(`hooks` 행이 전부 `runs`), 드롭 사유 증가 0. 하나라도 실패하면 **자동 롤백**. 시작→serving 5초 목표는 롤백 조건이 아니라 `verdict` 판정 항목이다(현재 측정치가 5초 위라 매번 되돌리는 셈이 된다).
+3. 자동 확인: build = daemon build, `CONBUS_CANARY_SERVING_LIMIT`(기본 30초) 안에 새 pid가 serving, 훅 왕복(`hooks` 행이 전부 `runs`), **이전에 없던 드롭 사유 0 — 단, 교체 창에 불가피하게 생기는 두 사유는 예외로 세어 `canary.json`의 `swap_window_drops`에 남긴다**. 하나라도 실패하면 **자동 롤백**. 시작→serving 5초 목표는 롤백 조건이 아니라 `verdict` 판정 항목이다(현재 측정치가 5초 위라 매번 되돌리는 셈이 된다).
 
-**계획된 재시작**: 1일 차와 6일 차에 `canary.sh restart`(`install --apply`를 돌리고 serving ms·새 드롭 수를 `~/.conbus/canary.json`에 기록 — `verdict`가 이 항목들을 계획된 것으로 제외한다).
+**첫 교체의 유실이 불가피한 이유**: `mv`와 레코더 정지 사이에 돈 새 훅(프로토콜 v6)은 옛 0.2.8 레코더(v5)에 거절당한다. 0.2.8의 `daemon.build`에는 보존 수준(`retention`)이 없어 훅이 스풀 동의를 얻지 못하고 드롭한다. `start`는 이 사유(`this daemon speaks protocol v<이전>; the hook speaks v<후보>`, `no daemon on … Connection refused`)를 실패가 아니라 `swap_window_drops`로 세고, `verdict`는 교체 후 60초 안의 것만 면제한다. 60초 뒤에도 같은 사유가 나오면 새 데몬이 거절하고 있다는 뜻이라 FAIL이다. 시작 복구의 gap fill이 일부를 되찾는다.
+
+**계획된 재시작**: 1일 차와 6일 차에 `canary.sh restart`(`install --apply`를 돌리고 serving ms·재시작 중 `drops.jsonl`에 추가된 줄 수를 `~/.conbus/canary.json`에 기록 — `verdict`가 이 항목들을 계획된 것으로 제외한다. 세션 없는 페이로드 거절은 유실이 아니라 따로 표시).
 
 **통과 조건** (`canary.sh verdict`가 교체 시각 이후 로그로 계산):
 
 1. 계획 외 레코더 재시작 0.
 2. 읽지 못한 줄 0.
-3. 계획된 재시작에서 유실 0, 새 드롭 사유 0.
+3. 계획된 재시작에서 유실 0(추가된 드롭 줄 수), 새 드롭 사유 0 — 교체 후 60초 안의 예상 사유(`swap_window_drops`)는 면제되고 개수가 표시된다.
 4. 7일 동안 활동이 있는 하네스(최근 실측 기준 `claude_code`, `codex`, `grok`, `cursor`) 전부 활동일마다 기록 있음. OpenCode는 S2로 대체.
 5. twins·`repeated` 증가가 기준선 이하.
 6. **닫힌 날마다** RC의 `usage --json` = 같은 로그를 읽은 0.2.8 (`tokens_*` 제외).
