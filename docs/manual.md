@@ -243,7 +243,8 @@ lost if the recorder stops before the log takes it, and on a really full disk th
 is every record. `conbus doctor` says so on its `writable` line while it lasts: free
 space, and do not restart the recorder. A spooled
 entry is dropped with a line only once the file is seven days old and the log has
-refused for seven days without one write working.
+refused for seven days without one write working. One written by a newer build
+that this daemon cannot read yet is dropped with a line after seven days.
 With the daemon down and the disk really full there is nowhere to put a record,
 so it is lost, with no trace left on that disk.
 ```

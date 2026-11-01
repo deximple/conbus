@@ -79,9 +79,10 @@ pub struct Daemon {
 const HELD_MAX_BYTES: usize = 16 * 1024 * 1024;
 
 /// How long a record waits for a log that keeps refusing it, in memory or in the
-/// spool. Long enough for a person to find a full disk and free some, and short
-/// enough that something which will never land does not sit there for good.
-const REFUSED_LIFE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+/// spool, or for a build that can read it. Long enough for a person to find a
+/// full disk and free some, or to restart a daemon an upgrade left behind, and
+/// short enough that something which will never land does not sit there for good.
+const WAITING_LIFE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 /// How often `daemon.log` hears about each of those, however often they happen.
 const REFUSAL_NOTE_EVERY: Duration = Duration::from_secs(10 * 60);
@@ -116,7 +117,7 @@ struct Refusal {
     began: std::time::Instant,
     first_error: String,
     landed: u64,
-    /// Past the memory cap, or held for longer than `REFUSED_LIFE`. A hook may
+    /// Past the memory cap, or held for longer than `WAITING_LIFE`. A hook may
     /// still have spooled one of these, so this is not a count of certain loss.
     not_held: u64,
 }
@@ -302,18 +303,7 @@ impl Daemon {
         {
             // The daemon's own stderr, like every other refusal here: it is the
             // channel launchd captures, and the hook's is swallowed.
-            note!(
-                "refusing a hook speaking protocol v{}; this daemon speaks v{}",
-                request.protocol_version.unwrap_or_default(),
-                crate::wire::PROTOCOL_VERSION
-            );
-            return Response::Failed {
-                error: format!(
-                    "this daemon speaks protocol v{}; the hook speaks v{}. Restart the daemon.",
-                    crate::wire::PROTOCOL_VERSION,
-                    request.protocol_version.unwrap_or_default()
-                ),
-            };
+            return refuse_a_newer_hook(u64::from(request.protocol_version.unwrap_or_default()));
         }
 
         // The hook refuses these before they are sent; this is the second
@@ -595,7 +585,7 @@ impl Daemon {
         let mut took_one = false;
         while let Some(front) = self.held.front() {
             let landed = self.log.append(front.entry.clone());
-            let expired = front.since.elapsed() >= REFUSED_LIFE;
+            let expired = front.since.elapsed() >= WAITING_LIFE;
             if landed.is_err() && !expired {
                 return;
             }
@@ -1828,8 +1818,11 @@ fn handle_connection(daemon: &mut Daemon, stream: UnixStream) -> io::Result<()> 
         }
         let response = match serde_json::from_str::<Request>(&line) {
             Ok(request) => daemon.handle(request),
-            Err(err) => Response::Failed {
-                error: format!("unreadable request: {err}"),
+            Err(err) => match from_a_build_that_can_read_it(&line) {
+                Some(theirs) => refuse_a_newer_hook(theirs),
+                None => Response::Failed {
+                    error: format!("unreadable request: {err}"),
+                },
             },
         };
         writeln!(
@@ -1841,6 +1834,37 @@ fn handle_connection(daemon: &mut Daemon, stream: UnixStream) -> io::Result<()> 
         served += 1;
     }
     Ok(())
+}
+
+/// Refuse a hook this build cannot speak to, in the words a hook of any version
+/// takes as "spool this and wait", and on the daemon's own stderr, the channel
+/// launchd captures, because the hook's is swallowed.
+fn refuse_a_newer_hook(theirs: u64) -> Response {
+    let ours = crate::wire::PROTOCOL_VERSION;
+    note!("refusing a hook speaking protocol v{theirs}; this daemon speaks v{ours}");
+    Response::Failed {
+        error: newer_hook(theirs),
+    }
+}
+
+fn newer_hook(theirs: u64) -> String {
+    let ours = crate::wire::PROTOCOL_VERSION;
+    format!("this daemon speaks protocol v{ours}; the hook speaks v{theirs}. Restart the daemon.")
+}
+
+/// The protocol a request this build cannot parse says it speaks, when that
+/// means a newer build wrote it.
+///
+/// `docs/stability.md` allows a new event kind in 1.x, and a request carrying one
+/// does not parse here at all, so the version check in `Daemon::record` never
+/// sees it. At the same version it is a newer build that forgot to move the
+/// number. An older hook this build cannot read is a bug a restart will not mend,
+/// and a request that names no protocol is no hook's: every build since the field
+/// writes it.
+fn from_a_build_that_can_read_it(text: &str) -> Option<u64> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    let theirs = value.get("pv")?.as_u64()?;
+    (theirs >= u64::from(crate::wire::PROTOCOL_VERSION)).then_some(theirs)
 }
 
 /// Bound how long this connection may keep the daemon waiting, in either
@@ -1880,6 +1904,33 @@ fn log_refused(error: &str) -> bool {
     error.contains(" record(s) written, ")
 }
 
+/// Give up on a spool entry whose life is over. The file goes first: on a full
+/// disk that is what makes room for the line that says so. If it cannot go, it
+/// has not gone, and there is nothing to say yet.
+fn let_go(paths: &Paths, file: &Path, reason: String, detail: String) {
+    if std::fs::remove_file(file).is_ok() {
+        crate::drops::record_in(
+            Some(paths),
+            &crate::drops::Dropped::new(format!("spooled hook refused: {reason}"))
+                .with_detail(detail),
+        );
+    }
+}
+
+/// What a spooled request this build cannot parse was and whose it was, in the
+/// shape every other spool drop gives. Identifiers, never content.
+fn named_by(text: &str) -> String {
+    let value: serde_json::Value = serde_json::from_str(text.trim()).unwrap_or_default();
+    let kind = value["event"]["event"].as_str().unwrap_or("unknown");
+    let session: String = value["vendor_session_id"]
+        .as_str()
+        .unwrap_or_default()
+        .chars()
+        .take(8)
+        .collect();
+    format!("{kind} for session {session}")
+}
+
 /// Whether this file was written longer ago than `life`.
 fn outlived(file: &Path, life: Duration) -> bool {
     std::fs::symlink_metadata(file)
@@ -1889,9 +1940,9 @@ fn outlived(file: &Path, life: Duration) -> bool {
 
 /// Requests the spool holds, oldest first — the files are named for a UUIDv7,
 /// so a name sort is time order. Each goes through `Daemon::record`, the one
-/// writer, and is deleted after; a refusal that names a NEWER protocol stays
-/// for a newer daemon, a log that refuses it keeps it until both the file and
-/// the refusal are `REFUSED_LIFE` old, and any other refusal is a drop with the
+/// writer, and is deleted after. A log that refuses it keeps it until both the
+/// file and the refusal are `WAITING_LIFE` old, a build that cannot read it keeps
+/// it for `WAITING_LIFE`, and any other refusal is a drop with the
 /// reason.
 fn drain_spool(daemon: &mut Daemon, paths: &Paths) {
     daemon.land_held();
@@ -1910,12 +1961,30 @@ fn drain_spool(daemon: &mut Daemon, paths: &Paths) {
         // and following or loading it would read whatever it points at.
         let regular = std::fs::symlink_metadata(&file)
             .is_ok_and(|meta| meta.file_type().is_file() && meta.len() <= 1_048_576);
-        let request = regular
-            .then(|| std::fs::read_to_string(&file).ok())
-            .flatten()
+        let text = regular.then(|| std::fs::read_to_string(&file));
+        // Could not be read just now. That is no decision about the entry, and
+        // the next tick reads it again.
+        if matches!(text, Some(Err(_))) {
+            if outlived(&file, WAITING_LIFE) {
+                let_go(paths, &file, "could not be read".into(), "unknown".into());
+            }
+            continue;
+        }
+        let text = text.and_then(Result::ok);
+        let request = text
+            .as_deref()
             .and_then(|text| serde_json::from_str::<Request>(text.trim()).ok());
         match request {
             None => {
+                // A newer build's request, which the build that can read it
+                // will drain. It waits, like everything else here, for a while.
+                let text = text.as_deref().map(str::trim).unwrap_or_default();
+                if let Some(theirs) = from_a_build_that_can_read_it(text) {
+                    if outlived(&file, WAITING_LIFE) {
+                        let_go(paths, &file, newer_hook(theirs), named_by(text));
+                    }
+                    continue;
+                }
                 crate::drops::record_in(
                     Some(paths),
                     &crate::drops::Dropped::new(format!(
@@ -1935,8 +2004,12 @@ fn drain_spool(daemon: &mut Daemon, paths: &Paths) {
                     .unwrap_or_else(|| "unknown".into());
                 let session: String = request.vendor_session_id.chars().take(8).collect();
                 match daemon.record(request, false) {
-                    Response::Failed { ref error } if error.contains("protocol v") => {
-                        // A newer hook wrote this; a newer daemon drains it.
+                    Response::Failed { error } if error.contains("protocol v") => {
+                        // A newer hook wrote this; a newer daemon drains it, if
+                        // one comes.
+                        if outlived(&file, WAITING_LIFE) {
+                            let_go(paths, &file, error, format!("{kind} for session {session}"));
+                        }
                     }
                     Response::Failed { error } if log_refused(&error) => {
                         // Temporary, and this file is the only copy on disk. The
@@ -1945,17 +2018,10 @@ fn drain_spool(daemon: &mut Daemon, paths: &Paths) {
                         // An old file is no reason to give up: a laptop shut for a
                         // fortnight comes back with its spool, and the log has only
                         // just refused it. It takes a log that has gone on refusing.
-                        if !(outlived(&file, REFUSED_LIFE) && daemon.refusing_for(REFUSED_LIFE)) {
+                        if !(outlived(&file, WAITING_LIFE) && daemon.refusing_for(WAITING_LIFE)) {
                             break;
                         }
-                        // In this order: on a full disk the file going is what
-                        // makes room for the line that says so.
-                        let _ = std::fs::remove_file(&file);
-                        crate::drops::record_in(
-                            Some(paths),
-                            &crate::drops::Dropped::new(format!("spooled hook refused: {error}"))
-                                .with_detail(format!("{kind} for session {session}")),
-                        );
+                        let_go(paths, &file, error, format!("{kind} for session {session}"));
                     }
                     Response::Failed { error } => {
                         crate::drops::record_in(
@@ -2470,7 +2536,7 @@ mod tests {
         let bytes_of_both = daemon.held_bytes;
         let first_bytes = daemon.held[0].bytes;
         daemon.held[0].since = std::time::Instant::now()
-            .checked_sub(REFUSED_LIFE + Duration::from_secs(60))
+            .checked_sub(WAITING_LIFE + Duration::from_secs(60))
             .expect("a week ago");
 
         daemon.land_held();
@@ -2559,7 +2625,7 @@ mod tests {
             .write(true)
             .open(&old)
             .expect("open")
-            .set_modified(std::time::SystemTime::now() - REFUSED_LIFE - Duration::from_secs(60))
+            .set_modified(std::time::SystemTime::now() - WAITING_LIFE - Duration::from_secs(60))
             .expect("age it");
 
         drain_spool(&mut daemon, &paths);
@@ -2571,7 +2637,7 @@ mod tests {
         assert_eq!(said(), "");
 
         daemon.refusal.as_mut().expect("refusing").began = std::time::Instant::now()
-            .checked_sub(REFUSED_LIFE + Duration::from_secs(60))
+            .checked_sub(WAITING_LIFE + Duration::from_secs(60))
             .expect("a week ago");
         drain_spool(&mut daemon, &paths);
 
