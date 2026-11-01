@@ -12,6 +12,10 @@ the entry says so when it does.
   reports them — `tokens_input`, `tokens_output`, `tokens_cache_read`,
   `tokens_cache_write`, today Cursor's `afterAgentResponse` only — and the
   `--shareable` rows carry them per RFD 0002's amendment.
+- conbus builds and records on Linux — x86_64 and aarch64 — with the recorder
+  as a systemd user unit; where there is no OS key store, tool bodies are
+  elided and `sync --join --apply` says so rather than writing one to a file.
+  `install.sh` picks the tarball by `uname -m`.
 - `conbus policy`: a local `policy.json` turns into `PreToolUse` decisions,
   off by default. The decision is made in the hook process, so a down
   recorder cannot lift a deny; a file that does not parse decides nothing

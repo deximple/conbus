@@ -37,6 +37,10 @@ State assumptions before implementing, and say so when a simpler approach exists
 
 Self-improve is `docs/self-improve.md`. Observe the live bus, pick one live defect, fix it, verify, ledger, repeat. Do not treat a stale HANDOFF paragraph as current.
 
+## Linux and cloud VMs
+
+conbus builds and records on Linux; the recorder runs as a systemd user unit there and `install --apply` expects launchd only on macOS. Set `CONBUS_HOME` when the log should not land in `~/.conbus`, and `CONBUS_SKIP_LAUNCHCTL=1` in CI so install paths never touch a service manager. `conbus doctor` may show `memory_locked=false` on a VM that refuses `mlockall` — the daemon still records.
+
 
 
 

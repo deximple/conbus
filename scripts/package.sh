@@ -5,9 +5,9 @@
 #     cargo build --release --locked -p conbus --target aarch64-apple-darwin
 #     cargo build --release --locked -p conbus --target x86_64-apple-darwin
 #     scripts/package.sh dist          → conbus-macos-universal.tar.gz
-#   Linux:
-#     cargo build --release --locked -p conbus --target x86_64-unknown-linux-gnu
-#     scripts/package.sh dist          → conbus-linux-x86_64.tar.gz
+#   Linux (any rust target triple; the asset is named for its arch):
+#     cargo build --release --locked -p conbus --target x86_64-unknown-linux-musl
+#     scripts/package.sh dist x86_64-unknown-linux-musl   → conbus-linux-x86_64.tar.gz
 #
 # Writes the tarball, its .sha256, and a copy of install.sh; the release notes
 # for this version go to target/release-notes.md.
@@ -37,8 +37,9 @@ case "$(uname -s)" in
     lipo -info "$out/stage/conbus"
     ;;
   Linux)
-    bin=target/x86_64-unknown-linux-gnu/release/conbus
-    asset=conbus-linux-x86_64.tar.gz
+    triple=${2:-x86_64-unknown-linux-gnu}
+    bin=target/$triple/release/conbus
+    asset=conbus-linux-${triple%%-*}.tar.gz
     [ -x "$bin" ] || { echo "package.sh: missing $bin — build the target first" >&2; exit 1; }
     cp "$bin" "$out/stage/conbus"
     ;;

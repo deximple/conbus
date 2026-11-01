@@ -26,8 +26,11 @@ case "$(uname -s)" in
     checksum() { shasum -a 256 -c "$1"; }
     ;;
   Linux)
-    [ "$(uname -m)" = x86_64 ] || die "on Linux conbus ships for x86_64 only for now."
-    asset=conbus-linux-x86_64.tar.gz
+    case "$(uname -m)" in
+      x86_64)         asset=conbus-linux-x86_64.tar.gz ;;
+      aarch64|arm64)  asset=conbus-linux-aarch64.tar.gz ;;
+      *)              die "on Linux conbus ships for x86_64 and aarch64 only for now." ;;
+    esac
     checksum() { sha256sum -c "$1"; }
     ;;
   *) die "conbus runs on macOS and Linux only for now." ;;

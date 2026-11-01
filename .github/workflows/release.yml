@@ -71,18 +71,30 @@ jobs:
           path: dist/
 
   release-linux:
-    runs-on: ubuntu-latest
     # `release` owns `gh release create`; this job only uploads to it.
     needs: release
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            asset_arch: x86_64
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            asset_arch: aarch64
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Toolchain
         run: |
-          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal \
-            --target x86_64-unknown-linux-gnu
-          rustup default "$RUST_TOOLCHAIN"
+          rustup toolchain install
+          rustup target add ${{ matrix.target }}
+
+      - name: musl toolchain
+        run: sudo apt-get install -y musl-tools
 
       - name: The tag names the version being released
         if: startsWith(github.ref, 'refs/tags/')
@@ -97,10 +109,10 @@ jobs:
         run: cargo test --workspace --locked
 
       - name: Build
-        run: cargo build --release --locked -p conbus --target x86_64-unknown-linux-gnu
+        run: cargo build --release --locked -p conbus --target ${{ matrix.target }}
 
       - name: Package
-        run: sh scripts/package.sh dist-linux
+        run: sh scripts/package.sh dist-linux ${{ matrix.target }}
 
       - name: Publish
         if: startsWith(github.ref, 'refs/tags/')
@@ -112,5 +124,5 @@ jobs:
         if: ${{ !startsWith(github.ref, 'refs/tags/') }}
         uses: actions/upload-artifact@v4
         with:
-          name: conbus-linux-x86_64
+          name: conbus-linux-${{ matrix.asset_arch }}
           path: dist-linux/
