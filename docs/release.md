@@ -29,17 +29,24 @@ steps that stay with the operator.
    for x86_64 and aarch64 Linux (testing the musl target that ships), and
    attaches `conbus-macos-universal.tar.gz`, `conbus-linux-x86_64.tar.gz`,
    `conbus-linux-aarch64.tar.gz`, their `.sha256`s, `install.sh`, and a
-   CycloneDX bill of materials (`conbus.cdx.json`), with build provenance
-   attested for each package (`gh attestation verify <file> --repo
-   deximple/conbus`).
+   CycloneDX bill of materials (`conbus.cdx.json`). The `release` job attaches
+   the macOS package, `install.sh` and the bill of materials; each
+   `release-linux` job attaches its own package and checksum.
+
+   Build provenance is attested for each package the workflow builds, so `gh
+   attestation verify <file> --repo deximple/conbus` passes on a Linux tarball.
+   On the macOS package a release carries it fails with a 404 and exit 1 (checked
+   on v1.0.0-rc.3): `sign-release.sh` replaced that package with one the workflow
+   did not build, and no attestation covers it. What vouches for that one is its
+   Developer ID signature and notarization, which `install.sh` checks by team.
 
    **`latest` never points at an unsigned package.** A tag with a hyphen
    (`v1.0.0-rc.1`) is published as a **prerelease**, which is never `latest`.
    Any other tag is created as a **draft**; `scripts/sign-release.sh vX.Y.Z
-   --upload` replaces the package with the signed, notarized one and only
-   then publishes the release as `latest` (`gh release edit --draft=false
-   --latest`). A release candidate is signed the same way and stays a
-   prerelease.
+   --upload` replaces the package with the signed, notarized one, checks that
+   everything an install fetches is on the release, and only then publishes it as
+   `latest` (`gh release edit --draft=false --latest`). A release candidate is
+   signed the same way and stays a prerelease.
 6. **Supply chain**: `supply-chain.yml` runs `cargo deny check` (advisories,
    licences, sources; `deny.toml`) on every release tag, by hand, and weekly —
    not on pull requests.
@@ -89,22 +96,40 @@ Once, by the operator, because each step needs their sign-in:
 3. `security find-identity -v -p codesigning` now lists
    `Developer ID Application: NAME (TEAMID)`.
 
-For each release, after the workflow has published `vX.Y.Z`:
+For each release, once all three jobs of the workflow have finished for `vX.Y.Z`:
 
 ```bash
 CONBUS_SIGN_IDENTITY="Developer ID Application: NAME (TEAMID)" sh scripts/sign-release.sh vX.Y.Z
 ```
 
 This writes `target/signed/` and uploads nothing. Run it again with
-`--upload` to replace the release's package and checksum. The script:
+`--upload` to replace the release's package and checksum, and for a stable tag to
+publish it. The script:
 
+- with `--upload`, before anything else, refuses a stable release that is no
+  longer a draft, and a release that lacks anything an install fetches: the macOS
+  package, both Linux tarballs, the checksum of each, and `install.sh`. It fetches
+  them and checks each checksum, so a package that does not match its checksum is
+  refused too;
 - checks the published package against its checksum;
 - signs both slices with the hardened runtime, a secure timestamp, the
   `sh.conbus` identifier and `scripts/conbus.entitlements`;
 - refuses a signature that names no team;
 - submits a zip to Apple and waits for `Accepted`, printing Apple's log when
   it is not;
-- asks Gatekeeper to assess the result, then repackages.
+- asks Gatekeeper to assess the result, then repackages;
+- with `--upload`, uploads the signed package and checksum, fetches everything
+  again, compares the macOS package with the signed one, and only then publishes.
+
+A refusal leaves the release a draft (a release candidate stays a prerelease) and
+says what is missing and what to do: `gh run list --workflow release.yml --branch
+vX.Y.Z` to see the jobs, `gh run rerun RUN_ID --failed` for one that failed, and
+then `--upload` again. If an upload from here stopped part way, `target/signed/`
+holds the signed package to upload by hand. A re-run finds Apple's ticket by code
+hash and does not wait on Apple twice.
+
+`scripts/sign-release-rehearsal.sh` runs all of this on a fake toolchain, and CI
+runs it on every pull request. A real draft release has never been through it.
 
 A bare binary cannot carry a stapled ticket, so Gatekeeper looks the
 notarization up online the first time it checks it. Apple publishes the ticket
