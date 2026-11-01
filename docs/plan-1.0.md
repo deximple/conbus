@@ -302,7 +302,9 @@ AGENTS.md의 "SQLite는 파생" 항목에 사이드카와 스풀을 추가해 �
 
 1. `preflight`: S1~S5 증거 존재, 서명본 sha 대조, `TeamIdentifier`, 롤백 복사본, plist 백업, 금지 시간대 확인. **새 바이너리로 라이브 루트에 사이드카를 미리 빌드한다**(`cache/`만 쓴다). 안 그러면 첫 시작이 수 분 걸려 아래 확인이 매번 실패한다.
 2. `mv -f conbus.new conbus && conbus install --apply` (kickstart 아님, HANDOFF 참고).
-3. 자동 확인: build = daemon build, `CONBUS_CANARY_SERVING_LIMIT`(기본 30초) 안에 새 pid가 serving, 훅 왕복(`hooks` 행이 전부 `runs`), **이전에 없던 드롭 사유 0 — 단, 교체 창에 불가피하게 생기는 두 사유는 예외로 세어 `canary.json`의 `swap_window_drops`에 남긴다**. 하나라도 실패하면 **자동 롤백**. 시작→serving 5초 목표는 롤백 조건이 아니라 `verdict` 판정 항목이다(현재 측정치가 5초 위라 매번 되돌리는 셈이 된다).
+3. 자동 확인: build = daemon build, `CONBUS_CANARY_SERVING_LIMIT`(기본 30초) 안에 새 pid가 serving, 설치된 벤더의 `hooks` 행이 전부 `runs`이고 빠진 이벤트 없음, 새 데몬이 소켓의 요청에 응답, **이전에 없던 드롭 사유 0 — 단, 교체 창에 불가피하게 생기는 두 사유는 예외로 세어 `canary.json`의 `swap_window_drops`에 남긴다**. 하나라도 실패하면 **자동 롤백**. 시작→serving 5초 목표는 롤백 조건이 아니라 `verdict` 판정 항목이다(현재 측정치가 5초 위라 매번 되돌리는 셈이 된다).
+
+**이 확인이 증명하는 것**: `hooks … runs`는 왕복이 아니다. 명령을 표식과 함께 띄워 소켓 앞에서 돌아오는 것을 보거나(Claude, Codex, Grok), 등록만 읽는다(Cursor, OpenCode). 그래서 `preflight --from`이 후보의 훅을 후보의 데몬으로 보내 버리는 임시 루트의 로그에 기록이 들어가는지 보고, 교체 뒤에는 새 데몬이 소켓에 응답해야 한다. 둘 다 진짜 로그에 쓰지 않는다. 벤더가 실제로 훅을 부르는지는 여기서 증명하지 못하며, `verdict`의 `harness-activity`가 실제 기록으로 판정한다. 기록을 잃지 않은 줄(세션 없는 페이로드, 로그에 없는 세션의 끝, 도구 본문 생략)은 이 확인에서 새 사유로 세지 않는다. Codex 신뢰는 사람이 하는 일이라 되돌리지 않고 알리기만 하며, `verdict`는 그대로면 FAIL이다.
 
 **첫 교체의 유실이 불가피한 이유**: `mv`와 레코더 정지 사이에 돈 새 훅(프로토콜 v6)은 옛 0.2.8 레코더(v5)에 거절당한다. 0.2.8의 `daemon.build`에는 보존 수준(`retention`)이 없어 훅이 스풀 동의를 얻지 못하고 드롭한다. `start`는 이 사유(`this daemon speaks protocol v<이전>; the hook speaks v<후보>`, `no daemon on … Connection refused`)를 실패가 아니라 `swap_window_drops`로 세고, `verdict`는 교체 후 60초 안의 것만 면제한다. 60초 뒤에도 같은 사유가 나오면 새 데몬이 거절하고 있다는 뜻이라 FAIL이다. 시작 복구의 gap fill이 일부를 되찾는다.
 

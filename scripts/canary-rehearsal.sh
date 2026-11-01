@@ -75,6 +75,8 @@ usage_rows() { # usage_rows <first-iso> <harness>...
 #   chatty    — like live, with far more output after the socket line than a pipe
 #               holds, so a reader that leaves at its first match costs the
 #               writer a SIGPIPE every time instead of once in a while
+#   novendor  — hooks run, and one vendor is simply not on this machine
+#   norecord  — its hook answers and no record lands
 #   tornlive  — doctor counts an unreadable line the last boot never saw
 #   nocount   — doctor fails before its log count, as with an unreadable segment
 #   readonly  — doctor says the log cannot be appended to
@@ -107,6 +109,8 @@ write_fake() {
             install_body='touch "$HOME/.install-called"; printf "{\"ts\":\"%s\",\"reason\":\"the daemon refused the record: this daemon speaks protocol v5; the hook speaks v6. Restart the daemon.\"}\n" "$(perl -MTime::HiRes=gettimeofday -MPOSIX=strftime -e "(\$s,\$u)=gettimeofday; printf \"%s.%03dZ\", strftime(\"%Y-%m-%dT%H:%M:%S\", gmtime(\$s)), int(\$u/1000)")" >> "$HOME/.conbus/drops.jsonl"' ;;
         sessions) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "hooks     claude_code  runs — x"'
             install_body='touch "$HOME/.install-called"; printf "{\"ts\":\"%s\",\"reason\":\"the hook payload names no session; an empty id would merge unrelated sessions into one conversation\"}\n" "$(perl -MTime::HiRes=gettimeofday -MPOSIX=strftime -e "(\$s,\$u)=gettimeofday; printf \"%s.%03dZ\", strftime(\"%Y-%m-%dT%H:%M:%S\", gmtime(\$s)), int(\$u/1000)")" >> "$HOME/.conbus/drops.jsonl"' ;;
+        novendor) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "hooks     claude_code  runs — x"; echo "hooks     codex        not installed here"' ;;
+        norecord) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "hooks     claude_code  runs — x"' ;;
         tornlive) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "disk      log 1.0 MB — 1.0 GB free of 2.0 GB (50.0%)"; echo "log       5 record(s), 1 conversation(s), 1 unreadable line(s)"; echo "hooks     claude_code  runs — x"' ;;
         nocount) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "disk      log 1.0 MB — 1.0 GB free of 2.0 GB (50.0%)"; echo "hooks     claude_code  runs — x"; exit 1' ;;
         readonly) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "writable  NOT APPENDABLE: Read-only file system — records will be refused"; echo "disk      log 1.0 MB — 1.0 GB free of 2.0 GB (50.0%)"; echo "log       5 record(s), 1 conversation(s), 0 unreadable line(s)"; echo "hooks     claude_code  runs — x"' ;;
@@ -130,6 +134,8 @@ write_fake() {
     # Both binaries read the rows a scenario wrote to $HOME/.usage-rows, as two
     # builds read one log; the older one without the tokens_* keys. .usage-fail
     # fails every read, .usage-fail-day only that day's.
+    hook_body='{ cat; echo; } >>"$HOME/.conbus/fake-records"; echo "{}"'
+    [ "$persona" = norecord ] && hook_body='cat >/dev/null; echo "{}"'
     usage_filter=cat
     if [ "$persona" = notokens ]; then
         usage_filter="sed -E 's/\"tokens_[a-z_]*\":[0-9]*,?//g; s/,}/}/g'"
@@ -143,7 +149,19 @@ case "\$1" in doctor|quota|status) echo "\${CONBUS_AGY_BIN:-unset}" >>"$tmp/agy-
 case "\$1" in
     --version) echo "conbus 0.0.0-$tag ($tag)" ;;
     doctor) $doctor ;;
-    log) echo "cache     0 closed segment(s): 0 built, 0 already valid" ;;
+    log)
+        case "\$2" in
+            --json) cat "\$HOME/.conbus/fake-records" 2>/dev/null ;;
+            *) echo "cache     0 closed segment(s): 0 built, 0 already valid" ;;
+        esac
+        ;;
+    daemon)
+        mkdir -p "\$HOME/.conbus"
+        printf '{"build":"$tag","pid":%s,"started":"2026-11-01T10:00:00.000Z","serving":"2026-11-01T10:00:02.000Z"}\\n' "\$\$" >"\$HOME/.conbus/daemon.build"
+        echo "\$\$ \$HOME" >>"$tmp/round-trip-daemons"
+        exec sleep 300
+        ;;
+    hook) $hook_body ;;
     usage)
         [ -f "\$HOME/.usage-fail" ] && { echo "a segment could not be read" >&2; exit 1; }
         case "\$2 \$3" in
@@ -310,6 +328,37 @@ daemon_boot() { # daemon_boot <build> <pid>
 }
 
 say() { printf 'rehearsal: %s\n' "$*"; }
+
+# A stand-in for the running recorder, named so `ps` shows `conbus daemon` the way
+# the real one reads, answering a line that is not a request the way the real one
+# does. <socket>.silent makes it hold connections and never reply: a wedged daemon.
+mkdir -p "$tmp/recorder"
+cat >"$tmp/recorder/conbus" <<'EOF'
+#!/usr/bin/perl
+use IO::Socket::UNIX;
+my $path = $ARGV[1];
+unlink $path;
+my $server = IO::Socket::UNIX->new(Type => SOCK_STREAM(), Local => $path, Listen => 16) or die "bind: $!";
+$SIG{PIPE} = "IGNORE";
+while (my $client = $server->accept) {
+    if (-e "$path.silent") { push @held, $client; next; }
+    $client->autoflush(1);
+    my $line = <$client>;
+    print $client qq({"status":"failed","error":"unreadable request"}\n);
+    close $client;
+}
+EOF
+chmod 755 "$tmp/recorder/conbus"
+start_recorder() {
+    "$tmp/recorder/conbus" daemon "$home/.conbus/conbus.sock" &
+    recorder_pid=$!
+    n=0
+    while [ ! -S "$home/.conbus/conbus.sock" ] && [ "$n" -lt 100 ]; do
+        sleep 0.05
+        n=$((n + 1))
+    done
+}
+start_recorder
 
 # --- read-only and preflight -------------------------------------------------
 
@@ -554,6 +603,84 @@ cat >"$home/.conbus/drops.jsonl" <<'EOF'
 {"ts":"2026-10-30T09:00:00.000Z","reason":"socket closed early"}
 EOF
 
+# --- what start proves --------------------------------------------------------
+
+# preflight proves a record can land through the candidate, under its own root.
+expect_grep '^PASS round-trip.*throwaway log' "$tmp/start.out" "preflight sends the candidate's hook through its own daemon"
+expect_absent "$home/.conbus/fake-records" "and nothing of it reaches this root"
+expect_file "$tmp/round-trip-daemons" "the candidate's daemon ran"
+still_running=0
+roots_left=0
+while read -r daemon_pid daemon_root; do
+    if kill -0 "$daemon_pid" 2>/dev/null; then
+        still_running=$((still_running + 1))
+        kill "$daemon_pid" 2>/dev/null || true
+    fi
+    if [ -e "$daemon_root" ]; then roots_left=$((roots_left + 1)); fi
+done <"$tmp/round-trip-daemons"
+expect 0 "$still_running" "and is stopped, not left running on a removed root"
+expect 0 "$roots_left" "and its throwaway root is gone"
+expect_grep 'not proved here: that a vendor fires its hooks' "$tmp/start.out" "start says what it did not prove"
+# A candidate whose hook answers and records nothing is refused before it swaps:
+# `hooks runs` would never have seen it.
+write_fake beef norecord "$tmp/stage/conbus-norecord"
+write_fake 01d old "$install_dir/conbus"
+code=0
+run start --from "$tmp/stage/conbus-norecord" >"$tmp/start-norecord.out" 2>&1 || code=$?
+expect 2 "$code" "a candidate that lands no record is refused"
+expect_grep '^FAIL round-trip.*no record reached the log' "$tmp/start-norecord.out" "it is the named failure"
+expect "conbus 0.0.0-01d (01d)" "$("$install_dir/conbus" --version)" "and nothing moved"
+
+# After the swap the new daemon has to answer. Doctor's `listening` only connects.
+touch "$home/.conbus/conbus.sock.silent"
+rm -f "$rollback_bin" "$home/.conbus/canary.json"
+daemon_boot beef 4252
+code=0
+CONBUS_CANARY_PROBE_S=1 SERVING_LIMIT=5 run start --from "$tmp/stage/conbus-good" >"$tmp/start-wedged.out" 2>&1 || code=$?
+rm -f "$home/.conbus/conbus.sock.silent"
+expect 1 "$code" "a daemon that listens and never answers rolls back"
+expect_grep 'did not answer a request on its socket' "$tmp/start-wedged.out" "the reason says so"
+expect "conbus 0.0.0-01d (01d)" "$("$install_dir/conbus" --version)" "the old build is back"
+
+# A registered hook missing events: the same gate as one that does not run.
+write_fake beef eventgap "$tmp/stage/conbus-eventgap"
+write_fake 01d old "$install_dir/conbus"
+rm -f "$home/.conbus/canary.json"
+daemon_boot beef 4253
+code=0
+SERVING_LIMIT=5 run start --from "$tmp/stage/conbus-eventgap" >"$tmp/start-eventgap.out" 2>&1 || code=$?
+expect 1 "$code" "a hook missing events rolls back"
+expect_grep "a hook is not 'runs'.*MISSING Stop" "$tmp/start-eventgap.out" "the events are named"
+
+# A vendor this machine does not have has no hook to run. It is no reason to roll
+# back, and neither is it proof of anything if no hook runs at all.
+write_fake beef novendor "$tmp/stage/conbus-novendor"
+write_fake 01d old "$install_dir/conbus"
+rm -f "$home/.conbus/canary.json"
+daemon_boot beef 4255
+code=0
+run start --from "$tmp/stage/conbus-novendor" >"$tmp/start-novendor.out" 2>&1 || code=$?
+if [ "$code" != 0 ]; then tail -6 "$tmp/start-novendor.out" >&2; fi
+expect 0 "$code" "a vendor not installed here does not roll back"
+write_fake beef nohooks "$tmp/stage/conbus-nohooks"
+write_fake 01d old "$install_dir/conbus"
+rm -f "$rollback_bin" "$home/.conbus/canary.json"
+daemon_boot beef 4256
+code=0
+SERVING_LIMIT=5 run start --from "$tmp/stage/conbus-nohooks" >"$tmp/start-nohooks.out" 2>&1 || code=$?
+expect 1 "$code" "no hook running at all rolls back"
+expect_grep 'no hook runs here' "$tmp/start-nohooks.out" "the reason says so"
+
+# Codex's trust is a person's act, so it warns and does not undo a healthy swap.
+write_fake beef untrusted "$tmp/stage/conbus-untrusted"
+write_fake 01d old "$install_dir/conbus"
+rm -f "$home/.conbus/canary.json"
+daemon_boot beef 4254
+code=0
+run start --from "$tmp/stage/conbus-untrusted" >"$tmp/start-untrusted.out" 2>&1 || code=$?
+expect 0 "$code" "a hook waiting on a person's trust does not roll back"
+expect_grep 'until you approve them inside Codex' "$tmp/start-untrusted.out" "and the person is told"
+
 # --- the real path through the test seam -------------------------------------
 
 # The same swap through the real code path: install --apply runs (the fake
@@ -725,37 +852,6 @@ expect_grep "ROLLBACK NOT VERIFIED" "$tmp/stuckrb.out" "the cap-hit verification
 rm -f "$rollback_bin"
 
 # --- restart + verdict -------------------------------------------------------
-
-# A stand-in for the running recorder, named so `ps` shows `conbus daemon` the way
-# the real one reads, answering a line that is not a request the way the real one
-# does. <socket>.silent makes it hold connections and never reply: a wedged daemon.
-mkdir -p "$tmp/recorder"
-cat >"$tmp/recorder/conbus" <<'EOF'
-#!/usr/bin/perl
-use IO::Socket::UNIX;
-my $path = $ARGV[1];
-unlink $path;
-my $server = IO::Socket::UNIX->new(Type => SOCK_STREAM(), Local => $path, Listen => 16) or die "bind: $!";
-$SIG{PIPE} = "IGNORE";
-while (my $client = $server->accept) {
-    if (-e "$path.silent") { push @held, $client; next; }
-    $client->autoflush(1);
-    my $line = <$client>;
-    print $client qq({"status":"failed","error":"unreadable request"}\n);
-    close $client;
-}
-EOF
-chmod 755 "$tmp/recorder/conbus"
-start_recorder() {
-    "$tmp/recorder/conbus" daemon "$home/.conbus/conbus.sock" &
-    recorder_pid=$!
-    n=0
-    while [ ! -S "$home/.conbus/conbus.sock" ] && [ "$n" -lt 100 ]; do
-        sleep 0.05
-        n=$((n + 1))
-    done
-}
-start_recorder
 
 # A complete, healthy window: everything verdict reads, dated around <swapped>
 # (default 7 days and an hour ago, so the window is over). A scenario then
