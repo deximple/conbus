@@ -441,6 +441,7 @@ impl Daemon {
     fn remember(&mut self, written: &[Record]) {
         for record in written {
             Chapter::apply(&mut self.chapters, record);
+            self.registry.note_written(record);
         }
     }
 
@@ -753,6 +754,7 @@ impl Daemon {
         }) {
             Ok(Some(record)) => {
                 Chapter::apply(&mut self.chapters, &record);
+                self.registry.note_written(&record);
                 seqs.push(record.seq);
                 written.push(record);
             }
@@ -1734,6 +1736,128 @@ mod tests {
             matches!(response, Response::Recorded { .. }),
             "{response:?}"
         );
+    }
+
+    /// A request from this conversation's session, ordering it to Cursor.
+    fn directed_at_cursor(session: &str) -> Request {
+        Request {
+            vendor_session_id: session.into(),
+            brief: false,
+            ..request(Event::Routed {
+                next: Harness::CURSOR.into(),
+                hop: Hop::HandedOff,
+                reason: "typed by hand".into(),
+                code_freshness: None,
+                provenance: None,
+            })
+        }
+    }
+
+    fn cursor_says(session: &str) -> Request {
+        Request {
+            harness: Harness::new(Harness::CURSOR),
+            vendor_session_id: session.into(),
+            brief: false,
+            ..request(Event::TurnStarted {
+                author: None,
+                prompt: Body::kept("continue"),
+            })
+        }
+    }
+
+    /// A daemon with conversation A's hop to Cursor in the log, and a second
+    /// session at work beside it.
+    fn a_seat_for_a_beside_session_b(dir: &Path) -> (Daemon, BusId) {
+        let log = SegmentLog::open(dir, Retention::default()).expect("open");
+        let mut daemon = Daemon::new(log, Registry::new(), HashMap::new());
+        let said = |text: &str| Event::TurnStarted {
+            author: None,
+            prompt: Body::kept(text),
+        };
+        daemon.handle(request(said("work on a")));
+        let a = SegmentLog::scan(dir).expect("scan").records[0].bus_id;
+        let hop = daemon.handle(directed_at_cursor("abc123"));
+        assert!(matches!(hop, Response::Recorded { .. }), "{hop:?}");
+        daemon.handle(Request {
+            vendor_session_id: "session-b".into(),
+            ..request(said("work on b"))
+        });
+        (daemon, a)
+    }
+
+    /// The next write fails, as a full disk fails it.
+    fn the_log_starts_refusing(daemon: &mut Daemon, dir: &Path) -> PathBuf {
+        daemon.log = SegmentLog::open(dir, Retention::default()).expect("reopen");
+        let segment = SegmentLog::current_segment(dir).expect("segment");
+        fs::set_permissions(&segment, fs::Permissions::from_mode(0o400)).expect("close");
+        segment
+    }
+
+    #[test]
+    fn a_refused_hop_does_not_cost_another_conversation_its_seat() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut daemon, a) = a_seat_for_a_beside_session_b(dir.path());
+        let segment = the_log_starts_refusing(&mut daemon, dir.path());
+
+        let refused = daemon.handle(directed_at_cursor("session-b"));
+
+        assert!(matches!(refused, Response::Failed { .. }), "{refused:?}");
+        fs::set_permissions(&segment, fs::Permissions::from_mode(0o600)).expect("open");
+        // A restart reads only A's hop, and gives A its seat. So must the daemon
+        // that was there.
+        let elsewhere = tempfile::tempdir().expect("tempdir");
+        let mut replayed = Daemon::new(
+            SegmentLog::open(elsewhere.path(), Retention::default()).expect("open"),
+            Registry::restore(&SegmentLog::scan(dir.path()).expect("scan").records),
+            HashMap::new(),
+        );
+        for (who, daemon) in [("replay", &mut replayed), ("live", &mut daemon)] {
+            let Response::Recorded { bus_id, .. } = daemon.handle(cursor_says("arrives")) else {
+                panic!("a prompt");
+            };
+            assert_eq!(bus_id, a, "{who}");
+        }
+    }
+
+    #[test]
+    fn a_refused_repeat_of_a_hop_does_not_cost_the_first_one_its_seat() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut daemon, a) = a_seat_for_a_beside_session_b(dir.path());
+        let segment = the_log_starts_refusing(&mut daemon, dir.path());
+
+        let refused = daemon.handle(directed_at_cursor("abc123"));
+
+        assert!(matches!(refused, Response::Failed { .. }), "{refused:?}");
+        fs::set_permissions(&segment, fs::Permissions::from_mode(0o600)).expect("open");
+        let Response::Recorded { bus_id, .. } = daemon.handle(cursor_says("arrives")) else {
+            panic!("a prompt");
+        };
+        assert_eq!(bus_id, a, "the first hop landed; only the repeat failed");
+    }
+
+    #[test]
+    fn a_refused_hop_leaves_no_seat_of_its_own() {
+        // The caller was told it failed. The next prompt in that checkout must not
+        // bind to the conversation of a hop that did not happen, and that binding
+        // would be for good.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = SegmentLog::open(dir.path(), Retention::default()).expect("open");
+        let mut daemon = Daemon::new(log, Registry::new(), HashMap::new());
+        daemon.handle(request(Event::TurnStarted {
+            author: None,
+            prompt: Body::kept("work"),
+        }));
+        let handed_off = SegmentLog::scan(dir.path()).expect("scan").records[0].bus_id;
+        let segment = the_log_starts_refusing(&mut daemon, dir.path());
+
+        let refused = daemon.handle(directed_at_cursor("abc123"));
+
+        assert!(matches!(refused, Response::Failed { .. }), "{refused:?}");
+        fs::set_permissions(&segment, fs::Permissions::from_mode(0o600)).expect("open");
+        let Response::Recorded { bus_id, .. } = daemon.handle(cursor_says("someone")) else {
+            panic!("a prompt");
+        };
+        assert_ne!(bus_id, handed_off, "it took the seat of a hop that failed");
     }
 
     #[test]
