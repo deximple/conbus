@@ -13,6 +13,11 @@
 # discarded for that reason — only numbers are printed. A daemon start reads
 # the real vendor transcripts for gap fill and may start `codex app-server`;
 # everything it writes lands in the clone.
+#
+# The M3 "start -> serving" number is the real-restart row: serve, write a
+# few records the way a hook does, TERM, then time the next start. Numbers
+# for the plan come from release builds only — a debug binary says nothing
+# about what ships.
 set -eu
 
 if [ $# -ne 3 ]; then
@@ -144,6 +149,86 @@ run_daemon() {
     echo "$serve|${rss1:-0}|${rss2:-0}|$note"
 }
 
+# A UserPromptSubmit payload with no real content: three of these through the
+# socket is what separates a warm restart from a real one — the daemon's own
+# writes move the log tip past whatever a prepare covered.
+HOOK_PAYLOAD='{"session_id":"00000000-0000-4000-8000-0000000000b1","transcript_path":"/tmp/bench-none.jsonl","cwd":"/tmp/bench","prompt_id":"00000000-0000-4000-8000-0000000000b2","permission_mode":"auto","hook_event_name":"UserPromptSubmit","prompt":"bench prompt, not a real one"}'
+
+# run_restart BIN CLONE -> prints "serve_seconds|rss_at_serving_kb|note"
+#
+# What a user restart actually costs: first serve, write a few records the
+# way a hook does, TERM, then time the next start until serving. The first
+# start's number is not this one — a daemon that wrote even one line since
+# its checkpoint (or sidecar coverage) takes the full prepare path.
+run_restart() {
+    bin=$1
+    clone=$2
+    sock="$clone/conbus.sock"
+    rm -f "$sock"
+    env CONBUS_HOME="$clone" CONBUS_SKIP_LAUNCHCTL=1 "$bin" daemon \
+        </dev/null >/dev/null 2>&1 &
+    pid=$!
+    n=0
+    until serving_probe "$sock" || ! kill -0 "$pid" 2>/dev/null || [ $n -ge 6000 ]; do
+        sleep 0.05
+        n=$((n + 1))
+    done
+    if ! kill -0 "$pid" 2>/dev/null; then
+        echo "daemon exited before serving|0|first start died"
+        return
+    fi
+    i=0
+    while [ $i -lt 3 ]; do
+        i=$((i + 1))
+        printf '%s\n' "$HOOK_PAYLOAD" | env CONBUS_HOME="$clone" \
+            CONBUS_SKIP_LAUNCHCTL=1 "$bin" hook --harness claude_code \
+            >/dev/null 2>&1 || true
+    done
+    kill -TERM "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+
+    rm -f "$sock"
+    t0=$(now)
+    env CONBUS_HOME="$clone" CONBUS_SKIP_LAUNCHCTL=1 "$bin" daemon \
+        </dev/null >/dev/null 2>&1 &
+    pid=$!
+    note=""
+    while :; do
+        if serving_probe "$sock"; then
+            break
+        fi
+        if ! kill -0 "$pid" 2>/dev/null; then
+            note="daemon exited before serving"
+            break
+        fi
+        elapsed=$(perl -e 'printf "%d", time() - $ARGV[0]' "$t0")
+        [ "$elapsed" -ge 300 ] && {
+            note="timeout"
+            break
+        }
+        sleep 0.05
+    done
+    if [ -z "$note" ]; then
+        t1=$(now)
+        serve=$(perl -e 'printf "%.3f", $ARGV[0] - $ARGV[1]' "$t1" "$t0")
+        rss1=$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ')
+    else
+        serve=$note
+        rss1=""
+    fi
+    kill -TERM "$pid" 2>/dev/null || true
+    n=0
+    while kill -0 "$pid" 2>/dev/null && [ $n -lt 200 ]; do
+        sleep 0.1
+        n=$((n + 1))
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        echo "$0: daemon pid $pid still running after TERM" >&2
+    fi
+    wait "$pid" 2>/dev/null || true
+    echo "$serve|${rss1:-0}|$note"
+}
+
 mb() { perl -e 'printf "%.1f", $ARGV[0] / 1048576' "$1"; }
 
 printf '%-30s %12s %12s\n' metric OLD NEW
@@ -170,6 +255,9 @@ for side in 1 2; do
     rss_s=$(echo "$result" | cut -d'|' -f2)
     rss_5=$(echo "$result" | cut -d'|' -f3)
     eval "serve$side=\$serve dserv$side=\$rss_s d5$side=\$rss_5"
+
+    result=$(run_restart "$bin" "$clone")
+    eval "restart$side=$(echo "$result" | cut -d'|' -f1) drss$side=$(echo "$result" | cut -d'|' -f2)"
 done
 
 printf '%-30s %12s %12s\n' "log --tail 1 median s" "$tail_s1" "$tail_s2"
@@ -181,3 +269,5 @@ printf '%-30s %12s %12s\n' "doctor max RSS MB" "$(mb "$doctor_rss1")" "$(mb "$do
 printf '%-30s %12s %12s\n' "start -> serving s" "$serve1" "$serve2"
 printf '%-30s %12s %12s\n' "daemon RSS at serving MB" "$(mb "$((${dserv1:-0} * 1024))")" "$(mb "$((${dserv2:-0} * 1024))")"
 printf '%-30s %12s %12s\n' "daemon RSS +5 s MB" "$(mb "$((${d51:-0} * 1024))")" "$(mb "$((${d52:-0} * 1024))")"
+printf '%-30s %12s %12s\n' "real restart -> serving s" "$restart1" "$restart2"
+printf '%-30s %12s %12s\n' "restart RSS at serving MB" "$(mb "$((${drss1:-0} * 1024))")" "$(mb "$((${drss2:-0} * 1024))")"

@@ -7,8 +7,10 @@
 //! A hop opens — or syncs — a bus-owned warm on both Claude/Codex legs so
 //! neither direction is a cold start. Those writes are not model turns.
 
+use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use conbus_core::attach;
@@ -35,15 +37,148 @@ pub fn decide_from(paths: &Paths, records: &[Record], from: Option<&str>) -> io:
         })
 }
 
+/// What a hop decision reads from the log, folded in one pass: the rest of
+/// a `scan_meta` materializes every record so a handful of "latest per X"
+/// lookups can walk it — the same answers without holding the log.
+#[derive(Default)]
+struct HopScan {
+    /// The record `focus` would pick: last TurnStarted/TurnEnded matching
+    /// `--from` or, without one, the last not written by a backfill.
+    focus: Option<Record>,
+    /// `latest_turn`: last `TurnEnded` state per harness.
+    ended_by_harness: HashMap<String, TurnState>,
+    /// `latest_turn_on`: last `TurnEnded` state per conversation.
+    ended_by_bus: HashMap<BusId, TurnState>,
+    /// `claude_profile_of`: profile of the last claude record per conversation.
+    claude_profile_by_bus: HashMap<BusId, Option<String>>,
+}
+
+impl HopScan {
+    fn absorb(&mut self, record: Record, wanted: Option<&str>) {
+        let harness = record.source.harness.as_str().to_string();
+        if let Event::TurnEnded { state, .. } = &record.event {
+            self.ended_by_harness.insert(harness.clone(), state.clone());
+            self.ended_by_bus.insert(record.bus_id, state.clone());
+        }
+        if harness == Harness::CLAUDE_CODE {
+            self.claude_profile_by_bus
+                .insert(record.bus_id, record.source.profile.clone());
+        }
+        if matches!(
+            record.event,
+            Event::TurnStarted { .. } | Event::TurnEnded { .. }
+        ) && match wanted {
+            Some(prefix) => record.bus_id.to_string().starts_with(prefix),
+            None => record.source.backfilled_from.is_none(),
+        } {
+            self.focus = Some(record);
+        }
+    }
+
+    fn scan(dir: &Path, cache: Option<&Path>, from: Option<&str>) -> io::Result<Self> {
+        let mut facts = HopScan::default();
+        SegmentLog::scan_meta_each(dir, cache, |record| facts.absorb(record, from))?;
+        Ok(facts)
+    }
+
+    fn focus(&self) -> Option<Focus> {
+        let record = self.focus.as_ref()?;
+        let machine_driven =
+            conbus_core::continuation::unattended(record.source.entrypoint.as_ref())
+                || matches!(
+                    &record.event,
+                    Event::TurnStarted { prompt, .. }
+                        if conbus_core::continuation::machine_authored(prompt)
+                );
+        Some(Focus {
+            harness: record.source.harness.clone(),
+            profile: record.source.profile.clone(),
+            machine_driven,
+            last_turn: self.ended_by_bus.get(&record.bus_id).cloned(),
+            vendor_session_id: record.source.vendor_session_id.clone(),
+            workspace: record.source.workspace.clone(),
+            bus_id: record.bus_id,
+        })
+    }
+
+    fn latest_turn(&self, harness: &str) -> Option<TurnState> {
+        self.ended_by_harness.get(harness).cloned()
+    }
+
+    fn claude_profile_of(&self, bus_id: BusId) -> Option<&str> {
+        self.claude_profile_by_bus
+            .get(&bus_id)
+            .and_then(|p| p.as_deref())
+    }
+}
+
+/// The apply path's slice of the log: every record of the one conversation
+/// being moved, plus the newest record of the leg it is leaving (the
+/// `predecessor` fallback). Two bounded facts, not the whole log.
+fn apply_records(
+    dir: &Path,
+    cache: Option<&Path>,
+    bus_id: BusId,
+    current_harness: &str,
+) -> io::Result<(Vec<Record>, Option<Record>)> {
+    let mut chapter = Vec::new();
+    let mut last_of_current = None;
+    SegmentLog::scan_meta_each(dir, cache, |record| {
+        if record.bus_id == bus_id {
+            chapter.push(record);
+        } else if record.source.harness.as_str() == current_harness {
+            last_of_current = Some(record);
+        }
+    })?;
+    Ok((chapter, last_of_current))
+}
+
+fn plan_facts(paths: &Paths, facts: &HopScan) -> io::Result<(Leg, Leg, Decision)> {
+    let focus = facts.focus().ok_or_else(|| {
+        io::Error::other("no conversation to route — pass --from <bus_id> or record a turn first")
+    })?;
+    let now = now_secs();
+    let current = leg(
+        paths,
+        &focus.harness,
+        focus.last_turn.clone(),
+        now,
+        focus.profile.as_deref(),
+    );
+    let other_harness = route::overflow_target(&focus.harness)
+        .or_else(|| route::opposite(&focus.harness))
+        .unwrap_or_else(|| Harness::new(Harness::CODEX));
+    let other = leg(
+        paths,
+        &other_harness,
+        facts.latest_turn(other_harness.as_str()),
+        now,
+        None,
+    );
+    let mut decision = route::decide_driven(&current, &other, focus.machine_driven);
+    if let Decision::Hop { to, .. } = &decision
+        && to.as_str() == Harness::CLAUDE_CODE
+        && let Some(name) = facts.claude_profile_of(focus.bus_id)
+    {
+        decision = Decision::Wait {
+            reason: format!(
+                "this conversation runs under Claude profile {name}; switching accounts is \
+                 manual — conbus go claude_code, or conbus run claude_code --profile {name}"
+            ),
+        };
+    }
+    Ok((current, other, decision))
+}
+
 pub fn run(paths: &Paths, from: Option<String>, to: Option<String>, apply: bool) -> io::Result<()> {
-    let scan = SegmentLog::scan_meta(paths.log_dir(), Some(&paths.cache_dir()))?;
-    let (current, other, automatic) = plan(paths, &scan.records, from.as_deref())?;
+    let facts = HopScan::scan(&paths.log_dir(), Some(&paths.cache_dir()), from.as_deref())?;
+    let (current, other, automatic) = plan_facts(paths, &facts)?;
     let decision = match to.as_deref() {
         Some(name) => directed(&current, &other, name)?,
         None => automatic,
     };
     println!("route     {}", decision.describe(&current.harness));
-    let workspace = focus(&scan.records, from.as_deref()).and_then(|f| f.workspace);
+    let workspace = facts.focus().and_then(|f| f.workspace);
     let freshness = crate::code::probe(workspace.as_deref());
     println!("code      {}", freshness.line());
     if let Decision::Hop {
@@ -54,10 +189,18 @@ pub fn run(paths: &Paths, from: Option<String>, to: Option<String>, apply: bool)
     {
         println!("next      {} · {reason}", next.as_str());
         if apply {
+            let focus = facts.focus().expect("plan_facts held a focus");
+            let (records, last_of_current) = apply_records(
+                &paths.log_dir(),
+                Some(&paths.cache_dir()),
+                focus.bus_id,
+                current.harness.as_str(),
+            )?;
             apply_hop(
                 paths,
-                &scan.records,
-                from.as_deref(),
+                &records,
+                last_of_current.as_ref(),
+                &focus,
                 &current,
                 &Chosen {
                     to: next,
@@ -78,7 +221,14 @@ pub fn run(paths: &Paths, from: Option<String>, to: Option<String>, apply: bool)
             );
         }
     } else if apply && let Some(name) = to.as_deref() {
-        resume_here(paths, &scan.records, from.as_deref(), name)?;
+        let focus = facts.focus().expect("plan_facts held a focus");
+        let (records, _last) = apply_records(
+            &paths.log_dir(),
+            Some(&paths.cache_dir()),
+            focus.bus_id,
+            current.harness.as_str(),
+        )?;
+        resume_here(paths, &records, focus, name)?;
     }
     let _ = other;
     Ok(())
@@ -250,6 +400,7 @@ fn claude_profile_of(records: &[Record], bus_id: BusId) -> Option<&str> {
         .and_then(|record| record.source.profile.as_deref())
 }
 
+#[derive(Clone)]
 struct Focus {
     harness: Harness,
     /// The Claude Code profile the focus record came under — which account's
@@ -375,7 +526,8 @@ struct Chosen<'a> {
 fn apply_hop(
     paths: &Paths,
     records: &[Record],
-    from: Option<&str>,
+    last_of_current: Option<&Record>,
+    chosen_focus: &Focus,
     current: &Leg,
     chosen: &Chosen<'_>,
 ) -> io::Result<()> {
@@ -387,7 +539,7 @@ fn apply_hop(
     } = *chosen;
     let started = std::time::Instant::now();
     let mut steps = Vec::new();
-    let focus = predecessor(records, from, current)?;
+    let focus = predecessor(chosen_focus, last_of_current, current)?;
     let code_freshness = Some(crate::code::probe(focus.workspace.as_deref()).line());
     if matches!(lease_of(records, focus.bus_id), Lease::Held(_)) {
         return Err(io::Error::other(
@@ -546,21 +698,11 @@ fn handoff(paths: &Paths, focus: &Focus, next: &str, thread: Option<&str>) -> io
 }
 
 /// Same-leg resume: reopen the destination without recording a second hop.
-fn resume_here(
-    paths: &Paths,
-    records: &[Record],
-    from: Option<&str>,
-    name: &str,
-) -> io::Result<()> {
+fn resume_here(paths: &Paths, records: &[Record], chosen: Focus, name: &str) -> io::Result<()> {
     let slug = attach::resolve(name).ok_or_else(|| {
         let catalog = attach::slugs().collect::<Vec<_>>().join(", ");
         io::Error::other(format!("unknown harness {name}; catalog is {catalog}"))
     })?;
-    let Some(chosen) = focus(records, from) else {
-        return Err(io::Error::other(
-            "no conversation to resume — pass --from <bus_id> or record a turn first",
-        ));
-    };
     let thread = match slug {
         Harness::CODEX => match lease_of(records, chosen.bus_id) {
             Lease::Warm(id) => Some(id),
@@ -572,23 +714,25 @@ fn resume_here(
     handoff(paths, &chosen, slug, thread.as_deref())
 }
 
-fn predecessor(records: &[Record], from: Option<&str>, current: &Leg) -> io::Result<Focus> {
-    focus(records, from)
-        .filter(|chosen| chosen.harness == current.harness)
+fn predecessor(
+    chosen_focus: &Focus,
+    last_of_current: Option<&Record>,
+    current: &Leg,
+) -> io::Result<Focus> {
+    (chosen_focus.harness == current.harness)
+        .then(|| chosen_focus.clone())
         .or_else(|| {
-            records.iter().rev().find_map(|record| {
-                (record.source.harness == current.harness).then(|| Focus {
-                    harness: record.source.harness.clone(),
-                    profile: record.source.profile.clone(),
-                    // This fallback only names where to *record* a hop the
-                    // caller already decided on, so authorship is not
-                    // consulted again here.
-                    machine_driven: false,
-                    last_turn: current.last_turn.clone(),
-                    vendor_session_id: record.source.vendor_session_id.clone(),
-                    workspace: record.source.workspace.clone(),
-                    bus_id: record.bus_id,
-                })
+            last_of_current.map(|record| Focus {
+                harness: record.source.harness.clone(),
+                profile: record.source.profile.clone(),
+                // This fallback only names where to *record* a hop the
+                // caller already decided on, so authorship is not
+                // consulted again here.
+                machine_driven: false,
+                last_turn: current.last_turn.clone(),
+                vendor_session_id: record.source.vendor_session_id.clone(),
+                workspace: record.source.workspace.clone(),
+                bus_id: record.bus_id,
             })
         })
         .ok_or_else(|| io::Error::other("no predecessor session to record under"))
@@ -1416,5 +1560,107 @@ mod tests {
             json.get("profile").is_none(),
             "a takeover names a leg, never an account: {json}"
         );
+    }
+
+    /// A TurnStarted on `harness` under `profile`, in the shape `rec` builds.
+    fn started(bus_id: BusId, harness: &str, profile: Option<&str>, prompt: &str) -> Record {
+        let mut record = rec(
+            bus_id,
+            "sess",
+            Event::TurnStarted {
+                author: None,
+                prompt: conbus_core::event::Body::kept(prompt),
+            },
+        );
+        record.source.harness = Harness::new(harness);
+        record.source.profile = profile.map(str::to_string);
+        record
+    }
+
+    #[test]
+    fn the_folded_scan_answers_what_a_full_scan_does() {
+        // M3.5: hop's facts come from one streaming fold now — pin them to
+        // the record-for-record answers the materialised scan gave.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::from_env(dir.path().to_str(), None, None).expect("paths");
+        std::fs::create_dir_all(paths.log_dir()).expect("log dir");
+        let bus_a = BusId::mint();
+        let bus_b = BusId::mint();
+        // Two segments: the fold must cover the closed sidecar and the
+        // live tail alike.
+        let mut log = SegmentLog::open_with_segment_size(
+            paths.log_dir(),
+            conbus_core::retention::Retention::default(),
+            1,
+        )
+        .expect("open");
+        let to_entry = |record: Record| conbus_core::record::Entry {
+            bus_id: record.bus_id,
+            observed_at: None,
+            source: record.source,
+            vendor_turn_id: None,
+            vendor_agent_id: None,
+            hook_id: None,
+            spooled_at: None,
+            event: record.event,
+        };
+        let mut written = Vec::new();
+        for record in [
+            started(bus_a, Harness::CLAUDE_CODE, Some("work"), "first"),
+            ended(
+                bus_a,
+                Harness::CLAUDE_CODE,
+                Some("work"),
+                TurnState::Complete,
+            ),
+            started(bus_b, Harness::CODEX, None, "other leg"),
+            ended(bus_b, Harness::CODEX, None, TurnState::Complete),
+            started(bus_a, Harness::CLAUDE_CODE, Some("work"), "again"),
+        ] {
+            if let Some(record) = log.append(to_entry(record)).expect("append") {
+                written.push(record);
+            }
+        }
+        drop(log);
+
+        let facts =
+            HopScan::scan(&paths.log_dir(), Some(&paths.cache_dir()), None).expect("hop scan");
+        let records: Vec<Record> = written.iter().map(conbus_core::segment::meta).collect();
+
+        let want_focus = focus(&records, None).expect("focus");
+        let got_focus = facts.focus().expect("facts focus");
+        assert_eq!(got_focus.bus_id, want_focus.bus_id);
+        assert_eq!(got_focus.harness, want_focus.harness);
+        assert_eq!(got_focus.profile, want_focus.profile);
+        assert_eq!(got_focus.machine_driven, want_focus.machine_driven);
+        assert_eq!(got_focus.last_turn, want_focus.last_turn);
+        assert_eq!(
+            facts.latest_turn(Harness::CODEX),
+            latest_turn(&records, Harness::CODEX)
+        );
+        assert_eq!(
+            facts.claude_profile_of(bus_a),
+            claude_profile_of(&records, bus_a)
+        );
+
+        // plan() and plan_facts() decide identically.
+        let (cur_a, other_a, decision_a) = plan(&paths, &records, None).expect("plan");
+        let (cur_b, other_b, decision_b) = plan_facts(&paths, &facts).expect("plan_facts");
+        assert_eq!(cur_a.harness, cur_b.harness);
+        assert_eq!(cur_a.reached, cur_b.reached);
+        assert_eq!(other_a.harness, other_b.harness);
+        assert_eq!(
+            decision_a.describe(&cur_a.harness),
+            decision_b.describe(&cur_b.harness)
+        );
+
+        // --from pins the fold to the same conversation the scan picks.
+        let pinned = HopScan::scan(
+            &paths.log_dir(),
+            Some(&paths.cache_dir()),
+            Some(&bus_b.to_string()),
+        )
+        .expect("pinned scan");
+        assert_eq!(pinned.focus().expect("pinned focus").bus_id, bus_b);
     }
 }

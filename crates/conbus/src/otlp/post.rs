@@ -503,12 +503,31 @@ mod tests {
             .to_string()
     }
 
+    /// A port that is provably closed for the whole test: a connect is
+    /// refused, and binding it needs a privilege the test does not have —
+    /// so nothing can take it the way a freed ephemeral port can be.
+    fn closed_port() -> u16 {
+        for port in [
+            1u16, 9, 13, 17, 19, 23, 25, 37, 42, 87, 95, 98, 110, 119, 123, 135, 139, 143,
+        ] {
+            let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+            let refused = matches!(
+                TcpStream::connect_timeout(&addr, Duration::from_millis(200)),
+                Err(err) if err.kind() == io::ErrorKind::ConnectionRefused
+            );
+            if !refused {
+                continue;
+            }
+            if std::net::TcpListener::bind(addr).is_err() {
+                return port;
+            }
+        }
+        panic!("no privileged port is both refused and unbindable here")
+    }
+
     #[test]
     fn a_closed_port_is_an_error_that_says_nobody_is_listening() {
-        let port = {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-            listener.local_addr().expect("addr").port()
-        };
+        let port = closed_port();
         let endpoint = Endpoint::parse(&format!("http://127.0.0.1:{port}")).expect("endpoint");
 
         let err = post(&endpoint, BODY, &BOUNDS).expect_err("nobody is there");
