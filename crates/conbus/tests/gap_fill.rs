@@ -647,20 +647,6 @@ fn a_spool_file_nobody_can_read_does_not_stop_the_fill() {
 
 const THREAD: &str = "01a19463-cbd4-7b50-b819-000000000abc";
 
-/// A stand-in `codex app-server` that lists one completed turn, `t1`.
-const FAKE_APP_SERVER: &str = r#"#!/usr/bin/env python3
-import json, sys
-for line in sys.stdin:
-    try: msg = json.loads(line)
-    except Exception: continue
-    m = msg.get("method"); i = msg.get("id")
-    if m == "initialize": print(json.dumps({"jsonrpc":"2.0","id":i,"result":{"userAgent":"fake"}}), flush=True)
-    elif m == "thread/turns/list":
-        data = [{"id":"t1","items":[{"type":"userMessage","content":[{"type":"text","text":"during"}]},{"type":"agentMessage","text":"a1"}],
-                 "status":"completed","startedAt":1788368800,"completedAt":1788368801}]
-        print(json.dumps({"jsonrpc":"2.0","id":i,"result":{"data":data,"nextCursor":None}}), flush=True)
-"#;
-
 fn codex_prompt(turn: &str, text: &str) -> String {
     json!({"session_id": THREAD, "hook_event_name": "UserPromptSubmit", "prompt": text,
            "turn_id": turn, "cwd": "/repo", "model": "m", "permission_mode": "default",
@@ -681,11 +667,27 @@ fn codex_rollout(home: &Path) {
 
 #[test]
 fn the_codex_pass_does_not_write_a_spooled_turn_twice() {
+    // It also lists t2, which nothing spooled: filling it shows the pass ran, and
+    // a Codex that could not start would pass this for the wrong reason.
+    const LISTS_TWO_TURNS: &str = r#"#!/usr/bin/env python3
+import json, sys
+def turn(i, said, reply):
+    return {"id":i,"items":[{"type":"userMessage","content":[{"type":"text","text":said}]},{"type":"agentMessage","text":reply}],
+            "status":"completed","startedAt":1788368800,"completedAt":1788368801}
+for line in sys.stdin:
+    try: msg = json.loads(line)
+    except Exception: continue
+    m = msg.get("method"); i = msg.get("id")
+    if m == "initialize": print(json.dumps({"jsonrpc":"2.0","id":i,"result":{"userAgent":"fake"}}), flush=True)
+    elif m == "thread/turns/list":
+        data = [turn("t1", "during", "a1"), turn("t2", "only the thread holds this", "a2")]
+        print(json.dumps({"jsonrpc":"2.0","id":i,"result":{"data":data,"nextCursor":None}}), flush=True)
+"#;
     let dir = tempfile::tempdir().expect("tempdir");
     let home = dir.path();
     let stub = tempfile::tempdir().expect("stub");
     let fake = stub.path().join("codex");
-    support::write_executable(&fake, FAKE_APP_SERVER);
+    support::write_executable(&fake, LISTS_TWO_TURNS);
     let daemon = start(home);
     hook_as(home, "codex", &codex_prompt("t0", "before"));
     stop(daemon);
@@ -702,18 +704,21 @@ fn the_codex_pass_does_not_write_a_spooled_turn_twice() {
     drained(home);
     stop(daemon);
 
-    let turn: Vec<Value> = log_lines(home)
-        .into_iter()
+    let all = log_lines(home);
+    let started = |id: &str| {
+        all.iter()
+            .filter(|record| record["vendor_turn_id"] == id && record["event"] == "turn_started")
+            .count()
+    };
+    assert_eq!(started("t2"), 1, "the pass ran:\n{}", show(&all));
+    assert_eq!(started("t1"), 1, "\n{}", show(&all));
+    let t1: Vec<&Value> = all
+        .iter()
         .filter(|record| record["vendor_turn_id"] == "t1")
         .collect();
-    let started = turn
-        .iter()
-        .filter(|record| record["event"] == "turn_started")
-        .count();
-    assert_eq!(started, 1, "\n{}", show(&turn));
     assert!(
-        turn.iter().all(|record| record["hook_id"].is_string()),
+        t1.iter().all(|record| record["hook_id"].is_string()),
         "\n{}",
-        show(&turn)
+        show(&all)
     );
 }
