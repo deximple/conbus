@@ -15,8 +15,19 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_conbus")
 }
 
-fn start(home: &Path) -> Child {
-    let mut child = Command::new(bin())
+/// A daemon that goes with its test, however the test ends. One a failed assert
+/// left behind would run on for good, over a root that has been deleted.
+struct Daemon(Child);
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn start(home: &Path) -> Daemon {
+    let child = Command::new(bin())
         .arg("daemon")
         .env("CONBUS_HOME", home)
         .env("HOME", home)
@@ -27,25 +38,24 @@ fn start(home: &Path) -> Child {
         .stderr(Stdio::null())
         .spawn()
         .expect("daemon");
+    let daemon = Daemon(child);
     let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
         let stamp: serde_json::Value = std::fs::read_to_string(home.join("daemon.build"))
             .ok()
             .and_then(|text| serde_json::from_str(text.trim()).ok())
             .unwrap_or_default();
-        if stamp["pid"].as_u64() == Some(u64::from(child.id())) && stamp.get("serving").is_some() {
-            return child;
+        if stamp["pid"].as_u64() == Some(u64::from(daemon.0.id())) && stamp.get("serving").is_some()
+        {
+            return daemon;
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    let _ = child.kill();
-    let _ = child.wait();
     panic!("the daemon never served");
 }
 
-fn stop(mut child: Child) {
-    let _ = child.kill();
-    let _ = child.wait();
+fn stop(daemon: Daemon) {
+    drop(daemon);
 }
 
 /// What the hook printed, and what it said on stderr.
@@ -338,7 +348,7 @@ fn a_short_write_leaves_no_torn_line_behind() {
     let at = std::fs::metadata(&segment).expect("meta").len();
     // `ulimit -f` counts 512-byte blocks: room for part of the next line.
     let blocks = at / 512 + 2;
-    let mut limited = Command::new("/bin/sh")
+    let limited = Command::new("/bin/sh")
         .args([
             "-c",
             "trap '' XFSZ; ulimit -f \"$1\"; exec \"$2\" daemon",
@@ -355,6 +365,7 @@ fn a_short_write_leaves_no_torn_line_behind() {
         .stderr(Stdio::null())
         .spawn()
         .expect("daemon under a limit");
+    let limited = Daemon(limited);
     let socket = home.path().join("conbus.sock");
     until("it serves", || {
         std::os::unix::net::UnixStream::connect(&socket).is_ok()
@@ -362,8 +373,7 @@ fn a_short_write_leaves_no_torn_line_behind() {
 
     let long = "x".repeat(4 * 1024);
     prompt(home.path(), "p1", &long);
-    let _ = limited.kill();
-    let _ = limited.wait();
+    stop(limited);
 
     assert!(
         std::fs::metadata(&segment).expect("meta").len() <= at + blocks * 512,
