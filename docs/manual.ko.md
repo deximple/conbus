@@ -120,7 +120,7 @@ conbus install --apply
 | Claude Code | `~/.claude/settings.json` | 이벤트 13개, 그리고 StatusLine(감싸서 등록하므로 원래 쓰던 상태 표시줄도 그대로 보입니다) |
 | Codex | `$CODEX_HOME/hooks.json` (기본 `~/.codex`) | 이벤트 7개 |
 | Cursor | `~/.cursor/hooks.json` | `sessionStart`, `beforeSubmitPrompt`, `stop`, `sessionEnd`, `afterAgentResponse` |
-| grok | `~/.grok/hooks/conbus.json` | 이벤트 9개 |
+| grok | `~/.grok/hooks/conbus.json` | 이벤트 10개 |
 | opencode | `~/.config/opencode/plugins/conbus.js` | 세션·메시지 이벤트를 전달하는 플러그인 |
 
 바이너리가 아직 없으면 `~/.local/bin/conbus`에 놓고, launchd 에이전트

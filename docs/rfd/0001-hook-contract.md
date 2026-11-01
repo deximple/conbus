@@ -1,7 +1,9 @@
 # RFD 0001 — Claude-settings-compatible hook contract
 
-Status: published for the public launch path.
-First public artefact. Bus id / event schema RFDs follow this one.
+Status: **accepted** for 1.0, 2026-11-01. Part of the 1.x promise
+([stability](../stability.md)): a change to the registrations or replies
+below is an addition, or it waits for 2.0. First public artefact. Bus id /
+event schema RFDs follow this one.
 
 The recorder is one binary. Vendors that already read Claude Code's
 `settings.json` hook shape can register `conbus hook` and stop. Field
@@ -16,9 +18,9 @@ absolute path because a vendor `PATH` is not ours.
 |---|---|---|---|
 | Claude Code | `~/.claude/settings.json` | 13 | `{bin} hook` |
 | Codex | `$CODEX_HOME/hooks.json` | 7 | `{bin} hook --harness codex` |
-| Grok | `~/.grok/hooks/conbus.json` | 9 | `{bin} hook --harness grok` |
+| Grok | `~/.grok/hooks/conbus.json` | 10 | `{bin} hook --harness grok` |
 | Cursor | `~/.cursor/hooks.json` | 5 | `{bin} hook --harness cursor` |
-| OpenCode | `~/.config/opencode/plugins/conbus.js` | plugin bus | `{bin} hook --harness opencode` |
+| OpenCode | `~/.config/opencode/plugins/conbus.js` | plugin bus (1.x or 2.x module, chosen by `opencode --version`) | `{bin} hook --harness opencode` |
 
 Claude Code also wraps StatusLine: `{bin} hook --statusline`. The person's
 original status bar command is saved at `~/.claude/conbus-statusline-forward`.

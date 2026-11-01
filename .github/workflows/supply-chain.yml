@@ -1,0 +1,33 @@
+# Known advisories, licences and sources for everything in Cargo.lock
+# (deny.toml), on release tags, by hand, and once a week. Not on every pull
+# request: an advisory published overnight should not turn unrelated work red.
+name: supply-chain
+
+on:
+  push:
+    tags: ["v*"]
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  deny:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: rustup toolchain install
+
+      - name: cargo-deny
+        run: cargo install --locked cargo-deny
+
+      - name: Check
+        run: cargo deny --locked check

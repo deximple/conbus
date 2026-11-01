@@ -16,6 +16,8 @@ on:
 
 permissions:
   contents: write
+  id-token: write
+  attestations: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -53,13 +55,34 @@ jobs:
       - name: Package
         run: sh scripts/package.sh dist
 
+      # A CycloneDX bill of materials for the binary, attached beside it.
+      - name: SBOM
+        run: |
+          cargo install --locked cargo-cyclonedx
+          cargo cyclonedx --format json
+          cp crates/conbus/conbus.cdx.json dist/conbus.cdx.json
+
+      # Provenance for what this run built, on a tag and on a dry run alike.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/conbus-macos-universal.tar.gz
+
+      # `latest` must never point at the ad-hoc package this job builds. A tag
+      # with a hyphen (v1.0.0-rc.1) is a prerelease, which is never `latest`;
+      # any other tag is created as a draft, and scripts/sign-release.sh
+      # publishes it as `latest` once the signed package has replaced this one.
       - name: Publish
         if: startsWith(github.ref, 'refs/tags/')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          case "$GITHUB_REF_NAME" in
+            *-*) kind=--prerelease ;;
+            *) kind=--draft ;;
+          esac
           gh release create "$GITHUB_REF_NAME" dist/* \
-            --verify-tag \
+            --verify-tag "$kind" \
             --title "conbus ${GITHUB_REF_NAME#v}" \
             --notes-file target/release-notes.md
 
@@ -117,6 +140,11 @@ jobs:
 
       - name: Package
         run: sh scripts/package.sh dist-linux ${{ matrix.target }}
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist-linux/conbus-linux-${{ matrix.asset_arch }}.tar.gz
 
       - name: Publish
         if: startsWith(github.ref, 'refs/tags/')
