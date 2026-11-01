@@ -1,6 +1,8 @@
 #!/bin/sh
 # Sign a published release with a Developer ID, have Apple notarize it, and
-# replace the ad-hoc package on the GitHub release with the signed one.
+# replace the ad-hoc package on the GitHub release with the signed one. A stable
+# tag's release is a draft until this has run with --upload, which refuses to
+# publish it unless everything an install fetches is on it.
 #
 #   CONBUS_SIGN_IDENTITY="Developer ID Application: Name (TEAMID)" \
 #     scripts/sign-release.sh v0.2.6            # sign and notarize into target/signed/
@@ -50,6 +52,73 @@ asset=conbus-macos-universal.tar.gz
 out=target/signed
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT INT TERM
+
+# What an install fetches: the package install.sh names for each OS and
+# architecture, the checksum beside each, and install.sh, which the release job
+# attaches. A release that lacks one of these 404s for somebody.
+required="$asset $asset.sha256
+conbus-linux-x86_64.tar.gz conbus-linux-x86_64.tar.gz.sha256
+conbus-linux-aarch64.tar.gz conbus-linux-aarch64.tar.gz.sha256
+install.sh"
+
+case $tag in
+  *-rc.*) stable=false held="a prerelease" ;;
+  *) stable=true held="a draft" ;;
+esac
+
+# Nothing has been published. Says what is wrong and what to do about it.
+refuse() {
+  die "$tag stays $held: $1
+  The release job attaches the macOS package, its checksum and install.sh; the
+  two release-linux jobs attach the Linux packages and theirs. To see them:
+    gh run list --workflow release.yml --branch $tag
+  To run a failed job again:
+    gh run rerun RUN_ID --failed
+  If an upload from here stopped part way, $out holds the signed package:
+    gh release upload $tag $out/$asset $out/$asset.sha256 --clobber
+  Then run this again with --upload."
+}
+
+# Fetch everything an install fetches, as an install fetches it, and check each
+# checksum. gh fails only when no pattern matches, and reports its own error, so
+# what arrived is what counts.
+check_release() {
+  rm -rf "$work/check"
+  mkdir "$work/check"
+  patterns=
+  for name in $required; do
+    patterns="$patterns -p $name"
+  done
+  # shellcheck disable=SC2086 # one word per flag and per name
+  gh release download "$tag" $patterns -D "$work/check" || true
+  missing=
+  for name in $required; do
+    [ -s "$work/check/$name" ] || missing="$missing $name"
+  done
+  [ -z "$missing" ] || refuse "it is missing$missing"
+  for name in $required; do
+    case $name in
+      *.sha256)
+        (cd "$work/check" && shasum -a 256 -c "$name" >/dev/null 2>&1) ||
+          refuse "${name%.sha256} does not match the checksum beside it"
+        ;;
+    esac
+  done
+}
+
+# Before any signing: Apple's first review of a release has taken hours, which is
+# a long wait to learn that the Linux jobs have not finished. A stable release
+# already public is not this script's to change: it would replace a live package
+# and make an old tag `latest` again.
+if [ -n "$upload" ]; then
+  if $stable; then
+    draft=$(gh release view "$tag" --json isDraft --jq .isDraft) ||
+      die "could not read the release $tag"
+    [ "$draft" = true ] ||
+      die "$tag is already published; this only finishes a draft, and changed nothing"
+  fi
+  check_release
+fi
 
 # 1. The package as published, checked against its own checksum.
 gh release download "$tag" -p "$asset" -p "$asset.sha256" -D "$work"
@@ -138,17 +207,19 @@ echo "sign-release.sh: $out/$asset ($(cut -d' ' -f1 < "$out/$asset.sha256"))"
 
 if [ -n "$upload" ]; then
   gh release upload "$tag" "$out/$asset" "$out/$asset.sha256" --clobber
-  echo "sign-release.sh: $tag now carries the signed, notarized package"
+  # Read it back. A job still running, or run again, can have changed the release
+  # since the first look, and this is the last look before people get it.
+  check_release
+  cmp -s "$work/check/$asset" "$out/$asset" ||
+    refuse "the $asset on it is not the signed one in $out"
+  echo "sign-release.sh: $tag now carries the signed, notarized package and all an install needs"
   # A release tag was created as a draft so that `latest` never pointed at the
   # ad-hoc package; only now, signed, does it become the release people get.
   # A release candidate stays a prerelease and never becomes `latest`.
-  case $tag in
-    *-rc.*) ;;
-    *)
-      gh release edit "$tag" --draft=false --latest
-      echo "sign-release.sh: $tag is published and is now the latest release"
-      ;;
-  esac
+  if $stable; then
+    gh release edit "$tag" --draft=false --latest
+    echo "sign-release.sh: $tag is published and is now the latest release"
+  fi
 elif ! $rehearsal; then
   echo "sign-release.sh: check it, then run again with --upload"
 fi
