@@ -17,10 +17,12 @@ use conbus_core::backfill::{
 };
 
 use crate::appserver::AppServer;
-use conbus_core::event::{Body, Event, Harness};
+use crate::wire::Request;
+use conbus_core::clock::Timestamp;
+use conbus_core::event::{Body, Event, Harness, Source};
 use conbus_core::ids::BusId;
 use conbus_core::paths::Paths;
-use conbus_core::record::{Entry, Record};
+use conbus_core::record::{Entry, Record, SCHEMA_VERSION};
 use conbus_core::retention::Retention;
 use conbus_core::segment::SegmentLog;
 
@@ -434,6 +436,7 @@ fn append_gaps_at_start_in(
                 held,
                 Some(&mut *log),
                 since,
+                &paths.spool_dir(),
                 &mut Some(&mut timing),
                 Some(deadline),
             )?
@@ -445,7 +448,7 @@ fn append_gaps_at_start_in(
     // thread/turns/list on threads we already bound fills those turns under
     // the live `bus_id` — not a second conversation.
     if !timing.budget_exhausted {
-        n += fill_live_codex_gaps(held, log, since, &mut timing, deadline)?;
+        n += fill_live_codex_gaps(held, log, since, &paths.spool_dir(), &mut timing, deadline)?;
     }
     if !timing.budget_exhausted {
         let export = Instant::now();
@@ -661,6 +664,7 @@ fn fill_live_codex_gaps(
     held: &[Record],
     log: &mut SegmentLog,
     since: Option<i64>,
+    spool: &Path,
     timing: &mut GapTiming,
     deadline: Instant,
 ) -> io::Result<u64> {
@@ -742,7 +746,8 @@ fn fill_live_codex_gaps(
         let thread = serde_json::json!({"id": name, "sessionId": name});
         let recovered = parse_codex_thread(&thread, &turns);
         let mine = grouped.get(name).into_iter().flatten().copied();
-        for entry in missing_from(mine, name, bus_id, recovered) {
+        let missing = missing_from(mine, name, bus_id, recovered);
+        for entry in not_on_its_way(missing, spool, name, bus_id) {
             if log.append(entry)?.is_some() {
                 filled += 1;
             }
@@ -902,7 +907,7 @@ pub fn fill_gaps(paths: &Paths, transcripts: &Path, apply: bool) -> io::Result<O
     let mut log = apply
         .then(|| SegmentLog::open(paths.log_dir(), Retention::default()))
         .transpose()?;
-    append_gaps(transcripts, &held, log.as_mut(), None)
+    append_gaps(transcripts, &held, log.as_mut(), None, &paths.spool_dir())
 }
 
 /// Turns the official transcript has that the live log does not.
@@ -995,6 +1000,74 @@ fn missing_from<'a>(
     out
 }
 
+/// Leave out what the spool's drain is about to write.
+///
+/// A hook that found no daemon waits in the spool, and the drain runs after this
+/// fill: the question is not whether the log holds a turn but whether it holds
+/// it or is about to. The hook's record is the stronger fact, and it knows what
+/// the transcript cannot, which is whether the vendor stopped.
+///
+/// Read only when something looks missing, and after the transcript that made it
+/// look so: a hook that spooled before its line was written is seen here. One
+/// that spools in the moment between the two reads is not, and is written by both.
+fn not_on_its_way(missing: Vec<Entry>, spool: &Path, session: &str, bus_id: BusId) -> Vec<Entry> {
+    if missing.is_empty() {
+        return missing;
+    }
+    let waiting = spooled_records(spool, session, bus_id);
+    if waiting.is_empty() {
+        return missing;
+    }
+    let entries = Recovered {
+        entries: missing,
+        ..Recovered::default()
+    };
+    missing_from(&waiting, session, bus_id, entries)
+}
+
+/// What the spool holds for one session, as the records the drain will make of
+/// it. An entry that does not read is the drain's to report, not this one's.
+fn spooled_records(spool: &Path, session: &str, bus_id: BusId) -> Vec<Record> {
+    let Ok(entries) = fs::read_dir(spool) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        // The drain's own rule: a regular file no larger than the hook's cap.
+        .filter(|path| {
+            fs::symlink_metadata(path)
+                .is_ok_and(|meta| meta.file_type().is_file() && meta.len() <= 1_048_576)
+        })
+        .filter_map(|path| {
+            let text = fs::read_to_string(path).ok()?;
+            serde_json::from_str::<Request>(text.trim()).ok()
+        })
+        .filter(|request| request.vendor_session_id == session)
+        .map(|request| Record {
+            schema_version: SCHEMA_VERSION,
+            seq: 0,
+            ts: Timestamp::now(),
+            bus_id,
+            vendor_turn_id: request.vendor_turn_id,
+            vendor_agent_id: request.vendor_agent_id,
+            hook_id: request.hook_id,
+            spooled_at: None,
+            source: Source {
+                harness: request.harness,
+                harness_version: None,
+                vendor_session_id: Some(request.vendor_session_id),
+                workspace: None,
+                entrypoint: None,
+                backfilled_from: None,
+                profile: None,
+            },
+            event: request.event,
+        })
+        .collect()
+}
+
 /// Use up one held prompt with these words, if any is left.
 fn take_one(words: &mut HashMap<String, u32>, text: Option<String>) -> bool {
     match text.and_then(|text| words.get_mut(&text)) {
@@ -1018,12 +1091,14 @@ fn append_gaps(
     held: &[Record],
     log: Option<&mut SegmentLog>,
     since: Option<i64>,
+    spool: &Path,
 ) -> io::Result<Outcome> {
     append_gaps_files(
         &session_files(transcripts)?,
         held,
         log,
         since,
+        spool,
         &mut None,
         None,
     )
@@ -1038,6 +1113,7 @@ fn append_gaps_files(
     held: &[Record],
     mut log: Option<&mut SegmentLog>,
     since: Option<i64>,
+    spool: &Path,
     timing: &mut Option<&mut GapTiming>,
     deadline: Option<Instant>,
 ) -> io::Result<Outcome> {
@@ -1084,6 +1160,7 @@ fn append_gaps_files(
             live_bus,
             recovered,
         );
+        let missing = not_on_its_way(missing, spool, stem, live_bus);
         if missing.is_empty() {
             continue;
         }
@@ -1764,8 +1841,11 @@ mod tests {
             .records;
         let since = newest_unix(&held).map(|newest| newest - GAP_MARGIN_SECS);
 
-        let at_start = append_gaps(&machine.transcripts, &held, None, since).expect("start");
-        let by_hand = append_gaps(&machine.transcripts, &held, None, None).expect("by hand");
+        let spool = machine.paths.spool_dir();
+        let at_start =
+            append_gaps(&machine.transcripts, &held, None, since, &spool).expect("start");
+        let by_hand =
+            append_gaps(&machine.transcripts, &held, None, None, &spool).expect("by hand");
 
         assert_eq!(at_start.gap_records, 0);
         assert_eq!(by_hand.gap_records, 2, "the missed prompt and its reply");
@@ -1781,7 +1861,14 @@ mod tests {
             .records;
         let since = newest_unix(&held).map(|newest| newest - GAP_MARGIN_SECS);
 
-        let at_start = append_gaps(&machine.transcripts, &held, None, since).expect("start");
+        let at_start = append_gaps(
+            &machine.transcripts,
+            &held,
+            None,
+            since,
+            &machine.paths.spool_dir(),
+        )
+        .expect("start");
 
         assert_eq!(at_start.gap_records, 2);
     }
@@ -2092,6 +2179,75 @@ mod tests {
         let outcome = ingest_chat_text(&records, export, Some(&mut log)).expect("ingest");
 
         assert_eq!(outcome.gap_turns, 1, "the second saying only");
+        assert_eq!(outcome.gap_records, 2);
+    }
+
+    /// A request waiting in the spool, as the hook writes it.
+    fn in_the_spool(machine: &Machine, name: &str, session: &str, turn: &str, words: &str) {
+        fs::create_dir_all(machine.paths.spool_dir()).expect("spool");
+        fs::write(
+            machine.paths.spool_dir().join(format!("{name}.json")),
+            serde_json::json!({
+                "harness": "claude_code", "vendor_session_id": session, "vendor_turn_id": turn,
+                "hid": name, "spooled": "2026-11-01T00:00:00.000Z",
+                "event": {"event": "turn_started", "prompt": {"kind": "kept", "text": words}}
+            })
+            .to_string(),
+        )
+        .expect("write");
+    }
+
+    #[test]
+    fn backfill_gaps_by_hand_leaves_a_spooled_turn_to_the_drain() {
+        let machine = machine();
+        recorded_live(&machine, SESSION);
+        transcript_two_turns(&machine, SESSION);
+        in_the_spool(&machine, "a", SESSION, "P2", "the turn the daemon missed");
+
+        let outcome = fill_gaps(&machine.paths, &machine.transcripts, true).expect("fill");
+
+        assert_eq!(outcome.gap_records, 0);
+        assert_eq!(records_on_disk(&machine), 1);
+    }
+
+    #[test]
+    fn another_sessions_spool_entry_does_not_stand_in_for_this_turn() {
+        let machine = machine();
+        recorded_live(&machine, SESSION);
+        transcript_two_turns(&machine, SESSION);
+        in_the_spool(
+            &machine,
+            "a",
+            "11111111-aaaa-bbbb-cccc-ddddeeeeffff",
+            "P2",
+            "the turn the daemon missed",
+        );
+
+        let outcome = fill_gaps(&machine.paths, &machine.transcripts, true).expect("fill");
+
+        assert_eq!(outcome.gap_records, 2);
+    }
+
+    #[test]
+    fn a_link_in_the_spool_is_not_followed_by_the_fill() {
+        // Only what the drain would read counts as on its way.
+        let machine = machine();
+        recorded_live(&machine, SESSION);
+        transcript_two_turns(&machine, SESSION);
+        in_the_spool(
+            &machine,
+            "real",
+            SESSION,
+            "P2",
+            "the turn the daemon missed",
+        );
+        let spool = machine.paths.spool_dir();
+        let elsewhere = machine.paths.root().join("elsewhere.json");
+        fs::rename(spool.join("real.json"), &elsewhere).expect("move");
+        std::os::unix::fs::symlink(&elsewhere, spool.join("real.json")).expect("link");
+
+        let outcome = fill_gaps(&machine.paths, &machine.transcripts, true).expect("fill");
+
         assert_eq!(outcome.gap_records, 2);
     }
 
