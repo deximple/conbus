@@ -12,6 +12,12 @@ the entry says so when it does.
   reports them — `tokens_input`, `tokens_output`, `tokens_cache_read`,
   `tokens_cache_write`, today Cursor's `afterAgentResponse` only — and the
   `--shareable` rows carry them per RFD 0002's amendment.
+- Reads that never print a tool body now run against a derived cache of
+  digested records under `<root>/cache/meta/` — tool bodies are 93% of the
+  log's bytes, so `usage`, `doctor`, `verdict`, `progress`, `hop`, the
+  daemon's restore, and `log --tail` stop reading them. `conbus log index`
+  builds the cache explicitly; `CONBUS_NO_CACHE=1` reads the segments
+  directly. Deleting `cache/` loses nothing.
 - Claude Code profiles (experimental): a second account under
   `CLAUDE_CONFIG_DIR`, switched only by hand — no limit signal, router rule
   or hop ever moves a conversation between profiles.

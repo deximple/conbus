@@ -53,6 +53,9 @@ pub enum Command {
         chat_export: Option<String>,
     },
     Doctor,
+    /// Build the derived sidecars for every closed segment; writes only
+    /// under `<root>/cache/`.
+    LogIndex,
     /// The control plane: routing rules, quota, hop history, cost.
     ///
     /// Not a chat. The vendor TUI stays the window.
@@ -220,6 +223,7 @@ where
             gaps: args.iter().any(|a| a == "--gaps"),
             chat_export: flag_value(&args, "--chat-export"),
         },
+        "log" if args.get(1).map(String::as_str) == Some("index") => Command::LogIndex,
         "log" => Command::Log {
             json: args.iter().any(|a| a == "--json"),
             filter: LogFilter {
@@ -342,6 +346,7 @@ USAGE:
                                   --inference-listen is the official HTTPS
                                   terminator target (default 127.0.0.1:8787)
     conbus log [--json] [--bus-id ID] [--since TS] [--tail N] [--grep TEXT] [--reveal]
+    conbus log index              build the derived read cache for every closed segment
                                   read the conversation log back; --reveal
                                   decrypts sealed tool bodies (explicit only)
     conbus install [--apply]      register the hooks with every vendor found;
@@ -884,6 +889,15 @@ mod tests {
                 filter: LogFilter::default()
             }
         );
+    }
+
+    #[test]
+    fn log_index_is_its_own_command() {
+        assert_eq!(parse(["log", "index"], None), Command::LogIndex);
+        let Command::Log { filter, .. } = parse(["log"], None) else {
+            panic!("expected a log command");
+        };
+        let _ = filter;
     }
 
     #[test]

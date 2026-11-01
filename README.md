@@ -197,6 +197,7 @@ and `rm -rf ~/.conbus` removes it if you want it gone.
 | `conbus status` | Routing rules, quota, hop history, cost |
 | `conbus quota` | What each leg has left |
 | `conbus log [FILTERS]` | Read the conversation log back |
+| `conbus log index` | Build the derived read cache under `<root>/cache/` (`CONBUS_NO_CACHE=1` reads without it) |
 | `conbus usage [--days N] [--since DAY] [--day DAY] [--json] [--shareable] [--otlp URL]` | What the agents did, counted: stops, tool failures, permission asks; `--otlp` sends the counts to a collector on this Mac |
 | `conbus progress [--days N] [--since DAY] [--day DAY] [--workspace DIR] [--json]` | The same counts per folder: the agents that worked there, the handovers between them, the commits `HEAD` gained |
 | `conbus hop [HARNESS]` | Preview the next leg (`--apply` records it) |

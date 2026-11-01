@@ -14,11 +14,32 @@ use conbus_core::registry::{Registry, SessionKey};
 
 use crate::cli::LogFilter;
 use conbus_core::record::Record;
-use conbus_core::segment::SegmentLog;
+use conbus_core::segment::{Scan, SegmentLog};
 use std::fs::OpenOptions;
 
 pub fn log(paths: &Paths, json: bool, filter: &LogFilter) -> io::Result<()> {
-    let scan = SegmentLog::scan(paths.log_dir())?;
+    // A bounded read only opens the newest segments it must; the record-level
+    // filters still apply below, so --tail --bus-id/--grep stay exact.
+    let scan = match filter.tail {
+        Some(n) => {
+            let (records, defects) = SegmentLog::tail(paths.log_dir(), n, |record| {
+                filter
+                    .bus_id
+                    .as_ref()
+                    .is_none_or(|wanted| record.bus_id.to_string().starts_with(wanted.as_str()))
+                    && filter
+                        .since
+                        .as_ref()
+                        .is_none_or(|from| record.ts.to_string().as_str() >= from.as_str())
+                    && filter
+                        .grep
+                        .as_ref()
+                        .is_none_or(|needle| summarise(record).contains(needle.as_str()))
+            })?;
+            Scan { records, defects }
+        }
+        None => SegmentLog::scan(paths.log_dir())?,
+    };
     for record in select(&scan.records, filter) {
         let revealed;
         let record = if filter.reveal {
@@ -1427,6 +1448,17 @@ pub fn status(paths: &Paths) -> io::Result<()> {
     if let Some(line) = crate::takeover::describe(paths) {
         println!("takeover  {line}");
     }
+    Ok(())
+}
+
+/// `conbus log index`: build the derived sidecars for every closed segment
+/// and say what was written — writes only under `<root>/cache/`.
+pub fn log_index(paths: &Paths) -> io::Result<()> {
+    let report = SegmentLog::build_cache(paths.log_dir(), paths.cache_dir())?;
+    println!(
+        "cache     {} closed segment(s): {} built, {} already valid",
+        report.closed, report.built, report.valid
+    );
     Ok(())
 }
 
