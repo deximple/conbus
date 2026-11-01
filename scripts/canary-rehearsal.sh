@@ -161,20 +161,38 @@ expect_grep() { # expect_grep <pattern> <file> <what>
     echo "rehearsal: ok: $3"
 }
 
-# Simulate the daemon coming up after install --apply. First writes the
-# OLD daemon's stamp synchronously (pid-1) so `start` reads a stable
-# old_stamp_pid no matter when its preflight finishes — without it, a slow
-# preflight could read the new stamp and wait_for_serving would wait for a
-# change that already happened. Then the new stamp lands after a delay.
-daemon_boot() { # daemon_boot <build> <pid> [delay]
-    printf '{"build":"01d","pid":%s,"started":"%s","serving":"%s","core_dumps_disabled":true,"memory_locked":true}\n' \
-        "$(($2 - 1))" "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)" "$(date -u +%Y-%m-%dT%H:%M:%S.002Z)" \
+write_stamp() { # write_stamp <build> <pid>
+    printf '{"build":"%s","pid":%s,"started":"%s","serving":"%s","core_dumps_disabled":true,"memory_locked":true}\n' \
+        "$1" "$2" "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)" "$(date -u +%Y-%m-%dT%H:%M:%S.002Z)" \
         >"$home/.conbus/daemon.build"
-    (sleep "${3:-1.0}"
-     [ -d "$home/.conbus" ] || exit 0
-     printf '{"build":"%s","pid":%s,"started":"%s","serving":"%s","core_dumps_disabled":true,"memory_locked":true}\n' \
-         "$1" "$2" "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)" "$(date -u +%Y-%m-%dT%H:%M:%S.002Z)" \
-         >"$home/.conbus/daemon.build") &
+}
+
+# Simulate the daemon coming up after install --apply. First writes the OLD
+# daemon's stamp synchronously (pid-1), which `start` reads as old_stamp_pid.
+# The new stamp lands once the script has swapped the binary or run install
+# --apply, and both come after that read. A fixed delay lost that race to a
+# slow preflight: wait_for_serving then waited for a change that had already
+# happened, and scenarios failed on a busy machine.
+daemon_boot() { # daemon_boot <build> <pid>
+    if [ -n "${boot_job:-}" ]; then
+        kill "$boot_job" 2>/dev/null || true
+        wait "$boot_job" 2>/dev/null || true
+    fi
+    write_stamp 01d "$(($2 - 1))"
+    rm -f "$home/.install-called"
+    installed=$(ls -i "$install_dir/conbus" 2>/dev/null || true)
+    (
+        n=0
+        while [ "$(ls -i "$install_dir/conbus" 2>/dev/null || true)" = "$installed" ] &&
+            [ ! -e "$home/.install-called" ]; do
+            n=$((n + 1))
+            [ "$n" -lt 1200 ] || exit 0
+            sleep 0.05
+        done
+        [ -d "$home/.conbus" ] || exit 0
+        write_stamp "$1" "$2"
+    ) &
+    boot_job=$!
 }
 
 say() { printf 'rehearsal: %s\n' "$*"; }
@@ -483,13 +501,13 @@ rm -f "$rollback_bin"
 
 # (c) the rollback subcommand, verified and not.
 write_fake 01d old "$rollback_bin"
-daemon_boot beef 4401
+write_stamp beef 4401
 code=0
 run rollback >"$tmp/rb-ok.out" 2>&1 || code=$?
 expect 0 "$code" "rollback exits 0 when the old build is verified"
 expect_grep "rollback verified" "$tmp/rb-ok.out" "the verification is announced"
 write_fake 01d silent "$rollback_bin"
-daemon_boot beef 4402
+write_stamp beef 4402
 code=0
 SERVING_LIMIT=1 run rollback >"$tmp/rb-bad.out" 2>&1 || code=$?
 expect 3 "$code" "rollback exits 3 when the old build never serves a stamp"
