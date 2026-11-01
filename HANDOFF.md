@@ -548,8 +548,9 @@ Next, each its own PR with a failing test first:
      after. Send each day within a couple of hours of 00:00 UTC; RFD 0002
      has the table. The pipe also counts any 2xx as sent where OTLP says
      200.
-   - `--inference-listen` authenticates nothing and binds whatever address it
-     is given.
+   - `--inference-listen` authenticates nothing. It now refuses any
+     non-loopback address, so whatever authenticates has to sit in front of
+     it on the same machine.
 3. After V1 (2026-11-04): the screen or the pipe, whichever the interviews'
    "where should this show up?" answers. Nothing is hosted before the gates,
    and no sync code is written before RFD 0002 and RFD 0003 are accepted.
