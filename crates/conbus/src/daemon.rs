@@ -510,11 +510,11 @@ impl Daemon {
         seqs: &mut Vec<u64>,
         declared: Option<HopProvenance>,
     ) {
-        let Some(reason) = written.iter().find_map(|record| match &record.event {
+        let Some((reason, waited)) = written.iter().find_map(|record| match &record.event {
             Event::TurnEnded {
                 state: TurnState::InterruptedQuota { reason },
                 ..
-            } => Some(reason.clone()),
+            } => Some((reason.clone(), record.spooled_at.is_some())),
             _ => None,
         }) else {
             return;
@@ -581,7 +581,11 @@ impl Daemon {
             written,
             seqs,
         );
-        if next.as_str() == conbus_core::event::Harness::CODEX {
+        // A stop that waited on its way here starts nothing, as a chat order that
+        // waited does not: a window opening on its own, however long after the
+        // stop, is an order carried out with nobody told. The decision stands in
+        // the log, for `conbus hop` and the next briefing.
+        if next.as_str() == conbus_core::event::Harness::CODEX && !waited {
             self.pending_warm = Some(bus_id);
         }
     }
@@ -2093,6 +2097,42 @@ mod tests {
                 Event::Briefed { .. } | Event::Continued { .. }
             )),
             "{:?}",
+            scan.records
+        );
+    }
+
+    #[test]
+    fn a_quota_stop_that_waited_in_the_spool_starts_no_hop_on_its_own() {
+        // The same rule as a chat order. A window opening on its own however long
+        // after the stop is an order carried out with nobody told. The decision
+        // stays in the log, and `conbus hop` and the next briefing still offer it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = SegmentLog::open(dir.path(), Retention::default()).expect("open");
+        let mut daemon = Daemon::new(log, Registry::new(), HashMap::new());
+        daemon.handle(request(Event::TurnStarted {
+            author: None,
+            prompt: Body::kept("keep going"),
+        }));
+
+        daemon.handle(spooled(Event::TurnEnded {
+            state: TurnState::InterruptedQuota {
+                reason: "rate_limit".into(),
+            },
+            assistant_message: None,
+            tokens: None,
+        }));
+
+        assert_eq!(
+            daemon.take_pending_warm(),
+            None,
+            "nobody asked for this now"
+        );
+        let scan = SegmentLog::scan(dir.path()).expect("scan");
+        assert!(
+            scan.records
+                .iter()
+                .any(|record| matches!(record.event, Event::Routed { .. })),
+            "the decision is still recorded: {:?}",
             scan.records
         );
     }
