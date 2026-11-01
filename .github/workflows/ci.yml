@@ -3,9 +3,10 @@
 # whole suite. PRs #11–#18 were merged without it and main went red for a day
 # without anyone knowing; this is the machine saying so instead.
 #
-# macOS only, because conbus is: launchd, AF_UNIX path limits and the vendor
-# apps it lands in are macOS facts. First-party actions only, and the toolchain
-# comes from rustup on the runner rather than a third-party action.
+# macOS and Linux, because conbus runs on both: launchd and the vendors' macOS
+# apps on one, a systemd user unit on the other. First-party actions only, and
+# the toolchain comes from rustup on the runner rather than a third-party
+# action.
 name: ci
 
 on:
@@ -23,7 +24,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # Install paths under test must never talk to the runner's launchd.
+  # Install paths under test must never talk to the runner's service manager.
   CONBUS_SKIP_LAUNCHCTL: "1"
 
 jobs:
@@ -48,8 +49,68 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: cargo-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}-
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-
+
+      - name: fmt
+        run: cargo fmt --all --check
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: test
+        run: cargo test --workspace --locked --no-fail-fast
+
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          rustup toolchain install
+          rustc --version
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-
+
+      - name: fmt
+        run: cargo fmt --all --check
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: test
+        run: cargo test --workspace --locked --no-fail-fast
+
+  linux-arm:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          rustup toolchain install
+          rustc --version
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-
 
       - name: fmt
         run: cargo fmt --all --check

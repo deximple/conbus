@@ -25,8 +25,10 @@ steps that stay with the operator.
 
    The workflow refuses a tag that does not match the workspace version, tests
    the tagged commit again, builds `aarch64-apple-darwin` and
-   `x86_64-apple-darwin`, joins them with `lipo`, and publishes
-   `conbus-macos-universal.tar.gz`, its `.sha256`, and `install.sh`.
+   `x86_64-apple-darwin`, joins them with `lipo`, builds
+   `x86_64-unknown-linux-gnu` on a Linux runner, and publishes
+   `conbus-macos-universal.tar.gz`, `conbus-linux-x86_64.tar.gz`, their
+   `.sha256`s, and `install.sh`.
 
 The asset names carry no version so `install.sh` can fetch
 `releases/latest/download/<name>`. A specific version is

@@ -21,7 +21,7 @@ pub const ALG: &str = "aes-256-gcm";
 
 /// How long `security` may take to answer. The recorder seals a tool body on
 /// the path that writes it, while the hook that sent it waits.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 const KEYCHAIN_LIMIT: Duration = Duration::from_secs(5);
 
 /// The Keychain's KEK, once read. Asking for it per body started a `security`

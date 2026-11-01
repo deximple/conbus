@@ -29,6 +29,7 @@ fn run(binary: &Path, home: &Path, args: &[&str]) -> Output {
         .env("CONBUS_SKIP_LAUNCHCTL", "1")
         .env_remove("CONBUS_HOME")
         .env_remove("XDG_STATE_HOME")
+        .env_remove("XDG_CONFIG_HOME")
         .env_remove("CODEX_HOME")
         .output()
         .expect("run conbus");
@@ -305,19 +306,30 @@ fn the_guidance_says_where_the_block_goes_and_how_it_merges() {
     let out = run(&built(), &machine.home, &["install", "--managed"]);
 
     let text = stderr(&out);
-    for needle in [
-        // Claude Code's managed settings on macOS, as its own docs give them.
+    // Claude Code's managed settings, as its own docs give them per OS; Codex
+    // and Cursor have admin-managed hooks of their own.
+    #[cfg(target_os = "macos")]
+    let needles = [
         "/Library/Application Support/ClaudeCode/managed-settings.json",
         "managed-settings.d",
         "com.anthropic.claudecode",
         "allowManagedHooksOnly",
-        // Codex and Cursor have admin-managed hooks of their own.
         "requirements.toml",
         "com.openai.codex",
         "/Library/Application Support/Cursor/hooks.json",
         // The recorder is still per user.
         "install --apply",
-    ] {
+    ];
+    #[cfg(not(target_os = "macos"))]
+    let needles = [
+        "/etc/claude-code/managed-settings.json",
+        "managed-settings.d",
+        "allowManagedHooksOnly",
+        "requirements.toml",
+        "/etc/cursor/hooks.json",
+        "install --apply",
+    ];
+    for needle in needles {
         assert!(
             text.contains(needle),
             "the guidance does not mention {needle}:\n{text}"

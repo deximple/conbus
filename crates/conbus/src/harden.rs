@@ -48,8 +48,17 @@ fn disable_core_dumps() -> bool {
 }
 
 fn lock_memory() -> (bool, Option<String>) {
-    // SAFETY: no arguments to get wrong; the call reports failure in errno.
-    let locked = unsafe { libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE) } == 0;
+    // MCL_FUTURE charges every later mapping — a spawned thread's stack
+    // included — against RLIMIT_MEMLOCK. Under the stock 8 MiB cap the
+    // first `thread::spawn` then fails EAGAIN and panics the daemon; heap
+    // growth is covered by the explicit `relock_derived` passes instead.
+    #[cfg(target_os = "macos")]
+    let flags = libc::MCL_CURRENT | libc::MCL_FUTURE;
+    #[cfg(not(target_os = "macos"))]
+    let flags = libc::MCL_CURRENT;
+    // SAFETY: `flags` are valid mlockall(2) flags; the call reports
+    // failure in errno.
+    let locked = unsafe { libc::mlockall(flags) } == 0;
     if locked {
         return (true, None);
     }

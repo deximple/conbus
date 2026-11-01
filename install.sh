@@ -1,9 +1,9 @@
 #!/bin/sh
-# Install conbus on macOS from a GitHub release.
+# Install conbus on macOS or Linux from a GitHub release.
 #
 #   curl -fsSL https://raw.githubusercontent.com/deximple/conbus/main/install.sh | sh
 #
-# Downloads the universal binary, checks its SHA-256, and places it at
+# Downloads the binary for this OS, checks its SHA-256, and places it at
 # ~/.local/bin/conbus (written beside, then renamed, so a hook running the old
 # binary is never cut off). Then it runs `conbus install`, which only reports:
 # nothing in your Claude Code, Codex, Cursor, grok or opencode settings changes
@@ -16,12 +16,25 @@ set -eu
 
 repo=${CONBUS_REPO:-deximple/conbus}
 version=${CONBUS_VERSION:-latest}
-asset=conbus-macos-universal.tar.gz
 
 say() { printf 'conbus-install: %s\n' "$*"; }
 die() { say "$*" >&2; exit 1; }
 
-[ "$(uname -s)" = Darwin ] || die "conbus runs on macOS only for now."
+case "$(uname -s)" in
+  Darwin)
+    asset=conbus-macos-universal.tar.gz
+    checksum() { shasum -a 256 -c "$1"; }
+    ;;
+  Linux)
+    case "$(uname -m)" in
+      x86_64)         asset=conbus-linux-x86_64.tar.gz ;;
+      aarch64|arm64)  asset=conbus-linux-aarch64.tar.gz ;;
+      *)              die "on Linux conbus ships for x86_64 and aarch64 only for now." ;;
+    esac
+    checksum() { sha256sum -c "$1"; }
+    ;;
+  *) die "conbus runs on macOS and Linux only for now." ;;
+esac
 
 if [ -n "${CONBUS_BASE_URL:-}" ]; then
   base=$CONBUS_BASE_URL
@@ -51,13 +64,13 @@ fetch() {
 }
 
 say "downloading $asset ($version) from $base"
-fetch "$asset" || die "could not download $asset. If the repository is private, run 'gh auth login' first."
+fetch "$asset" || die "could not download $asset"
 fetch "$asset.sha256" || die "could not download $asset.sha256"
-(cd "$tmp" && shasum -a 256 -c "$asset.sha256" >/dev/null 2>&1) ||
+(cd "$tmp" && checksum "$asset.sha256" >/dev/null 2>&1) ||
   die "the download does not match its checksum; nothing was installed"
 
 tar -xzf "$tmp/$asset" -C "$tmp"
-"$tmp/conbus" --version >/dev/null 2>&1 || die "the downloaded binary does not run on this Mac"
+"$tmp/conbus" --version >/dev/null 2>&1 || die "the downloaded binary does not run on this machine"
 
 dest="$HOME/.local/bin"
 mkdir -p "$dest"

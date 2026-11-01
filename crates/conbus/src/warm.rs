@@ -305,13 +305,10 @@ sys.exit(1)
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("claude");
         let log = dir.path().join("argv");
-        std::fs::write(
+        crate::test_support::write_executable(
             &path,
-            FAKE_CLAUDE.replace("__LOG__", log.to_str().expect("utf-8")),
-        )
-        .expect("write");
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+            &FAKE_CLAUDE.replace("__LOG__", log.to_str().expect("utf-8")),
+        );
         (dir, path, log)
     }
 

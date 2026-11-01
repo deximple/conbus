@@ -150,19 +150,16 @@ mod tests {
 
     #[test]
     fn reveal_hands_the_official_url_to_open() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().expect("tempdir");
         let stub = dir.path().join("open");
         let mark = dir.path().join("url");
-        std::fs::write(
+        crate::test_support::write_executable(
             &stub,
-            format!(
+            &format!(
                 "#!/bin/sh\nfor a in \"$@\"; do last=\"$a\"; done\nprintf '%s' \"$last\" > {}\n",
                 mark.display()
             ),
-        )
-        .expect("stub");
-        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        );
         let opened = reveal_with(
             stub.as_os_str(),
             Harness::CODEX,

@@ -4,6 +4,7 @@ use std::io::Write;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
+mod support;
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_conbus")
@@ -557,6 +558,7 @@ fn install_into(home: &Path) {
         .env("CONBUS_SKIP_LAUNCHCTL", "1")
         .env_remove("CONBUS_HOME")
         .env_remove("XDG_STATE_HOME")
+        .env_remove("XDG_CONFIG_HOME")
         .env_remove("CODEX_HOME")
         .output()
         .expect("run install");
@@ -1700,10 +1702,8 @@ fn a_person_can_switch_the_briefing_off() {
 
 /// A stub vendor CLI that takes its time.
 fn slow_stub(dir: &Path, name: &str, seconds: u32) -> std::path::PathBuf {
-    use std::os::unix::fs::PermissionsExt;
     let path = dir.join(name);
-    std::fs::write(&path, format!("#!/bin/sh\nsleep {seconds}\n")).expect("stub");
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    support::write_executable(&path, &format!("#!/bin/sh\nsleep {seconds}\n"));
     path
 }
 

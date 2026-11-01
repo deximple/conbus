@@ -486,6 +486,8 @@ pub fn installed_binary(home: &Path) -> PathBuf {
     home.join(".local").join("bin").join("conbus")
 }
 
+/// The launchd agent `install --apply` writes on a Mac.
+#[cfg(target_os = "macos")]
 pub fn launch_agent_path(home: &Path) -> PathBuf {
     home.join("Library")
         .join("LaunchAgents")
@@ -562,23 +564,27 @@ fn same_file(a: &Path, b: &Path) -> bool {
 
 pub const DAEMON_LABEL: &str = "sh.conbus.daemon";
 
-/// How long launchd waits to start the agent again after a start that failed
-/// at once.
+/// How long the service manager waits to start the recorder again after a
+/// start that failed at once — launchd's `ThrottleInterval` on a Mac,
+/// systemd's `RestartSec` on Linux.
 ///
-/// Its default is ten seconds, and an upgrade meets it every time: the first
-/// start of a replaced binary is refused by a Background Task Management launch
-/// constraint until macOS has looked at the new file again. Two seconds keeps
-/// that window short, and still spaces out a daemon that cannot start — most of
-/// its failures come before the log is read, so a retry costs little.
+/// launchd's default is ten seconds, and an upgrade meets it every time: the
+/// first start of a replaced binary is refused by a Background Task Management
+/// launch constraint until macOS has looked at the new file again. Two seconds
+/// keeps that window short, and still spaces out a daemon that cannot start —
+/// most of its failures come before the log is read, so a retry costs little.
 pub const DAEMON_THROTTLE_SECS: u32 = 2;
 
 /// A bootstrap straight after a bootout can fail with an I/O error while
 /// launchd lets go of the job (seen on this machine on 2026-09-03).
+#[cfg(target_os = "macos")]
 const BOOTSTRAP_TRIES: u32 = 5;
+#[cfg(target_os = "macos")]
 const LAUNCHCTL_PAUSE: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// launchd agent that keeps one daemon on the socket, with the environment
 /// the recorder runs in — where `CONBUS_RETENTION` is set for it.
+#[cfg(target_os = "macos")]
 pub fn daemon_plist(binary: &Path, log: &Path, env: &BTreeMap<String, String>) -> String {
     let env = if env.is_empty() {
         String::new()
@@ -620,6 +626,7 @@ pub fn daemon_plist(binary: &Path, log: &Path, env: &BTreeMap<String, String>) -
     )
 }
 
+#[cfg(target_os = "macos")]
 fn xml_escape(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -632,6 +639,7 @@ fn xml_escape(text: &str) -> String {
 /// install rewrote the file from the template, so an upgrade put the log back
 /// to its default level without a word. `plutil` reads whatever form the file
 /// was left in; a missing file, or one it cannot read, has none.
+#[cfg(target_os = "macos")]
 pub fn environment_of(path: &Path) -> BTreeMap<String, String> {
     if !path.exists() {
         return BTreeMap::new();
@@ -654,20 +662,68 @@ pub fn environment_of(path: &Path) -> BTreeMap<String, String> {
         .collect()
 }
 
-/// Write the plist. `load` talks to launchctl; tests leave it false.
-pub fn apply_daemon(home: &Path, binary: &Path, log: &Path, load: bool) -> io::Result<bool> {
-    let path = launch_agent_path(home);
-    let body = daemon_plist(binary, log, &environment_of(&path));
-    let unchanged = fs::read_to_string(&path).is_ok_and(|existing| existing == body);
+/// What `install --apply` did with the recorder's service file.
+pub struct DaemonApply {
+    /// The file on disk changed.
+    pub changed: bool,
+    /// Whether the machine's service manager took it.
+    pub manager: Manager,
+}
+
+/// Whether a service manager runs the recorder now.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Manager {
+    /// launchd bootstrapped the agent, or systemd enabled the unit `--now`.
+    Loaded,
+    /// `load` was false — `--print`-style callers and tests start it
+    /// themselves.
+    NotAsked,
+    /// `systemctl --user` answered nothing: a container, a CI runner, a remote
+    /// shell with no user bus. The unit is written; the report prints the one
+    /// command that runs the recorder by hand instead of failing.
+    #[cfg(any(test, not(target_os = "macos")))]
+    Unavailable,
+}
+
+/// Write `body` to `path` unless the file already says exactly that.
+fn write_service(path: &Path, body: &str) -> io::Result<bool> {
+    let unchanged = fs::read_to_string(path).is_ok_and(|existing| existing == body);
     if !unchanged {
-        write_atomically(&path, &body)?;
-    }
-    if load {
-        load_launch_agent(&path)?;
+        write_atomically(path, body)?;
     }
     Ok(!unchanged)
 }
 
+/// Write the recorder's service file — the launchd plist on a Mac, the
+/// systemd user unit on Linux — and load it when `load` asks. A machine with
+/// no user manager to ask reports `Manager::Unavailable`, not an error.
+pub fn apply_daemon(home: &Path, binary: &Path, log: &Path, load: bool) -> io::Result<DaemonApply> {
+    #[cfg(target_os = "macos")]
+    {
+        let path = launch_agent_path(home);
+        let changed = write_service(&path, &daemon_plist(binary, log, &environment_of(&path)))?;
+        let manager = if load {
+            load_launch_agent(&path)?;
+            Manager::Loaded
+        } else {
+            Manager::NotAsked
+        };
+        Ok(DaemonApply { changed, manager })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let path = daemon_unit_path(home);
+        let changed = write_daemon_unit(&path, binary, log)?;
+        let manager = if load {
+            load_daemon_unit(&path, &mut systemctl)?
+        } else {
+            Manager::NotAsked
+        };
+        Ok(DaemonApply { changed, manager })
+    }
+}
+
+#[cfg(target_os = "macos")]
 fn load_launch_agent(plist: &Path) -> io::Result<()> {
     let uid = unsafe { libc::getuid() };
     let domain = format!("gui/{uid}");
@@ -690,6 +746,7 @@ fn load_launch_agent(plist: &Path) -> io::Result<()> {
 /// Background Task Management look at the item again, and the new binary
 /// starts at once. `launchctl` is a parameter so the order can be tested
 /// without talking to launchd.
+#[cfg(target_os = "macos")]
 fn reload_agent(
     domain: &str,
     target: &str,
@@ -714,8 +771,140 @@ fn reload_agent(
 }
 
 /// Run launchctl quietly; `print` in particular writes pages of state.
+#[cfg(target_os = "macos")]
 fn launchctl(args: &[&str]) -> bool {
     std::process::Command::new("launchctl")
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// The systemd user unit `install --apply` writes on Linux:
+/// `$XDG_CONFIG_HOME/systemd/user/sh.conbus.daemon.service`, or
+/// `~/.config/systemd/user/` where XDG is unset — a remote shell or a
+/// container usually exports none.
+#[cfg(not(target_os = "macos"))]
+pub fn daemon_unit_path(home: &Path) -> PathBuf {
+    let config = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".config"));
+    unit_path_in(&config)
+}
+
+/// The unit file inside a resolved XDG config directory.
+#[cfg(any(test, not(target_os = "macos")))]
+fn unit_path_in(config: &Path) -> PathBuf {
+    config
+        .join("systemd")
+        .join("user")
+        .join(format!("{DAEMON_LABEL}.service"))
+}
+
+/// The unit that keeps one daemon on the socket — the Linux form of the
+/// launchd agent, down to the restart backoff and the log both streams join.
+#[cfg(any(test, not(target_os = "macos")))]
+pub fn daemon_unit(binary: &Path, log: &Path, env: &BTreeMap<String, String>) -> String {
+    let env: String = env
+        .iter()
+        .map(|(key, value)| format!("Environment=\"{key}={}\"\n", unit_escape(value)))
+        .collect();
+    format!(
+        "[Unit]\nDescription=conbus recorder\n\n[Service]\nExecStart=\"{}\" daemon\nRestart=on-failure\nRestartSec={DAEMON_THROTTLE_SECS}\nStandardOutput=append:{}\nStandardError=append:{}\n{env}\n[Install]\nWantedBy=default.target\n",
+        unit_escape(&binary.display().to_string()),
+        log.display(),
+        log.display(),
+    )
+}
+
+/// What a value inside a unit's `"…"` cannot carry bare.
+#[cfg(any(test, not(target_os = "macos")))]
+fn unit_escape(text: &str) -> String {
+    text.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// The `Environment=` settings the unit at `path` already gives the recorder —
+/// what `environment_of` reads out of a plist on a Mac. A missing file, or
+/// one it cannot read, has none.
+#[cfg(any(test, not(target_os = "macos")))]
+fn environment_of_unit(path: &Path) -> BTreeMap<String, String> {
+    let Ok(text) = fs::read_to_string(path) else {
+        return BTreeMap::new();
+    };
+    let mut env = BTreeMap::new();
+    for line in text.lines() {
+        let Some(rest) = line.trim().strip_prefix("Environment=") else {
+            continue;
+        };
+        // conbus writes one "K=V" a line; systemd also allows several quoted
+        // pairs on one line, and an unquoted pair is still a pair.
+        let mut quoted = false;
+        let mut escaped = false;
+        let mut current = String::new();
+        let mut pairs: Vec<String> = Vec::new();
+        for c in rest.chars() {
+            if escaped {
+                current.push(c);
+                escaped = false;
+            } else if quoted && c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                if quoted {
+                    pairs.push(std::mem::take(&mut current));
+                }
+                quoted = !quoted;
+            } else if quoted || !c.is_whitespace() {
+                current.push(c);
+            } else if !current.is_empty() {
+                pairs.push(std::mem::take(&mut current));
+            }
+        }
+        if !current.is_empty() {
+            pairs.push(current);
+        }
+        for pair in pairs {
+            if let Some((key, value)) = pair.split_once('=') {
+                env.insert(key.to_string(), value.to_string());
+            }
+        }
+    }
+    env
+}
+
+/// Write the unit, keeping an environment an operator gave it — the same care
+/// `apply_daemon` takes with the plist on a Mac.
+#[cfg(any(test, not(target_os = "macos")))]
+fn write_daemon_unit(path: &Path, binary: &Path, log: &Path) -> io::Result<bool> {
+    write_service(path, &daemon_unit(binary, log, &environment_of_unit(path)))
+}
+
+/// Reload systemd's view of the user units, then enable this one and start it
+/// now. `systemctl` is a parameter so the order can be tested without talking
+/// to a manager — and so a machine with none is a report, not a failure.
+#[cfg(any(test, not(target_os = "macos")))]
+fn load_daemon_unit(
+    unit: &Path,
+    systemctl: &mut impl FnMut(&[&str]) -> bool,
+) -> io::Result<Manager> {
+    if !systemctl(&["--user", "daemon-reload"]) {
+        return Ok(Manager::Unavailable);
+    }
+    let unit = unit.display().to_string();
+    if !systemctl(&["--user", "enable", "--now", &unit]) {
+        return Err(io::Error::other(format!(
+            "systemd --user would not enable {unit}; the recorder is not running"
+        )));
+    }
+    Ok(Manager::Loaded)
+}
+
+/// Run systemctl quietly; a machine without one answers `false`, which the
+/// caller turns into the one command that runs the recorder by hand.
+#[cfg(not(target_os = "macos"))]
+fn systemctl(args: &[&str]) -> bool {
+    Command::new("systemctl")
         .args(args)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -1112,6 +1301,7 @@ mod tests {
         assert!(!place_binary(&src, &dest).expect("same bytes"));
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn the_launchd_plist_names_the_installed_binary_and_never_async() {
         let body = daemon_plist(
@@ -1126,6 +1316,7 @@ mod tests {
         assert!(!body.contains("async"));
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn a_start_macos_refuses_once_is_retried_in_seconds_not_ten() {
         // After an upgrade replaced the binary, the first start of the agent
@@ -1152,6 +1343,7 @@ mod tests {
 
     /// launchctl as a script: `print` answers "still loaded" `loaded_for`
     /// times, and `bootstrap` fails `refusals` times before it succeeds.
+    #[cfg(target_os = "macos")]
     fn scripted(loaded_for: usize, refusals: usize) -> impl FnMut(&[&str]) -> bool {
         let mut prints = 0;
         let mut bootstraps = 0;
@@ -1168,6 +1360,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn install_reloads_the_agent_and_never_just_restarts_it() {
         // A `kickstart -k` restarts the job under the launch constraint macOS
@@ -1206,6 +1399,7 @@ mod tests {
         assert!(!seen.iter().any(|call| call.starts_with("kickstart")));
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn a_reload_launchd_never_takes_is_reported_not_swallowed() {
         let mut script = scripted(0, usize::MAX);
@@ -1217,19 +1411,29 @@ mod tests {
         ));
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn applying_the_daemon_is_idempotent_without_talking_to_launchctl() {
         let home = tempfile::tempdir().expect("tempdir");
         let bin = Path::new("/opt/conbus");
         let log = home.path().join(".conbus").join("daemon.log");
-        assert!(apply_daemon(home.path(), bin, &log, false).expect("write"));
-        assert!(!apply_daemon(home.path(), bin, &log, false).expect("again"));
+        assert!(
+            apply_daemon(home.path(), bin, &log, false)
+                .expect("write")
+                .changed
+        );
+        assert!(
+            !apply_daemon(home.path(), bin, &log, false)
+                .expect("again")
+                .changed
+        );
         let written = fs::read_to_string(launch_agent_path(home.path())).expect("plist");
         assert_eq!(written, daemon_plist(bin, &log, &BTreeMap::new()));
     }
 
     /// The plist as an operator leaves it after following the manual: an
     /// environment added with PlistBuddy, which rewrites the file its own way.
+    #[cfg(target_os = "macos")]
     const EDITED_BY_HAND: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -1247,6 +1451,7 @@ mod tests {
 </plist>
 "#;
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn reinstalling_keeps_the_environment_an_operator_gave_the_recorder() {
         let home = tempfile::tempdir().expect("tempdir");
@@ -1256,7 +1461,11 @@ mod tests {
         fs::create_dir_all(path.parent().expect("dir")).expect("dir");
         fs::write(&path, EDITED_BY_HAND).expect("plist");
 
-        assert!(apply_daemon(home.path(), bin, &log, false).expect("write"));
+        assert!(
+            apply_daemon(home.path(), bin, &log, false)
+                .expect("write")
+                .changed
+        );
         let env = environment_of(&path);
         assert_eq!(
             env.get("CONBUS_RETENTION").map(String::as_str),
@@ -1267,7 +1476,11 @@ mod tests {
             Some("a & b")
         );
         // And it is the file conbus writes, so the next install changes nothing.
-        assert!(!apply_daemon(home.path(), bin, &log, false).expect("again"));
+        assert!(
+            !apply_daemon(home.path(), bin, &log, false)
+                .expect("again")
+                .changed
+        );
         let written = fs::read_to_string(&path).expect("plist");
         assert!(
             written.contains("<string>/opt/conbus</string>"),
@@ -1276,6 +1489,7 @@ mod tests {
         assert!(written.contains("<string>a &amp; b</string>"), "{written}");
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn a_plist_with_no_environment_gets_none() {
         let body = daemon_plist(
@@ -1286,6 +1500,121 @@ mod tests {
         assert!(!body.contains("EnvironmentVariables"), "{body}");
         let home = tempfile::tempdir().expect("tempdir");
         assert!(environment_of(&home.path().join("missing.plist")).is_empty());
+    }
+
+    // The systemd user unit is the same recorder on Linux. These helpers take
+    // no OS service — a unit is a string and `systemctl` is injected — so the
+    // tests run on a Mac too.
+
+    #[test]
+    fn a_daemon_unit_runs_the_binary_and_restarts_like_the_agent() {
+        let unit = daemon_unit(
+            Path::new("/opt/conbus"),
+            Path::new("/var/log/conbus.log"),
+            &BTreeMap::new(),
+        );
+        assert!(unit.contains("ExecStart=\"/opt/conbus\" daemon"), "{unit}");
+        assert!(unit.contains("Restart=on-failure"), "{unit}");
+        assert!(
+            unit.contains(&format!("RestartSec={DAEMON_THROTTLE_SECS}")),
+            "{unit}"
+        );
+        assert!(
+            unit.contains("StandardOutput=append:/var/log/conbus.log"),
+            "{unit}"
+        );
+        assert!(
+            unit.contains("StandardError=append:/var/log/conbus.log"),
+            "{unit}"
+        );
+        assert!(unit.contains("WantedBy=default.target"), "{unit}");
+        assert!(!unit.contains("Environment="), "{unit}");
+    }
+
+    #[test]
+    fn the_unit_goes_where_systemd_looks_for_user_services() {
+        assert_eq!(
+            unit_path_in(Path::new("/home/dev/.config")),
+            Path::new("/home/dev/.config/systemd/user/sh.conbus.daemon.service")
+        );
+    }
+
+    /// The unit as an operator leaves it: an environment added by hand or by
+    /// `systemctl --user edit`.
+    const EDITED_UNIT_BY_HAND: &str = "[Unit]\n\
+        Description=conbus recorder\n\
+        \n\
+        [Service]\n\
+        ExecStart=\"/old/conbus\" daemon\n\
+        Environment=\"CONBUS_RETENTION=ephemeral\"\n\
+        Environment=\"CONBUS_BRIEFING=a b\"\n";
+
+    #[test]
+    fn rewriting_the_unit_keeps_the_environment_an_operator_gave_the_recorder() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bin = Path::new("/opt/conbus");
+        let log = dir.path().join("daemon.log");
+        let unit = dir.path().join("sh.conbus.daemon.service");
+        fs::write(&unit, EDITED_UNIT_BY_HAND).expect("unit");
+
+        assert!(write_daemon_unit(&unit, bin, &log).expect("write"));
+        let written = fs::read_to_string(&unit).expect("unit");
+        assert!(
+            written.contains("Environment=\"CONBUS_RETENTION=ephemeral\""),
+            "{written}"
+        );
+        assert!(
+            written.contains("Environment=\"CONBUS_BRIEFING=a b\""),
+            "{written}"
+        );
+        assert!(
+            written.contains("ExecStart=\"/opt/conbus\" daemon"),
+            "{written}"
+        );
+        // And it is the file conbus writes, so the next install changes nothing.
+        assert!(!write_daemon_unit(&unit, bin, &log).expect("again"));
+    }
+
+    #[test]
+    fn a_user_manager_is_asked_to_reload_then_enable_and_start() {
+        let mut seen: Vec<String> = Vec::new();
+        let mut systemctl = |args: &[&str]| {
+            seen.push(args.join(" "));
+            true
+        };
+
+        let manager = load_daemon_unit(Path::new("/u/sh.conbus.daemon.service"), &mut systemctl)
+            .expect("load");
+
+        assert_eq!(manager, Manager::Loaded);
+        assert_eq!(
+            seen,
+            [
+                "--user daemon-reload",
+                "--user enable --now /u/sh.conbus.daemon.service"
+            ],
+            "systemd only sees the new file after daemon-reload"
+        );
+    }
+
+    #[test]
+    fn a_machine_with_no_user_manager_reports_it_instead_of_failing() {
+        // A container or a CI runner has no `systemctl --user`: install still
+        // writes everything, and the report prints the one command that runs
+        // the recorder by hand.
+        let mut systemctl = |_: &[&str]| false;
+        let manager = load_daemon_unit(Path::new("/u/sh.conbus.daemon.service"), &mut systemctl)
+            .expect("a report, not an error");
+        assert_eq!(manager, Manager::Unavailable);
+    }
+
+    #[test]
+    fn a_manager_that_refuses_the_unit_is_an_error() {
+        let mut systemctl = |args: &[&str]| args.get(1) != Some(&"enable");
+        assert!(
+            load_daemon_unit(Path::new("/u/sh.conbus.daemon.service"), &mut systemctl).is_err(),
+            "a manager that answered the reload but refused the unit"
+        );
     }
 }
 

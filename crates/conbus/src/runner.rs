@@ -217,7 +217,6 @@ mod tests {
     use crate::takeover::Takeover;
     use conbus_core::paths::Paths;
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
 
     fn bins(pairs: &[(&str, &std::path::Path)]) -> Bins {
         Bins::Fixed(
@@ -238,8 +237,7 @@ mod tests {
 
     fn stub(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
         let path = dir.join(name);
-        fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write");
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod");
+        crate::test_support::write_executable(&path, &format!("#!/bin/sh\n{body}\n"));
         path
     }
 

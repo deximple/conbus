@@ -369,11 +369,9 @@ mod tests {
         // probe only feeds the pack's freshness line. On 2026-09-27 the first
         // organic hop reached its Codex thread 21.6 minutes after the decision,
         // and `gh` was one of the calls on that path with no limit at all.
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().expect("tempdir");
         let gh = dir.path().join("gh");
-        std::fs::write(&gh, "#!/bin/sh\nsleep 30\n").expect("write");
-        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        crate::test_support::write_executable(&gh, "#!/bin/sh\nsleep 30\n");
 
         let started = std::time::Instant::now();
         let line = probe_with(gh.to_str().expect("utf-8"), Some(CHECKOUT)).line();

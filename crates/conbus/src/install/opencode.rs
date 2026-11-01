@@ -60,7 +60,6 @@ mod tests {
     use super::*;
 
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
     use std::process::{Child, Command, Output, Stdio};
     use std::time::{Duration, Instant};
 
@@ -179,8 +178,7 @@ await Promise.all(calls);
         let dir = captured.display().to_string();
         assert!(!dir.contains('\''), "{dir}");
         let script = format!("#!/bin/sh\n{}\n", body.replace("{captured}", &dir));
-        fs::write(path, script).expect("stub");
-        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("chmod");
+        crate::test_support::write_executable(path, &script);
     }
 
     fn settle(mut child: Child, limit: Duration) -> Output {
