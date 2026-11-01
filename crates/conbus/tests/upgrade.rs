@@ -207,10 +207,7 @@ fn install_over_a_0_2_x_layout_keeps_the_unit_environment() {
     .expect("claude settings");
     // A unit as 0.2.x wrote it, plus the operator's own Environment lines —
     // including one in systemd's multi-pair form the parser must also read.
-    let units = home
-        .join(".config")
-        .join("systemd")
-        .join("user");
+    let units = home.join(".config").join("systemd").join("user");
     std::fs::create_dir_all(&units).expect("unit dir");
     let unit = units.join("sh.conbus.daemon.service");
     std::fs::write(
@@ -251,11 +248,10 @@ fn install_over_a_0_2_x_layout_keeps_the_unit_environment() {
         "someone else's hook survived"
     );
 
-    let fingerprints: Vec<(String, String)> =
-        [unit.clone(), claude.join("settings.json")]
-            .iter()
-            .map(|p| (p.display().to_string(), sha256(p)))
-            .collect();
+    let fingerprints: Vec<(String, String)> = [unit.clone(), claude.join("settings.json")]
+        .iter()
+        .map(|p| (p.display().to_string(), sha256(p)))
+        .collect();
     let second = conbus(home, conbus_home, &["install", "--apply"]);
     assert_eq!(second.status.code(), Some(0));
     for (name, before) in &fingerprints {
@@ -273,10 +269,7 @@ fn install_over_a_0_2_x_layout_keeps_the_unit_environment() {
         "uninstall failed: {}",
         String::from_utf8_lossy(&un.stderr)
     );
-    assert!(
-        !unit.exists(),
-        "uninstall removed conbus's own unit"
-    );
+    assert!(!unit.exists(), "uninstall removed conbus's own unit");
     assert!(
         std::fs::read_to_string(claude.join("settings.json"))
             .expect("settings")
