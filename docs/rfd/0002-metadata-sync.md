@@ -1,6 +1,7 @@
 # RFD 0002 — What a sync may send
 
-Status: **draft**, 2026-09-23, revised the same day after review. The client
+Status: **draft**, 2026-09-23, revised the same day after review. Still a draft at 1.0: `conbus sync` ships as experimental
+([stability](../stability.md)) and no service exists. The client
 ships in 0.2.9; no service exists. This RFD and
 [RFD 0003](0003-security-design.md), the security design, have to be accepted
 before a service runs, and every field a sync sends has to be named here first.
