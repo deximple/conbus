@@ -2595,3 +2595,218 @@ fn an_export_read_once_is_not_read_again_at_every_start() {
 
     assert!(!said("said twce"), "read again");
 }
+
+/// A real FIFO, and it held open for as long as the file returned lives. Open
+/// read-write and non-blocking so this cannot hang, and so a reader's open does not
+/// either. A read waits for as long as this holds the write end, and when a test
+/// fails, its unwinding closes it, and what was blocked sees the end and goes away.
+fn a_fifo(path: &Path) -> std::fs::File {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::create_dir_all(path.parent().expect("a parent")).expect("dir");
+    let name = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("a path");
+    // SAFETY: `name` is a valid C string that outlives the call.
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0, "mkfifo");
+    std::fs::File::options()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .expect("open the fifo")
+}
+
+/// Run `conbus` with these arguments, and kill it if it has not finished in time.
+fn conbus_within(home: &Path, args: &[&str], limit: Duration) -> Option<(bool, String)> {
+    let mut command = Command::new(bin());
+    command.args(args);
+    env_for(&mut command, home);
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("conbus");
+    let end = Instant::now() + limit;
+    while Instant::now() < end {
+        if child.try_wait().expect("wait").is_some() {
+            let output = child.wait_with_output().expect("output");
+            return Some((
+                output.status.success(),
+                String::from_utf8_lossy(&output.stdout).into_owned()
+                    + &String::from_utf8_lossy(&output.stderr),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    None
+}
+
+#[test]
+fn a_fifo_named_like_a_transcript_does_not_hold_a_start() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let daemon = start(home);
+    hook(home, &prompt(CHILD, "cc", "the fifo's session"));
+    hook(home, &prompt(S, "p0", "before"));
+    stop(daemon);
+    let _fifo = a_fifo(&home.join(format!(".claude/projects/-repo/{CHILD}.jsonl")));
+    transcript(
+        home,
+        S,
+        &[
+            user(S, "p0", "before"),
+            user(S, "p1", "beside the fifo"),
+            reply(S, "a1"),
+        ],
+    );
+    let notes = home.join("notes");
+
+    timed_start(home, Path::new("/nonexistent/codex"), "4000", &notes);
+
+    assert!(
+        log_lines(home)
+            .iter()
+            .any(|record| record["prompt"]["text"] == "beside the fifo"),
+        "the transcript beside it was not read"
+    );
+    assert!(
+        !home.join("cache/gap-since").exists(),
+        "a read that can never work does not hold the range"
+    );
+    let said = std::fs::read_to_string(&notes).unwrap_or_default();
+    assert!(said.contains("1 not a regular file"), "{said}");
+}
+
+#[test]
+fn a_fifo_newer_than_a_sessions_transcript_does_not_stand_in_for_it() {
+    // One file per session, the most recently written, so it must not be this.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let daemon = start(home);
+    hook(home, &prompt(S, "p0", "before"));
+    stop(daemon);
+    transcript(
+        home,
+        S,
+        &[
+            user(S, "p0", "before"),
+            user(S, "p1", "only the real file holds this"),
+            reply(S, "a1"),
+        ],
+    );
+    std::thread::sleep(Duration::from_millis(1100));
+    let _fifo = a_fifo(&home.join(format!(".claude/projects/-moved/{S}.jsonl")));
+
+    stop(start(home));
+
+    assert!(
+        log_lines(home)
+            .iter()
+            .any(|record| record["vendor_turn_id"] == "p1"),
+        "the session's real transcript was not read"
+    );
+}
+
+#[test]
+fn a_fifo_does_not_hold_a_fill_by_hand_either() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let daemon = start(home);
+    hook(home, &prompt(CHILD, "cc", "the fifo's session"));
+    stop(daemon);
+    let _live = a_fifo(&home.join(format!(".claude/projects/-repo/{CHILD}.jsonl")));
+    // Not live, so what `backfill --apply` reads.
+    let _unseen = a_fifo(&home.join(format!(".claude/projects/-repo/{PARENT}.jsonl")));
+
+    let (ok, said) = conbus_within(home, &["backfill", "--gaps"], Duration::from_secs(30))
+        .expect("`backfill --gaps` was still reading after 30 s");
+    assert!(ok, "{said}");
+    assert!(said.contains("1 not a regular file"), "{said}");
+
+    let (ok, said) = conbus_within(home, &["backfill"], Duration::from_secs(30))
+        .expect("`backfill` was still reading after 30 s");
+    assert!(ok, "{said}");
+    assert!(said.contains("1 not a regular file"), "{said}");
+}
+
+#[test]
+fn a_fifo_in_the_drop_folder_does_not_hold_a_start() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let daemon = start(home);
+    hook(home, &prompt(S, "p0", "before"));
+    stop(daemon);
+    let folder = home.join("chat-export");
+    let _json = a_fifo(&folder.join("conversations.json"));
+    let _zip = a_fifo(&folder.join("data-export-2026-11-01.zip"));
+    let _inner = a_fifo(&folder.join("a/conversations.json"));
+    std::fs::create_dir_all(folder.join("b")).expect("dir");
+    let export = json!([chat(
+        "11111111-2222-4333-8444-555555555555",
+        &[
+            ("m1", "human", "beside the fifos"),
+            ("m2", "assistant", "a1")
+        ]
+    )]);
+    std::fs::write(folder.join("b/conversations.json"), export.to_string()).expect("write");
+    let notes = home.join("notes");
+
+    timed_start(home, Path::new("/nonexistent/codex"), "4000", &notes);
+
+    assert!(
+        log_lines(home)
+            .iter()
+            .any(|record| record["prompt"]["text"] == "beside the fifos"),
+        "the export beside them was not read"
+    );
+    let said = std::fs::read_to_string(&notes).unwrap_or_default();
+    assert!(said.contains("3 not a regular file"), "{said}");
+}
+
+#[test]
+fn a_fifo_named_as_an_export_by_hand_is_refused_and_does_not_hang() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let path = home.join("conversations.json");
+    let _fifo = a_fifo(&path);
+
+    let (ok, said) = conbus_within(
+        home,
+        &["backfill", "--chat-export", path.to_str().expect("utf-8")],
+        Duration::from_secs(30),
+    )
+    .expect("`backfill --chat-export` was still reading after 30 s");
+
+    assert!(!ok, "{said}");
+    assert!(said.contains("not a regular file"), "{said}");
+}
+
+#[test]
+fn a_fifo_named_like_a_rollout_is_no_sign_of_a_thread_to_ask() {
+    // The server would be the one reading it, and it can wedge on it the same way. By
+    // hand there are ten minutes for that, so this stand-in answers.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let (stub, fake) = codex_stand_in(WEDGED_ON_B);
+    std::fs::write(stub.path().join("answer-b"), "").expect("flag");
+    let daemon = start(home);
+    codex_thread_live(home, THREAD_B, "b0", "before");
+    stop(daemon);
+    let _fifo = a_fifo(&home.join(format!(
+        ".codex/sessions/2026/11/01/rollout-2026-11-01T00-00-00-{THREAD_B}.jsonl"
+    )));
+    let launches = || {
+        std::fs::read_to_string(stub.path().join("launches"))
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+    let before = launches();
+
+    let (ok, said) = backfill_gaps(home, &fake, false);
+
+    assert!(ok, "{said}");
+    assert!(said.contains("1 not a regular file"), "{said}");
+    assert_eq!(launches(), before, "brought up to ask about it");
+}

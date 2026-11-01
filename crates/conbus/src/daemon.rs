@@ -1145,7 +1145,7 @@ pub fn prepare(paths: &Paths, retention: Retention) -> io::Result<()> {
         "prepare breakdown: meta scan {} ms, gap fill {} ms \
          (claude: walk {} ms, read {} files {} MB in {} ms; \
          codex: walk {} ms, app-server {} ms, thread/list {} pages {} ms, \
-         list_turns {}/{} threads {} ms{}; chat export {} ms), split repair {} ms{}{}",
+         list_turns {}/{} threads {} ms{}; chat export {} ms), split repair {} ms{}{}{}",
         t_scan.as_millis(),
         t_gaps.as_millis(),
         gap_timing.claude_walk_ms,
@@ -1166,6 +1166,11 @@ pub fn prepare(paths: &Paths, retention: Retention) -> io::Result<()> {
             .unwrap_or_default(),
         gap_timing.chat_export_ms,
         (t0.elapsed() - t_scan - t_gaps).as_millis(),
+        if gap_timing.not_regular > 0 {
+            format!("; {} not a regular file, not read", gap_timing.not_regular)
+        } else {
+            String::new()
+        },
         if gap_timing.codex_layout_unknown {
             format!(
                 "; codex rollout names unrecognised ({} files) — fell back to thread/list",

@@ -288,8 +288,15 @@ fn ingest_chat_text(
 }
 
 fn read_chat_export(path: &Path) -> io::Result<String> {
-    if path.is_dir() {
-        return fs::read_to_string(path.join("conversations.json"));
+    if fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir()) {
+        let inner = path.join("conversations.json");
+        if !is_regular(&inner) {
+            return Err(not_regular(&inner));
+        }
+        return fs::read_to_string(inner);
+    }
+    if !is_regular(path) {
+        return Err(not_regular(path));
     }
     let ext = path.extension().and_then(|ext| ext.to_str());
     if ext == Some("json")
@@ -375,6 +382,9 @@ pub struct GapTiming {
     /// Transcripts in range that could not be read. Their range is held in
     /// `cache/gap-since` too: nothing of them was compared with the log.
     pub claude_unreadable: u64,
+    /// Transcripts, rollouts and exports in range that were not regular files, and
+    /// so were not read.
+    pub not_regular: u64,
     /// Why the Codex pass did not read everything it was asked to, when it did
     /// not. Its range is held in `cache/gap-since-codex` for the next start.
     pub codex_deferred: Option<String>,
@@ -544,7 +554,7 @@ fn append_gaps_at_start_in(
             let files = session_files(&transcripts)?;
             timing.claude_walk_ms = elapsed_ms(walk);
             let started = Instant::now();
-            n += append_gaps_files(
+            let outcome = append_gaps_files(
                 &files,
                 held,
                 Some(&mut *log),
@@ -555,8 +565,9 @@ fn append_gaps_at_start_in(
                     deadline,
                     read: &mut read,
                 }),
-            )?
-            .gap_records;
+            )?;
+            n += outcome.gap_records;
+            timing.not_regular += outcome.unread.get(NOT_REGULAR).copied().unwrap_or(0);
             timing.claude_read_ms = elapsed_ms(started);
         }
     }
@@ -583,13 +594,14 @@ fn append_gaps_at_start_in(
             server_limit,
         )?;
         n += fill.records;
+        timing.not_regular += fill.not_regular;
         if timing.codex_deferred.is_none() {
             timing.codex_deferred = fill.refused_for_now;
         }
     }
     if !timing.budget_exhausted {
         let export = Instant::now();
-        n += ingest_chat_exports_at_start(paths, held, log, since)?;
+        n += ingest_chat_exports_at_start(paths, held, log, since, &mut timing.not_regular)?;
         timing.chat_export_ms = elapsed_ms(export);
     }
     let transcripts_read = !timing.budget_exhausted && timing.claude_unreadable == 0;
@@ -691,6 +703,24 @@ fn modified_unix(path: &Path) -> Option<i64> {
         .ok()?
         .as_secs();
     i64::try_from(seconds).ok()
+}
+
+/// How a skip of anything but a regular file is counted.
+const NOT_REGULAR: &str = "not a regular file";
+
+/// Whether a path is a regular file and not what a read could wait on for ever.
+/// Opening a FIFO waits for a writer, reading one waits for data, and a link can lead
+/// to one. A fill has a socket waiting, and by hand there is no deadline at all.
+fn is_regular(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|meta| meta.is_file())
+}
+
+/// The error for a path that is not one. `InvalidInput` tells it from a failed read.
+fn not_regular(path: &Path) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("{}: {NOT_REGULAR}", path.display()),
+    )
 }
 
 /// When a file was created, where the file system keeps that.
@@ -805,7 +835,7 @@ pub fn chat_export_signature_filtered(dir: &Path, official_only: bool) -> Vec<(S
 /// Official Claude.ai / Desktop export drop folder. Chat-only windows have
 /// no hook; a newer `conversations.json` is the identity-preserving channel.
 pub fn ingest_chat_exports(dir: &Path, held: &[Record], log: &mut SegmentLog) -> io::Result<u64> {
-    ingest_chat_exports_filtered(dir, held, log, false, None, None)
+    ingest_chat_exports_filtered(dir, held, log, false, None, None, &mut 0)
 }
 
 /// The drop folder at start: what was written after `since`, and what it has not
@@ -818,6 +848,7 @@ fn ingest_chat_exports_at_start(
     held: &[Record],
     log: &mut SegmentLog,
     since: Option<i64>,
+    not_regular_seen: &mut u64,
 ) -> io::Result<u64> {
     let marker = paths.cache_dir().join("chat-export-read");
     let mut read = ReadSoFar::load(&marker);
@@ -829,6 +860,7 @@ fn ingest_chat_exports_at_start(
         false,
         since,
         Some(&mut read),
+        not_regular_seen,
     )?;
     if read.0 != before {
         read.save(paths, &marker);
@@ -849,7 +881,7 @@ pub fn ingest_official_privacy_exports(
     held: &[Record],
     log: &mut SegmentLog,
 ) -> io::Result<u64> {
-    ingest_chat_exports_filtered(dir, held, log, true, None, None)
+    ingest_chat_exports_filtered(dir, held, log, true, None, None, &mut 0)
 }
 
 fn ingest_chat_exports_filtered(
@@ -859,6 +891,7 @@ fn ingest_chat_exports_filtered(
     official_only: bool,
     since: Option<i64>,
     mut consumed: Option<&mut ReadSoFar>,
+    not_regular_seen: &mut u64,
 ) -> io::Result<u64> {
     if !dir.is_dir() {
         return Ok(0);
@@ -877,8 +910,12 @@ fn ingest_chat_exports_filtered(
         .collect();
     entries.sort();
     for path in entries {
-        let Ok(text) = read_chat_export(&path) else {
-            continue;
+        let text = match read_chat_export(&path) {
+            Ok(text) => text,
+            Err(err) => {
+                *not_regular_seen += u64::from(err.kind() == io::ErrorKind::InvalidInput);
+                continue;
+            }
         };
         let outcome = ingest_chat_text(held, &mut written, &text, Some(log))?;
         filled += outcome.records + outcome.gap_records;
@@ -947,6 +984,9 @@ struct CodexFill {
     /// The first of those answers that asking again could change, which holds the
     /// range. `-32001`, "Server overloaded; retry later", is one the real server has.
     refused_for_now: Option<String>,
+    /// Things named like a rollout that were not regular files, and so no sign of a
+    /// thread the server could read.
+    not_regular: u64,
 }
 
 /// Official app-server only. Live Codex threads the recorder already bound.
@@ -982,7 +1022,12 @@ fn fill_live_codex_gaps(
     // at all the ask falls back to `thread/list` as before.
     let walk = Instant::now();
     let mut unknown = 0;
-    let mut recent = codex_threads_touched_since(&known.live_codex, since, &mut unknown);
+    let mut recent = codex_threads_touched_since(
+        &known.live_codex,
+        since,
+        &mut unknown,
+        &mut fill.not_regular,
+    );
     timing.codex_walk_ms = elapsed_ms(walk);
     timing.codex_unknown_files = unknown;
     timing.codex_layout_unknown = recent.is_none() && unknown > 0;
@@ -1188,12 +1233,13 @@ fn codex_threads_touched_since(
     sessions: &HashSet<BusId>,
     since: Option<i64>,
     unknown: &mut u64,
+    not_regular_seen: &mut u64,
 ) -> Option<Vec<(BusId, i64)>> {
     let since = since.unwrap_or(i64::MIN);
     let home = std::env::var_os("CODEX_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))?;
-    codex_threads_touched_since_in(&home, sessions, since, unknown)
+    codex_threads_touched_since_in(&home, sessions, since, unknown, not_regular_seen)
 }
 
 fn codex_threads_touched_since_in(
@@ -1201,11 +1247,12 @@ fn codex_threads_touched_since_in(
     sessions: &HashSet<BusId>,
     since: i64,
     unknown: &mut u64,
+    not_regular_seen: &mut u64,
 ) -> Option<Vec<(BusId, i64)>> {
     let mut touched = HashMap::new();
     let sessions_dir = codex_home.join("sessions");
     for dir in [sessions_dir.clone(), codex_home.join("archived_sessions")] {
-        collect_rollout_mtimes(&dir, 6, &mut touched, unknown);
+        collect_rollout_mtimes(&dir, 6, &mut touched, unknown, not_regular_seen);
     }
     // Files are here but none parse as a rollout — the vendor changed the
     // layout under the build, and a silent empty list would mean "no
@@ -1245,6 +1292,7 @@ fn collect_rollout_mtimes(
     depth: u8,
     touched: &mut HashMap<BusId, i64>,
     unknown: &mut u64,
+    not_regular_seen: &mut u64,
 ) {
     if depth == 0 {
         return;
@@ -1255,13 +1303,17 @@ fn collect_rollout_mtimes(
     for entry in entries.filter_map(Result::ok) {
         let path = entry.path();
         if path.is_dir() {
-            collect_rollout_mtimes(&path, depth - 1, touched, unknown);
+            collect_rollout_mtimes(&path, depth - 1, touched, unknown, not_regular_seen);
             continue;
         }
         let Some(id) = entry.file_name().to_str().and_then(rollout_thread_id) else {
             *unknown += 1;
             continue;
         };
+        if !is_regular(&path) {
+            *not_regular_seen += 1;
+            continue;
+        }
         if let Some(mtime) = modified_unix(&path) {
             touched
                 .entry(id)
@@ -1330,6 +1382,9 @@ pub fn fill_gaps(
             outcome
                 .unread
                 .insert("thread/turns/list refused".into(), fill.refused);
+        }
+        if fill.not_regular > 0 {
+            *outcome.unread.entry(NOT_REGULAR.into()).or_default() += fill.not_regular;
         }
     }
     if elsewhere.claims.set_aside > 0 {
@@ -1743,7 +1798,14 @@ fn append_gaps_files(
         .filter_map(|file| {
             let (stem, session) = session_of(file)?;
             let live_bus = *known.live_bus.get(&session)?;
-            (!untouched_since(file, since)).then_some((file, stem, live_bus))
+            if untouched_since(file, since) {
+                return None;
+            }
+            if !is_regular(file) {
+                *outcome.unread.entry(NOT_REGULAR.into()).or_default() += 1;
+                return None;
+            }
+            Some((file, stem, live_bus))
         })
         .collect();
     // One file per session, the most recently written. What this pass writes is
@@ -1874,6 +1936,10 @@ pub fn recover(paths: &Paths, transcripts: &Path, apply: bool, codex: bool) -> i
         // Already complete: it is in the log and it knows where it happened.
         if already.get(&bus_id) == Some(&true) {
             outcome.already_backfilled += 1;
+            continue;
+        }
+        if !is_regular(&file) {
+            *outcome.unread.entry(NOT_REGULAR.into()).or_default() += 1;
             continue;
         }
         let Ok(text) = fs::read_to_string(&file) else {
@@ -3178,6 +3244,23 @@ mod tests {
     }
 
     #[test]
+    fn a_link_named_like_a_transcript_is_counted_and_not_followed() {
+        let machine = machine();
+        recorded_live(&machine, SESSION);
+        transcript_two_turns(&machine, SESSION);
+        let project = machine.transcripts.join("-Applications-conbus");
+        let file = project.join(format!("{SESSION}.jsonl"));
+        let elsewhere = machine.paths.root().join("elsewhere.jsonl");
+        fs::rename(&file, &elsewhere).expect("move");
+        std::os::unix::fs::symlink(&elsewhere, &file).expect("link");
+
+        let outcome = fill_gaps(&machine.paths, &machine.transcripts, true, false).expect("fill");
+
+        assert_eq!(outcome.gap_records, 0);
+        assert_eq!(outcome.unread.get(NOT_REGULAR), Some(&1));
+    }
+
+    #[test]
     fn a_later_chat_export_appends_only_the_new_turn() {
         let machine = machine();
         let first = r#"{
@@ -3351,8 +3434,9 @@ mod tests {
         assert!(!is_official_privacy_export(&dir.path().join("random.zip")));
         let mut log =
             SegmentLog::open(machine.paths.log_dir(), Retention::default()).expect("open");
-        let filled = ingest_chat_exports_filtered(dir.path(), &[], &mut log, true, None, None)
-            .expect("ingest");
+        let filled =
+            ingest_chat_exports_filtered(dir.path(), &[], &mut log, true, None, None, &mut 0)
+                .expect("ingest");
         assert!(filled >= 2, "{filled}");
         let all = SegmentLog::scan(machine.paths.log_dir())
             .expect("scan")
@@ -3426,15 +3510,17 @@ mod tests {
         // sessions/: the map still carries the thread id.
         let mut bound = HashSet::from([old, fresh, gone]);
         let mut unknown = 0;
-        let asked = codex_threads_touched_since_in(home.path(), &bound, 1_500, &mut unknown)
-            .expect("sessions dir read");
+        let asked =
+            codex_threads_touched_since_in(home.path(), &bound, 1_500, &mut unknown, &mut 0)
+                .expect("sessions dir read");
         // Asked about in most-recently-touched order.
         assert_eq!(asked, vec![(gone, 3_000), (fresh, 2_000)]);
         // A thread with no file anywhere cannot be hydrated by the
         // app-server — it is out rather than asked.
         bound.insert(BusId::mint());
-        let asked = codex_threads_touched_since_in(home.path(), &bound, 1_500, &mut unknown)
-            .expect("sessions dir read");
+        let asked =
+            codex_threads_touched_since_in(home.path(), &bound, 1_500, &mut unknown, &mut 0)
+                .expect("sessions dir read");
         assert_eq!(asked, vec![(gone, 3_000), (fresh, 2_000)]);
     }
 
@@ -3827,7 +3913,7 @@ mod tests {
         fs::write(dir.join("foo.jsonl"), "{}\n").expect("file");
         let mut unknown = 0;
         assert_eq!(
-            codex_threads_touched_since_in(home.path(), &bound, 1_500, &mut unknown),
+            codex_threads_touched_since_in(home.path(), &bound, 1_500, &mut unknown, &mut 0),
             None,
             "unrecognised files mean the walk cannot be trusted"
         );
@@ -3837,7 +3923,7 @@ mod tests {
         fs::create_dir_all(empty.path().join("sessions")).expect("dir");
         let mut unknown = 0;
         assert_eq!(
-            codex_threads_touched_since_in(empty.path(), &bound, 1_500, &mut unknown),
+            codex_threads_touched_since_in(empty.path(), &bound, 1_500, &mut unknown, &mut 0),
             Some(vec![])
         );
     }
@@ -3847,7 +3933,7 @@ mod tests {
         let home = tempfile::tempdir().expect("tempdir");
         let bound = HashSet::from([SESSION.parse::<BusId>().expect("uuid")]);
         assert_eq!(
-            codex_threads_touched_since_in(home.path(), &bound, 1_500, &mut 0),
+            codex_threads_touched_since_in(home.path(), &bound, 1_500, &mut 0, &mut 0),
             None
         );
     }
