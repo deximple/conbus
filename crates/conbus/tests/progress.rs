@@ -162,6 +162,26 @@ fn a_checkout_and_its_worktree_are_one_place_with_both_agents_and_the_commits() 
     let lines: Vec<&str> = stdout.lines().collect();
     assert_eq!(lines.len(), 1, "{stdout}");
     let place: serde_json::Value = serde_json::from_str(lines[0]).expect("json");
+    // The keys 1.x promises (docs/stability.md): added to, never renamed.
+    let mut keys: Vec<&str> = place
+        .as_object()
+        .expect("object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "active_days",
+            "agents",
+            "commits",
+            "first_day",
+            "folders",
+            "last_day",
+            "workspace"
+        ]
+    );
     assert_eq!(place["workspace"], main.as_str());
     assert_eq!(place["folders"], 2);
     assert_eq!(place["commits"], 2);
