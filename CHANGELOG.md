@@ -6,6 +6,13 @@ the entry says so when it does.
 
 ## [Unreleased]
 
+### Added
+
+- `usage` rows and the OTLP pipe now count turn tokens where a vendor's hook
+  reports them — `tokens_input`, `tokens_output`, `tokens_cache_read`,
+  `tokens_cache_write`, today Cursor's `afterAgentResponse` only — and the
+  `--shareable` rows carry them per RFD 0002's amendment.
+
 ### Changed
 
 - Building from source needs Rust 1.99.1, pinned in `rust-toolchain.toml`;
