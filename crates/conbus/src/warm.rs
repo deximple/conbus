@@ -253,7 +253,23 @@ for line in sys.stdin:
         std::fs::write(&path, FAKE).expect("write");
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        runs_when_nobody_holds_it(&path);
         (dir, path)
+    }
+
+    /// A test thread that forks while this file is being written holds it open
+    /// for writing until its child execs, and until then Linux refuses to run it
+    /// with "Text file busy". Once it has run, nothing is still holding it.
+    fn runs_when_nobody_holds_it(path: &std::path::Path) {
+        while let Err(err) = Command::new(path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+        {
+            assert_eq!(err.raw_os_error(), Some(libc::ETXTBSY), "{err}");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     #[test]
