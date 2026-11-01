@@ -689,11 +689,27 @@ fn codex_rollout(home: &Path) {
 
 #[test]
 fn the_codex_pass_does_not_write_a_spooled_turn_twice() {
+    // It also lists t2, which nothing spooled: filling it shows the pass ran, and
+    // a Codex that could not start would pass this for the wrong reason.
+    const LISTS_TWO_TURNS: &str = r#"#!/usr/bin/env python3
+import json, sys
+def turn(i, said, reply):
+    return {"id":i,"items":[{"type":"userMessage","content":[{"type":"text","text":said}]},{"type":"agentMessage","text":reply}],
+            "status":"completed","startedAt":1788368800,"completedAt":1788368801}
+for line in sys.stdin:
+    try: msg = json.loads(line)
+    except Exception: continue
+    m = msg.get("method"); i = msg.get("id")
+    if m == "initialize": print(json.dumps({"jsonrpc":"2.0","id":i,"result":{"userAgent":"fake"}}), flush=True)
+    elif m == "thread/turns/list":
+        data = [turn("t1", "during", "a1"), turn("t2", "only the thread holds this", "a2")]
+        print(json.dumps({"jsonrpc":"2.0","id":i,"result":{"data":data,"nextCursor":None}}), flush=True)
+"#;
     let dir = tempfile::tempdir().expect("tempdir");
     let home = dir.path();
     let stub = tempfile::tempdir().expect("stub");
     let fake = stub.path().join("codex");
-    support::write_executable(&fake, FAKE_APP_SERVER);
+    support::write_executable(&fake, LISTS_TWO_TURNS);
     let daemon = start(home);
     hook_as(home, "codex", &codex_prompt("t0", "before"));
     stop(daemon);
@@ -710,19 +726,22 @@ fn the_codex_pass_does_not_write_a_spooled_turn_twice() {
     drained(home);
     stop(daemon);
 
-    let turn: Vec<Value> = log_lines(home)
-        .into_iter()
+    let all = log_lines(home);
+    let started = |id: &str| {
+        all.iter()
+            .filter(|record| record["vendor_turn_id"] == id && record["event"] == "turn_started")
+            .count()
+    };
+    assert_eq!(started("t2"), 1, "the pass ran:\n{}", show(&all));
+    assert_eq!(started("t1"), 1, "\n{}", show(&all));
+    let t1: Vec<&Value> = all
+        .iter()
         .filter(|record| record["vendor_turn_id"] == "t1")
         .collect();
-    let started = turn
-        .iter()
-        .filter(|record| record["event"] == "turn_started")
-        .count();
-    assert_eq!(started, 1, "\n{}", show(&turn));
     assert!(
-        turn.iter().all(|record| record["hook_id"].is_string()),
+        t1.iter().all(|record| record["hook_id"].is_string()),
         "\n{}",
-        show(&turn)
+        show(&all)
     );
 }
 
@@ -844,25 +863,65 @@ fn a_read_error_at_start_does_not_ingest_a_chat_export_again() {
     );
 }
 
+/// A prompt recorded at `when`, in unix seconds.
+fn recorded_at(home: &Path, session: &str, turn: &str, when: i64) {
+    use conbus_core::clock::Timestamp;
+    use conbus_core::event::{Body, Event, Harness, Source, VendorTurnId};
+    use conbus_core::ids::BusId;
+    use conbus_core::record::Entry;
+    use conbus_core::retention::Retention;
+    use conbus_core::segment::SegmentLog;
+
+    let mut log = SegmentLog::open(home.join("log"), Retention::default()).expect("open");
+    log.append(Entry {
+        bus_id: BusId::mint(),
+        observed_at: Timestamp::from_unix_seconds(when),
+        source: Source {
+            harness: Harness::new(Harness::CLAUDE_CODE),
+            harness_version: None,
+            vendor_session_id: Some(session.into()),
+            workspace: Some("/repo".into()),
+            entrypoint: None,
+            backfilled_from: None,
+            profile: None,
+        },
+        vendor_turn_id: Some(VendorTurnId::new(turn)),
+        vendor_agent_id: None,
+        hook_id: None,
+        spooled_at: None,
+        event: Event::TurnStarted {
+            author: None,
+            prompt: Body::kept("a recorded prompt"),
+        },
+    })
+    .expect("append");
+}
+
 #[test]
-fn a_fill_the_log_refused_keeps_its_range() {
-    // A full disk at start: the fill stops part way and says so. The range it
-    // did not finish must not be lost to the records the daemon goes on to serve.
+fn a_fill_the_log_refused_keeps_the_range_from_before_it_wrote() {
+    // A full disk after a long downtime. The fill stops part way and says so, and
+    // the range it did not finish starts at the downtime, not at the last write.
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().expect("tempdir");
     let home = dir.path();
-    let daemon = start(home);
-    hook(home, &prompt(S, "p0", "before"));
-    stop(daemon);
+    let epoch = conbus_core::clock::Timestamp::from_unix_seconds(0).expect("epoch");
+    let now = conbus_core::clock::Timestamp::now().seconds_since(epoch);
+    recorded_at(home, S, "p0", now - 3 * 3600);
     transcript(
         home,
         S,
         &[
-            user(S, "p0", "before"),
+            user(S, "p0", "a recorded prompt"),
             user(S, "p1", "missed"),
             reply(S, "a1"),
         ],
     );
+    std::fs::File::options()
+        .write(true)
+        .open(home.join(format!(".claude/projects/-repo/{S}.jsonl")))
+        .expect("open")
+        .set_modified(std::time::SystemTime::now() - Duration::from_secs(2 * 3600))
+        .expect("backdate");
     let segment = home.join("log/segment-00000000.jsonl");
     // A read-only segment stands in for ENOSPC.
     std::fs::set_permissions(&segment, std::fs::Permissions::from_mode(0o400)).expect("chmod");
@@ -870,6 +929,8 @@ fn a_fill_the_log_refused_keeps_its_range() {
     std::fs::set_permissions(&segment, std::fs::Permissions::from_mode(0o600)).expect("chmod");
     let marker = home.join("cache/gap-since");
     assert!(marker.exists(), "nothing remembers the range");
+    // The daemon goes on serving, so the next start's own range is past the file.
+    recorded_at(home, CHILD, "later", now + 2 * 3600);
 
     stop(start(home));
 
@@ -877,7 +938,7 @@ fn a_fill_the_log_refused_keeps_its_range() {
         log_lines(home)
             .iter()
             .any(|record| record["vendor_turn_id"] == "p1"),
-        "the range was not filled"
+        "the range was lost to the records served after it"
     );
     assert!(!marker.exists(), "a finished fill clears the marker");
 }
@@ -1006,22 +1067,28 @@ fn a_range_the_codex_pass_could_not_read_is_read_by_the_next_start_that_can() {
 
 #[test]
 fn an_app_server_that_dies_part_way_keeps_the_range() {
-    const DIES: &str = r#"#!/usr/bin/env python3
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let witness = home.join("the-stand-in-was-asked");
+    let dies = format!(
+        r#"#!/usr/bin/env python3
 import json, sys
 for line in sys.stdin:
     msg = json.loads(line)
     if msg.get("method") == "initialize":
-        print(json.dumps({"jsonrpc":"2.0","id":msg.get("id"),"result":{"userAgent":"fake"}}), flush=True)
+        print(json.dumps({{"jsonrpc":"2.0","id":msg.get("id"),"result":{{"userAgent":"fake"}}}}), flush=True)
     elif msg.get("method") == "thread/turns/list":
+        open({:?}, "w").close()
         sys.exit(1)
-"#;
-    let dir = tempfile::tempdir().expect("tempdir");
-    let home = dir.path();
-    let (_stub, fake) = stand_in(DIES);
+"#,
+        witness.to_str().expect("utf-8")
+    );
+    let (_stub, fake) = stand_in(&dies);
     a_live_codex_thread(home);
 
     start_with_codex(home, &fake);
 
+    assert!(witness.exists(), "the pass reached the thread");
     assert!(home.join("cache/gap-since-codex").exists());
 }
 

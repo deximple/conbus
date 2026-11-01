@@ -420,10 +420,10 @@ fn append_gaps_at_start_in(
     // filled by earlier starts; `conbus backfill --gaps` still reads them all.
     let mut timing = GapTiming::default();
     let deadline = Instant::now() + budget;
-    // A fill the budget cut short leaves `cache/gap-since` holding the
-    // effective since it stopped at, so the next start resumes the range
-    // rather than losing it to a newer `newest`. A fill that finishes
-    // deletes the marker; a garbled one is ignored and said so.
+    // `cache/gap-since` holds the range from before the first write, and only a
+    // fill that finishes deletes it. So a budget cut, a write the log refused and
+    // a killed process all leave the next start resuming the range rather than
+    // losing it to a newer `newest`. A garbled one is ignored and said so.
     //
     // The Codex pass keeps its own marker, because it can fail for as long as
     // the app-server cannot start, and the transcripts must not pay for that: a
@@ -441,6 +441,13 @@ fn append_gaps_at_start_in(
         .map(|newest| newest - GAP_MARGIN_SECS)
         .map(|fresh| remembered.map_or(fresh, |old| old.min(fresh)));
     let codex_since = since.map(|since| codex_remembered.map_or(since, |old| old.min(since)));
+    if let Some(since) = since {
+        write_since(paths, &marker, since);
+    }
+    if let Some(since) = codex_since {
+        write_since(paths, &codex_marker, since);
+    }
+    let mut spool = Spool::new(paths.spool_dir());
     let mut n = 0;
     if let Some(home) = home {
         let transcripts = home.join(".claude").join("projects");
@@ -454,7 +461,7 @@ fn append_gaps_at_start_in(
                 held,
                 Some(&mut *log),
                 since,
-                &paths.spool_dir(),
+                &mut spool,
                 &mut Some(&mut timing),
                 Some(deadline),
             )?
@@ -476,7 +483,7 @@ fn append_gaps_at_start_in(
             held,
             Some(&mut *log),
             codex_since,
-            &paths.spool_dir(),
+            &mut spool,
             &mut timing,
             deadline,
             server_limit,
@@ -488,20 +495,11 @@ fn append_gaps_at_start_in(
         n += ingest_chat_exports_since(&paths.chat_export(), held, log, since)?;
         timing.chat_export_ms = elapsed_ms(export);
     }
-    if timing.budget_exhausted {
-        // The cut-short range outlives this start: next start resumes it.
-        if let Some(since) = since {
-            write_since(paths, &marker, since);
-        }
-    } else {
+    if !timing.budget_exhausted {
         let _ = std::fs::remove_file(&marker);
     }
-    match (&timing.codex_deferred, codex_since) {
-        (None, _) => {
-            let _ = std::fs::remove_file(&codex_marker);
-        }
-        (Some(_), Some(since)) => write_since(paths, &codex_marker, since),
-        (Some(_), None) => {}
+    if timing.codex_deferred.is_none() {
+        let _ = std::fs::remove_file(&codex_marker);
     }
     Ok((n, timing))
 }
@@ -542,12 +540,12 @@ fn write_since(paths: &Paths, marker: &Path, since: i64) {
     }
 }
 
-/// Keep the range for the next start, when this one could not fill at all.
+/// Keep the range for the next start, when the log could not be read to fill it.
 ///
-/// The log could not be read, so its newest record is not known. The newest
-/// segment's write time is as good, and needs no read of the segment. Without
-/// this the hooks served after this start would move the next start's range past
-/// whatever this downtime missed.
+/// Its newest record is not known then. The newest segment's write time is as
+/// good, since nothing has written since, and needs no read of the segment.
+/// Without this the hooks served after this start would move the next start's
+/// range past whatever this downtime missed.
 pub fn defer_fill(paths: &Paths) {
     let Some(written) = SegmentLog::current_segment(&paths.log_dir())
         .ok()
@@ -757,7 +755,7 @@ fn fill_live_codex_gaps(
     held: &[Record],
     mut log: Option<&mut SegmentLog>,
     since: Option<i64>,
-    spool: &Path,
+    spool: &mut Spool,
     timing: &mut GapTiming,
     deadline: Instant,
     server_limit: std::time::Duration,
@@ -851,8 +849,7 @@ fn fill_live_codex_gaps(
         let thread = serde_json::json!({"id": name, "sessionId": name});
         let recovered = parse_codex_thread(&thread, &turns);
         let mine = grouped.get(name).into_iter().flatten().copied();
-        let missing = missing_from(mine, name, bus_id, recovered);
-        let missing = not_on_its_way(missing, spool, name, bus_id);
+        let missing = still_missing(mine, spool, name, bus_id, recovered);
         if !missing.is_empty() {
             fill.threads += 1;
             fill.turns += missing
@@ -1041,7 +1038,7 @@ pub fn fill_gaps(
             &held,
             log.as_mut(),
             None,
-            &paths.spool_dir(),
+            &mut Spool::new(paths.spool_dir()),
             &mut timing,
             Instant::now() + CODEX_DEADLINE,
             CODEX_DEADLINE,
@@ -1083,12 +1080,29 @@ fn missing_from<'a>(
     bus_id: BusId,
     recovered: Recovered,
 ) -> Vec<Entry> {
-    let listed: HashSet<&str> = recovered
+    let listed = listed_turns(&recovered);
+    not_held(held, &listed, session, bus_id, recovered.entries)
+}
+
+/// The turn ids a source lists: what a held prompt's id can explain.
+fn listed_turns(recovered: &Recovered) -> HashSet<String> {
+    recovered
         .entries
         .iter()
         .filter(|entry| matches!(entry.event, Event::TurnStarted { .. }))
-        .filter_map(|entry| entry.vendor_turn_id.as_ref().map(|id| id.as_str()))
-        .collect();
+        .filter_map(|entry| entry.vendor_turn_id.as_ref())
+        .map(|id| id.as_str().to_string())
+        .collect()
+}
+
+/// The entries `held` does not hold; see [`missing_from`].
+fn not_held<'a>(
+    held: impl IntoIterator<Item = &'a Record>,
+    listed: &HashSet<String>,
+    session: &str,
+    bus_id: BusId,
+    entries: Vec<Entry>,
+) -> Vec<Entry> {
     let mut started = HashSet::new();
     let mut ended = HashSet::new();
     let mut unexplained: HashMap<String, u32> = HashMap::new();
@@ -1106,10 +1120,12 @@ fn missing_from<'a>(
                 let Some(text) = prompt_text(prompt) else {
                     continue;
                 };
-                let answers_by_words = id.is_none_or(|id| {
-                    !listed.contains(id)
-                        && record.source.vendor_session_id.as_deref() == Some(session)
-                });
+                let answers_by_words = id.is_none_or(|id| !listed.contains(id))
+                    && record
+                        .source
+                        .vendor_session_id
+                        .as_deref()
+                        .is_none_or(|name| name == session);
                 if answers_by_words {
                     *unexplained.entry(text.clone()).or_default() += 1;
                 }
@@ -1121,7 +1137,7 @@ fn missing_from<'a>(
     let mut out = Vec::new();
     let mut keep_open = false;
     let mut turn: Option<String> = None;
-    for mut entry in recovered.entries {
+    for mut entry in entries {
         match &entry.event {
             Event::SessionCandidate { .. } => continue,
             Event::TurnStarted { prompt, .. } => {
@@ -1149,72 +1165,112 @@ fn missing_from<'a>(
     out
 }
 
-/// Leave out what the spool's drain is about to write.
+/// What a source holds that neither the log nor the spool does.
 ///
 /// A hook that found no daemon waits in the spool, and the drain runs after this
 /// fill: the question is not whether the log holds a turn but whether it holds
 /// it or is about to. The hook's record is the stronger fact, and it knows what
 /// the transcript cannot, which is whether the vendor stopped.
 ///
-/// Read only when something looks missing, and after the transcript that made it
-/// look so: a hook that spooled before its line was written is seen here. One
-/// that spools in the moment between the two reads is not, and is written by both.
-fn not_on_its_way(missing: Vec<Entry>, spool: &Path, session: &str, bus_id: BusId) -> Vec<Entry> {
+/// The spool is asked only when something looks missing, and after the source
+/// that made it look so: a hook that spooled before its line was written is seen
+/// here. One that spools in the moment between the two reads is not, and is
+/// written by both.
+fn still_missing<'a>(
+    held: impl IntoIterator<Item = &'a Record>,
+    spool: &mut Spool,
+    session: &str,
+    bus_id: BusId,
+    recovered: Recovered,
+) -> Vec<Entry> {
+    let listed = listed_turns(&recovered);
+    let missing = not_held(held, &listed, session, bus_id, recovered.entries);
     if missing.is_empty() {
         return missing;
     }
-    let waiting = spooled_records(spool, session, bus_id);
+    let waiting = spool.waiting(session, bus_id);
     if waiting.is_empty() {
         return missing;
     }
-    let entries = Recovered {
-        entries: missing,
-        ..Recovered::default()
-    };
-    missing_from(&waiting, session, bus_id, entries)
+    not_held(&waiting, &listed, session, bus_id, missing)
 }
 
-/// What the spool holds for one session, as the records the drain will make of
-/// it. An entry that does not read is the drain's to report, not this one's.
-fn spooled_records(spool: &Path, session: &str, bus_id: BusId) -> Vec<Record> {
-    let Ok(entries) = fs::read_dir(spool) else {
-        return Vec::new();
-    };
-    entries
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
-        // The drain's own rule: a regular file no larger than the hook's cap.
-        .filter(|path| {
-            fs::symlink_metadata(path)
-                .is_ok_and(|meta| meta.file_type().is_file() && meta.len() <= 1_048_576)
-        })
-        .filter_map(|path| {
-            let text = fs::read_to_string(path).ok()?;
-            serde_json::from_str::<Request>(text.trim()).ok()
-        })
-        .filter(|request| request.vendor_session_id == session)
-        .map(|request| Record {
-            schema_version: SCHEMA_VERSION,
-            seq: 0,
-            ts: Timestamp::now(),
-            bus_id,
-            vendor_turn_id: request.vendor_turn_id,
-            vendor_agent_id: request.vendor_agent_id,
-            hook_id: request.hook_id,
-            spooled_at: None,
-            source: Source {
-                harness: request.harness,
-                harness_version: None,
-                vendor_session_id: Some(request.vendor_session_id),
-                workspace: None,
-                entrypoint: None,
-                backfilled_from: None,
-                profile: None,
-            },
-            event: request.event,
-        })
-        .collect()
+/// The spool as one fill sees it. Each entry is read once, however many sessions
+/// ask: after a long downtime it can hold 16 MiB of them, and that is when every
+/// session looks like it has gaps.
+struct Spool {
+    dir: PathBuf,
+    seen: HashSet<std::ffi::OsString>,
+    by_session: HashMap<String, Vec<Request>>,
+}
+
+impl Spool {
+    fn new(dir: PathBuf) -> Self {
+        Spool {
+            dir,
+            seen: HashSet::new(),
+            by_session: HashMap::new(),
+        }
+    }
+
+    /// Read what has landed since the last ask. An entry that does not read is
+    /// the drain's to report, not this one's.
+    fn refresh(&mut self) {
+        let Ok(entries) = fs::read_dir(&self.dir) else {
+            return;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if !path.extension().is_some_and(|ext| ext == "json")
+                || !self.seen.insert(entry.file_name())
+            {
+                continue;
+            }
+            // The drain's own rule: a regular file no larger than the hook's cap.
+            let regular = fs::symlink_metadata(&path)
+                .is_ok_and(|meta| meta.file_type().is_file() && meta.len() <= 1_048_576);
+            let request = regular
+                .then(|| fs::read_to_string(&path).ok())
+                .flatten()
+                .and_then(|text| serde_json::from_str::<Request>(text.trim()).ok());
+            if let Some(request) = request {
+                self.by_session
+                    .entry(request.vendor_session_id.clone())
+                    .or_default()
+                    .push(request);
+            }
+        }
+    }
+
+    /// What it holds for one session, as the records the drain will make of it.
+    fn waiting(&mut self, session: &str, bus_id: BusId) -> Vec<Record> {
+        self.refresh();
+        self.by_session
+            .get(session)
+            .into_iter()
+            .flatten()
+            .map(|request| Record {
+                schema_version: SCHEMA_VERSION,
+                seq: 0,
+                ts: Timestamp::now(),
+                bus_id,
+                vendor_turn_id: request.vendor_turn_id.clone(),
+                vendor_agent_id: request.vendor_agent_id.clone(),
+                hook_id: request.hook_id.clone(),
+                spooled_at: None,
+                source: Source {
+                    harness: request.harness.clone(),
+                    harness_version: None,
+                    vendor_session_id: Some(request.vendor_session_id.clone()),
+                    workspace: None,
+                    entrypoint: None,
+                    backfilled_from: None,
+                    profile: None,
+                },
+                event: request.event.clone(),
+            })
+            .collect()
+    }
 }
 
 /// Use up one held prompt with these words, if any is left.
@@ -1247,7 +1303,7 @@ fn append_gaps(
         held,
         log,
         since,
-        spool,
+        &mut Spool::new(spool.to_path_buf()),
         &mut None,
         None,
     )
@@ -1262,7 +1318,7 @@ fn append_gaps_files(
     held: &[Record],
     mut log: Option<&mut SegmentLog>,
     since: Option<i64>,
-    spool: &Path,
+    spool: &mut Spool,
     timing: &mut Option<&mut GapTiming>,
     deadline: Option<Instant>,
 ) -> io::Result<Outcome> {
@@ -1274,7 +1330,7 @@ fn append_gaps_files(
             known.unreadable_live.len() as u64,
         );
     }
-    let to_read: Vec<(&PathBuf, &str, BusId)> = files
+    let mut to_read: Vec<(&PathBuf, &str, BusId)> = files
         .iter()
         .filter_map(|file| {
             let (stem, session) = session_of(file)?;
@@ -1282,6 +1338,12 @@ fn append_gaps_files(
             (!untouched_since(file, since)).then_some((file, stem, live_bus))
         })
         .collect();
+    // One file per session, the most recently written. What this pass writes is
+    // not in `held`, so a second copy would write the same turns again.
+    to_read.sort_by_key(|(file, ..)| std::cmp::Reverse(modified_unix(file)));
+    let mut sessions = HashSet::new();
+    to_read.retain(|(_, stem, _)| sessions.insert(*stem));
+    to_read.sort_by_key(|(file, ..)| *file);
     let targets: Vec<(&str, BusId)> = to_read.iter().map(|&(_, stem, bus)| (stem, bus)).collect();
     let grouped = records_of(held, &targets);
     for (file, stem, live_bus) in to_read {
@@ -1303,13 +1365,13 @@ fn append_gaps_files(
         for (reason, count) in &recovered.skipped {
             *outcome.unread.entry(reason.clone()).or_default() += count;
         }
-        let missing = missing_from(
+        let missing = still_missing(
             grouped.get(stem).into_iter().flatten().copied(),
+            spool,
             stem,
             live_bus,
             recovered,
         );
-        let missing = not_on_its_way(missing, spool, stem, live_bus);
         if missing.is_empty() {
             continue;
         }
@@ -2274,6 +2336,57 @@ mod tests {
     }
 
     #[test]
+    fn a_prompt_with_no_id_on_another_leg_does_not_hide_a_missed_turn_either() {
+        // Grok's adapter sets no turn id at all, and neither did old hooks.
+        let machine = machine();
+        let bus = BusId::mint();
+        let records = logged(
+            &machine,
+            vec![live_prompt(
+                "another-leg",
+                Harness::GROK,
+                bus,
+                None,
+                "continue",
+            )],
+        );
+
+        let missing = missing_from(&records, SESSION, bus, transcript_of(&[("p1", "continue")]));
+
+        assert_eq!(turns_in(&missing), vec!["p1"]);
+    }
+
+    #[test]
+    fn two_copies_of_one_sessions_transcript_fill_it_once() {
+        // Nothing on this machine has two today, and `relocated` lines say a
+        // session can move. The newer copy is the one that holds everything.
+        let machine = machine();
+        recorded_live(&machine, SESSION);
+        let copy = machine.transcripts.join("-Applications-conbus-moved");
+        fs::create_dir_all(&copy).expect("dir");
+        transcript_two_turns(&machine, SESSION);
+        let original = machine
+            .transcripts
+            .join("-Applications-conbus")
+            .join(format!("{SESSION}.jsonl"));
+        let moved = copy.join(format!("{SESSION}.jsonl"));
+        fs::copy(&original, &moved).expect("copy");
+        let hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3_600);
+        fs::File::options()
+            .write(true)
+            .open(&original)
+            .expect("open")
+            .set_modified(hour_ago)
+            .expect("backdate");
+
+        let outcome = fill_gaps(&machine.paths, &machine.transcripts, true, false).expect("fill");
+
+        assert_eq!(outcome.gap_turns, 1, "not once per copy");
+        assert_eq!(outcome.gap_records, 2);
+        assert_eq!(records_on_disk(&machine), 3);
+    }
+
+    #[test]
     fn a_line_with_no_id_is_matched_by_its_words_against_any_prompt() {
         let machine = machine();
         let bus = BusId::mint();
@@ -2375,6 +2488,63 @@ mod tests {
         let outcome = fill_gaps(&machine.paths, &machine.transcripts, true, false).expect("fill");
 
         assert_eq!(outcome.gap_records, 2);
+    }
+
+    #[test]
+    fn a_spooled_copy_of_a_held_prompt_does_not_answer_for_another_turn() {
+        // The daemon wrote it and died before replying, so the hook spooled the
+        // same request. Its id explains a line of the transcript, so its words
+        // say nothing about the other turn with those words.
+        let machine = machine();
+        let bus = BusId::mint();
+        logged(
+            &machine,
+            vec![live_prompt(
+                SESSION,
+                Harness::CLAUDE_CODE,
+                bus,
+                Some("p0"),
+                "continue",
+            )],
+        );
+        in_the_spool(&machine, "a", SESSION, "p0", "continue");
+        let project = machine.transcripts.join("-repo");
+        fs::create_dir_all(&project).expect("dir");
+        let lines: Vec<String> = ["p0", "p1"]
+            .iter()
+            .map(|id| {
+                serde_json::json!({
+                    "type": "user", "sessionId": SESSION, "promptId": id,
+                    "timestamp": "2026-08-31T09:33:02.222Z",
+                    "message": {"role": "user", "content": "continue"}
+                })
+                .to_string()
+            })
+            .collect();
+        fs::write(project.join(format!("{SESSION}.jsonl")), lines.join("\n")).expect("write");
+
+        let outcome = fill_gaps(&machine.paths, &machine.transcripts, true, false).expect("fill");
+
+        assert_eq!(outcome.gap_turns, 1, "p1 really is missing");
+    }
+
+    #[test]
+    fn the_spool_is_read_once_however_many_sessions_ask() {
+        let machine = machine();
+        in_the_spool(&machine, "a", SESSION, "p1", "first");
+        let dir = machine.paths.spool_dir();
+        let mut spool = Spool::new(dir.clone());
+        let bus = BusId::mint();
+
+        assert_eq!(spool.waiting(SESSION, bus).len(), 1);
+        // Gone from disk: asking again does not read it, and still knows it.
+        fs::remove_file(dir.join("a.json")).expect("remove");
+        assert_eq!(spool.waiting(SESSION, bus).len(), 1);
+
+        // A hook that spools after the first ask is seen by the next.
+        in_the_spool(&machine, "b", SESSION, "p2", "second");
+        assert_eq!(spool.waiting(SESSION, bus).len(), 2);
+        assert_eq!(spool.waiting("another-session", bus).len(), 0);
     }
 
     #[test]
