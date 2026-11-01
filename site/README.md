@@ -48,3 +48,11 @@ timestamp), the email, the form answers and the consent flag; a click keeps a
 `(day, variant)` counter. No IP address, user agent or cookie is ever stored.
 A duplicate email returns the same `{ok: true}` as a fresh signup — the list
 cannot be enumerated through the form. See `public/privacy.html`.
+
+## Name
+
+Public name: **conbus.sh**. `conbus.io` and `conbus.ai` were open when
+checked; they are alternates, not the brand. `conbus.com` is taken (2008).
+This directory is the only landing; the older static page that lived in
+`docs/www/` was folded into it for 1.0. DNS, hosting and the deploy are
+operator steps, and nothing here is deployed by CI.
