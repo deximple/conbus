@@ -12,10 +12,10 @@ check saw.
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | Claude Code | 2.1.316 | yes | yes | yes | `StopFailure` (fixture 2.1.241) | yes | `effort` now on `Stop` too. Not exercised this round: `StopFailure`, permission events, `Notification`, `SubagentStop`, the status line |
 | Codex | 0.166.0 | yes | yes | yes | `account/rateLimits/read` | yes | `codex exec` fires hooks (needs the official `--dangerously-bypass-hook-trust` in a throwaway run; a person's own sessions use Codex's trust dialog) |
-| OpenCode | 2.2.3 | yes | — | — | `session.error` (shape unverified) | n/a (plugin) | 2.x refused the 1.x plugin until this release; the 2.x plugin loads (OpenCode's own log). Turn ends, tools and tokens are published by 2.x and not yet forwarded |
+| OpenCode | 2.2.3, 2.2.5 | yes | — | — | `session.error` (shape unverified) | n/a (plugin) | 2.x refused the 1.x plugin until this release; the 2.x plugin loads (OpenCode's own log). Turn ends, tools and tokens are published by 2.x and not yet forwarded. A persistent `opencode serve` carries `CONBUS_HOME` from its start environment — a stale server redirects plugin hooks to its old root |
 | Grok | 1.0.71 | yes | (fixture 1.0.3) | yes | `StopFailure` | not run | Both registrations fire; only Grok's own copy is recorded. `StopCancelled` recorded from this release; the shutdown `Stop` ignored |
 | Cursor (IDE) | unverified | | | | | n/a | The IDE is not installed on the test Mac; last verified 3.19 (fixtures) |
-| cursor-agent | 2026.10.19 | **no** | yes | **no** | — | n/a | In `-p` mode only `sessionStart`, `preToolUse`, `postToolUse` and `sessionEnd` fire, so there are no turn records and no tokens; tool calls mint the conversation |
+| cursor-agent | 2026.10.19, 2026.10.22 | **no** | yes | **no** | — | n/a | In `-p` mode only `sessionStart`, `preToolUse`, `postToolUse` and `sessionEnd` fire, so there are no turn records and no tokens; tool calls mint the conversation. `status` may claim a login while `-p` answers `AUTH_REQUIRED` — check the run, not the status |
 | agy | 1.4.12 | — | — | — | `agy -p /usage` | — | Usage read only, after `agy models` shows a login |
 
 Platform: one universal binary, signed with conbus's Developer ID and
