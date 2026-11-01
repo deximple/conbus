@@ -6,6 +6,13 @@ the entry says so when it does.
 
 ## [Unreleased]
 
+### Fixed
+
+- A daemon that writes a record and dies before replying, or before deleting the
+  spool file it drained, no longer leaves a second copy. A new daemon now reads
+  the newest hook ids back from the log at start, so a re-delivery is answered
+  rather than written again.
+
 ## [1.0.0-rc.3] — 2026-11-01
 
 ### Fixed
