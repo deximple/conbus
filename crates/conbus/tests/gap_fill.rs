@@ -1200,3 +1200,38 @@ fn threads_a_budget_cut_off_are_reached_by_later_starts() {
         .count();
     assert_eq!(turns, THREADS.len(), "each thread's turn once");
 }
+
+#[test]
+fn the_codex_pass_does_not_copy_a_parent_thread_into_its_fork() {
+    // Older than THREAD, so older than the thread that lists it.
+    const LISTS_THE_PARENTS_TURN: &str = r#"#!/usr/bin/env python3
+import json, sys
+def turn(i, said):
+    return {"id":i,"items":[{"type":"userMessage","content":[{"type":"text","text":said}]},{"type":"agentMessage","text":"a"}],
+            "status":"completed","startedAt":1788368800,"completedAt":1788368801}
+for line in sys.stdin:
+    msg = json.loads(line)
+    m = msg.get("method"); i = msg.get("id")
+    if m == "initialize":
+        print(json.dumps({"jsonrpc":"2.0","id":i,"result":{"userAgent":"fake"}}), flush=True)
+    elif m == "thread/turns/list":
+        data = [turn("01a00000-0000-7000-8000-000000000001", "the parent's prompt"),
+                turn("01a19463-ffff-7000-8000-000000000002", "the fork's own prompt")]
+        print(json.dumps({"jsonrpc":"2.0","id":i,"result":{"data":data,"nextCursor":None}}), flush=True)
+"#;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let (_stub, fake) = stand_in(LISTS_THE_PARENTS_TURN);
+    a_live_codex_thread(home);
+
+    start_with_codex(home, &fake);
+
+    let filled: Vec<Value> = log_lines(home)
+        .into_iter()
+        .filter(|record| {
+            record["event"] == "turn_started" && record.get("backfilled_from").is_some()
+        })
+        .collect();
+    assert_eq!(filled.len(), 1, "\n{}", show(&filled));
+    assert_eq!(filled[0]["prompt"]["text"], "the fork's own prompt");
+}

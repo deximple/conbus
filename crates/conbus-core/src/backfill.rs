@@ -503,7 +503,23 @@ pub fn parse_codex_thread(thread: &serde_json::Value, turns: &[serde_json::Value
     // prompt turn and reply-only turns (590 of 1,070 turns in the 60 most
     // recent threads on 2026-09-03 carried nothing but replies).
     let mut open: Option<OpenCodexTurn> = None;
+    let thread_minted = thread
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .and_then(minted_ms);
     for turn in turns {
+        // A fork lists its parent's turns as its own, and they are the parent's.
+        let turn_minted = turn
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .and_then(minted_ms);
+        if thread_minted
+            .zip(turn_minted)
+            .is_some_and(|(thread, turn)| turn < thread)
+        {
+            out.skip("turn older than its thread");
+            continue;
+        }
         let items: Vec<&serde_json::Value> = turn
             .get("items")
             .and_then(serde_json::Value::as_array)
@@ -600,6 +616,12 @@ pub fn parse_codex_thread(thread: &serde_json::Value, turns: &[serde_json::Value
         },
     );
     out
+}
+
+/// When a UUIDv7 says it was minted, in milliseconds. Any other id says nothing.
+fn minted_ms(id: &str) -> Option<u64> {
+    let id = uuid::Uuid::try_parse(id).ok()?;
+    (id.get_version_num() == 7).then(|| (id.as_u128() >> 80) as u64)
 }
 
 /// A Codex prompt that has not yet been ended by the next prompt.
@@ -1660,6 +1682,54 @@ mod codex_tests {
         assert_eq!(
             out.entries[1].observed_at.map(|t| t.to_string()).as_deref(),
             Some("2026-09-02T17:06:36.000Z")
+        );
+    }
+
+    #[test]
+    fn a_turn_older_than_its_thread_is_the_parent_a_fork_inherited() {
+        // A forked thread lists its parent's turns as its own, under the parent's
+        // turn ids. Both ids are UUIDv7, so they say when they were minted: on real
+        // rollouts all 280 inherited turns are older than their fork, and none of
+        // 2,356 turns a thread ran itself is older than it.
+        let inherited = serde_json::json!({
+            "id": "01a06316-03db-7000-8000-000000000001",
+            "items": [
+                {"type": "userMessage", "id": "u0", "content": [{"type": "text", "text": "the parent's prompt"}]},
+                {"type": "agentMessage", "id": "a0", "text": "the parent's reply", "phase": "final_answer"}
+            ],
+            "status": "completed", "startedAt": 1788368700, "completedAt": 1788368701
+        });
+        let mut listed = vec![inherited];
+        listed.extend(turns());
+
+        let out = parse_codex_thread(&thread(), &listed);
+
+        let prompts: Vec<&Entry> = out
+            .entries
+            .iter()
+            .filter(|e| matches!(e.event, Event::TurnStarted { .. }))
+            .collect();
+        assert_eq!(prompts.len(), 2, "the thread's own two: {prompts:?}");
+        assert!(prompts.iter().all(|e| {
+            e.vendor_turn_id.as_ref().map(VendorTurnId::as_str)
+                != Some("01a06316-03db-7000-8000-000000000001")
+        }));
+        assert_eq!(out.skipped.get("turn older than its thread"), Some(&1));
+    }
+
+    #[test]
+    fn a_turn_whose_id_says_nothing_about_time_is_kept() {
+        // Legacy history can number turns any way it likes.
+        let mut turn = turns().remove(0);
+        turn["id"] = serde_json::json!("legacy-1");
+
+        let out = parse_codex_thread(&thread(), &[turn]);
+
+        assert_eq!(out.skipped.get("turn older than its thread"), None);
+        assert!(
+            out.entries
+                .iter()
+                .any(|e| matches!(e.event, Event::TurnStarted { .. }))
         );
     }
 
