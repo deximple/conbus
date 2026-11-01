@@ -5,6 +5,7 @@ mod note;
 
 mod appserver;
 mod arena;
+mod auth;
 mod backfill;
 mod build_info;
 mod cli;
@@ -181,6 +182,9 @@ fn main() -> ExitCode {
             }
         }),
         Command::Doctor => run(report::doctor),
+        Command::Auth { url, html, open } => {
+            run(|paths| auth::run(paths, url.as_deref(), html, open))
+        }
         Command::Status => run(report::status),
         Command::Quota => run(quota::run),
         Command::Policy { test } => run(|paths| match test {

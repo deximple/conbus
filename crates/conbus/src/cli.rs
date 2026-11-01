@@ -53,6 +53,14 @@ pub enum Command {
         chat_export: Option<String>,
     },
     Doctor,
+    /// Who needs a sign-in (never conbus itself), and for a URL that opened,
+    /// whose page it is and which process asked. `--html` writes one
+    /// self-contained page; `--open` opens it — explicit calls only.
+    Auth {
+        url: Option<String>,
+        html: Option<String>,
+        open: bool,
+    },
     /// Build the derived sidecars for every closed segment; writes only
     /// under `<root>/cache/`.
     LogIndex,
@@ -216,6 +224,7 @@ where
                 usize::MAX,
             ),
             "doctor" | "status" | "quota" | "verdict" => (&[], &[], &[], 0),
+            "auth" => (&["--open"], &["--url"], &["--html"], 0),
             "policy" => (&[], &["--harness", "--tool", "--input"], &[], usize::MAX),
             "hop" => (&["--apply", "--demo"], &["--from", "--to"], &[], usize::MAX),
             "go" => (&[], &["--from", "--to"], &[], usize::MAX),
@@ -297,6 +306,15 @@ where
             },
         },
         "doctor" => Command::Doctor,
+        "auth" => Command::Auth {
+            url: flag_value(&args, "--url"),
+            html: args.iter().any(|a| a == "--html").then(|| {
+                flag_value(&args, "--html")
+                    .filter(|value| !value.starts_with('-'))
+                    .unwrap_or_default()
+            }),
+            open: args.iter().any(|a| a == "--open"),
+        },
         "status" => Command::Status,
         "quota" => Command::Quota,
         "policy" => Command::Policy {
@@ -463,6 +481,11 @@ USAGE:
                                   recover history; --gaps fills missed turns of live sessions;
                                   --chat-export reads official Claude.ai conversations.json (or zip)
     conbus doctor                 report what is and is not wired up
+    conbus auth [--url URL] [--html [PATH]] [--open]
+                                  (experimental) whether any vendor needs a sign-in
+                                  (conbus itself never does), whose page a URL is,
+                                  and which process asked for it; --html writes
+                                  one self-contained page, --open opens it
     conbus status                 routing rules, quota, hop history, cost
     conbus quota                  Codex probe + Claude StatusLine cache + catalog
     conbus policy check           (experimental) the effective policy.json rules;

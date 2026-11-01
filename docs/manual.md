@@ -733,6 +733,14 @@ named no session under one shared conversation. 0.1.0 and later refuse such
 events; the old records stay in the log, which is append-only, and this line
 says what they are.
 
+**A sign-in tab opened and you do not know whose it is** — paste its address
+into `conbus auth --url "<URL>"`. It names the page (Google OAuth, OpenAI,
+Anthropic, the Playwright MCP bridge, …), which process is listening on the
+port the page calls back to, whether anything in that process's ancestry is
+conbus (it opens no sign-in page on its own), and — for the bridge — which
+vendor config file holds the token it expects. `conbus auth` alone lists
+which vendor needs a sign-in right now; recording never does.
+
 **A hop did not happen when a limit hit** — check `conbus status`: the rules
 line, the destination's quota, and whether the session was a program
 (unattended sessions never hop). `conbus hop` shows what it would decide now.
@@ -837,6 +845,7 @@ or `conbus run claude_code --profile NAME`.
 | `conbus install --managed` | Print the hooks block for Claude Code's managed settings (JSON on stdout) and where it goes; writes nothing ([Managed Macs](fleet.md)) |
 | `conbus uninstall [--apply] [--profile NAME]` | Take them all back out; the log is kept. `--profile` removes only `$HOME/.claude-NAME`'s registration |
 | `conbus doctor` | What is wired up and what is not |
+| `conbus auth [--url URL] [--html [PATH]] [--open]` | Which vendor needs a sign-in (conbus itself never does); `--url` names whose page opened and which process asked; `--html` writes the same as one offline page (experimental) |
 | `conbus status` | Routing rules, quota, hop history, cost |
 | `conbus quota` | What each leg has left |
 | `conbus policy check` | The effective `policy.json` rules, or why there are none (section 15) |

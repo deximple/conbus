@@ -676,6 +676,14 @@ conbus uninstall --apply  # 지우기
 **`takeover  stale → …`** — 기다리는 `conbus run`이 없을 때 hop이 일어났습니다.
 다음 `conbus run`이 그것을 버립니다. 따로 할 일은 없습니다.
 
+**누구 것인지 모를 로그인 탭이 떴다면** — 그 주소를 `conbus auth --url "<URL>"`에
+붙여 넣으세요. 페이지가 무엇인지(Google OAuth, OpenAI, Anthropic, Playwright
+MCP 브리지 등), 페이지가 돌아가는 포트를 어느 프로세스가 잡고 있는지, 그
+프로세스의 계보에 conbus가 있는지(conbus는 스스로 로그인 페이지를 열지 않습니다),
+그리고 브리지라면 어느 벤더 설정 파일에 토큰이 있는지를 알려 줍니다. `conbus auth`
+만 치면 지금 어느 벤더가 로그인을 필요로 하는지를 보여 줍니다. 기록에는 로그인이
+필요 없습니다.
+
 **`nameless  <bus id> — N records…`** — 0.1.0 이전 빌드가 세션을 밝히지 않은
 이벤트를 공용 대화 하나 아래 묶었습니다. 0.1.0부터는 그런 이벤트를 거부합니다.
 로그는 덧붙이기만 하므로 예전 레코드는 남아 있고, 이 줄이 그것이 무엇인지 알려
@@ -775,6 +783,7 @@ hop도 대화를 내 계정 하나에서 다른 계정으로 옮기지 않습니
 | `conbus install --managed` | Claude Code 관리 설정에 넣을 훅 블록(stdout의 JSON)과 넣을 곳을 출력. 아무것도 쓰지 않음([Managed Macs](fleet.md)) |
 | `conbus uninstall [--apply]` | 모두 다시 빼기. 로그는 남김 |
 | `conbus doctor` | 무엇이 연결됐고 무엇이 안 됐는지 |
+| `conbus auth [--url URL] [--html [PATH]] [--open]` | 어느 벤더가 로그인을 필요로 하는지(conbus 자체는 절대 아님). `--url`은 뜬 페이지가 누구 것인지와 어느 프로세스가 요청했는지를 알려 주고, `--html`은 같은 내용을 오프라인 한 장으로 씀(실험적) |
 | `conbus status` | 라우팅 규칙, 쿼터, hop 기록, 비용 |
 | `conbus quota` | 각 레그에 남은 양 |
 | `conbus log [--json] [--bus-id ID] [--since TS] [--tail N] [--grep TEXT] [--reveal]` | 로그 읽기 |
