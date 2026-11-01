@@ -185,12 +185,6 @@ impl Registry {
         restoring.finish()
     }
 
-    /// A hop the log refused did not happen, so nothing waits for it. The seat is
-    /// reserved when the event is observed, before anyone knows it will land.
-    pub fn take_back_seat(&mut self, bus_id: BusId) {
-        self.clear_pending_bus(bus_id);
-    }
-
     /// The conversation a vendor session is bound to, if any.
     pub fn bus_id(&self, key: &SessionKey) -> Option<BusId> {
         self.bound.get(key).copied()
