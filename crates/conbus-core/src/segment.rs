@@ -964,6 +964,11 @@ fn write_sidecar(cache: &Path, segment: &Path, records: &[Record], defects: &[De
     let run = || -> io::Result<()> {
         let dir = cache.join("meta");
         std::fs::create_dir_all(&dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(cache, std::fs::Permissions::from_mode(0o700));
+        }
         let bytes = std::fs::metadata(segment)?.len();
         let name = segment
             .file_name()
@@ -1076,45 +1081,38 @@ impl SegmentLog {
         let workers = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1)
-            .min(8)
-            .min(segments.len().max(1));
-        let chunk = segments.len().div_ceil(workers).max(1);
-        let mut grouped: Vec<io::Result<(Vec<Record>, Vec<Defect>)>> =
-            Vec::with_capacity(segments.len());
-        std::thread::scope(|scope| {
-            let handles: Vec<_> = segments
-                .chunks(chunk)
-                .map(|group| {
-                    let group = group.to_vec();
-                    let newest = newest.clone();
-                    let cache = cache.clone();
-                    scope.spawn(move || {
-                        group
-                            .into_iter()
-                            .map(|segment| {
-                                let closed = newest.as_ref() != Some(&segment);
-                                load_meta_segment(&segment, closed && !no_cache, cache.as_deref())
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                })
-                .collect();
-            for handle in handles {
-                grouped.extend(
-                    handle
-                        .join()
-                        .unwrap_or_else(|_| vec![Err(io::Error::other("a cache worker panicked"))]),
-                );
-            }
-        });
-
+            .min(8);
+        // In waves of `workers` segments, each wave handed over in order before
+        // the next is read: parallel, and never more than a wave in memory. The
+        // daemon folds its state through this at start, and holding the whole
+        // log's records at once is what `scan_each` was written to stop.
         let mut defects = Vec::new();
-        for result in grouped {
-            let (records, segment_defects) = result?;
-            for record in records {
-                each(record);
+        for wave in segments.chunks(workers) {
+            let loaded: Vec<io::Result<(Vec<Record>, Vec<Defect>)>> = std::thread::scope(|scope| {
+                let handles: Vec<_> = wave
+                    .iter()
+                    .map(|segment| {
+                        let closed = newest.as_ref() != Some(segment) && !no_cache;
+                        let cache = cache.as_deref();
+                        scope.spawn(move || load_meta_segment(segment, closed, cache))
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|handle| {
+                        handle
+                            .join()
+                            .unwrap_or_else(|_| Err(io::Error::other("a cache worker panicked")))
+                    })
+                    .collect()
+            });
+            for result in loaded {
+                let (records, segment_defects) = result?;
+                for record in records {
+                    each(record);
+                }
+                defects.extend(segment_defects);
             }
-            defects.extend(segment_defects);
         }
         Ok(defects)
     }
