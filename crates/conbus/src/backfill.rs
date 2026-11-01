@@ -982,11 +982,7 @@ fn append_gaps_files(
             }
             break;
         }
-        let Some(session) = file
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .and_then(|stem| stem.parse::<BusId>().ok())
-        else {
+        let Some((stem, session)) = session_of(file) else {
             continue;
         };
         let Some(&live_bus) = known.live_bus.get(&session) else {
@@ -1003,7 +999,7 @@ fn append_gaps_files(
             t.claude_files += 1;
             t.claude_bytes += text.len() as u64;
         }
-        let recovered = parse_claude_transcript(&text, live_bus);
+        let recovered = parse_claude_transcript(&text, stem, live_bus);
         for (reason, count) in &recovered.skipped {
             *outcome.unread.entry(reason.clone()).or_default() += count;
         }
@@ -1064,11 +1060,7 @@ pub fn recover(paths: &Paths, transcripts: &Path, apply: bool, codex: bool) -> i
         // The file's own name is the vendor session id, and it is a UUID — so
         // it can *be* the `bus_id`. That makes a second run produce identical
         // ids for the same conversations rather than a second copy of history.
-        let Some(bus_id) = file
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .and_then(|stem| stem.parse::<BusId>().ok())
-        else {
+        let Some((stem, bus_id)) = session_of(&file) else {
             *outcome
                 .unread
                 .entry("file name is not a session id".into())
@@ -1094,7 +1086,7 @@ pub fn recover(paths: &Paths, transcripts: &Path, apply: bool, codex: bool) -> i
             continue;
         };
 
-        let mut recovered = parse_claude_transcript(&text, bus_id);
+        let mut recovered = parse_claude_transcript(&text, stem, bus_id);
         for (reason, count) in &recovered.skipped {
             *outcome.unread.entry(reason.clone()).or_default() += count;
         }
@@ -1342,6 +1334,13 @@ fn known_from<'a>(records: impl IntoIterator<Item = &'a Record>) -> Known {
     known
 }
 
+/// The vendor session a transcript is named for: the name itself, and as a
+/// UUID. The name is the file's identity, whatever its lines go on to claim.
+fn session_of(file: &Path) -> Option<(&str, BusId)> {
+    let stem = file.file_stem()?.to_str()?;
+    Some((stem, stem.parse().ok()?))
+}
+
 /// Top-level session files only.
 ///
 /// The nested `subagents/` and `subagents/workflows/` trees are deliberately
@@ -1562,6 +1561,44 @@ mod tests {
 
         assert!(refused.is_err(), "two writers on one segment");
         assert_eq!(records_on_disk(&machine), 0);
+    }
+
+    /// A session's transcript that opens on its parent's lines.
+    fn transcript_of_a_fork(machine: &Machine, session: &str, parent: &str) {
+        let project = machine.transcripts.join("-Applications-conbus");
+        fs::create_dir_all(&project).expect("project dir");
+        fs::write(
+            project.join(format!("{session}.jsonl")),
+            format!(
+                "{{\"type\":\"user\",\"sessionId\":\"{parent}\",\"timestamp\":\"2026-08-30T09:33:02.222Z\",\
+                 \"version\":\"2.1.241\",\"cwd\":\"/parent\",\"entrypoint\":\"cli\",\
+                 \"promptId\":\"P0\",\"message\":{{\"role\":\"user\",\"content\":\"the parent's prompt\"}}}}\n\
+                 {{\"type\":\"user\",\"sessionId\":\"{session}\",\"timestamp\":\"2026-08-31T09:33:02.222Z\",\
+                 \"version\":\"2.1.241\",\"cwd\":\"/Applications/conbus\",\"entrypoint\":\"cli\",\
+                 \"promptId\":\"P1\",\"message\":{{\"role\":\"user\",\"content\":\"the fork's prompt\"}}}}\n"
+            ),
+        )
+        .expect("write transcript");
+    }
+
+    #[test]
+    fn recovering_a_fork_keeps_its_own_lines_under_its_own_session() {
+        // The same parser serves `backfill --apply`, so a recovered fork must
+        // not carry its parent's turns or its parent's session id either.
+        let machine = machine();
+        transcript_of_a_fork(&machine, SESSION, "11111111-aaaa-bbbb-cccc-ddddeeeeffff");
+
+        let outcome = recover(&machine.paths, &machine.transcripts, true, false).expect("recover");
+
+        assert_eq!(outcome.turns, 1);
+        assert_eq!(outcome.unread.get("line of another session"), Some(&1));
+        let records = held(&machine);
+        assert!(!records.is_empty());
+        assert!(records.iter().all(|record| {
+            record.bus_id.to_string() == SESSION
+                && record.source.vendor_session_id.as_deref() == Some(SESSION)
+                && record.source.workspace.as_deref() == Some("/Applications/conbus")
+        }));
     }
 
     fn transcript_two_turns(machine: &Machine, session: &str) {
