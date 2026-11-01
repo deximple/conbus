@@ -40,11 +40,22 @@ the entry says so when it does.
 
 ### Changed
 
+- `docs/log-format.md` documents a log line, the event kinds, bodies, and the
+  rules for change: additions only in 1.x, older records always read, newer
+  ones reported rather than guessed at, and what a rollback reads.
+- `docs/stability.md` says what 1.x keeps — commands, exit codes, machine
+  output keys, OTLP names, the log format, the data root, the hook contract —
+  and what stays experimental; `--help` marks the experimental surfaces.
 - Building from source needs Rust 1.99.1, pinned in `rust-toolchain.toml`;
   CI reads the same file.
 
 ### Fixed
 
+- Grok 1.0.71: a turn that ends without completing (`StopCancelled`: a
+  person interrupting, a declined permission, a turn limit) is recorded as an
+  interrupted turn, and the extra `Stop` Grok fires after the session ends is
+  no longer recorded as a second turn end. `install --apply` registers
+  `StopCancelled`.
 - OpenCode 2.x is recorded again. It refuses the plugin 1.x loads, so nothing
   reached the log from OpenCode after it moved to 2.0. `conbus install` now
   writes the plugin the installed OpenCode loads (asking `opencode --version`),

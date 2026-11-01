@@ -102,7 +102,7 @@ pub const CLAUDE_EVENTS: [&str; 13] = [
 
 /// Grok's documented Claude-compatible events. `StopFailure` is the quota
 /// substitute: remaining JSON does not exist, but `error=rate_limit` does.
-pub const GROK_EVENTS: [&str; 9] = [
+pub const GROK_EVENTS: [&str; 10] = [
     "SessionStart",
     "UserPromptSubmit",
     "PreToolUse",
@@ -110,6 +110,7 @@ pub const GROK_EVENTS: [&str; 9] = [
     "PostToolUseFailure",
     "Stop",
     "StopFailure",
+    "StopCancelled",
     "SubagentStop",
     "SessionEnd",
 ];

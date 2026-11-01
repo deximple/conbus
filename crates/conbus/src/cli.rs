@@ -343,12 +343,13 @@ USAGE:
                                   an Inference hooks prompt frame
                                   (source.application=claude-ai) attaches as
                                   claude_chat and prints an allow verdict;
-                                  --inference-listen is the official HTTPS
-                                  terminator target (default 127.0.0.1:8787)
+                                  --inference-listen (experimental) is the
+                                  official HTTPS terminator target, loopback
+                                  only (default 127.0.0.1:8787)
     conbus log [--json] [--bus-id ID] [--since TS] [--tail N] [--grep TEXT] [--reveal]
-    conbus log index              build the derived read cache for every closed segment
                                   read the conversation log back; --reveal
                                   decrypts sealed tool bodies (explicit only)
+    conbus log index              build the derived read cache for every closed segment
     conbus install [--apply]      register the hooks with every vendor found;
                                   reports unless told to write
     conbus install --managed      print, and never write, the hooks block for
@@ -363,19 +364,20 @@ USAGE:
     conbus doctor                 report what is and is not wired up
     conbus status                 routing rules, quota, hop history, cost
     conbus quota                  Codex probe + Claude StatusLine cache + catalog
-    conbus policy check           the effective policy.json rules; a file that
-                                  cannot be a policy exits non-zero
+    conbus policy check           (experimental) the effective policy.json rules;
+                                  a file that cannot be a policy exits non-zero
     conbus policy test --harness H --tool T --input JSON
-                                  what the rules would decide, or none
+                                  (experimental) what the rules would decide, or none
     conbus hop [HARNESS] [--from ID] [--to HARNESS] [--apply] [--demo]
                                   decide the next harness; a positional name
                                   is --to; --apply records it and opens the
                                   destination (dual-warm on Claude/Codex;
                                   Cursor opens the checkout). A chat line
-                                  that is only an order does the same.
+                                  that is only an order does the same. The
+                                  automatic hop after a vendor limit is experimental
     conbus go [HARNESS]           hop --apply for the current conversation
-    conbus summary --bus-id ID    opposite-leg digest; never the protected leg
-    conbus verdict                4-week dogfood score; open window is not a kill
+    conbus summary --bus-id ID    (experimental) opposite-leg digest; never the protected leg
+    conbus verdict                (experimental) 4-week dogfood score; open window is not a kill
     conbus usage [--days N] [--since DAY] [--day DAY] [--json] [--shareable] [--otlp URL]
                                   what the agents did, per harness: turns, stops,
                                   tool failures, permission asks (default 7 days;
@@ -387,7 +389,7 @@ USAGE:
                                   --otlp sends those rows as OTLP metrics to a
                                   collector on this machine over plain HTTP
                                   (http://127.0.0.1:4318); send a --day once
-    conbus sync --join INVITE    print the invite; write nothing
+    conbus sync --join INVITE    (experimental) print the invite; write nothing
     conbus sync --join INVITE --apply
                                   store the device key and the invite settings
     conbus sync                   send closed days not yet sent
@@ -401,8 +403,8 @@ USAGE:
     conbus run [claude_code|codex|cursor|agy|opencode|grok]
                                   same TTY: start a vendor; hop execs the next;
                                   --profile NAME (claude_code) is experimental
-    conbus arena fact --workspace DIR --claim TEXT --anchor PATH
-    conbus arena link --from DIR --to DIR
+    conbus arena fact --workspace DIR --claim TEXT --anchor PATH   (experimental)
+    conbus arena link --from DIR --to DIR   (experimental)
                                   accept a fact or link workspaces for the pack
     conbus --version              say which build this is
 ";
@@ -932,5 +934,66 @@ mod tests {
         };
 
         assert_eq!(filter.tail, None);
+    }
+
+    #[test]
+    fn the_help_says_what_docs_stability_promises() {
+        // `docs/stability.md` is the 1.x promise. Every command it calls
+        // stable is in the help, and every surface it calls experimental is
+        // marked so on the line that names it.
+        const STABILITY: &str = include_str!("../../../docs/stability.md");
+        let ticked = |text: &str| -> Vec<String> {
+            text.split('`')
+                .skip(1)
+                .step_by(2)
+                .map(str::to_string)
+                .collect()
+        };
+        let stable_row = STABILITY
+            .lines()
+            .find(|line| line.starts_with("| Commands and flags |"))
+            .expect("the stable commands row");
+        for command in ticked(stable_row) {
+            let first = command.split_whitespace().next().unwrap_or_default();
+            let named = format!("conbus {first}");
+            assert!(
+                USAGE.contains(&named),
+                "stable `{command}` is not in the help"
+            );
+        }
+        let experimental = STABILITY
+            .split("## Experimental")
+            .nth(1)
+            .and_then(|rest| rest.split("\n## ").next())
+            .expect("the experimental section");
+        let bullets: Vec<&str> = experimental
+            .lines()
+            .filter_map(|line| line.strip_prefix("- "))
+            .collect();
+        assert!(!bullets.is_empty());
+        for bullet in bullets {
+            let names = ticked(bullet);
+            if names.is_empty() {
+                assert!(
+                    USAGE
+                        .lines()
+                        .any(|line| line.contains("automatic hop") && line.contains("experimental")),
+                    "the help does not mark the automatic hop experimental"
+                );
+                continue;
+            }
+            for name in names {
+                let key = name
+                    .split_whitespace()
+                    .last()
+                    .unwrap_or_default()
+                    .to_string();
+                let marked = USAGE
+                    .lines()
+                    .filter(|line| line.contains(&key))
+                    .any(|line| line.contains("experimental"));
+                assert!(marked, "the help does not mark `{name}` experimental");
+            }
+        }
     }
 }
