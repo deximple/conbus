@@ -1094,9 +1094,11 @@ pub fn prepare(paths: &Paths, retention: Retention) -> io::Result<()> {
     // Official transcripts only, same parser as `backfill --gaps`. Turns
     // that happened while no recorder was running join the live `bus_id`
     // before hooks are accepted, so the registry sees one conversation.
+    let mut gap_timing = crate::backfill::GapTiming::default();
     match crate::backfill::append_gaps_at_start(paths, &scan.records, &mut log) {
-        Ok(0) => {}
-        Ok(n) => {
+        Ok((0, timing)) => gap_timing = timing,
+        Ok((n, timing)) => {
+            gap_timing = timing;
             note!("filled {n} gap record(s) from official transcripts");
             // The written records are the log's newest n — read just the tail
             // instead of scanning every segment a second time.
@@ -1113,10 +1115,35 @@ pub fn prepare(paths: &Paths, retention: Retention) -> io::Result<()> {
         Ok(n) => note!("aliased {n} split conversation pair(s)"),
         Err(err) => note!("split alias skipped ({err})"),
     }
+    if gap_timing.budget_exhausted {
+        // The socket serving matters more than finishing the fill: the
+        // skipped part lands on the next start or `conbus backfill --gaps`.
+        note!("gap fill hit its start budget; the rest lands on a later fill");
+    }
     note!(
-        "prepare breakdown: meta scan {} ms, gap fill {} ms, split repair {} ms",
+        "prepare breakdown: meta scan {} ms, gap fill {} ms \
+         (claude: walk {} ms, read {} files {} MB in {} ms; \
+         codex: walk {} ms, app-server {} ms, thread/list {} pages {} ms, \
+         list_turns {}/{} threads {} ms{}; chat export {} ms), split repair {} ms",
         t_scan.as_millis(),
         t_gaps.as_millis(),
+        gap_timing.claude_walk_ms,
+        gap_timing.claude_files,
+        gap_timing.claude_bytes / 1048576,
+        gap_timing.claude_read_ms,
+        gap_timing.codex_walk_ms,
+        gap_timing.codex_start_ms,
+        gap_timing.thread_list_pages,
+        gap_timing.thread_list_ms,
+        gap_timing.list_turns_threads,
+        gap_timing.list_turns_attempted,
+        gap_timing.list_turns_ms,
+        gap_timing
+            .list_turns_err
+            .as_deref()
+            .map(|err| format!(", first error: {err}"))
+            .unwrap_or_default(),
+        gap_timing.chat_export_ms,
         (t0.elapsed() - t_scan - t_gaps).as_millis()
     );
     Ok(())

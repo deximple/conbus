@@ -507,7 +507,10 @@ conbus install --apply     # starts the recorder again
 
 **Missed turns** of live sessions — from times the recorder was down — are
 filled in automatically when it starts, from Claude Code's transcripts, Codex's
-threads and any chat export. `conbus backfill --gaps` does it on demand for
+threads and any chat export. The start path spends at most two seconds on it
+(`CONBUS_GAP_BUDGET_MS` overrides) so a slow vendor never holds the socket
+closed; whatever the budget skips is said in `daemon.log` and lands on the
+next start. `conbus backfill --gaps` does it on demand for
 Claude Code, across all history; with `--apply` it too needs the recorder
 stopped.
 

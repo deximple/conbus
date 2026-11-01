@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use conbus_core::backfill::{
     CLAUDE_CHAT_EXPORT, CLAUDE_TRANSCRIPT, CODEX_THREAD, Recovered, parse_claude_chat_export,
@@ -321,31 +322,100 @@ fn unzip_conversations(path: &Path) -> io::Result<String> {
 ///
 /// The socket is bound but the accept loop has not started, so this is not
 /// racing hook writes. A failure here must not stop the daemon recording.
+/// Per-part times of one start-up gap fill — the `prepare breakdown` line
+/// carries them so the next restart investigation starts from evidence
+/// rather than another guess.
+#[derive(Default, Debug)]
+pub struct GapTiming {
+    /// Enumerating `~/.claude/projects`.
+    pub claude_walk_ms: u64,
+    /// Session files that passed the mtime filter and were read.
+    pub claude_files: u64,
+    /// Bytes those files brought in.
+    pub claude_bytes: u64,
+    pub claude_read_ms: u64,
+    /// Statting `~/.codex` rollouts for the `since` cut.
+    pub codex_walk_ms: u64,
+    /// `codex app-server` initialize.
+    pub codex_start_ms: u64,
+    /// All `thread/list` pages together.
+    pub thread_list_ms: u64,
+    pub thread_list_pages: u64,
+    /// Per-thread `list_turns` calls: how many threads were asked and how
+    /// many answered before the budget or an error stopped the walk.
+    pub list_turns_ms: u64,
+    pub list_turns_threads: u64,
+    pub list_turns_attempted: u64,
+    /// First `list_turns` failure seen, so an always-failing call is visible
+    /// rather than a silent zero.
+    pub list_turns_err: Option<String>,
+    pub chat_export_ms: u64,
+    /// The start budget cut the fill short; whatever was left lands on the
+    /// next start or through `conbus backfill --gaps`.
+    pub budget_exhausted: bool,
+}
+
+/// How long a start may spend filling gaps before it stops and serves.
+/// Overridable for tests; the point is that a wedged vendor call or a giant
+/// transcript never holds the socket closed past a bound.
+fn gap_budget() -> std::time::Duration {
+    std::env::var("CONBUS_GAP_BUDGET_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(std::time::Duration::from_millis)
+        .unwrap_or(std::time::Duration::from_secs(2))
+}
+
+fn elapsed_ms(at: std::time::Instant) -> u64 {
+    at.elapsed().as_millis() as u64
+}
+
 pub fn append_gaps_at_start(
     paths: &Paths,
     held: &[Record],
     log: &mut SegmentLog,
-) -> io::Result<u64> {
+) -> io::Result<(u64, GapTiming)> {
     // Only what changed after the log's newest record can hold a turn that
     // happened while no daemon was listening. Reading every transcript the log
     // had ever bound took ten seconds with a warm cache and 71 after a reboot
     // on a machine with 6,190 of them (6.3 GB) — with the socket already
     // bound, so every hook in that window timed out. Earlier downtimes were
     // filled by earlier starts; `conbus backfill --gaps` still reads them all.
+    let mut timing = GapTiming::default();
+    let deadline = Instant::now() + gap_budget();
     let since = newest_unix(held).map(|newest| newest - GAP_MARGIN_SECS);
     let mut n = 0;
     if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
         let transcripts = home.join(".claude").join("projects");
         if transcripts.is_dir() {
-            n += append_gaps(&transcripts, held, Some(log), since)?.gap_records;
+            let walk = Instant::now();
+            let files = session_files(&transcripts)?;
+            timing.claude_walk_ms = elapsed_ms(walk);
+            let read = Instant::now();
+            n += append_gaps_files(
+                &files,
+                held,
+                Some(&mut *log),
+                since,
+                &mut Some(&mut timing),
+                Some(deadline),
+            )?
+            .gap_records;
+            timing.claude_read_ms = elapsed_ms(read);
         }
     }
     // Codex.app burns the same account and never hits CLI hooks. Official
     // thread/turns/list on threads we already bound fills those turns under
     // the live `bus_id` — not a second conversation.
-    n += fill_live_codex_gaps(held, log, since)?;
-    n += ingest_chat_exports_since(&paths.chat_export(), held, log, since)?;
-    Ok(n)
+    if !timing.budget_exhausted {
+        n += fill_live_codex_gaps(held, log, since, &mut timing, deadline)?;
+    }
+    if !timing.budget_exhausted {
+        let export = Instant::now();
+        n += ingest_chat_exports_since(&paths.chat_export(), held, log, since)?;
+        timing.chat_export_ms = elapsed_ms(export);
+    }
+    Ok((n, timing))
 }
 
 /// How long before the log's newest record a file may have last changed and
@@ -500,37 +570,76 @@ fn fill_live_codex_gaps(
     held: &[Record],
     log: &mut SegmentLog,
     since: Option<i64>,
+    timing: &mut GapTiming,
+    deadline: Instant,
 ) -> io::Result<u64> {
     let known = known_from(held.iter());
     if known.live_codex.is_empty() {
         return Ok(0);
     }
+    // Rollout mtimes answer the same question `thread/list` does — the
+    // app-server's `updatedAt` for a thread is its rollout file's mtime —
+    // for a stat instead of seconds a page. A session with no rollout on
+    // disk is out: the app-server cannot hydrate one it cannot find, so
+    // `list_turns` would only refuse. When the directories cannot be walked
+    // at all the ask falls back to `thread/list` as before.
+    let walk = Instant::now();
+    let mut recent = codex_threads_touched_since(&known.live_codex, since);
+    timing.codex_walk_ms = elapsed_ms(walk);
+    if recent.as_ref().is_some_and(|recent| recent.is_empty()) {
+        return Ok(0);
+    }
     // Restart must not wait out the 10-minute backfill budget: the socket
     // is already bound, so a wedged initialize leaves every hook as EAGAIN.
-    let mut server = match AppServer::start(std::time::Duration::from_secs(8)) {
+    // The gap budget is the tighter bound of the two.
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .unwrap_or(std::time::Duration::ZERO)
+        .min(std::time::Duration::from_secs(8));
+    let start = Instant::now();
+    let mut server = match AppServer::start(remaining) {
         Ok(server) => server,
         Err(_) => return Ok(0),
     };
-    // One `thread/list` pass says which threads moved since the cutoff, so a
-    // start asks for the turns of those rather than of every thread the log
-    // has ever bound. When the list cannot be read, every thread is asked.
-    let recent = since.and_then(|since| threads_updated_since(&mut server, since));
+    timing.codex_start_ms = elapsed_ms(start);
+    // When the rollout walk could not answer, one `thread/list` pass says
+    // which threads moved since the cutoff, so a start asks for the turns of
+    // those rather than of every thread the log has ever bound. When the
+    // list cannot be read either, every thread is asked.
+    if recent.is_none() {
+        let list = Instant::now();
+        recent = since
+            .and_then(|since| threads_updated_since(&mut server, since, timing))
+            .map(|set| set.into_iter().collect());
+        timing.thread_list_ms = elapsed_ms(list);
+    }
+    let sessions: Vec<BusId> = match recent {
+        Some(asked) => asked,
+        None => known.live_codex.iter().copied().collect(),
+    };
     let grouped = by_bus(held);
     let mut filled = 0u64;
-    for session in &known.live_codex {
-        if recent
-            .as_ref()
-            .is_some_and(|recent| !recent.contains(session))
-        {
-            continue;
+    let turns_at = Instant::now();
+    for session in &sessions {
+        if Instant::now() >= deadline {
+            timing.budget_exhausted = true;
+            break;
         }
         let Some(&bus_id) = known.live_codex_bus.get(session) else {
             continue;
         };
+        timing.list_turns_attempted += 1;
         let turns = match list_turns(&mut server, &session.to_string()) {
             Ok(turns) => turns,
-            Err(_) => continue,
+            Err(err) => {
+                if timing.list_turns_err.is_none() {
+                    let why = err.to_string();
+                    timing.list_turns_err = Some(why.chars().take(120).collect());
+                }
+                continue;
+            }
         };
+        timing.list_turns_threads += 1;
         let thread =
             serde_json::json!({"id": session.to_string(), "sessionId": session.to_string()});
         let recovered = parse_codex_thread(&thread, &turns);
@@ -541,12 +650,17 @@ fn fill_live_codex_gaps(
             }
         }
     }
+    timing.list_turns_ms = elapsed_ms(turns_at);
     Ok(filled)
 }
 
 /// Threads `thread/list` says were updated at or after `since`, or `None`
 /// when the list cannot be read to the end.
-fn threads_updated_since(server: &mut AppServer, since: i64) -> Option<HashSet<BusId>> {
+fn threads_updated_since(
+    server: &mut AppServer,
+    since: i64,
+    timing: &mut GapTiming,
+) -> Option<HashSet<BusId>> {
     let mut recent = HashSet::new();
     let mut cursor: Option<String> = None;
     loop {
@@ -555,6 +669,7 @@ fn threads_updated_since(server: &mut AppServer, since: i64) -> Option<HashSet<B
             params["cursor"] = serde_json::json!(cursor);
         }
         let page = server.call("thread/list", params).ok()?;
+        timing.thread_list_pages += 1;
         for thread in page["data"].as_array().into_iter().flatten() {
             // Strings on `thread/list`, numbers elsewhere in the same API.
             let updated = match &thread["updatedAt"] {
@@ -575,6 +690,87 @@ fn threads_updated_since(server: &mut AppServer, since: i64) -> Option<HashSet<B
         cursor = page["nextCursor"].as_str().map(str::to_string);
         if cursor.is_none() {
             return Some(recent);
+        }
+    }
+}
+
+/// The threads whose rollout file could hold turns newer than `since` —
+/// `~/.codex/sessions/<y>/<m>/<d>/rollout-<stamp>-<thread-id>.jsonl`, plus
+/// `archived_sessions/` whose `<id>.jsonl.zst` keeps the same tail. A thread
+/// whose file is old is out; so is one with no file at all — the app-server
+/// hydrates a thread from its rollout and answers "no rollout found" when
+/// there is none, so asking could never return turns anyway (most sessions
+/// in a long-lived log have no file on this disk). `None` when neither
+/// directory could be walked, leaving the caller its `thread/list` fallback.
+fn codex_threads_touched_since(
+    sessions: &HashSet<BusId>,
+    since: Option<i64>,
+) -> Option<Vec<BusId>> {
+    let since = since?;
+    let home = std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))?;
+    codex_threads_touched_since_in(&home, sessions, since)
+}
+
+fn codex_threads_touched_since_in(
+    codex_home: &Path,
+    sessions: &HashSet<BusId>,
+    since: i64,
+) -> Option<Vec<BusId>> {
+    let mut touched = HashMap::new();
+    let sessions_dir = codex_home.join("sessions");
+    for dir in [sessions_dir.clone(), codex_home.join("archived_sessions")] {
+        collect_rollout_mtimes(&dir, 6, &mut touched);
+    }
+    if touched.is_empty() && !sessions_dir.is_dir() {
+        return None;
+    }
+    let mut asked: Vec<BusId> = sessions
+        .iter()
+        .filter(|session| touched.get(*session).is_some_and(|mtime| *mtime >= since))
+        .copied()
+        .collect();
+    // Most recently touched first: a bounded start fills the threads most
+    // likely to hold missed turns before older ones.
+    asked.sort_by_key(|session| std::cmp::Reverse(touched[session]));
+    Some(asked)
+}
+
+/// `rollout-<stamp>-<thread-id>.jsonl[.zst]` → the thread id: the last 36
+/// characters of the stem, a uuid.
+fn rollout_thread_id(name: &str) -> Option<BusId> {
+    let stem = name
+        .strip_suffix(".jsonl.zst")
+        .or_else(|| name.strip_suffix(".jsonl"))?;
+    let stem = stem.strip_prefix("rollout-")?;
+    stem.get(stem.len().saturating_sub(36)..)?.parse().ok()
+}
+
+/// Latest mtime per thread id under `dir`, recursing no deeper than `depth`
+/// — `sessions/` nests three levels of date buckets, and the cap keeps a
+/// pathological tree from stalling a start.
+fn collect_rollout_mtimes(dir: &Path, depth: u8, touched: &mut HashMap<BusId, i64>) {
+    if depth == 0 {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rollout_mtimes(&path, depth - 1, touched);
+            continue;
+        }
+        let Some(id) = entry.file_name().to_str().and_then(rollout_thread_id) else {
+            continue;
+        };
+        if let Some(mtime) = modified_unix(&path) {
+            touched
+                .entry(id)
+                .and_modify(|seen| *seen = (*seen).max(mtime))
+                .or_insert(mtime);
         }
     }
 }
@@ -664,8 +860,30 @@ fn prompt_text(body: &Body) -> Option<String> {
 fn append_gaps(
     transcripts: &Path,
     held: &[Record],
+    log: Option<&mut SegmentLog>,
+    since: Option<i64>,
+) -> io::Result<Outcome> {
+    append_gaps_files(
+        &session_files(transcripts)?,
+        held,
+        log,
+        since,
+        &mut None,
+        None,
+    )
+}
+
+/// The per-file loop of `append_gaps`, lifted out of the walk so the start
+/// path can time each half separately and stop when its budget runs out.
+/// `timing` and `deadline` are the start path's; the manual `backfill` path
+/// passes none of either — an explicit backfill has no socket to free.
+fn append_gaps_files(
+    files: &[PathBuf],
+    held: &[Record],
     mut log: Option<&mut SegmentLog>,
     since: Option<i64>,
+    timing: &mut Option<&mut GapTiming>,
+    deadline: Option<Instant>,
 ) -> io::Result<Outcome> {
     let known = known_from(held.iter());
     let grouped = by_bus(held);
@@ -676,7 +894,13 @@ fn append_gaps(
             known.unreadable_live.len() as u64,
         );
     }
-    for file in session_files(transcripts)? {
+    for file in files {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            if let Some(t) = timing.as_deref_mut() {
+                t.budget_exhausted = true;
+            }
+            break;
+        }
         let Some(session) = file
             .file_stem()
             .and_then(|stem| stem.to_str())
@@ -687,13 +911,17 @@ fn append_gaps(
         let Some(&live_bus) = known.live_bus.get(&session) else {
             continue;
         };
-        if untouched_since(&file, since) {
+        if untouched_since(file, since) {
             continue;
         }
-        let Ok(text) = fs::read_to_string(&file) else {
+        let Ok(text) = fs::read_to_string(file) else {
             *outcome.unread.entry("unreadable file".into()).or_default() += 1;
             continue;
         };
+        if let Some(t) = timing.as_deref_mut() {
+            t.claude_files += 1;
+            t.claude_bytes += text.len() as u64;
+        }
         let recovered = parse_claude_transcript(&text, live_bus);
         for (reason, count) in &recovered.skipped {
             *outcome.unread.entry(reason.clone()).or_default() += count;
@@ -1588,5 +1816,85 @@ mod tests {
             &r.event,
             Event::TurnStarted { prompt, .. } if prompt_text(prompt).as_deref() == Some("from downloads")
         )));
+    }
+
+    /// A rollout file with the modification time `stamp` (unix seconds).
+    fn rollout(dir: &Path, name: &str, stamp: u64) {
+        fs::create_dir_all(dir).expect("dir");
+        let file = fs::File::create(dir.join(name)).expect("rollout");
+        file.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(stamp))
+            .expect("mtime");
+    }
+
+    #[test]
+    fn a_rollout_name_yields_its_thread_id() {
+        let id: BusId = SESSION.parse().expect("uuid");
+        assert_eq!(
+            rollout_thread_id(&format!("rollout-2026-11-01T13-45-52-{SESSION}.jsonl")),
+            Some(id)
+        );
+        assert_eq!(
+            rollout_thread_id(&format!("rollout-2026-03-21T00-15-32-{SESSION}.jsonl.zst")),
+            Some(id)
+        );
+        assert_eq!(rollout_thread_id("rollout-not-a-thread.jsonl"), None);
+        assert_eq!(rollout_thread_id("notes.txt"), None);
+    }
+
+    #[test]
+    fn only_codex_threads_touched_since_the_cutoff_are_asked() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let old: BusId = SESSION.parse().expect("uuid");
+        let fresh: BusId = "00000000-aaaa-bbbb-cccc-ddddeeeeffff"
+            .parse()
+            .expect("uuid");
+        let gone: BusId = "11111111-aaaa-bbbb-cccc-ddddeeeeffff"
+            .parse()
+            .expect("uuid");
+        let sessions = home
+            .path()
+            .join("sessions")
+            .join("2026")
+            .join("11")
+            .join("01");
+        rollout(
+            &sessions,
+            &format!("rollout-2026-11-01T01-00-00-{old}.jsonl"),
+            1_000,
+        );
+        rollout(
+            &sessions,
+            &format!("rollout-2026-11-01T13-00-00-{fresh}.jsonl"),
+            2_000,
+        );
+        // The archived store answers the same way, compressed.
+        rollout(
+            &home.path().join("archived_sessions"),
+            &format!("rollout-2026-03-21T00-15-32-{gone}.jsonl.zst"),
+            3_000,
+        );
+        // `gone` names its file through the archived name rather than
+        // sessions/: the map still carries the thread id.
+        let mut bound = HashSet::from([old, fresh, gone]);
+        let asked =
+            codex_threads_touched_since_in(home.path(), &bound, 1_500).expect("sessions dir read");
+        // Asked about in most-recently-touched order.
+        assert_eq!(asked, vec![gone, fresh]);
+        // A thread with no file anywhere cannot be hydrated by the
+        // app-server — it is out rather than asked.
+        bound.insert(BusId::mint());
+        let asked =
+            codex_threads_touched_since_in(home.path(), &bound, 1_500).expect("sessions dir read");
+        assert_eq!(asked, vec![gone, fresh]);
+    }
+
+    #[test]
+    fn an_unwalkable_codex_home_falls_back_to_the_rpc() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let bound = HashSet::from([SESSION.parse::<BusId>().expect("uuid")]);
+        assert_eq!(
+            codex_threads_touched_since_in(home.path(), &bound, 1_500),
+            None
+        );
     }
 }
