@@ -676,13 +676,38 @@ conbus uninstall --apply  # 지우기
 **`takeover  stale → …`** — 기다리는 `conbus run`이 없을 때 hop이 일어났습니다.
 다음 `conbus run`이 그것을 버립니다. 따로 할 일은 없습니다.
 
-**누구 것인지 모를 로그인 탭이 떴다면** — 그 주소를 `conbus auth --url "<URL>"`에
-붙여 넣으세요. 페이지가 무엇인지(Google OAuth, OpenAI, Anthropic, Playwright
-MCP 브리지 등), 페이지가 돌아가는 포트를 어느 프로세스가 잡고 있는지, 그
-프로세스의 계보에 conbus가 있는지(conbus는 스스로 로그인 페이지를 열지 않습니다),
-그리고 브리지라면 어느 벤더 설정 파일에 토큰이 있는지를 알려 줍니다. `conbus auth`
-만 치면 지금 어느 벤더가 로그인을 필요로 하는지를 보여 줍니다. 기록에는 로그인이
-필요 없습니다.
+**누구 것인지 모를 로그인 탭이 떴다면** — 그 주소를 복사한 뒤
+`pbpaste | conbus auth --url -`를 실행하세요(Linux에서는
+`wl-paste | conbus auth --url -` 또는
+`xclip -o -selection clipboard | conbus auth --url -`). 표준 입력으로 넘기면 주소에
+든 토큰이 셸 기록에도, 이 명령을 실행한 에이전트의 기록에도 남지 않습니다.
+`conbus auth --url "<URL>"`도 동작하지만, 쿼리가 있는 URL이면 경고합니다. 아무것도
+저장하지 않으며, 쿼리 값은 콜백 포트와 `client` 이름만 출력합니다. `client` 이름은
+URL의 주장으로만 보여 줍니다.
+
+페이지는 스킴과 호스트로만 판별하고, 그 밖은 `unknown page`입니다. 페이지가 이
+컴퓨터의 포트로 콜백하면 그 포트에서 듣는 프로세스를 모두 루트까지 거슬러 올라갑니다.
+그 결과는 다음과 같습니다.
+
+- `conbus yes` — 그 계보에 conbus라는 이름의 프로세스가 있습니다.
+- `conbus no` — 없습니다. 계보에 대한 말일 뿐이며, 다음 줄이 이 추적으로 볼 수 없는
+  것을 알려 줍니다. 자기를 시작한 프로세스보다 오래 살아남은 서버와 hop이 연 앱은
+  모두 루트에 바로 매달립니다. conbus의 모든 읽기는 `codex app-server`를 시작하고,
+  `conbus status`가 hop 목록을 보여 줍니다.
+- `conbus cannot tell` — 듣는 프로세스가 없거나, 포트가 없거나, 콜백이 다른
+  호스트에 있거나, 추적이 도중에 끊긴 경우입니다. 무엇이 있으면 알 수 있는지 함께
+  알려 줍니다.
+
+`conbus auth`는 벤더 설정을 읽지 않습니다. Playwright 브리지 페이지에
+`Invalid token provided`가 보이면 그 클라이언트가 받은 토큰이, 탭이 열린 Chrome
+프로필의 확장 프로그램 토큰과 다른 것입니다. 확장 프로그램 페이지의 토큰을 그
+클라이언트의 `PLAYWRIGHT_MCP_EXTENSION_TOKEN`에 복사하세요.
+`PLAYWRIGHT_MCP_PROFILE_DIR_NAME`으로 프로필을 고정할 수 있습니다.
+
+`conbus auth`만 실행하면 지금 어느 벤더에 로그인이 필요한지와, 아무도 없을 때
+conbus가 무엇을 실행하는지를 보여 줍니다. 기록에는 로그인이 필요 없습니다.
+`conbus auth --html`은 같은 내용을 오프라인 한 장으로 쓰고, `--open`을 더해야만
+그 페이지를 엽니다.
 
 **`nameless  <bus id> — N records…`** — 0.1.0 이전 빌드가 세션을 밝히지 않은
 이벤트를 공용 대화 하나 아래 묶었습니다. 0.1.0부터는 그런 이벤트를 거부합니다.
@@ -783,7 +808,7 @@ hop도 대화를 내 계정 하나에서 다른 계정으로 옮기지 않습니
 | `conbus install --managed` | Claude Code 관리 설정에 넣을 훅 블록(stdout의 JSON)과 넣을 곳을 출력. 아무것도 쓰지 않음([Managed Macs](fleet.md)) |
 | `conbus uninstall [--apply]` | 모두 다시 빼기. 로그는 남김 |
 | `conbus doctor` | 무엇이 연결됐고 무엇이 안 됐는지 |
-| `conbus auth [--url URL] [--html [PATH]] [--open]` | 어느 벤더가 로그인을 필요로 하는지(conbus 자체는 절대 아님). `--url`은 뜬 페이지가 누구 것인지와 어느 프로세스가 요청했는지를 알려 주고, `--html`은 같은 내용을 오프라인 한 장으로 씀(실험적) |
+| `conbus auth [--url URL] [--html [PATH]] [--open]` | 어느 벤더가 로그인을 필요로 하는지(conbus 자체는 절대 아님). `--url`은 URL이 누구 페이지인지와 콜백 포트에서 무엇이 듣는지를 알려 주고, `--url -`는 URL을 표준 입력에서 읽음. `--html`은 같은 내용을 오프라인 한 장으로 씀(실험적) |
 | `conbus status` | 라우팅 규칙, 쿼터, hop 기록, 비용 |
 | `conbus quota` | 각 레그에 남은 양 |
 | `conbus log [--json] [--bus-id ID] [--since TS] [--tail N] [--grep TEXT] [--reveal]` | 로그 읽기 |
