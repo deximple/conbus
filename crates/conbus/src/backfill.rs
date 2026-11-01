@@ -13,7 +13,7 @@ use std::time::Instant;
 
 use conbus_core::backfill::{
     CLAUDE_CHAT_EXPORT, CLAUDE_TRANSCRIPT, CODEX_THREAD, Recovered, parse_claude_chat_export,
-    parse_claude_transcript, parse_codex_thread,
+    parse_claude_transcript, parse_claude_transcript_born, parse_codex_thread,
 };
 
 use crate::appserver::AppServer;
@@ -510,7 +510,7 @@ fn append_gaps_at_start_in(
     if let Some(since) = codex_since {
         write_since(paths, &codex_marker, since);
     }
-    let mut spool = Spool::new(paths.spool_dir());
+    let mut elsewhere = Elsewhere::new(paths.spool_dir(), held);
     let mut n = 0;
     if let Some(home) = home {
         let transcripts = home.join(".claude").join("projects");
@@ -524,7 +524,7 @@ fn append_gaps_at_start_in(
                 held,
                 Some(&mut *log),
                 since,
-                &mut spool,
+                &mut elsewhere,
                 Some(StartFill {
                     timing: &mut timing,
                     deadline,
@@ -549,7 +549,7 @@ fn append_gaps_at_start_in(
             held,
             Some(&mut *log),
             codex_since,
-            &mut spool,
+            &mut elsewhere,
             StartFill {
                 timing: &mut timing,
                 deadline,
@@ -662,6 +662,20 @@ fn modified_unix(path: &Path) -> Option<i64> {
         .ok()?
         .as_secs();
     i64::try_from(seconds).ok()
+}
+
+/// When a file was created, where the file system keeps that.
+fn born(path: &Path) -> Option<std::time::SystemTime> {
+    fs::metadata(path).ok()?.created().ok()
+}
+
+/// [`born`], as a stamp.
+fn born_at(path: &Path) -> Option<Timestamp> {
+    let seconds = born(path)?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    Timestamp::from_unix_seconds(i64::try_from(seconds).ok()?)
 }
 
 /// Whether a file is old enough that it cannot hold anything after `since`.
@@ -849,7 +863,7 @@ fn fill_live_codex_gaps(
     held: &[Record],
     mut log: Option<&mut SegmentLog>,
     since: Option<i64>,
-    spool: &mut Spool,
+    elsewhere: &mut Elsewhere<'_>,
     start: StartFill<'_>,
     server_limit: std::time::Duration,
 ) -> io::Result<CodexFill> {
@@ -983,7 +997,7 @@ fn fill_live_codex_gaps(
         let thread = serde_json::json!({"id": name, "sessionId": name});
         let recovered = parse_codex_thread(&thread, &turns);
         let mine = grouped.get(name).into_iter().flatten().copied();
-        let missing = still_missing(mine, spool, name, bus_id, recovered);
+        let missing = still_missing(mine, elsewhere, name, bus_id, recovered);
         if !missing.is_empty() {
             fill.threads += 1;
             fill.turns += missing
@@ -1173,14 +1187,22 @@ pub fn fill_gaps(
     let mut log = apply
         .then(|| SegmentLog::open(paths.log_dir(), Retention::default()))
         .transpose()?;
-    let mut outcome = append_gaps(transcripts, &held, log.as_mut(), None, &paths.spool_dir())?;
+    let mut elsewhere = Elsewhere::new(paths.spool_dir(), &held);
+    let mut outcome = append_gaps_files(
+        &session_files(transcripts)?,
+        &held,
+        log.as_mut(),
+        None,
+        &mut elsewhere,
+        None,
+    )?;
     if codex {
         let mut timing = GapTiming::default();
         let fill = fill_live_codex_gaps(
             &held,
             log.as_mut(),
             None,
-            &mut Spool::new(paths.spool_dir()),
+            &mut elsewhere,
             StartFill {
                 timing: &mut timing,
                 deadline: Instant::now() + CODEX_DEADLINE,
@@ -1197,6 +1219,12 @@ pub fn fill_gaps(
                 .unread
                 .insert("thread/turns/list refused".into(), fill.refused);
         }
+    }
+    if elsewhere.claims.set_aside > 0 {
+        outcome.unread.insert(
+            "turn another conversation holds".into(),
+            elsewhere.claims.set_aside,
+        );
     }
     Ok(outcome)
 }
@@ -1321,9 +1349,13 @@ fn not_held<'a>(
 /// that made it look so: a hook that spooled before its line was written is seen
 /// here. One that spools in the moment between the two reads is not, and is
 /// written by both.
+///
+/// Nor does it hold what another conversation holds: see [`Claims`]. What it does
+/// leave counts as held from here on, so a second source listing the same turn
+/// leaves it too, in a dry run as well.
 fn still_missing<'a>(
     held: impl IntoIterator<Item = &'a Record>,
-    spool: &mut Spool,
+    elsewhere: &mut Elsewhere<'_>,
     session: &str,
     bus_id: BusId,
     recovered: Recovered,
@@ -1333,11 +1365,115 @@ fn still_missing<'a>(
     if missing.is_empty() {
         return missing;
     }
-    let waiting = spool.waiting(session, bus_id);
-    if waiting.is_empty() {
-        return missing;
+    let waiting = elsewhere.spool.waiting(session, bus_id);
+    let missing = if waiting.is_empty() {
+        missing
+    } else {
+        not_held(&waiting, &listed, session, bus_id, missing)
+    };
+    elsewhere.without_copies(missing, session, bus_id)
+}
+
+/// What a fill checks a source against besides the conversation it would write to.
+struct Elsewhere<'a> {
+    spool: Spool,
+    claims: Claims<'a>,
+}
+
+impl<'a> Elsewhere<'a> {
+    fn new(spool: PathBuf, log: &'a [Record]) -> Self {
+        Elsewhere {
+            spool: Spool::new(spool),
+            claims: Claims {
+                log,
+                holders: None,
+                set_aside: 0,
+            },
+        }
     }
-    not_held(&waiting, &listed, session, bus_id, missing)
+
+    /// `missing`, whole turns of it, without what another conversation holds or
+    /// has waiting in the spool. Each turn left is then claimed by this one.
+    fn without_copies(&mut self, missing: Vec<Entry>, session: &str, bus_id: BusId) -> Vec<Entry> {
+        let mut kept = Vec::with_capacity(missing.len());
+        let mut keep = true;
+        for entry in missing {
+            if matches!(entry.event, Event::TurnStarted { .. }) {
+                keep = entry.vendor_turn_id.as_ref().is_none_or(|id| {
+                    !self.claims.held_by_another(id.as_str(), session, bus_id)
+                        && !self.spool.waiting_for_another(id.as_str(), session)
+                });
+                self.claims.set_aside += u64::from(!keep);
+            }
+            if !keep {
+                continue;
+            }
+            if let (Event::TurnStarted { .. }, Some(id)) = (&entry.event, &entry.vendor_turn_id) {
+                self.claims.claim(id.as_str(), Some(session), bus_id);
+            }
+            kept.push(entry);
+        }
+        kept
+    }
+}
+
+/// Which conversations hold each turn id, as far as one fill can see: the log it
+/// read, and what it has decided to write since.
+///
+/// A vendor's turn id is a UUID, so another conversation holding one means this
+/// source's line was copied from there. Any record with the id counts, because a
+/// hook can lose a prompt and still report the turn's tools and its end. Built the
+/// first time anything looks missing, which at most starts is never.
+struct Claims<'a> {
+    log: &'a [Record],
+    holders: Option<Holders>,
+    /// Turns left out because another conversation holds them.
+    set_aside: u64,
+}
+
+/// Each turn id, with the session and conversation of every record holding it.
+type Holders = HashMap<String, Vec<(Option<String>, BusId)>>;
+
+impl Claims<'_> {
+    fn holders(&mut self) -> &mut Holders {
+        let log = self.log;
+        self.holders.get_or_insert_with(|| {
+            let mut holders = HashMap::new();
+            for record in log {
+                if let Some(id) = &record.vendor_turn_id {
+                    let session = record.source.vendor_session_id.as_deref();
+                    add_holder(&mut holders, id.as_str(), session, record.bus_id);
+                }
+            }
+            holders
+        })
+    }
+
+    /// Whether a conversation other than this one holds `id`. A split leaves one
+    /// session under two conversations and a hop leaves two sessions under one, and
+    /// neither is a copy, so another means both another session and another `bus_id`.
+    fn held_by_another(&mut self, id: &str, session: &str, bus_id: BusId) -> bool {
+        self.holders().get(id).is_some_and(|holders| {
+            holders
+                .iter()
+                .any(|(name, bus)| *bus != bus_id && name.as_deref() != Some(session))
+        })
+    }
+
+    fn claim(&mut self, id: &str, session: Option<&str>, bus_id: BusId) {
+        add_holder(self.holders(), id, session, bus_id);
+    }
+}
+
+fn add_holder(holders: &mut Holders, id: &str, session: Option<&str>, bus_id: BusId) {
+    let held = |(name, bus): &(Option<String>, BusId)| *bus == bus_id && name.as_deref() == session;
+    match holders.get_mut(id) {
+        Some(known) if known.iter().any(held) => {}
+        Some(known) => known.push((session.map(str::to_string), bus_id)),
+        None => {
+            holders.insert(id.to_string(), vec![(session.map(str::to_string), bus_id)]);
+        }
+    }
 }
 
 /// The spool as one fill sees it. Each entry is read once, however many sessions
@@ -1347,6 +1483,8 @@ struct Spool {
     dir: PathBuf,
     seen: HashSet<std::ffi::OsString>,
     by_session: HashMap<String, Vec<Request>>,
+    /// The sessions each turn id waits for.
+    by_turn: HashMap<String, HashSet<String>>,
 }
 
 impl Spool {
@@ -1355,6 +1493,7 @@ impl Spool {
             dir,
             seen: HashSet::new(),
             by_session: HashMap::new(),
+            by_turn: HashMap::new(),
         }
     }
 
@@ -1379,12 +1518,26 @@ impl Spool {
                 .flatten()
                 .and_then(|text| serde_json::from_str::<Request>(text.trim()).ok());
             if let Some(request) = request {
+                if let Some(turn) = &request.vendor_turn_id {
+                    self.by_turn
+                        .entry(turn.as_str().to_string())
+                        .or_default()
+                        .insert(request.vendor_session_id.clone());
+                }
                 self.by_session
                     .entry(request.vendor_session_id.clone())
                     .or_default()
                     .push(request);
             }
         }
+    }
+
+    /// Whether a hook of another session is waiting with this turn id. Asked after
+    /// [`Spool::waiting`], which is what reads it.
+    fn waiting_for_another(&self, turn: &str, session: &str) -> bool {
+        self.by_turn
+            .get(turn)
+            .is_some_and(|sessions| sessions.iter().any(|name| name != session))
     }
 
     /// What it holds for one session, as the records the drain will make of it.
@@ -1436,23 +1589,6 @@ fn prompt_text(body: &Body) -> Option<String> {
     }
 }
 
-fn append_gaps(
-    transcripts: &Path,
-    held: &[Record],
-    log: Option<&mut SegmentLog>,
-    since: Option<i64>,
-    spool: &Path,
-) -> io::Result<Outcome> {
-    append_gaps_files(
-        &session_files(transcripts)?,
-        held,
-        log,
-        since,
-        &mut Spool::new(spool.to_path_buf()),
-        None,
-    )
-}
-
 /// The per-file loop of `append_gaps`, lifted out of the walk so the start
 /// path can time each half separately and stop when its budget runs out.
 fn append_gaps_files(
@@ -1460,7 +1596,7 @@ fn append_gaps_files(
     held: &[Record],
     mut log: Option<&mut SegmentLog>,
     since: Option<i64>,
-    spool: &mut Spool,
+    elsewhere: &mut Elsewhere<'_>,
     mut start: Option<StartFill<'_>>,
 ) -> io::Result<Outcome> {
     let known = known_from(held.iter());
@@ -1485,6 +1621,14 @@ fn append_gaps_files(
     let mut sessions = HashSet::new();
     to_read.retain(|(_, stem, _)| sessions.insert(*stem));
     to_read.sort_by_key(|(file, ..)| *file);
+    // Oldest file first, so a parent reaches a turn before its fork's copy does.
+    // Neither holds it yet, the lines look the same, and what is read first is what
+    // writes. On all 57,608 real lines that still name their parent's session, the
+    // file they name was created first.
+    to_read.sort_by_cached_key(|(file, ..)| {
+        let born = born(file);
+        (born.is_none(), born)
+    });
     // What a cut range has read at this length is done, and what it has not read
     // at all goes first, or a file that keeps growing uses every budget up.
     if let Some(read) = start.as_ref().map(|start| &*start.read) {
@@ -1511,13 +1655,13 @@ fn append_gaps_files(
             start.timing.claude_files += 1;
             start.timing.claude_bytes += text.len() as u64;
         }
-        let recovered = parse_claude_transcript(&text, stem, live_bus);
+        let recovered = parse_claude_transcript_born(&text, stem, live_bus, born_at(file));
         for (reason, count) in &recovered.skipped {
             *outcome.unread.entry(reason.clone()).or_default() += count;
         }
         let missing = still_missing(
             grouped.get(stem).into_iter().flatten().copied(),
-            spool,
+            elsewhere,
             stem,
             live_bus,
             recovered,
@@ -1936,18 +2080,25 @@ mod tests {
         }
     }
 
+    /// A stamp from now. A fill takes a line stamped well before its file was
+    /// created for a copy, so what a test wants filled cannot carry a fixed date.
+    fn stamp_now() -> String {
+        Timestamp::now().to_string()
+    }
+
     /// One Claude Code transcript for `session`, shaped like the real ones:
     /// a prompt line carrying the checkout and the front end, and a reply.
     fn transcript(machine: &Machine, session: &str) {
         let project = machine.transcripts.join("-Applications-conbus");
         fs::create_dir_all(&project).expect("project dir");
+        let now = stamp_now();
         fs::write(
             project.join(format!("{session}.jsonl")),
             format!(
-                "{{\"type\":\"user\",\"sessionId\":\"{session}\",\"timestamp\":\"2026-08-31T09:33:02.222Z\",\
+                "{{\"type\":\"user\",\"sessionId\":\"{session}\",\"timestamp\":\"{now}\",\
                  \"version\":\"2.1.241\",\"cwd\":\"/Applications/conbus\",\"entrypoint\":\"cli\",\
                  \"promptId\":\"P1\",\"message\":{{\"role\":\"user\",\"content\":\"Reply with OK\"}}}}\n\
-                 {{\"type\":\"assistant\",\"sessionId\":\"{session}\",\"timestamp\":\"2026-08-31T09:33:03.000Z\",\
+                 {{\"type\":\"assistant\",\"sessionId\":\"{session}\",\"timestamp\":\"{now}\",\
                  \"version\":\"2.1.241\",\"message\":{{\"role\":\"assistant\",\"stop_reason\":\"end_turn\",\"content\":[{{\"type\":\"text\",\
                  \"text\":\"OK\"}}]}}}}\n"
             ),
@@ -1981,6 +2132,23 @@ mod tests {
             },
         })
         .expect("append");
+    }
+
+    fn append_gaps(
+        transcripts: &Path,
+        held: &[Record],
+        log: Option<&mut SegmentLog>,
+        since: Option<i64>,
+        spool: &Path,
+    ) -> io::Result<Outcome> {
+        append_gaps_files(
+            &session_files(transcripts)?,
+            held,
+            log,
+            since,
+            &mut Elsewhere::new(spool.to_path_buf(), held),
+            None,
+        )
     }
 
     fn records_on_disk(machine: &Machine) -> usize {
@@ -2121,19 +2289,20 @@ mod tests {
     fn transcript_two_turns(machine: &Machine, session: &str) {
         let project = machine.transcripts.join("-Applications-conbus");
         fs::create_dir_all(&project).expect("project dir");
+        let now = stamp_now();
         fs::write(
             project.join(format!("{session}.jsonl")),
             format!(
-                "{{\"type\":\"user\",\"sessionId\":\"{session}\",\"timestamp\":\"2026-08-31T09:33:02.222Z\",\
+                "{{\"type\":\"user\",\"sessionId\":\"{session}\",\"timestamp\":\"{now}\",\
                  \"version\":\"2.1.241\",\"cwd\":\"/Applications/conbus\",\"entrypoint\":\"cli\",\
                  \"promptId\":\"P1\",\"message\":{{\"role\":\"user\",\"content\":\"Reply with OK\"}}}}\n\
-                 {{\"type\":\"assistant\",\"sessionId\":\"{session}\",\"timestamp\":\"2026-08-31T09:33:03.000Z\",\
+                 {{\"type\":\"assistant\",\"sessionId\":\"{session}\",\"timestamp\":\"{now}\",\
                  \"version\":\"2.1.241\",\"message\":{{\"role\":\"assistant\",\"stop_reason\":\"end_turn\",\"content\":[{{\"type\":\"text\",\
                  \"text\":\"OK\"}}]}}}}\n\
-                 {{\"type\":\"user\",\"sessionId\":\"{session}\",\"timestamp\":\"2026-08-31T09:34:00.000Z\",\
+                 {{\"type\":\"user\",\"sessionId\":\"{session}\",\"timestamp\":\"{now}\",\
                  \"version\":\"2.1.241\",\"cwd\":\"/Applications/conbus\",\"entrypoint\":\"cli\",\
                  \"promptId\":\"P2\",\"message\":{{\"role\":\"user\",\"content\":\"the turn the daemon missed\"}}}}\n\
-                 {{\"type\":\"assistant\",\"sessionId\":\"{session}\",\"timestamp\":\"2026-08-31T09:34:01.000Z\",\
+                 {{\"type\":\"assistant\",\"sessionId\":\"{session}\",\"timestamp\":\"{now}\",\
                  \"version\":\"2.1.241\",\"message\":{{\"role\":\"assistant\",\"stop_reason\":\"end_turn\",\"content\":[{{\"type\":\"text\",\
                  \"text\":\"caught up\"}}]}}}}\n"
             ),
@@ -2626,7 +2795,27 @@ mod tests {
     }
 
     #[test]
-    fn another_sessions_spool_entry_does_not_stand_in_for_this_turn() {
+    fn another_sessions_words_in_the_spool_do_not_stand_in_for_this_turn() {
+        let machine = machine();
+        recorded_live(&machine, SESSION);
+        transcript_two_turns(&machine, SESSION);
+        in_the_spool(
+            &machine,
+            "a",
+            "11111111-aaaa-bbbb-cccc-ddddeeeeffff",
+            "its-own-turn",
+            "the turn the daemon missed",
+        );
+
+        let outcome = fill_gaps(&machine.paths, &machine.transcripts, true, false).expect("fill");
+
+        assert_eq!(outcome.gap_records, 2);
+    }
+
+    #[test]
+    fn a_turn_waiting_in_the_spool_for_another_session_is_a_copy_here() {
+        // The parent's hook found no daemon, and the fork lists the same turn. The
+        // drain will write it under the parent, so the fork must not.
         let machine = machine();
         recorded_live(&machine, SESSION);
         transcript_two_turns(&machine, SESSION);
@@ -2640,7 +2829,132 @@ mod tests {
 
         let outcome = fill_gaps(&machine.paths, &machine.transcripts, true, false).expect("fill");
 
-        assert_eq!(outcome.gap_records, 2);
+        assert_eq!(outcome.gap_records, 0);
+        assert_eq!(
+            outcome.unread.get("turn another conversation holds"),
+            Some(&1)
+        );
+        assert_eq!(records_on_disk(&machine), 1);
+    }
+
+    /// A recorded prompt with this turn id, under its own session and conversation.
+    fn held_under_another_conversation(machine: &Machine, turn: &str) {
+        logged(
+            machine,
+            vec![live_prompt(
+                "11111111-aaaa-bbbb-cccc-ddddeeeeffff",
+                Harness::CLAUDE_CODE,
+                BusId::mint(),
+                Some(turn),
+                "said in the other conversation",
+            )],
+        );
+    }
+
+    #[test]
+    fn a_turn_another_conversation_holds_is_not_missing() {
+        let machine = machine();
+        recorded_live(&machine, SESSION);
+        transcript_two_turns(&machine, SESSION);
+        held_under_another_conversation(&machine, "P2");
+        let before = records_on_disk(&machine);
+
+        let outcome = fill_gaps(&machine.paths, &machine.transcripts, true, false).expect("fill");
+
+        assert_eq!(outcome.gap_turns, 0, "neither the prompt nor its ending");
+        assert_eq!(outcome.gap_records, 0);
+        assert_eq!(
+            outcome.unread.get("turn another conversation holds"),
+            Some(&1)
+        );
+        assert_eq!(records_on_disk(&machine), before);
+    }
+
+    #[test]
+    fn only_a_prompts_id_on_another_conversation_is_enough_to_leave_it() {
+        // Its prompt hook was lost and a tool or `Stop` hook still named the turn.
+        let machine = machine();
+        recorded_live(&machine, SESSION);
+        transcript_two_turns(&machine, SESSION);
+        let mut log =
+            SegmentLog::open(machine.paths.log_dir(), Retention::default()).expect("open");
+        let mut ending = live_prompt(
+            "11111111-aaaa-bbbb-cccc-ddddeeeeffff",
+            Harness::CLAUDE_CODE,
+            BusId::mint(),
+            Some("P2"),
+            "",
+        );
+        ending.event = Event::TurnEnded {
+            state: conbus_core::event::TurnState::Complete,
+            assistant_message: None,
+            tokens: None,
+        };
+        log.append(ending).expect("append");
+        drop(log);
+
+        let outcome = fill_gaps(&machine.paths, &machine.transcripts, true, false).expect("fill");
+
+        assert_eq!(outcome.gap_records, 0);
+    }
+
+    #[test]
+    fn the_same_session_under_a_second_conversation_is_not_another_conversation() {
+        // A split: one session under two ids. Its turn with no ending yet is filled
+        // as before, not taken for a copy of itself.
+        let machine = machine();
+        let bus = BusId::mint();
+        logged(
+            &machine,
+            vec![live_prompt(
+                SESSION,
+                Harness::CLAUDE_CODE,
+                bus,
+                Some("P9"),
+                "seen",
+            )],
+        );
+        let mut elsewhere = Elsewhere::new(machine.paths.spool_dir(), &[]);
+        let records = held(&machine);
+        elsewhere.claims.log = &records;
+
+        assert!(
+            !elsewhere
+                .claims
+                .held_by_another("P9", SESSION, BusId::mint())
+        );
+        assert!(
+            !elsewhere
+                .claims
+                .held_by_another("P9", "a-leg-of-the-hop", bus)
+        );
+        assert!(
+            elsewhere
+                .claims
+                .held_by_another("P9", "another", BusId::mint())
+        );
+    }
+
+    #[test]
+    fn a_dry_run_counts_a_turn_two_sources_list_once() {
+        // What a dry run says is what `--apply` would do, and it writes nothing for
+        // the second source to find.
+        let machine = machine();
+        let (older, newer) = (
+            "aaaaaaaa-0000-4000-8000-000000000001",
+            "ffffffff-0000-4000-8000-000000000002",
+        );
+        recorded_live(&machine, older);
+        recorded_live(&machine, newer);
+        transcript_two_turns(&machine, older);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        transcript_two_turns(&machine, newer);
+
+        let dry = fill_gaps(&machine.paths, &machine.transcripts, false, false).expect("dry");
+        let applied = fill_gaps(&machine.paths, &machine.transcripts, true, false).expect("apply");
+
+        assert_eq!(dry.gap_turns, 1, "P2, once: P1 is held by its words");
+        assert_eq!(dry, applied);
     }
 
     #[test]
@@ -2668,7 +2982,7 @@ mod tests {
             .map(|id| {
                 serde_json::json!({
                     "type": "user", "sessionId": SESSION, "promptId": id,
-                    "timestamp": "2026-08-31T09:33:02.222Z",
+                    "timestamp": stamp_now(),
                     "message": {"role": "user", "content": "continue"}
                 })
                 .to_string()
@@ -2991,13 +3305,14 @@ mod tests {
             .join("projects")
             .join("-Applications-conbus");
         fs::create_dir_all(&project).expect("project dir");
+        let now = stamp_now();
         fs::write(
             project.join(format!("{session}.jsonl")),
             format!(
-                "{{\"type\":\"user\",\"sessionId\":\"{session}\",\"timestamp\":\"2026-08-31T09:33:02.222Z\",\
+                "{{\"type\":\"user\",\"sessionId\":\"{session}\",\"timestamp\":\"{now}\",\
                  \"version\":\"2.1.241\",\"cwd\":\"/Applications/conbus\",\"entrypoint\":\"cli\",\
                  \"promptId\":\"P1\",\"message\":{{\"role\":\"user\",\"content\":\"Reply with OK\"}}}}\n\
-                 {{\"type\":\"assistant\",\"sessionId\":\"{session}\",\"timestamp\":\"2026-08-31T09:33:03.000Z\",\
+                 {{\"type\":\"assistant\",\"sessionId\":\"{session}\",\"timestamp\":\"{now}\",\
                  \"version\":\"2.1.241\",\"message\":{{\"role\":\"assistant\",\"stop_reason\":\"end_turn\",\"content\":[{{\"type\":\"text\",\
                  \"text\":\"OK\"}}]}}}}\n"
             ),
@@ -3196,13 +3511,14 @@ mod tests {
     /// a read that takes longer than a tiny budget.
     fn a_big_transcript(project: &Path, session: &str, filler: usize) {
         let padding = "x".repeat(1024);
+        let now = stamp_now();
         let mut big = format!(
-            "{{\"type\":\"user\",\"sessionId\":\"{session}\",\"timestamp\":\"2026-11-01T00:00:00.000Z\",\
+            "{{\"type\":\"user\",\"sessionId\":\"{session}\",\"timestamp\":\"{now}\",\
              \"promptId\":\"seen\",\"message\":{{\"role\":\"user\",\"content\":\"a live prompt the transcript does not hold\"}}}}\n"
         );
         for _ in 0..filler {
             big.push_str(&format!(
-                "{{\"type\":\"assistant\",\"sessionId\":\"{session}\",\"timestamp\":\"2026-11-01T00:00:01.000Z\",\
+                "{{\"type\":\"assistant\",\"sessionId\":\"{session}\",\"timestamp\":\"{now}\",\
                  \"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"{padding}\"}}]}}}}\n"
             ));
         }
@@ -3210,10 +3526,11 @@ mod tests {
     }
 
     fn a_missed_turn(project: &Path, session: &str, words: &str) {
+        let now = stamp_now();
         fs::write(
             project.join(format!("{session}.jsonl")),
             format!(
-                "{{\"type\":\"user\",\"sessionId\":\"{session}\",\"timestamp\":\"2026-11-01T00:00:00.000Z\",\
+                "{{\"type\":\"user\",\"sessionId\":\"{session}\",\"timestamp\":\"{now}\",\
                  \"promptId\":\"missed\",\"message\":{{\"role\":\"user\",\"content\":\"{words}\"}}}}\n"
             ),
         )
@@ -3309,8 +3626,9 @@ mod tests {
             std::io::Write::write_all(
                 &mut grown,
                 format!(
-                    "{{\"type\":\"user\",\"sessionId\":\"{first}\",\"timestamp\":\"2026-11-01T00:01:00.000Z\",\
+                    "{{\"type\":\"user\",\"sessionId\":\"{first}\",\"timestamp\":\"{}\",\
                      \"promptId\":\"{}\",\"message\":{{\"role\":\"user\",\"content\":\"it grew\"}}}}\n",
+                    stamp_now(),
                     BusId::mint()
                 )
                 .as_bytes(),

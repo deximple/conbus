@@ -16,6 +16,12 @@ const CHILD: &str = "437e9522-0000-4000-8000-000000000002";
 const S: &str = "ea1d23e9-bb83-4df5-9a73-a6a12e138d85";
 const T0: &str = "2026-11-01T00:00:00.000Z";
 
+/// A stamp from now. A fill takes a line stamped well before its file was created
+/// for a copy, so what a test wants filled cannot carry a fixed date.
+fn now() -> String {
+    conbus_core::clock::Timestamp::now().to_string()
+}
+
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_conbus")
 }
@@ -121,14 +127,14 @@ fn ended(session: &str, id: &str, text: &str) -> String {
 }
 
 fn user(session: &str, id: &str, text: &str) -> String {
-    json!({"type": "user", "sessionId": session, "timestamp": T0, "version": "2.1.316",
+    json!({"type": "user", "sessionId": session, "timestamp": now(), "version": "2.1.316",
            "cwd": "/repo", "entrypoint": "cli", "promptId": id,
            "message": {"role": "user", "content": text}})
     .to_string()
 }
 
 fn reply(session: &str, text: &str) -> String {
-    json!({"type": "assistant", "sessionId": session, "timestamp": T0, "version": "2.1.316",
+    json!({"type": "assistant", "sessionId": session, "timestamp": now(), "version": "2.1.316",
            "message": {"role": "assistant", "stop_reason": "end_turn",
                        "content": [{"type": "text", "text": text}]}})
     .to_string()
@@ -136,7 +142,7 @@ fn reply(session: &str, text: &str) -> String {
 
 /// What a running turn's transcript ends on: text, and the model not stopped.
 fn partial(session: &str, text: &str) -> String {
-    json!({"type": "assistant", "sessionId": session, "timestamp": T0, "version": "2.1.316",
+    json!({"type": "assistant", "sessionId": session, "timestamp": now(), "version": "2.1.316",
            "message": {"role": "assistant", "stop_reason": "tool_use",
                        "content": [{"type": "text", "text": text}]}})
     .to_string()
@@ -273,6 +279,175 @@ fn a_start_still_fills_what_a_fork_itself_missed() {
         filled
             .iter()
             .all(|record| record["bus_id"] == fork && record["vendor_session_id"] == CHILD)
+    );
+}
+
+/// A `user` line the way a front end writes it.
+fn sdk_user(session: &str, id: &str, text: &str) -> String {
+    let flags = json!({"promptSource": "sdk"});
+    flagged(session, id, text, flags)
+}
+
+/// A line stamped well before the file it is written to can have existed.
+fn from_before_the_file(line: String) -> String {
+    let mut line: Value = serde_json::from_str(&line).expect("json");
+    let epoch = conbus_core::clock::Timestamp::from_unix_seconds(0).expect("epoch");
+    let hours_ago = conbus_core::clock::Timestamp::now().seconds_since(epoch) - 2 * 3600;
+    line["timestamp"] = json!(
+        conbus_core::clock::Timestamp::from_unix_seconds(hours_ago)
+            .expect("a time")
+            .to_string()
+    );
+    line.to_string()
+}
+
+/// A turn neither conversation holds, in the parent's transcript and in the one of
+/// a fork taken moments later: the parent's lines with the fork's own session id
+/// and the parent's prompt id, the shape real forks have before 2026-08-31.
+fn a_fork_taken_right_after_a_turn_nobody_holds(home: &Path) {
+    a_recorded_fork(home);
+    transcript(
+        home,
+        PARENT,
+        &[
+            sdk_user(PARENT, "pp", "the parent's prompt"),
+            reply(PARENT, "the parent's reply"),
+            sdk_user(
+                PARENT,
+                "pq",
+                "a parent turn only its own conversation should hold",
+            ),
+            reply(PARENT, "the parent's other reply"),
+        ],
+    );
+    // CHILD sorts first by name, so only their ages put the parent first.
+    std::thread::sleep(Duration::from_millis(20));
+    transcript(
+        home,
+        CHILD,
+        &[
+            sdk_user(CHILD, "pp", "the parent's prompt"),
+            reply(CHILD, "the parent's reply"),
+            sdk_user(
+                CHILD,
+                "pq",
+                "a parent turn only its own conversation should hold",
+            ),
+            reply(CHILD, "the parent's other reply"),
+            sdk_user(CHILD, "cc", "the fork's prompt"),
+            reply(CHILD, "the fork's reply"),
+        ],
+    );
+}
+
+fn filled_under(all: &[Value], turn: &str) -> Vec<Value> {
+    let bus = all
+        .iter()
+        .find(|record| record["vendor_turn_id"] == turn)
+        .expect("the live prompt")["bus_id"]
+        .clone();
+    all.iter()
+        .filter(|record| record["bus_id"] == bus && record.get("backfilled_from").is_some())
+        .cloned()
+        .collect()
+}
+
+#[test]
+fn a_turn_two_transcripts_list_goes_to_the_older_file_and_not_the_fork() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    a_fork_taken_right_after_a_turn_nobody_holds(home);
+
+    stop(start(home));
+
+    let all = log_lines(home);
+    let under_fork = filled_under(&all, "cc");
+    assert!(
+        under_fork.is_empty(),
+        "under the fork:\n{}",
+        show(&under_fork)
+    );
+    let under_parent = filled_under(&all, "pp");
+    assert_eq!(
+        under_parent.len(),
+        2,
+        "the prompt and its ending:\n{}",
+        show(&all)
+    );
+    assert_eq!(under_parent[0]["vendor_turn_id"], "pq");
+    assert_eq!(under_parent[0]["vendor_session_id"], PARENT);
+
+    stop(start(home));
+    assert_eq!(
+        log_lines(home).len(),
+        all.len(),
+        "a second start adds nothing"
+    );
+}
+
+#[test]
+fn a_fork_does_not_write_a_turn_of_a_parent_the_recorder_never_saw() {
+    // Most of what the real case is: the parent's transcript is not one a fill reads,
+    // and nothing holds these turns, so only their age says they are not the fork's.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let daemon = start(home);
+    hook(home, &prompt(CHILD, "cc", "the fork's prompt"));
+    hook(home, &ended(CHILD, "cc", "the fork's reply"));
+    stop(daemon);
+    transcript(
+        home,
+        CHILD,
+        &[
+            from_before_the_file(sdk_user(CHILD, "pq", "the parent's prompt")),
+            from_before_the_file(reply(CHILD, "the parent's reply")),
+            sdk_user(CHILD, "cc", "the fork's prompt"),
+            reply(CHILD, "the fork's reply"),
+            sdk_user(CHILD, "c2", "said while the recorder was down"),
+            reply(CHILD, "answered while the recorder was down"),
+        ],
+    );
+
+    let (ok, said) = backfill_gaps(home, Path::new("/nonexistent/codex"), true);
+
+    assert!(ok, "{said}");
+    let filled: Vec<Value> = log_lines(home)
+        .into_iter()
+        .filter(|record| record.get("backfilled_from").is_some())
+        .collect();
+    assert_eq!(filled.len(), 2, "\n{}", show(&filled));
+    assert_eq!(
+        filled[0]["prompt"]["text"],
+        "said while the recorder was down"
+    );
+    assert!(said.contains("2 line older than its file"), "{said}");
+}
+
+#[test]
+fn a_start_leaves_a_turn_another_conversation_recorded_out_of_its_fork() {
+    // Taken moments after the turn, so its age does not give it away, and the parent
+    // has no transcript in range: the record is all there is to go on.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    a_recorded_fork(home);
+    transcript(
+        home,
+        CHILD,
+        &[
+            sdk_user(CHILD, "pp", "the parent's prompt"),
+            reply(CHILD, "the parent's reply"),
+            sdk_user(CHILD, "cc", "the fork's prompt"),
+            reply(CHILD, "the fork's reply"),
+        ],
+    );
+
+    stop(start(home));
+
+    let under_fork = filled_under(&log_lines(home), "cc");
+    assert!(
+        under_fork.is_empty(),
+        "under the fork:\n{}",
+        show(&under_fork)
     );
 }
 

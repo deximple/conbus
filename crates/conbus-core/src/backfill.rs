@@ -265,6 +265,35 @@ fn text_of(content: &serde_json::Value) -> Option<String> {
 /// the file's own first line). Those turns belong to the parent's conversation
 /// and are already in the parent's own file.
 pub fn parse_claude_transcript(text: &str, session: &str, bus_id: BusId) -> Recovered {
+    parse_claude_transcript_born(text, session, bus_id, None)
+}
+
+/// How long before a transcript was created one of its own lines can be stamped.
+///
+/// The vendor stamps a line when it happens and can hold a new session's first
+/// lines before the file exists. On 2,409 real transcripts the most that came to is
+/// 10.2 s, and the next file up is at 595 s.
+pub const OWN_LINE_MARGIN_SECS: i64 = 60;
+
+/// As [`parse_claude_transcript`], for a file whose creation time is known: a line
+/// stamped well before the file existed was not written to it, it was copied in.
+///
+/// A fork opens on its parent's lines, and they say so nowhere. Their keys are the
+/// same, older builds rewrote their `sessionId` to the fork's and kept their
+/// `promptId`, and newer ones rewrite the `promptId` to the fork's first. What they
+/// keep is their stamp: on all 67,769 lines real files share, the same in both. So
+/// the file's birth is what tells: of those lines 67,689 are over this margin older
+/// than the later file, and none of the 39,756 in the earlier one is.
+///
+/// Only a fill may use this. A file copied or restored has a new birth and every
+/// line older than it, which costs a fill the turns of that file it has not got and
+/// would cost `backfill --apply` the whole file.
+pub fn parse_claude_transcript_born(
+    text: &str,
+    session: &str,
+    bus_id: BusId,
+    born: Option<Timestamp>,
+) -> Recovered {
     let mut out = Recovered {
         vendor_session_id: Some(session.to_string()),
         ..Recovered::default()
@@ -294,6 +323,17 @@ pub fn parse_claude_transcript(text: &str, session: &str, bus_id: BusId) -> Reco
             out.skip("line of another session");
             continue;
         }
+        let at = line
+            .timestamp
+            .as_deref()
+            .and_then(|text| text.parse::<Timestamp>().ok());
+        if born
+            .zip(at)
+            .is_some_and(|(born, at)| born.seconds_since(at) > OWN_LINE_MARGIN_SECS)
+        {
+            out.skip("line older than its file");
+            continue;
+        }
         // Kept as the last one seen rather than the first: a transcript's
         // opening lines are bookkeeping that carries no `cwd`, and a session
         // that moved should be remembered where it ended up.
@@ -303,10 +343,6 @@ pub fn parse_claude_transcript(text: &str, session: &str, bus_id: BusId) -> Reco
         if let Some(entrypoint) = &line.entrypoint {
             out.entrypoint = Some(Entrypoint::new(entrypoint.clone()));
         }
-        let at = line
-            .timestamp
-            .as_deref()
-            .and_then(|text| text.parse::<Timestamp>().ok());
         let source = Source {
             harness: Harness::new(Harness::CLAUDE_CODE),
             // The transcript carries the vendor version on every message line,
@@ -1154,6 +1190,61 @@ mod tests {
                     == Some("2026-11-01T00:00:00.000Z")
         }));
         assert_eq!(out.entrypoint.as_ref().map(Entrypoint::as_str), Some("cli"));
+    }
+
+    /// A fork as older builds wrote it: the parent's lines under the fork's own id,
+    /// with their old stamps and their old prompt ids.
+    const FORK_UNDER_ITS_OWN_ID: &str = r#"
+{"type":"user","sessionId":"CHILD","timestamp":"2026-10-01T00:00:00.000Z","version":"2.1.200","cwd":"/parent/checkout","entrypoint":"claude-desktop","promptId":"P0","message":{"role":"user","content":"the parent's prompt"}}
+{"type":"assistant","sessionId":"CHILD","timestamp":"2026-10-01T00:00:01.000Z","version":"2.1.200","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"the parent's reply"}]}}
+{"type":"user","sessionId":"CHILD","timestamp":"2026-11-01T00:00:00.000Z","version":"2.1.316","cwd":"/child/checkout","entrypoint":"cli","promptId":"C0","message":{"role":"user","content":"the fork's prompt"}}
+{"type":"assistant","sessionId":"CHILD","timestamp":"2026-11-01T00:00:05.000Z","version":"2.1.316","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"the fork's reply"}]}}
+"#;
+
+    fn stamped(text: &str) -> Timestamp {
+        text.parse().expect("a time")
+    }
+
+    #[test]
+    fn a_line_older_than_its_file_is_a_copy_and_not_a_turn() {
+        let out = parse_claude_transcript_born(
+            FORK_UNDER_ITS_OWN_ID,
+            "CHILD",
+            BusId::mint(),
+            Some(stamped("2026-11-01T00:00:00.100Z")),
+        );
+
+        assert_eq!(prompts(&out), vec!["the fork's prompt"]);
+        assert_eq!(endings(&out), vec!["the fork's reply"]);
+        assert_eq!(out.skipped.get("line older than its file"), Some(&2));
+        assert!(out.entries.iter().all(|entry| {
+            entry.source.workspace.as_deref() == Some("/child/checkout")
+                && entry.source.harness_version.as_deref() == Some("2.1.316")
+        }));
+    }
+
+    #[test]
+    fn a_line_inside_the_margin_of_its_files_birth_is_its_own() {
+        // The vendor holds a new session's first lines for a while before the file
+        // exists, so the file's own first turn is older than the file.
+        let out = parse_claude_transcript_born(
+            FORK_UNDER_ITS_OWN_ID,
+            "CHILD",
+            BusId::mint(),
+            Some(stamped("2026-11-01T00:01:00.000Z")),
+        );
+
+        assert_eq!(prompts(&out), vec!["the fork's prompt"]);
+    }
+
+    #[test]
+    fn a_file_whose_creation_is_not_known_keeps_all_its_lines() {
+        let out = parse_claude_transcript_born(FORK_UNDER_ITS_OWN_ID, "CHILD", BusId::mint(), None);
+
+        assert_eq!(
+            prompts(&out),
+            vec!["the parent's prompt", "the fork's prompt"]
+        );
     }
 
     #[test]
