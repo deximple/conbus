@@ -137,7 +137,7 @@ impl RefServer {
             if !verify(key, signature, body) {
                 return br#"{"error":"bad signature"}"#.to_vec();
             }
-            let device = format!("dev-{:04}", self.devices.len() + 1);
+            let device = format!("{:032x}", self.devices.len() + 1);
             self.devices.insert(key.to_string(), device.clone());
             return serde_json::to_vec(&serde_json::json!({ "device": device }))
                 .unwrap_or_default();
@@ -179,7 +179,7 @@ impl RefServer {
         }
         // Batch: revision only ever goes up per device.
         let day = value
-            .get("day")
+            .get("day_closed")
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default()
             .to_string();
@@ -194,7 +194,8 @@ impl RefServer {
             _ => {}
         }
         self.revisions.insert(device, (day, revision));
-        serde_json::to_vec(&serde_json::json!({ "accepted": revision })).unwrap_or_default()
+        serde_json::to_vec(&serde_json::json!({ "accepted": true, "revision": revision }))
+            .unwrap_or_default()
     }
 }
 
