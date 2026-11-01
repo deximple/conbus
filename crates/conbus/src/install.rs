@@ -22,8 +22,8 @@ pub mod managed;
 mod opencode;
 
 pub use opencode::{
-    apply_opencode_plugin, opencode_plugin_current, opencode_plugin_path,
-    opencode_plugin_registered,
+    PluginApi, apply_opencode_plugin, opencode_plugin_api, opencode_plugin_api_in_place,
+    opencode_plugin_current, opencode_plugin_path, opencode_plugin_registered,
 };
 
 /// The command `install` registers for a harness: the binary by absolute path,
