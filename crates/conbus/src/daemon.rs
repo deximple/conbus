@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -985,6 +985,122 @@ fn someone_is_serving(socket: &Path) -> bool {
     }
 }
 
+/// How long a starting daemon waits for the recorder already here to go.
+///
+/// `install --apply` boots the old daemon out and bootstraps the new one, and
+/// the old one can outlive that by a moment. Giving up at once would only cost
+/// a restart under the service manager, which comes back after
+/// `DAEMON_THROTTLE_SECS`, so this does not have to outlast everything, and it
+/// has to stay well inside the 30 s a canary allows the new stamp.
+const CLAIM_WAIT: Duration = Duration::from_secs(5);
+const CLAIM_POLL: Duration = Duration::from_millis(100);
+
+/// Set by a daemon on the `--prepare` child it starts, naming itself: the
+/// parent holds the claim and the child writes under it.
+const PREPARE_FOR: &str = "CONBUS_PREPARE_FOR";
+
+/// How long a `--prepare` child may run. It holds the root's claim, past its
+/// daemon if it has to, so a read that never returns would lock the root for good.
+/// Gap fill's budget stops a slow vendor in seconds, and this is for what no budget
+/// can stop. A fill killed partway is safe: every line is whole or healed, and the
+/// next fill finds what is already written.
+const PREPARE_LIMIT: Duration = Duration::from_secs(120);
+
+/// The exit code of a `--prepare` child that hit [`PREPARE_LIMIT`].
+const PREPARE_GAVE_UP: i32 = 75;
+
+/// Become the one recorder of this root, before anything in it is written.
+///
+/// The socket cannot answer this. It is bound last, so that a hook arriving
+/// during a long start meets a refused socket rather than half a second of a
+/// listener that cannot answer, and until then two daemons would both stamp,
+/// fill gaps and drain. So a lock answers it: `flock` on a file beside the
+/// socket, which the kernel lets go of when the process ends, however it ends.
+/// The file staying behind means nothing.
+///
+/// The socket is still asked, because a daemon of an older build holds no lock
+/// and a rollback or an upgrade can put one here. A volume without `flock`
+/// must not stop recording, so failing to lock is said and walked past: `bind`
+/// still refuses a second listener, as it did before there was a lock.
+fn claim_recorder(paths: &Paths) -> io::Result<Option<fs::File>> {
+    let file = paths.root().join("daemon.lock");
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .open(&file)
+        .map_err(|err| note!("could not open {} ({err}); not locking", file.display()))
+        .ok();
+    let deadline = std::time::Instant::now() + CLAIM_WAIT;
+    let mut said = false;
+    loop {
+        let locked = match lock.as_ref().map(fs::File::try_lock) {
+            None | Some(Ok(())) => true,
+            Some(Err(fs::TryLockError::WouldBlock)) => false,
+            Some(Err(fs::TryLockError::Error(err))) => {
+                note!("could not lock {} ({err}); going on", file.display());
+                true
+            }
+        };
+        if locked && !someone_is_serving(&paths.socket()) {
+            return Ok(lock);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                format!(
+                    "another conbus daemon is the recorder of {}, or its start-up repair is \
+                     still running; nothing was written",
+                    paths.root().display()
+                ),
+            ));
+        }
+        if !said {
+            note!(
+                "another daemon is the recorder of {}, or its start-up repair is still running; \
+                 waiting up to {CLAIM_WAIT:?} for it to go",
+                paths.root().display()
+            );
+            said = true;
+        }
+        std::thread::sleep(CLAIM_POLL);
+    }
+}
+
+/// `conbus daemon --prepare`. A daemon's own child is handed the claim, so it
+/// outlives that daemon if it has to (`prepare_in_child`); anything else has to
+/// take the claim itself first.
+pub fn prepare_command(paths: &Paths, retention: Retention) -> io::Result<()> {
+    let under_parent = std::env::var(PREPARE_FOR)
+        .is_ok_and(|pid| pid == std::os::unix::process::parent_id().to_string());
+    let _claim = if under_parent {
+        give_up_after(prepare_limit());
+        None
+    } else {
+        claim_recorder(paths)?
+    };
+    prepare(paths, retention)
+}
+
+/// The test knob shortens it, as a wedge cannot be waited out in a test.
+fn prepare_limit() -> Duration {
+    std::env::var("CONBUS_TEST_PREPARE_LIMIT_MS")
+        .ok()
+        .and_then(|ms| ms.parse().ok())
+        .map_or(PREPARE_LIMIT, Duration::from_millis)
+}
+
+/// End this process when `limit` is up, whatever the rest of it is stuck in. Its
+/// parent says so, if it still has one: a note from here could block on the same
+/// thing that stopped everything else.
+fn give_up_after(limit: Duration) {
+    std::thread::spawn(move || {
+        std::thread::sleep(limit);
+        std::process::exit(PREPARE_GAVE_UP);
+    });
+}
+
 /// Bind the control socket, refusing to steal one a live daemon still owns.
 pub fn bind(socket: &Path) -> io::Result<UnixListener> {
     if socket.exists() {
@@ -1080,6 +1196,12 @@ struct Restored {
 pub fn prepare(paths: &Paths, retention: Retention) -> io::Result<()> {
     // No core dump of a process holding every prompt on the machine.
     let _ = harden::harden();
+    // Stands in for a read that never returns.
+    if let Ok(ms) = std::env::var("CONBUS_TEST_PAUSE_IN_PREPARE_MS")
+        && let Ok(ms) = ms.parse::<u64>()
+    {
+        std::thread::sleep(Duration::from_millis(ms));
+    }
     let t0 = std::time::Instant::now();
     let mut scan =
         SegmentLog::scan_meta(paths.log_dir(), Some(&paths.cache_dir())).unwrap_or_else(|err| {
@@ -1167,12 +1289,27 @@ pub fn prepare(paths: &Paths, retention: Retention) -> io::Result<()> {
 
 /// Run [`prepare`] in a child process, and in this one only if the child could
 /// not run.
-fn prepare_in_child(paths: &Paths, retention: Retention) {
+///
+/// The child holds the claim as well, on its stdin, which it never reads. `flock`
+/// belongs to the open file and not to a process, so if this daemon dies alone the
+/// child goes on holding it. The next daemon then waits for the child rather than
+/// writing beside it, and comes back under its service manager if that takes longer
+/// than [`CLAIM_WAIT`]. Everything the child starts gets a stdin of its own, so the
+/// claim ends with the child.
+fn prepare_in_child(paths: &Paths, retention: Retention, claim: Option<&fs::File>) {
     let started = std::time::Instant::now();
+    let stdin = claim
+        .and_then(|lock| {
+            lock.try_clone()
+                .map_err(|err| note!("could not hand the claim to the repair ({err})"))
+                .ok()
+        })
+        .map_or_else(Stdio::null, Stdio::from);
     let status = std::env::current_exe().and_then(|bin| {
         Command::new(bin)
             .args(["daemon", "--prepare"])
-            .stdin(Stdio::null())
+            .env(PREPARE_FOR, std::process::id().to_string())
+            .stdin(stdin)
             .stdout(Stdio::null())
             // The child's notes belong in the same place as the daemon's.
             .stderr(Stdio::inherit())
@@ -1183,6 +1320,16 @@ fn prepare_in_child(paths: &Paths, retention: Retention) {
             note!(
                 "start-up repair ran in a separate process in {} ms",
                 started.elapsed().as_millis()
+            );
+            return;
+        }
+        // Not run again here. Whatever stopped the child would stop this process
+        // next, with no watchdog, and it has hooks to serve.
+        Ok(status) if status.code() == Some(PREPARE_GAVE_UP) => {
+            note!(
+                "start-up repair gave up after {:?}; serving without it. What it did not fill \
+                 is still in the vendor's transcripts: `conbus backfill --gaps` reads them",
+                prepare_limit()
             );
             return;
         }
@@ -1251,6 +1398,9 @@ pub fn serve(paths: &Paths, retention: Retention) -> io::Result<()> {
             paths.root().display()
         );
     }
+    // Nothing below is written until this process knows it is the recorder.
+    // Held until the process ends, so it is never dropped: `serve` only loops.
+    let claim = claim_recorder(paths)?;
     // The first stamp, before anything long: a daemon that takes a minute to
     // prepare shows "starting" to a doctor, never a dead process — and a hook
     // that arrives early meets a refused socket at once rather than waiting
@@ -1263,7 +1413,7 @@ pub fn serve(paths: &Paths, retention: Retention) -> io::Result<()> {
     // But a log we cannot read must not stop us recording: an empty registry
     // costs a forked conversation, which the vendor session id on every record
     // still makes recoverable, while refusing to start costs every future turn.
-    prepare_in_child(paths, retention);
+    prepare_in_child(paths, retention, claim.as_ref());
     let (log, restored) = restore(paths, retention)?;
     let mut daemon = Daemon::new(log, restored.registry, restored.chapters)
         .with_arena(paths.root().to_path_buf())

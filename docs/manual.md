@@ -564,6 +564,7 @@ folder's facts visible in another.
 | `drops.jsonl` | events that could not be recorded, and why |
 | `daemon.log` | the recorder's own messages, timestamped |
 | `daemon.build` | which build the running recorder is |
+| `daemon.lock` | empty; the running recorder holds a lock on it, so a second daemon writes nothing. **Do not delete it**, even when a start says the root is taken: the holder may be a start-up repair that outlived its daemon, still writing, and it gives up by itself within two minutes. Deleted with a repair still running, the next daemon wrote beside it: 3 duplicate `seq` and every recovered turn twice, for good |
 | `conbus.sock` | the recorder's socket (mode `0600`) |
 | `quota/` | the last quota readings |
 | `takeover.json` | a hop waiting for `conbus run`, while one is |
