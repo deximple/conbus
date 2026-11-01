@@ -406,10 +406,10 @@ fn append_gaps_at_start_in(
     // filled by earlier starts; `conbus backfill --gaps` still reads them all.
     let mut timing = GapTiming::default();
     let deadline = Instant::now() + budget;
-    // A fill the budget cut short leaves `cache/gap-since` holding the
-    // effective since it stopped at, so the next start resumes the range
-    // rather than losing it to a newer `newest`. A fill that finishes
-    // deletes the marker; a garbled one is ignored and said so.
+    // `cache/gap-since` holds the range from before the first write, and only a
+    // fill that finishes deletes it. So a budget cut, a write the log refused and
+    // a killed process all leave the next start resuming the range rather than
+    // losing it to a newer `newest`. A garbled one is ignored and said so.
     let marker = paths.cache_dir().join("gap-since");
     let remembered = read_since(&marker);
     if marker.exists() && remembered.is_none() {
@@ -418,6 +418,9 @@ fn append_gaps_at_start_in(
     let since = newest_unix(held)
         .map(|newest| newest - GAP_MARGIN_SECS)
         .map(|fresh| remembered.map_or(fresh, |old| old.min(fresh)));
+    if let Some(since) = since {
+        write_since(paths, &marker, since);
+    }
     let mut spool = Spool::new(paths.spool_dir());
     let mut n = 0;
     if let Some(home) = home {
@@ -451,12 +454,7 @@ fn append_gaps_at_start_in(
         n += ingest_chat_exports_since(&paths.chat_export(), held, log, since)?;
         timing.chat_export_ms = elapsed_ms(export);
     }
-    if timing.budget_exhausted {
-        // The cut-short range outlives this start: next start resumes it.
-        if let Some(since) = since {
-            write_since(paths, &marker, since);
-        }
-    } else {
+    if !timing.budget_exhausted {
         let _ = std::fs::remove_file(&marker);
     }
     Ok((n, timing))
@@ -498,12 +496,12 @@ fn write_since(paths: &Paths, marker: &Path, since: i64) {
     }
 }
 
-/// Keep the range for the next start, when this one could not fill at all.
+/// Keep the range for the next start, when the log could not be read to fill it.
 ///
-/// The log could not be read, so its newest record is not known. The newest
-/// segment's write time is as good, and needs no read of the segment. Without
-/// this the hooks served after this start would move the next start's range past
-/// whatever this downtime missed.
+/// Its newest record is not known then. The newest segment's write time is as
+/// good, since nothing has written since, and needs no read of the segment.
+/// Without this the hooks served after this start would move the next start's
+/// range past whatever this downtime missed.
 pub fn defer_fill(paths: &Paths) {
     let Some(written) = SegmentLog::current_segment(&paths.log_dir())
         .ok()

@@ -1114,10 +1114,7 @@ pub fn prepare(paths: &Paths, retention: Retention) -> io::Result<()> {
             scan.records
                 .extend(written.iter().map(conbus_core::segment::meta));
         }
-        Err(err) => {
-            note!("gap fill skipped ({err}); the next start fills the range");
-            crate::backfill::defer_fill(paths);
-        }
+        Err(err) => note!("gap fill stopped ({err}); the next start fills the range"),
     }
     let t_gaps = t0.elapsed() - t_scan;
     match repair_splits(&scan.records, &mut log) {
