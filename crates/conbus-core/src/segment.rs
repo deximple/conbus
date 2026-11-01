@@ -3,7 +3,7 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use crate::clock::Timestamp;
@@ -44,6 +44,20 @@ fn segment_paths(dir: &Path) -> io::Result<Vec<PathBuf>> {
     // Zero padding makes the byte order the append order.
     paths.sort();
     Ok(paths)
+}
+
+/// Make the log directory, owner only: the segments hold prompts and replies.
+fn make_private_dir(dir: &Path) -> io::Result<()> {
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).map_err(|err| {
+        io::Error::new(
+            err.kind(),
+            format!("could not make {} private: {err}", dir.display()),
+        )
+    })
 }
 
 /// Close an unterminated last line left by a crash.
@@ -173,17 +187,7 @@ impl SegmentLog {
         max_segment_bytes: u64,
     ) -> io::Result<Self> {
         let dir = dir.as_ref().to_path_buf();
-        // Owner only: the segments hold prompts and replies.
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(&dir)?;
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).map_err(|err| {
-            io::Error::new(
-                err.kind(),
-                format!("could not make {} private: {err}", dir.display()),
-            )
-        })?;
+        make_private_dir(&dir)?;
         let existing = segment_paths(&dir)?;
         let next_seq = last_sequence(&existing)?.map_or(0, |seq| seq + 1);
         Ok(SegmentLog {
@@ -260,7 +264,19 @@ impl SegmentLog {
     /// The segment that should receive `incoming` bytes, rolling over first if
     /// this record would push a non-empty segment past its size.
     fn segment_for(&mut self, incoming: u64) -> io::Result<&mut Current> {
+        // A file deleted while open goes on taking writes that nothing can ever
+        // read, and each one reports success.
+        if self
+            .current
+            .as_ref()
+            .is_some_and(|current| self.has_left_its_name(current))
+        {
+            self.current = None;
+        }
         if self.current.is_none() {
+            if !self.dir.is_dir() {
+                make_private_dir(&self.dir)?;
+            }
             let existing = segment_paths(&self.dir)?;
             let index = existing.last().and_then(|p| segment_index(p)).unwrap_or(0);
             self.current = Some(self.open_segment(index)?);
@@ -274,6 +290,19 @@ impl SegmentLog {
             self.current = Some(self.open_segment(next)?);
         }
         Ok(self.current.as_mut().expect("segment was just opened"))
+    }
+
+    /// Whether the file this writer holds is no longer the one at its name:
+    /// deleted, moved aside, or replaced by a restore. A name that cannot be
+    /// looked up for any other reason says nothing about the file.
+    fn has_left_its_name(&self, current: &Current) -> bool {
+        match fs::metadata(self.dir.join(segment_name(current.index))) {
+            Ok(named) => current
+                .file
+                .metadata()
+                .is_ok_and(|held| (held.dev(), held.ino()) != (named.dev(), named.ino())),
+            Err(err) => err.kind() == io::ErrorKind::NotFound,
+        }
     }
 
     fn open_segment(&self, index: u64) -> io::Result<Current> {
@@ -344,6 +373,116 @@ mod tests {
     use super::*;
     use crate::event::{Body, Event, Harness, Source, TurnState};
     use crate::ids::BusId;
+
+    /// What a fresh read of `dir` finds: each record's sequence number, in order.
+    fn seqs_in(dir: &Path) -> Vec<u64> {
+        SegmentLog::scan(dir)
+            .expect("scan")
+            .records
+            .iter()
+            .map(|record| record.seq)
+            .collect()
+    }
+
+    #[test]
+    fn a_segment_deleted_under_the_writer_is_not_written_into_the_void() {
+        // A deleted file goes on taking writes through an open handle. Every
+        // record after a stray `rm` reported success and reached nothing.
+        let home = tempfile::tempdir().expect("tempdir");
+        let dir = home.path().join("log");
+        let mut log = SegmentLog::open(&dir, Retention::default()).expect("open");
+        log.append(entry(BusId::mint(), prompt("before")))
+            .expect("append");
+        fs::remove_file(SegmentLog::current_segment(&dir).expect("segment")).expect("rm");
+
+        log.append(entry(BusId::mint(), prompt("after")))
+            .expect("append");
+
+        assert_eq!(seqs_in(&dir), [1], "the record went nowhere");
+    }
+
+    #[test]
+    fn a_log_folder_deleted_under_the_writer_comes_back_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().expect("tempdir");
+        let dir = home.path().join("log");
+        let mut log = SegmentLog::open(&dir, Retention::default()).expect("open");
+        log.append(entry(BusId::mint(), prompt("before")))
+            .expect("append");
+        fs::remove_dir_all(&dir).expect("rm -r");
+
+        log.append(entry(BusId::mint(), prompt("after")))
+            .expect("append");
+
+        assert_eq!(seqs_in(&dir), [1]);
+        let mode = |path: &Path| fs::metadata(path).expect("metadata").permissions().mode() & 0o777;
+        assert_eq!(mode(&dir), 0o700, "the log directory");
+        let segment = SegmentLog::current_segment(&dir).expect("segment");
+        assert_eq!(mode(&segment), 0o600, "a segment");
+    }
+
+    #[test]
+    fn a_log_folder_deleted_before_the_first_write_comes_back_too() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let dir = home.path().join("log");
+        let mut log = SegmentLog::open(&dir, Retention::default()).expect("open");
+        fs::remove_dir_all(&dir).expect("rm -r");
+
+        log.append(entry(BusId::mint(), prompt("first")))
+            .expect("append");
+
+        assert_eq!(seqs_in(&dir), [0]);
+    }
+
+    #[test]
+    fn a_log_moved_aside_under_the_writer_keeps_what_it_had() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let dir = home.path().join("log");
+        let aside = home.path().join("log.old");
+        let mut log = SegmentLog::open(&dir, Retention::default()).expect("open");
+        log.append(entry(BusId::mint(), prompt("before")))
+            .expect("append");
+        fs::rename(&dir, &aside).expect("mv");
+
+        log.append(entry(BusId::mint(), prompt("after")))
+            .expect("append");
+
+        assert_eq!(seqs_in(&aside), [0], "what was moved aside took a write");
+        assert_eq!(seqs_in(&dir), [1]);
+    }
+
+    #[test]
+    fn a_segment_put_back_under_the_writer_takes_the_next_record() {
+        // A restore while the recorder runs: the same name, a new file, and the
+        // old handle writing to neither of them.
+        let home = tempfile::tempdir().expect("tempdir");
+        let dir = home.path().join("log");
+        let mut log = SegmentLog::open(&dir, Retention::default()).expect("open");
+        log.append(entry(BusId::mint(), prompt("before")))
+            .expect("append");
+        let segment = SegmentLog::current_segment(&dir).expect("segment");
+        let copy = fs::read(&segment).expect("read");
+        fs::remove_file(&segment).expect("rm");
+        fs::write(&segment, &copy).expect("restore");
+
+        log.append(entry(BusId::mint(), prompt("after")))
+            .expect("append");
+
+        assert_eq!(seqs_in(&dir), [0, 1]);
+    }
+
+    #[test]
+    fn a_writer_with_its_file_in_place_is_not_told_it_went_away() {
+        // Reopening heals the tail and measures the file, which is not a cost to
+        // pay on every record.
+        let home = tempfile::tempdir().expect("tempdir");
+        let dir = home.path().join("log");
+        let mut log = SegmentLog::open(&dir, Retention::default()).expect("open");
+        log.append(entry(BusId::mint(), prompt("one")))
+            .expect("append");
+        let current = log.current.as_ref().expect("open");
+        assert!(!log.has_left_its_name(current));
+    }
 
     #[test]
     fn a_new_log_is_readable_by_its_owner_only() {
