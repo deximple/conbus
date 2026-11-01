@@ -34,6 +34,8 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+use serde::{Deserialize, Serialize};
+
 use crate::clock::Timestamp;
 use crate::event::{Entrypoint, Event, Harness, TurnState};
 use crate::ids::BusId;
@@ -76,7 +78,7 @@ pub struct Asking {
 }
 
 /// A conversation that has happened in some checkout.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct Candidate {
     pub bus_id: BusId,
     pub harness: Harness,

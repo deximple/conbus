@@ -1053,6 +1053,49 @@ fn load_meta_segment(
     Ok((records, defects))
 }
 
+/// The point a fold reached: the newest segment's name and its byte length
+/// at that moment. A checkpoint's coverage; a later reader folds only what
+/// came after.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct Covered {
+    pub segment: String,
+    pub bytes: u64,
+}
+
+/// What one segment parses to from `offset` on — the same rules
+/// `parse_segment` applies, line numbers kept absolute by counting the
+/// prefix's newlines rather than reading it.
+fn parse_segment_from(path: &Path, offset: u64) -> io::Result<(Vec<Record>, Vec<Defect>)> {
+    let bytes = std::fs::read(path)?;
+    let prefix = &bytes[..(offset as usize).min(bytes.len())];
+    let base = prefix.iter().filter(|b| **b == b'\n').count() as u64;
+    let mut records = Vec::new();
+    let mut defects = Vec::new();
+    for (line_no, raw) in (base + 1..).zip(bytes[offset as usize..].split(|b| *b == b'\n')) {
+        let line: &[u8] = raw.strip_suffix(b"\r").unwrap_or(raw);
+        if line.is_empty() {
+            continue;
+        }
+        match serde_json::from_slice::<Record>(line) {
+            Ok(record) if record.schema_version > SCHEMA_VERSION => defects.push(Defect {
+                segment: path.to_path_buf(),
+                line: line_no,
+                reason: format!(
+                    "record schema v{} is newer than this build's v{SCHEMA_VERSION}",
+                    record.schema_version
+                ),
+            }),
+            Ok(record) => records.push(record),
+            Err(err) => defects.push(Defect {
+                segment: path.to_path_buf(),
+                line: line_no,
+                reason: err.to_string(),
+            }),
+        }
+    }
+    Ok((records, defects))
+}
+
 /// What `build_cache` reports.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct CacheReport {
@@ -1126,6 +1169,76 @@ impl SegmentLog {
         let mut records = Vec::new();
         let defects = Self::scan_meta_each(dir, cache, |record| records.push(record))?;
         Ok(Scan { records, defects })
+    }
+
+    /// Where a fold reading now would stop: the newest segment's name and
+    /// its byte length. `None` when the directory holds no segment yet.
+    pub fn coverage(dir: impl AsRef<Path>) -> io::Result<Option<Covered>> {
+        let segments = segment_paths(dir.as_ref())?;
+        let Some(newest) = segments.last() else {
+            return Ok(None);
+        };
+        let name = newest
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
+        let bytes = std::fs::metadata(newest)?.len();
+        Ok(Some(Covered {
+            segment: name,
+            bytes,
+        }))
+    }
+
+    /// `scan_meta_each` over only the part of the log `covered` does not
+    /// reach: bytes appended to that segment since, and every newer segment.
+    /// The covered segment must still exist at least as long as `covered`
+    /// says — a caller validates that before asking, so a short or missing
+    /// one is an error, not a fold.
+    pub fn scan_meta_after(
+        dir: impl AsRef<Path>,
+        cache: Option<&Path>,
+        covered: &Covered,
+        mut each: impl FnMut(Record),
+    ) -> io::Result<Vec<Defect>> {
+        let segments = segment_paths(dir.as_ref())?;
+        let no_cache = cache.is_none() || std::env::var_os("CONBUS_NO_CACHE").is_some();
+        let newest = segments.last().cloned();
+        let mut defects = Vec::new();
+        for segment in &segments {
+            let name = segment
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
+            if name < covered.segment.as_str() {
+                continue;
+            }
+            let (records, segment_defects) = if name == covered.segment {
+                let len = std::fs::metadata(segment)?.len();
+                if len < covered.bytes {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "covered segment {name} is {len} bytes, shorter than the checkpoint's {}",
+                            covered.bytes
+                        ),
+                    ));
+                }
+                let (mut records, defects) = parse_segment_from(segment, covered.bytes)?;
+                for record in &mut records {
+                    *record = meta(record);
+                }
+                (records, defects)
+            } else {
+                let closed = newest.as_ref() != Some(segment) && !no_cache;
+                load_meta_segment(segment, closed, cache)?
+            };
+            for record in records {
+                each(record);
+            }
+            defects.extend(segment_defects);
+        }
+        Ok(defects)
     }
 
     /// The explicit build: refresh every closed segment's sidecar and say how

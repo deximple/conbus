@@ -351,7 +351,7 @@ pub fn append_gaps_at_start(
 /// How long before the log's newest record a file may have last changed and
 /// still hold a turn this daemon missed: vendors buffer their writes, and a
 /// clock can step.
-const GAP_MARGIN_SECS: i64 = 15 * 60;
+pub(crate) const GAP_MARGIN_SECS: i64 = 15 * 60;
 
 /// The newest record's time, as unix seconds.
 fn newest_unix(held: &[Record]) -> Option<i64> {

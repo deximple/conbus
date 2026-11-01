@@ -47,7 +47,7 @@ use crate::record::Record;
 /// conversation is a different piece of work wearing the same id, and carrying
 /// it would mislead rather than orient. What is in the person's head is the
 /// tail, which is the same premise that made the gate fire at all.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Chapter {
     /// The conversation's state, folded by the same code the briefing decision
     /// reads, so a chapter and the decision that chose it cannot disagree.
