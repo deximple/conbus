@@ -1213,11 +1213,13 @@ case $sub in
             fi
             mv -f "$rollback_bin" "$bin"
             reregister_daemon "$mode" || true
-            verify_rollback "$prev_build" "$cand_pid" "$mode"
+            # The rollback happened whether or not it boots — record it
+            # before verification, which exits 3 when it cannot confirm.
             state_write "$swapped_ts" "$prev_build" "$cand_build" "$cand_sha" '[]' \
                 "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
             say "rolled back $bin to $("$bin" --version 2>&1 || echo unknown)"
             say_spool
+            verify_rollback "$prev_build" "$cand_pid" "$mode"
             die "start failed: $fail_reason (rolled back automatically)"
         fi
 

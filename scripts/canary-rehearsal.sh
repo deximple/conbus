@@ -462,6 +462,7 @@ SERVING_LIMIT=1 run start --from "$tmp/stage/conbus-dropper" >"$tmp/norb.out" 2>
 expect 3 "$code" "unverified rollback -> start exits 3"
 expect_grep "ROLLBACK NOT VERIFIED" "$tmp/norb.out" "the script says the rollback was not verified"
 expect_live 01d "the rollback binary was still moved back"
+expect_grep 'rolled_back' "$home/.conbus/canary.json" "an unverified rollback still records rolled_back in canary.json"
 rm -f "$rollback_bin"
 
 # (c) the rollback subcommand, verified and not.
