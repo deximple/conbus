@@ -207,10 +207,12 @@ pub fn describe(locations: &Locations) -> String {
     };
     parts.push(match &claude_registered {
         Some(file) => format!("claude_code: hooks in {} ({lock})", file.display()),
-        None if locked => format!(
-            "claude_code: {lock} and no conbus block — the user-level hooks will not fire"
-        ),
-        None if claude_present => format!("claude_code: managed files present, no conbus block ({lock})"),
+        None if locked => {
+            format!("claude_code: {lock} and no conbus block — the user-level hooks will not fire")
+        }
+        None if claude_present => {
+            format!("claude_code: managed files present, no conbus block ({lock})")
+        }
         None => "claude_code: no managed file".to_string(),
     });
 
@@ -340,8 +342,7 @@ fn warnings(binary: &Path, home: Option<&Path>, apply: bool) -> String {
     ];
     [
         in_home.then(|| section("warning", &home_warning)),
-        (!in_home && writable_by_non_root(binary))
-            .then(|| section("warning", &writable_warning)),
+        (!in_home && writable_by_non_root(binary)).then(|| section("warning", &writable_warning)),
         (!shell_safe(&shown)).then(|| section("warning", &shell_warning)),
         apply.then(|| section("note", &apply_note)),
     ]
@@ -591,8 +592,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let binary = dir.path().join("conbus");
         std::fs::write(&binary, b"#!").expect("binary");
-        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))
-            .expect("chmod");
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).expect("chmod");
 
         let out = printed(&binary, None, false).expect("print");
 
