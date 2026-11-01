@@ -30,6 +30,29 @@ fn payload(hook_event_name: &str) -> serde_json::Value {
         .unwrap_or_else(|| panic!("no {hook_event_name} in the fixture"))
 }
 
+/// Wait until the daemon serves, not merely until its socket exists.
+///
+/// It binds before it repairs and folds the log, so a hook that connects in
+/// between waits on a daemon that is not answering yet, gives up at its 500ms
+/// deadline, and drops the record — which on a busy CI runner is often enough
+/// that "a segment must exist" failed. The build stamp gains its hardening
+/// fields once restore is done, the same signal `recorder.rs` waits for.
+fn wait_until_serving(home: &std::path::Path) {
+    let socket = home.join("conbus.sock");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        let settled = std::fs::read_to_string(home.join("daemon.build"))
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(text.trim()).ok())
+            .is_some_and(|stamp| stamp.get("memory_locked").is_some());
+        if settled && std::os::unix::net::UnixStream::connect(&socket).is_ok() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    panic!("the daemon never started serving on {}", socket.display());
+}
+
 /// Run the payload through `conbus hook` against a live daemon and return the
 /// record it produced.
 fn record_for(subject: &serde_json::Value) -> serde_json::Value {
@@ -42,13 +65,7 @@ fn record_for(subject: &serde_json::Value) -> serde_json::Value {
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn daemon");
-    let socket = home.path().join("conbus.sock");
-    for _ in 0..250 {
-        if std::os::unix::net::UnixStream::connect(&socket).is_ok() {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
+    wait_until_serving(home.path());
 
     // Mint a conversation first: only a prompt binds a `bus_id`.
     let minting = payload_from(
@@ -244,13 +261,7 @@ fn codex_record_for(subject: &serde_json::Value) -> serde_json::Value {
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn daemon");
-    let socket = home.path().join("conbus.sock");
-    for _ in 0..250 {
-        if std::os::unix::net::UnixStream::connect(&socket).is_ok() {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
+    wait_until_serving(home.path());
 
     let minting = codex_payloads("UserPromptSubmit")
         .into_iter()
