@@ -388,8 +388,24 @@ Measured at 1.0 (2026-11-01, a 10 GB real log; `docs/plan-1.0.md`):
 - Linux: install, the systemd unit and fixture hooks are checked; real vendor
   sessions on Linux are not.
 - cursor-agent in print mode fires no prompt or turn-end hook, so it leaves no
-  turn records. OpenCode 2.x publishes turn ends, tool calls and tokens that
+  turn records. `cursor-agent status` may also report a login while `-p`
+  answers `AUTH_REQUIRED` (seen 2026-11-01) — check the actual run, not the
+  status claim. OpenCode 2.x publishes turn ends, tool calls and tokens that
   the plugin does not forward yet.
+- A persistent `opencode serve --service` carries `CONBUS_HOME` from the
+  environment it started in. A stale one silently answers this binary's
+  `conbus hook` writes into its old root — records and drops land there, not
+  in the live log. If OpenCode records nothing, check the serving process's
+  environment first.
+- `doctor`, `status` and `hop` must never invoke `agy`: a logged-out `agy`
+  starts an OAuth flow and opens a browser even with no terminal. Only
+  `conbus quota` — the command a person ran on purpose — may query it;
+  everything else reads the cache `quota` writes. `conbus auth` reports
+  which vendor needs login and inspects a pasted OAuth URL without echoing
+  its query.
+- A `drops.jsonl` that reaches its 4 MiB cap used to stop recording with no
+  signal; it now rotates to `drops.1.jsonl`, and `canary.sh` treats a capped
+  log as unobservable rather than clean.
 - `hook --inference-listen` authenticates nothing; it binds loopback only and
   relies on the terminator running on the same machine.
 
@@ -494,12 +510,14 @@ Measured at 1.0 (2026-11-01, a 10 GB real log; `docs/plan-1.0.md`):
 1.0 is cut from `docs/plan-1.0.md`; its progress table at the end says what
 landed, what was measured and what was cut. What is left needs a person:
 
-1. **Canary.** After `rc.2` is cut (the rc.1 shadow pass found defects to
-   ship in it — see the plan table), run `scripts/canary.sh preflight`, then
-   `start`, on this Mac with the release candidate, outside the blackout
-   hours, and leave it seven days; `status` and `verdict` read it, `rollback`
-   puts 0.2.x back. `v1.0.0` is tagged only on a passing verdict
-   (`docs/plan-1.0.md` §7).
+1. **Canary verdict and release.** `v1.0.0-rc.3` was swapped onto the live
+   recorder on 2026-11-01 — the seven-day window is running; `verdict` exits
+   3 until it closes. While it ran, the pre-release sweep opened PRs for the
+   remaining fixes and coverage (the plan table's "출시 전 점검" row lists
+   them and which ones change the recorder path). Merge decisions and the
+   operator sequence — merge → possible `rc.4` → verdict → `v1.0.0` tag →
+   sign → publish — are in the session's `final-stage.md`. `v1.0.0` is
+   tagged only on a passing verdict (`docs/plan-1.0.md` §7).
 2. **RFD 0002 and 0003** stay drafts until the operator accepts them; no sync
    service exists.
 3. Then back to `docs/self-improve.md`, from live evidence rather than this
