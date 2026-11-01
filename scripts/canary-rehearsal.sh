@@ -40,6 +40,9 @@ mkdir -p "$install_dir" "$tmp/stage" "$home/.conbus" \
 #               rollback-verify path can pass the stamp check and still
 #               hang on the agreeing-doctor check
 #   nousage   — usage answers nothing: a parity of emptiness must not pass
+#   chatty    — like live, with far more output after the socket line than a pipe
+#               holds, so a reader that leaves at its first match costs the
+#               writer a SIGPIPE every time instead of once in a while
 #   flap      — doctor sleeps on its first call, then answers fast: a
 #               single-shot time budget flakes where a median does not
 #   polfail   — `policy check` exits 1: a file that cannot be a policy
@@ -66,6 +69,7 @@ write_fake() {
         notokens) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "hooks     claude_code  runs — x"' ;;
         stuck) doctor='sleep 3600' ;;
         stuckboot) doctor='printf "{\"build\":\"'"$tag"'\",\"pid\":$$,\"started\":\"2026-11-01T10:00:00.000Z\",\"serving\":\"2026-11-01T10:00:04.000Z\"}\n" > "$HOME/.conbus/daemon.build"; sleep 3600' ;;
+        chatty) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "disk      log 1.0 MB — 1.0 GB free of 2.0 GB (50.0%)"; echo "hooks     claude_code  runs — x"; perl -e "print qq(note\n) x 60000"' ;;
         flap) doctor='n=$(cat "$HOME/.flap" 2>/dev/null || echo 0); echo $((n + 1)) > "$HOME/.flap"; [ "$n" = 0 ] && sleep 3; echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "log       5 record(s), 1 conversation(s), 0 unreadable line(s)"' ;;
     esac
     policy_body=':'
@@ -447,6 +451,19 @@ expect_absent "$install_dir/conbus.new" "write-beside temp is renamed, not left"
 expect_absent "$home/.install-called" "rehearsal never invoked install --apply"
 expect_file "$home/.conbus/canary.json" "canary.json records the window"
 expect_grep '"candidate_build":"beef"' "$home/.conbus/canary.json" "canary.json names the candidate build"
+
+# A healthy doctor with a lot to say. `echo "$out" | grep -q listening` leaves at the
+# first match, echo takes a SIGPIPE, pipefail fails the pipeline, and a daemon that
+# said `listening` was rolled back as not answering. Seen once in about fifteen
+# runs with ordinary output; with this much it happens every time.
+write_fake beef chatty "$tmp/stage/conbus-chatty"
+write_fake 01d old "$install_dir/conbus"
+rm -f "$rollback_bin" "$home/.conbus/canary.json"
+daemon_boot beef 4249
+code=0
+run start --from "$tmp/stage/conbus-chatty" >"$tmp/start-chatty.out" 2>&1 || code=$?
+if [ "$code" != 0 ]; then tail -8 "$tmp/start-chatty.out" >&2; fi
+expect 0 "$code" "a doctor with a lot to say does not roll a healthy swap back"
 
 # --- the real path through the test seam -------------------------------------
 
