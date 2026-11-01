@@ -393,7 +393,7 @@ Copilot CLI 어댑터(설치·실 payload 필요), Gemini CLI 어댑터, 프롬�
 | M6 | 완료 | #98 #103 | `check-docs.sh` 초록(0.2.9, 명령 19개). site 테스트 6/6(vitest) | `check-docs.sh`가 첫 실행에서 실제 누락 4건을 잡았다(README·한국어 매뉴얼에 `policy`, 두 매뉴얼에 `sync`). 한국어 매뉴얼은 Linux 미지원이라고 적혀 있던 것을 고치고 정책·프로필·sync 절을 넣었다. 랜딩은 `site/` 하나로 합치고 `docs/www/`를 지웠다. site는 `site/**` 경로 필터 CI로만 돌고 배포하지 않았다 |
 | M7 | 완료 | #108 #109 | `v1.0.0-rc.1` 태그 게시, `pre=true`·`draft=false`, `latest`는 v0.2.9 유지. 릴리스 드라이런 3타깃 초록 | canary.sh·shadow-replay.sh·canary-rehearsal.sh(#108). RC PR #109: 버전 범프·Cargo.lock·CHANGELOG·매뉴얼 헤드라인 |
 | S1–S5 | 완료 | #110 | S1: 0.2.8↔RC 읽기 차이는 `tokens_*` 키·새 doctor 항목뿐, 캐시 유무 동일; RC가 969,129레코드 전수 읽고 0.2.8이 RC 기록을 역방향으로 읽음. S3 스톰 10/10 무손실. S4 Colima ARM64 왕복. S5 TLS 왕복 | S2 실세션 패리티(claude·codex 각 4==4; grok 프로젝트 훅 없음·cursor 미인증·opencode 비대화형 이벤트 없음 — 한계로 기록). S5가 refserver의 와이어 불일치 3건(`day_closed`, `accepted` 형상, 장치 id 형식)을 잡아 시험 하니스를 고쳤다(#110) |
-| Canary | 준비 완료 | #110, 이후 PR | `canary.sh`를 §7 계약대로 재작성: start가 preflight를 먼저 돌리고, 교체 뒤 serving·build·훅 왕복·드롭 검사 실패 시 자동 롤백. `restart` 서브커맨드와 `canary.json` 창 기록 추가. verdict가 재시작 분류·패리티·RSS·시간 예산을 실제로 계산. 리허설이 CI gate에서 돈다 | 라이브 교체는 하지 않음. RC 바이너리는 Developer ID 서명·공증 완료 — 운영자가 `canary.sh start --from`으로 시작 (operator-todo.md에 절차) |
+| Canary | 준비 완료 | #110 #113 | `canary.sh`를 §7 계약대로 재작성: start가 preflight를 먼저 돌리고, 교체 뒤 serving·build·훅 왕복·드롭 검사 실패 시 자동 롤백. `restart` 서브커맨드와 `canary.json` 창 기록 추가. verdict가 재시작 분류·패리티·RSS·시간 예산을 실제로 계산. 리허설이 CI gate에서 돈다 | 라이브 교체는 하지 않음. RC 바이너리는 Developer ID 서명·공증 완료 — 운영자가 `canary.sh start --from`으로 시작 (operator-todo.md에 절차) |
 | 1.0.0 | | | | |
 
 ### 변경 기록
