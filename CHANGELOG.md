@@ -6,6 +6,12 @@ the entry says so when it does.
 
 ## [Unreleased]
 
+### Fixed
+
+- A hook that connects to a daemon just as it closes now spools its record instead
+  of dropping it. On macOS that failure shows up as `could not bound the daemon
+  call`, which is a restart like any other.
+
 ## [1.0.0-rc.3] — 2026-11-01
 
 ### Fixed
