@@ -539,4 +539,44 @@ mod tests {
             record
         );
     }
+
+    #[test]
+    fn docs_log_format_names_every_envelope_key() {
+        // `docs/log-format.md` is the 1.x contract for a line. The envelope is
+        // what two records with different events have in common once every
+        // optional key is populated; the document has to list exactly that.
+        const DOC: &str = include_str!("../../../docs/log-format.md");
+        let table = DOC
+            .split("## A line")
+            .nth(1)
+            .and_then(|rest| rest.split("\n## ").next())
+            .expect("the envelope table");
+        let documented: std::collections::BTreeSet<String> = table
+            .lines()
+            .filter(|line| line.starts_with("| `"))
+            .filter_map(|line| line.split('`').nth(1))
+            .map(str::to_string)
+            .collect();
+        let keys = |event: Event| -> std::collections::BTreeSet<String> {
+            let mut record = fully_populated(event);
+            record.source.profile = Some("work".into());
+            serde_json::to_value(&record)
+                .expect("serialise")
+                .as_object()
+                .expect("object")
+                .keys()
+                .cloned()
+                .collect()
+        };
+        let prompt = keys(Event::TurnStarted {
+            author: None,
+            prompt: Body::kept("hi"),
+        });
+        let alias = keys(Event::Aliased {
+            also: "01996b1e-2c4a-7c31-9d0e-4f2a6b8c1d3f".parse().expect("id"),
+        });
+        let envelope: std::collections::BTreeSet<String> =
+            prompt.intersection(&alias).cloned().collect();
+        assert_eq!(documented, envelope);
+    }
 }
