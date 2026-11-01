@@ -8,7 +8,12 @@
 # stand-in that writes a mark. A sandbox denies the real `open`, `osascript` and
 # Launch Services, so a failure opens no tab by those routes.
 #
-#   exit 0  no browser, and agy's line says AUTH_REQUIRED
+# Only `conbus quota` — a command a person ran — may call `agy` at all:
+# doctor and status read the cache `quota` writes, so the vendor's own
+# `$HOME/.gemini` must not even appear on their runs, and their agy lines
+# say `no reading yet`.
+#
+#   exit 0  no browser, doctor/status never ran agy, quota's line says AUTH_REQUIRED
 #   exit 1  a browser would have opened, or the line is wrong
 #   exit 2  nothing proved: no agy, no sandbox, or the control below saw nothing
 #
@@ -101,15 +106,19 @@ echo "no-browser: control: agy -p went for the browser (open called: $([ -e "$tm
 # --- the check ---------------------------------------------------------------
 
 failed=0
-check() { # check <label> <grep -E pattern for agy's line> <command...>
+check() { # check <label> <grep -E pattern for agy's line> <may-call-vendor: yes|no> <command...>
     label=$1
     pattern=$2
-    shift 2
+    vendored=$3
+    shift 3
     user=user-$label
     (as_nobody "$user" "$@") >"$tmp/$user.out" 2>&1 </dev/null
     line=$(grep -E '^agy |^quota +agy ' "$tmp/$user.out" | head -n 1)
     if went_for_browser "$user"; then
         echo "no-browser: FAIL: $label went for the browser (OAuth starts: $(oauth_starts "$user")) — $line"
+        failed=1
+    elif [ "$vendored" = no ] && [ -d "$tmp/$user/.gemini" ]; then
+        echo "no-browser: FAIL: $label ran the agy binary at all — $line"
         failed=1
     elif ! printf '%s\n' "$line" | grep -Eq "$pattern"; then
         echo "no-browser: FAIL: $label: agy's line does not say $pattern: $line"
@@ -120,14 +129,14 @@ check() { # check <label> <grep -E pattern for agy's line> <command...>
     fi
 }
 
-# doctor allows two seconds, which a busy machine can use up: not knowing is
-# still not asking.
-doctor_says='AUTH_REQUIRED|SKIP: .*did not answer within 2s'
-check doctor "$doctor_says" "$conbus" doctor
-check quota AUTH_REQUIRED "$conbus" quota
-check status AUTH_REQUIRED "$conbus" status
+# Only `conbus quota` — a command a person ran — may call the vendor at all.
+# doctor and status read the cache `quota` wrote: with no reading they say so,
+# and the vendor's own directory must not even appear.
+check doctor "no reading yet" no "$conbus" doctor
+check quota AUTH_REQUIRED yes "$conbus" quota
+check status "no reading yet" no "$conbus" status
 # The same with a terminal, where `agy -p` might behave differently.
-check doctor-tty "$doctor_says" /usr/bin/script -q /dev/null "$conbus" doctor
+check doctor-tty "no reading yet" no /usr/bin/script -q /dev/null "$conbus" doctor
 
 if [ "$failed" != 0 ]; then
     exit 1
