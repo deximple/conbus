@@ -1224,6 +1224,7 @@ pub fn doctor(paths: &Paths) -> io::Result<()> {
             let started = std::time::Instant::now();
             match read() {
                 Ok(quota) => crate::quota::describe(&quota, now_probe),
+                Err(err) if crate::quota::agy_not_asked(&err) => format!("unavailable — {err}"),
                 // A probe that ran its whole deadline out says so;
                 // one that failed fast names why.
                 Err(err) if started.elapsed() >= std::time::Duration::from_secs(2) => {

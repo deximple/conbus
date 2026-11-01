@@ -76,6 +76,10 @@ serving_probe() {
     ' "$1" </dev/null >/dev/null 2>&1
 }
 
+# A build older than conbus's sign-in check runs `agy -p /usage` from doctor,
+# and with no login that opens a browser tab for OAuth.
+"${CONBUS_AGY_BIN:-agy}" models >/dev/null 2>&1 </dev/null || export CONBUS_AGY_BIN=/usr/bin/false
+
 # run_timed BIN CLONE args... -> prints "median_seconds max_rss_bytes"
 run_timed() {
     bin=$1

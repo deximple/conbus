@@ -6,6 +6,17 @@ the entry says so when it does.
 
 ## [Unreleased]
 
+### Fixed
+
+- `quota`, `doctor`, `status` and `hop` no longer open a browser tab when `agy`
+  is not signed in. `agy -p` starts an OAuth flow with no login, and neither a
+  deadline nor the lack of a terminal stops it, so they now run `agy models`
+  first. `quota`, `doctor` and `status` report `AUTH_REQUIRED` or `SKIP` instead
+  of a reading, and a hop goes on without one. Signing in by running `agy` is
+  unchanged. `scripts/canary.sh`, `bench-corpus.sh` and `shadow-replay.sh` also
+  keep older builds away from an `agy` with no login, and
+  `scripts/check-no-browser.sh` checks the real `agy`.
+
 ## [1.0.0-rc.2] — 2026-11-01
 
 ### Fixed

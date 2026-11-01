@@ -23,6 +23,9 @@ fn a_codex_that_never_answers_does_not_hold_doctor() {
         .env("CONBUS_HOME", home.path())
         .env("CONBUS_SKIP_LAUNCHCTL", "1")
         .env("CONBUS_CODEX_BIN", stub_dir.path().join("codex"))
+        // Left unset this ran the machine's real `agy`, whose answer could also
+        // satisfy the assertion below.
+        .env("CONBUS_AGY_BIN", "/nonexistent/conbus-test-vendor")
         .output()
         .expect("run doctor");
     let elapsed = started.elapsed();

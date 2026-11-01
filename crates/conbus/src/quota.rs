@@ -14,7 +14,7 @@ use std::collections::BTreeSet;
 use std::io::{self, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use conbus_core::clock::ago;
 use conbus_core::event::Harness;
@@ -176,9 +176,17 @@ pub fn read_agy() -> io::Result<Quota> {
 }
 
 /// [`read_agy`] with the caller's deadline — the same two seconds `doctor`
-/// gives every probe.
+/// gives every probe. The sign-in check spends it first.
+///
+/// `agy -p` runs only on an account [`agy_signed_in`] vouched for. Measured on
+/// 1.4.12 in a throwaway HOME: with no login it starts an OAuth flow and opens
+/// a browser tab, with or without a controlling terminal. `--print-timeout` and
+/// this deadline stop the wait, not the tab.
 pub fn read_agy_with(deadline: Duration) -> io::Result<Quota> {
+    let started = Instant::now();
     let binary = agy_binary();
+    agy_signed_in(&binary, deadline).map_err(io::Error::other)?;
+    let left = deadline.saturating_sub(started.elapsed());
     let mut command = Command::new(&binary);
     command
         .args([
@@ -187,12 +195,12 @@ pub fn read_agy_with(deadline: Duration) -> io::Result<Quota> {
             "--output-format",
             "json",
             "--print-timeout",
-            &format!("{}s", deadline.as_secs().max(1)),
+            &format!("{}s", left.as_secs().max(1)),
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    let output = crate::code::output_within(command, deadline)
+    let output = crate::code::output_within(command, left)
         .map_err(|err| io::Error::other(format!("agy -p /usage: {err}")))?;
     if !output.status.success() {
         return Err(io::Error::other(format!(
@@ -210,6 +218,65 @@ fn agy_binary() -> std::ffi::OsString {
     std::env::var_os("CONBUS_AGY_BIN")
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "agy".into())
+}
+
+/// Why `agy` was not asked for its usage. Neither is a reading.
+#[derive(Debug)]
+enum AgyNotAsked {
+    /// `agy models` says there is no login.
+    AuthRequired,
+    /// `agy models` said neither yes nor no.
+    Skip(String),
+}
+
+impl std::fmt::Display for AgyNotAsked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AuthRequired => f.write_str(
+                "AUTH_REQUIRED: not signed in, so usage was not asked; \
+                 run `agy` in a terminal to sign in",
+            ),
+            Self::Skip(why) => {
+                write!(
+                    f,
+                    "SKIP: sign-in not confirmed ({why}), so usage was not asked"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for AgyNotAsked {}
+
+/// True when [`read_agy_with`] gave up before asking for usage: the reason is
+/// the answer, however long the check took.
+pub fn agy_not_asked(err: &io::Error) -> bool {
+    err.get_ref().is_some_and(|inner| inner.is::<AgyNotAsked>())
+}
+
+/// With no login, `agy models` says so, fails and opens nothing. Only a plain
+/// listing counts as a login: a request to sign in outranks a clean exit, and
+/// anything else leaves the login unknown, which is not asked either. The
+/// wording decides only which of the two refusals is reported.
+fn agy_signed_in(binary: &std::ffi::OsStr, deadline: Duration) -> Result<(), AgyNotAsked> {
+    let mut command = Command::new(binary);
+    command.arg("models");
+    let output = crate::code::output_within(command, deadline).map_err(AgyNotAsked::Skip)?;
+    let said = [&output.stdout, &output.stderr]
+        .map(|bytes| String::from_utf8_lossy(bytes).to_ascii_lowercase());
+    if said.iter().any(|text| text.contains("sign in")) {
+        return Err(AgyNotAsked::AuthRequired);
+    }
+    if !output.status.success() {
+        return Err(AgyNotAsked::Skip(format!(
+            "`agy models` exited {}",
+            output.status
+        )));
+    }
+    if said[0].trim().is_empty() {
+        return Err(AgyNotAsked::Skip("`agy models` listed nothing".into()));
+    }
+    Ok(())
 }
 
 /// `agy -p "/usage" --output-format json`, captured on 1.1.27.

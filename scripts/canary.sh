@@ -75,13 +75,6 @@ new_bin=$install_dir/conbus.new
 # sees. launchd never inherits a shell's CONBUS_HOME/XDG_STATE_HOME, so
 # neither does this script.
 unset CONBUS_HOME XDG_STATE_HOME
-
-# A rehearsal runs real conbus under a throwaway HOME, where `agy -p` is not
-# logged in and, given a controlling terminal, opens a browser tab for OAuth.
-# Nobody asked for that, and its quota line is not what a rehearsal tests.
-if [ -n "${CONBUS_CANARY_REHEARSAL:-}" ]; then
-    export CONBUS_AGY_BIN=/usr/bin/false
-fi
 root=$HOME/.conbus
 stamp=$root/daemon.build
 daemon_log=$root/daemon.log
@@ -164,6 +157,32 @@ is_real_env() {
     this_home=$(cd "$HOME" && pwd -P)
     [ "$(cd "$CONBUS_CANARY_TEST_REAL_HOME" 2>/dev/null && pwd -P)" = "$this_home" ]
 }
+
+# True when `agy models` lists models. With no login it fails and opens nothing.
+agy_signed_in() {
+    "${CONBUS_AGY_BIN:-agy}" models >/dev/null 2>&1 </dev/null &
+    agy_pid=$!
+    n=0
+    while kill -0 "$agy_pid" 2>/dev/null && [ "$n" -lt 150 ]; do
+        sleep 0.1
+        n=$((n + 1))
+    done
+    if kill -0 "$agy_pid" 2>/dev/null; then
+        kill "$agy_pid" 2>/dev/null || true
+        wait "$agy_pid" 2>/dev/null || true
+        return 1
+    fi
+    wait "$agy_pid" 2>/dev/null
+}
+
+# With no login, `agy -p /usage` opens a browser tab for OAuth, terminal or no
+# terminal, and doctor on a build older than conbus's own sign-in check still
+# runs it. That build may be the one installed or the one rolled back to, so
+# the check is made here too. A throwaway HOME has no login to ask about, and a
+# quota line is not what this script tests.
+if ! is_real_env || ! agy_signed_in; then
+    export CONBUS_AGY_BIN=/usr/bin/false
+fi
 
 # --- blackout ---------------------------------------------------------------
 

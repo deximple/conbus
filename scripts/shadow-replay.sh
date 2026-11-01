@@ -76,6 +76,10 @@ printf '%s\n' "${newest:-none}" >"$out/excluded-newest.txt"
 
 fails=0
 
+# A build older than conbus's sign-in check runs `agy -p /usage` from doctor,
+# and with no login that opens a browser tab for OAuth.
+"${CONBUS_AGY_BIN:-agy}" models >/dev/null 2>&1 </dev/null || export CONBUS_AGY_BIN=/usr/bin/false
+
 # replay <dir> <base> <ext> <conbus args...>: the command once plain, once
 # under CONBUS_NO_CACHE=1, stdout and stderr to separate files.
 replay() {
