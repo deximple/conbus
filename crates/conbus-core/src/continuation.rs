@@ -86,6 +86,9 @@ pub struct Candidate {
     /// How the last turn ended, when the last thing that happened *was* a turn
     /// ending. `None` means a turn was in flight.
     pub last_turn: Option<TurnState>,
+    /// When the newest turn end folded so far happened. What [`overtaken`] holds
+    /// a late record against, so it outlives the next turn's start.
+    pub turn_ended_at: Option<Timestamp>,
     pub turns: u64,
     /// Reconstructed from the vendor's own history rather than mirrored live.
     pub backfilled: bool,
@@ -193,6 +196,20 @@ pub const SELF_SUPPLIED_UNITS: usize = 1_200;
 /// conversations in the real log are a single turn with nothing to carry.
 pub const MIN_TURNS: u64 = 2;
 
+/// Whether a record that waited on its way to the log happened before the
+/// conversation's last turn end, and so says nothing about now.
+///
+/// A record's place in the log is when it landed, and it can land behind a turn
+/// end that came after it: through the spool, parked for the prompt that binds its
+/// session, or overtaken by a live hook. The tool ran, or the prompt came, and that
+/// turn is over. A record that did not wait has no `spooled_at`, and is news.
+fn overtaken(record: &Record, turn_ended_at: Option<Timestamp>) -> bool {
+    record
+        .spooled_at
+        .zip(turn_ended_at)
+        .is_some_and(|(waited_from, ended)| waited_from < ended)
+}
+
 impl Candidate {
     /// Build one candidate per conversation from the log.
     ///
@@ -233,11 +250,13 @@ impl Candidate {
             workspace: None,
             last_activity: record.ts,
             last_turn: None,
+            turn_ended_at: None,
             turns: 0,
             backfilled: false,
             live: false,
         });
 
+        let says_nothing_now = overtaken(record, candidate.turn_ended_at);
         candidate.harness = record.source.harness.clone();
         candidate.last_activity = record.ts;
         if record.source.workspace.is_some() {
@@ -249,9 +268,15 @@ impl Candidate {
         match &record.event {
             Event::TurnStarted { .. } => {
                 candidate.turns += 1;
-                candidate.last_turn = None;
+                if !says_nothing_now {
+                    candidate.last_turn = None;
+                }
             }
-            Event::TurnEnded { state, .. } => candidate.last_turn = Some(state.clone()),
+            Event::TurnEnded { state, .. } => {
+                candidate.last_turn = Some(state.clone());
+                let happened = record.spooled_at.unwrap_or(record.ts);
+                candidate.turn_ended_at = candidate.turn_ended_at.max(Some(happened));
+            }
             // A session opening or closing does not disturb how the last turn
             // ended: a conversation that finished and then had its window
             // closed is still a finished conversation. Neither does a briefing,
@@ -267,12 +292,17 @@ impl Candidate {
             | Event::Summarised { .. }
             | Event::Leased { .. }
             | Event::Aliased { .. } => {}
-            // Tool traffic means a turn is in flight, whatever came before.
+            // Tool traffic means a turn is in flight, whatever came before, as
+            // long as it is about now.
             Event::ToolRequested { .. }
             | Event::PermissionAsked { .. }
             | Event::ToolDenied { .. }
             | Event::ToolUse { .. }
-            | Event::ToolBatchEnded { .. } => candidate.last_turn = None,
+            | Event::ToolBatchEnded { .. } => {
+                if !says_nothing_now {
+                    candidate.last_turn = None;
+                }
+            }
         }
     }
 }
@@ -606,6 +636,7 @@ mod tests {
             workspace: Some(WORKSPACE.into()),
             last_activity: ago(120),
             last_turn: Some(TurnState::Complete),
+            turn_ended_at: None,
             turns: 6,
             backfilled: false,
             live: false,
@@ -1173,6 +1204,179 @@ mod tests {
         ];
 
         assert_eq!(stopped(&Candidate::index(&records)[0]), Stopped::InFlight);
+    }
+
+    fn tool_call() -> Event {
+        Event::ToolRequested {
+            tool: "Read".into(),
+            tool_use_id: None,
+            input: Body::kept("i"),
+        }
+    }
+
+    /// A record that landed `at` and first tried to at `from`.
+    fn waited(bus_id: BusId, at: Timestamp, from: Timestamp, event: Event) -> Record {
+        Record {
+            spooled_at: Some(from),
+            ..logged(bus_id, at, event)
+        }
+    }
+
+    /// Two turns, the last ended 100 seconds ago with `last`, and then what landed.
+    fn after_the_last_turn(bus_id: BusId, last: TurnState, landed: Record) -> Candidate {
+        let records = vec![
+            logged(bus_id, ago(300), prompt()),
+            logged(bus_id, ago(280), ended(TurnState::Complete)),
+            logged(bus_id, ago(200), prompt()),
+            logged(bus_id, ago(100), ended(last)),
+            landed,
+        ];
+        Candidate::index(&records).remove(0)
+    }
+
+    #[test]
+    fn a_tool_event_that_landed_behind_the_turn_end_does_not_reopen_the_turn() {
+        // Parked for the prompt that bound its session, or overtaken by a live
+        // hook. The turn it belonged to is over, and saying "still mid-turn" to
+        // the next session would stay true for as long as nothing else happens.
+        let bus_id = BusId::mint();
+        let late = waited(bus_id, ago(60), ago(150), tool_call());
+
+        let candidate = after_the_last_turn(bus_id, TurnState::Complete, late);
+
+        assert_eq!(stopped(&candidate), Stopped::Finished);
+    }
+
+    #[test]
+    fn a_tool_event_that_landed_late_does_not_clear_a_quota_stop() {
+        // The one stop a person has to be told about, the one `decide` leads with
+        // and the one the next leg's `continued` edge depends on.
+        let bus_id = BusId::mint();
+        let quota = TurnState::InterruptedQuota {
+            reason: "rate_limit".into(),
+        };
+        let late = waited(bus_id, ago(60), ago(150), tool_call());
+
+        let candidate = after_the_last_turn(bus_id, quota, late);
+
+        assert_eq!(stopped(&candidate), Stopped::Displaced);
+        let other = Candidate {
+            bus_id: BusId::mint(),
+            last_activity: ago(10),
+            last_turn: Some(TurnState::Complete),
+            ..candidate.clone()
+        };
+        assert_eq!(
+            named(&brief(&[other, candidate.clone()]))[0],
+            candidate.bus_id,
+            "it still leads"
+        );
+    }
+
+    #[test]
+    fn a_prompt_its_own_turn_end_overtook_does_not_reopen_the_turn() {
+        // The same order from a spooled prompt: its hook missed the daemon, the
+        // turn's end did not, and the drain came after both.
+        let bus_id = BusId::mint();
+        let late = waited(bus_id, ago(60), ago(150), prompt());
+
+        let candidate = after_the_last_turn(bus_id, TurnState::Complete, late);
+
+        assert_eq!(stopped(&candidate), Stopped::Finished);
+        assert_eq!(candidate.turns, 3, "it still happened");
+    }
+
+    #[test]
+    fn a_tool_event_that_waited_but_came_after_the_turn_end_is_news() {
+        // Its prompt hook never fired, and it is the only sign a turn is running.
+        let bus_id = BusId::mint();
+        let later = waited(bus_id, ago(50), ago(60), tool_call());
+
+        let candidate = after_the_last_turn(bus_id, TurnState::Complete, later);
+
+        assert_eq!(stopped(&candidate), Stopped::InFlight);
+    }
+
+    #[test]
+    fn a_tool_event_that_did_not_wait_is_news() {
+        let bus_id = BusId::mint();
+        let live = logged(bus_id, ago(50), tool_call());
+
+        let candidate = after_the_last_turn(bus_id, TurnState::Complete, live);
+
+        assert_eq!(stopped(&candidate), Stopped::InFlight);
+    }
+
+    #[test]
+    fn a_turn_end_that_waited_is_held_against_when_it_happened() {
+        // It landed after everything here, and it happened before the tool call
+        // did, so that tool call is a new turn running.
+        let bus_id = BusId::mint();
+        let records = vec![
+            logged(bus_id, ago(300), prompt()),
+            waited(bus_id, ago(50), ago(200), ended(TurnState::Complete)),
+            waited(bus_id, ago(40), ago(100), tool_call()),
+        ];
+
+        assert_eq!(stopped(&Candidate::index(&records)[0]), Stopped::InFlight);
+    }
+
+    #[test]
+    fn an_older_turn_end_that_landed_late_does_not_move_the_line_back() {
+        let bus_id = BusId::mint();
+        let records = vec![
+            logged(bus_id, ago(300), prompt()),
+            logged(bus_id, ago(100), ended(TurnState::Complete)),
+            waited(bus_id, ago(90), ago(250), ended(TurnState::Complete)),
+            waited(bus_id, ago(80), ago(150), tool_call()),
+        ];
+
+        assert_eq!(stopped(&Candidate::index(&records)[0]), Stopped::Finished);
+    }
+
+    #[test]
+    fn a_tool_event_that_waited_still_reads_as_late_through_the_cache() {
+        // What the daemon folds at start, and what `hop` reads: closed segments
+        // come back from their sidecars, and a fold that lost the field there
+        // would turn a finished conversation back into a running one at a restart.
+        use crate::retention::Retention;
+        use crate::segment::SegmentLog;
+        let home = tempfile::tempdir().expect("tempdir");
+        let dir = home.path().join("log");
+        let cache = home.path().join("cache");
+        let bus_id = BusId::mint();
+        let entry = |record: Record| crate::record::Entry {
+            bus_id: record.bus_id,
+            observed_at: Some(record.ts),
+            source: record.source,
+            vendor_turn_id: None,
+            vendor_agent_id: None,
+            hook_id: None,
+            spooled_at: record.spooled_at,
+            event: record.event,
+        };
+        {
+            let mut log =
+                SegmentLog::open_with_segment_size(&dir, Retention::default(), 1).expect("open");
+            for record in [
+                logged(bus_id, ago(300), prompt()),
+                logged(bus_id, ago(100), ended(TurnState::Complete)),
+                waited(bus_id, ago(60), ago(150), tool_call()),
+                logged(bus_id, ago(50), Event::SessionEnded { reason: None }),
+            ] {
+                log.append(entry(record)).expect("append");
+            }
+        }
+        // Once to write the sidecars, and once to read them back.
+        for read in ["fresh", "from the sidecars"] {
+            let mut folded = HashMap::new();
+            SegmentLog::scan_meta_each(&dir, Some(&cache), |record| {
+                Candidate::apply(&mut folded, &record);
+            })
+            .expect("scan");
+            assert_eq!(stopped(&folded[&bus_id]), Stopped::Finished, "{read}");
+        }
+        assert!(cache.join("meta").is_dir(), "the sidecars were really used");
     }
 
     #[test]

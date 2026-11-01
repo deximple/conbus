@@ -2373,6 +2373,45 @@ mod tests {
     }
 
     #[test]
+    fn a_late_tool_event_leaves_a_quota_stop_a_quota_stop() {
+        // The next session is told about it first, offered `conbus hop`, and
+        // its `continued` edge depends on it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = SegmentLog::open(dir.path(), Retention::default()).expect("open");
+        let mut daemon = Daemon::new(log, Registry::new(), HashMap::new());
+        let before_the_stop = Timestamp::now().to_string();
+        daemon.handle(request(turn("work")));
+        std::thread::sleep(Duration::from_millis(2));
+        daemon.handle(request(Event::TurnEnded {
+            state: TurnState::InterruptedQuota {
+                reason: "rate_limit".into(),
+            },
+            assistant_message: None,
+            tokens: None,
+        }));
+
+        daemon.handle(Request {
+            hook_id: Some(BusId::mint().to_string()),
+            spooled_at: Some(before_the_stop),
+            ..request(Event::ToolRequested {
+                tool: "Read".into(),
+                tool_use_id: None,
+                input: Body::kept("{}"),
+            })
+        });
+
+        let scan = SegmentLog::scan(dir.path()).expect("scan");
+        let chapter = &daemon.chapters[&scan.records[0].bus_id];
+        assert_eq!(chapter.stopped(), Stopped::Displaced);
+        let restarted = Daemon::chapters(&scan.records);
+        assert_eq!(
+            restarted[&scan.records[0].bus_id].stopped(),
+            Stopped::Displaced,
+            "and a restart folds the same log the same way"
+        );
+    }
+
+    #[test]
     fn a_first_prompt_that_waited_is_not_briefed() {
         let dir = tempfile::tempdir().expect("tempdir");
         let log = SegmentLog::open(dir.path(), Retention::default()).expect("open");
