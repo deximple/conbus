@@ -9,7 +9,7 @@ briefed on what recent sessions there were doing, and when a vendor stops a
 turn for quota — or when you say so — the next leg picks the conversation up.
 The vendor TUIs stay the window; conbus is the part underneath.
 
-**0.2.9 · macOS · Linux · Apache-2.0.** Local only: no hosted service, no
+**1.0.0-rc.1 · macOS · Linux · Apache-2.0.** Local only: no hosted service, no
 telemetry, and conbus never reads or stores vendor auth tokens. One harness
 on one laptop does not need it.
 
@@ -19,7 +19,7 @@ The record is an append-only JSONL stream. Git, a shared folder, and a remote
 database of the text each handle that stream badly. conbus keeps the stream on
 this Mac.
 
-| Approach | What happens to the stream | What 0.2.9 does |
+| Approach | What happens to the stream | What 1.0 does |
 | --- | --- | --- |
 | Git or dotfiles | High-frequency JSONL collides, and prompts land in the repository history. | Segments stay in `~/.conbus/log`. They are the source of truth (`crates/conbus-core/src/segment.rs`). |
 | A file sync | The copy does not know where a record ends, and it is a copy of the prompts. | The log directory is mode `0700` and each segment is `0600`. conbus does not upload them. |
@@ -222,8 +222,8 @@ Operational guides and the decisions behind them:
 - [매뉴얼 (한국어)](docs/manual.ko.md) · [운영자 매뉴얼 (한국어)](docs/beginner-manual.md)
 - [RFD 0001](docs/rfd/0001-hook-contract.md) — the hook contract the binary registers. Field names come from `crates/conbus/tests/fixtures/`.
 - [Support matrix](docs/support-matrix.md) — which vendor versions were checked live, and what each one sends. [Stability](docs/stability.md) — what 1.x keeps. [Log format](docs/log-format.md).
-- [RFD 0002](docs/rfd/0002-metadata-sync.md) — draft. Which usage rows a sync may send. The client ships in 0.2.9; there is no service.
-- [RFD 0003](docs/rfd/0003-security-design.md) — draft. Device keys and `conbus sync --off`. It is accepted only together with RFD 0002, and neither has been accepted. The client side ships in 0.2.9.
+- [RFD 0002](docs/rfd/0002-metadata-sync.md) — draft. Which usage rows a sync may send. The client ships in 1.0; there is no service.
+- [RFD 0003](docs/rfd/0003-security-design.md) — draft. Device keys and `conbus sync --off`. It is accepted only together with RFD 0002, and neither has been accepted. The client side ships in 1.0.
 - [Changelog](CHANGELOG.md) · [Security](SECURITY.md) · [Releasing](docs/release.md) · [Managed Macs](docs/fleet.md) · [Hop walkthrough](docs/hop-demo.md) · [Fact schema](docs/fact-schema.md) · [License](LICENSE)
 
 conbus is a local tool. There is no hosted bus, account or price
@@ -231,11 +231,11 @@ conbus is a local tool. There is no hosted bus, account or price
 
 ## 한국어
 
-0.2.9는 한 대의 Mac에서 Claude Code, Codex, Cursor, grok, opencode의 대화를
+1.0은 한 대의 Mac에서 Claude Code, Codex, Cursor, grok, opencode의 대화를
 로컬 JSONL 세그먼트로 남기고, 쿼터로 멈추거나 직접 말했을 때 다음 하네스로
 넘기는 도구입니다. 호스티드 동기화 서비스는 없습니다.
 
 설치는 위의 `install.sh`와 `conbus install --apply`가 전부입니다.
-`conbus sync`는 0.2.9에 있지만 join할 서비스가 아직 없습니다. 참여한 뒤에는
+`conbus sync`는 1.0에 있지만 join할 서비스가 아직 없습니다. 참여한 뒤에는
 닫힌 날의 횟수만 초대에 적힌 origin으로 나가고, 프롬프트는 로그에 남습니다.
 운영 절차는 [한국어 매뉴얼](docs/manual.ko.md)에 있습니다.

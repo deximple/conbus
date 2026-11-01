@@ -6,6 +6,8 @@ the entry says so when it does.
 
 ## [Unreleased]
 
+## [1.0.0-rc.1] — 2026-11-01
+
 ### Added
 
 - `usage` rows and the OTLP pipe now count turn tokens where a vendor's hook
