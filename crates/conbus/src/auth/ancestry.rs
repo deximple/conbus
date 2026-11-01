@@ -57,11 +57,10 @@ pub(super) fn holders(port: u16) -> Holders {
     match pids {
         Err(_) => Holders::CouldNotAsk("lsof printed something that is not a pid".into()),
         Ok(pids) if pids.is_empty() => Holders::Nothing,
-        Ok(pids) => {
-            let unique: HashSet<u32> = pids.iter().copied().collect();
-            let mut unique: Vec<u32> = unique.into_iter().collect();
-            unique.sort_unstable();
-            Holders::Listeners(unique.into_iter().map(walk).collect())
+        Ok(mut pids) => {
+            pids.sort_unstable();
+            pids.dedup();
+            Holders::Listeners(pids.into_iter().map(walk).collect())
         }
     }
 }

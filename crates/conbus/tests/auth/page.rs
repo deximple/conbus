@@ -116,7 +116,9 @@ fn a_script_in_a_vendors_error_stays_text() {
 
 #[test]
 fn control_characters_in_a_vendors_error_reach_neither_page_nor_terminal() {
-    let (_codex_dir, codex) = codex_refusing_with("bad\u{1b}[2K\nconbus    no: forged");
+    // The error reaches this command as JSON, whose escapes stop the first two. A
+    // bidirectional override is not escaped by JSON, so it is what would get through.
+    let (_codex_dir, codex) = codex_refusing_with("bad\u{1b}[2K\nconbus    no: forged\u{202e}txet");
     let root = tempfile::tempdir().expect("tempdir");
 
     let output = conbus(root.path())
@@ -126,13 +128,16 @@ fn control_characters_in_a_vendors_error_reach_neither_page_nor_terminal() {
         .expect("run auth");
     let stdout = String::from_utf8_lossy(&output.stdout);
 
+    assert!(row(&stdout, "codex").contains("SKIP"), "{stdout}");
     assert!(!stdout.contains('\u{1b}'), "{stdout:?}");
+    assert!(!stdout.contains('\u{202e}'), "{stdout:?}");
     assert!(
         !stdout.lines().any(|l| l.starts_with("conbus    no")),
         "{stdout}"
     );
     let html = page_with(&[("CONBUS_CODEX_BIN", &codex)]);
     assert!(!html.contains('\u{1b}'), "{html:?}");
+    assert!(!html.contains('\u{202e}'), "{html:?}");
 }
 
 #[test]
@@ -368,15 +373,8 @@ fn the_page_goes_in_a_closed_root_by_default() {
 
 #[test]
 fn auth_html_is_self_contained_and_owner_only() {
-    let agy_dir = tempfile::tempdir().expect("tempdir");
-    let agy = agy_dir.path().join("agy");
-    support::write_executable(
-        &agy,
-        "#!/bin/sh\nif [ \"$1\" = models ]; then\n  echo 'claude-opus'\nfi\n",
-    );
-    let codex_dir = tempfile::tempdir().expect("tempdir");
-    let codex = codex_dir.path().join("codex");
-    support::write_executable(&codex, FAKE_APP_SERVER);
+    let (_agy_dir, agy) = agy_signed_in();
+    let (_codex_dir, codex) = codex_signed_in();
     let (_gh_dir, gh) = fake_gh(0);
 
     let root = tempfile::tempdir().expect("tempdir");

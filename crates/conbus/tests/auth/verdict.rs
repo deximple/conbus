@@ -351,6 +351,25 @@ fn a_port_with_several_callbacks_needs_all_of_them_clear_for_no() {
     );
 }
 
+#[test]
+fn conbus_above_one_callback_is_yes_whatever_another_says() {
+    let table = ProcessTable::new(
+        &[50],
+        &[(50, 40, "node"), (40, 1, "conbus"), (1, 0, "launchd")],
+    );
+    let local = "http%3A%2F%2F127.0.0.1%3A55407%2F";
+    let remote = "https%3A%2F%2Fanother.example%3A1%2F";
+
+    let stdout = table.ask(&format!(
+        "https://x.example/?redirect_uri={remote}&callback={local}"
+    ));
+
+    assert!(
+        verdict_of(&stdout).starts_with("conbus    yes:"),
+        "{stdout}"
+    );
+}
+
 /// The real `lsof` and `ps`, for what stand-ins cannot pin: the arguments.
 fn have_lsof_and_ps() -> bool {
     ["lsof", "ps"].iter().all(|name| {
