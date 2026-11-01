@@ -415,6 +415,14 @@ pub fn install(apply: bool, profile: Option<&str>) -> io::Result<()> {
                 );
             }
         }
+        if crate::install::vendor_present("opencode", &home)
+            && let Err(why) = crate::install::opencode_version_for_install()
+        {
+            println!(
+                "{:<12} could not read which version this is ({why}); the plugin is for the current major, and `conbus doctor` says if it does not load",
+                "opencode"
+            );
+        }
 
         let cursor_hooks = crate::install::cursor_hooks_path(&home);
         if !crate::install::vendor_present("cursor", &home) {
@@ -948,9 +956,14 @@ fn report_hooks(home: &Path) {
     if !crate::install::vendor_present("opencode", home) {
         println!("hooks     {:<12} not installed here", "opencode");
     } else if crate::install::opencode_plugin_registered(home) {
-        let loads = crate::install::opencode_plugin_api();
-        match crate::install::opencode_plugin_api_in_place(home) {
-            Some(written) if written != loads => println!(
+        let loads = crate::install::opencode_plugin_api_within(Duration::from_secs(2));
+        match (&loads, crate::install::opencode_plugin_api_in_place(home)) {
+            (Err(why), _) => println!(
+                "hooks     {:<12} could not read which version this is ({why}), so whether {} loads is not known",
+                "opencode",
+                crate::install::opencode_plugin_path(home).display()
+            ),
+            (Ok(loads), Some(written)) if written != *loads => println!(
                 "hooks     {:<12} MISMATCH — {} is written for OpenCode {}, which this OpenCode does not load; run `conbus install --apply`",
                 "opencode",
                 crate::install::opencode_plugin_path(home).display(),

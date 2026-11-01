@@ -21,12 +21,17 @@ fn built() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_conbus"))
 }
 
+/// A vendor binary that is not there, so `install` and `doctor` do not run the real
+/// `opencode` on every `cargo test`.
+const NOT_THERE: &str = "/nonexistent/conbus-test-vendor";
+
 fn run(binary: &Path, home: &Path, args: &[&str]) -> Output {
     let out = Command::new(binary)
         .args(args)
         .env("HOME", home)
         // Never the runner's or the developer's launchd.
         .env("CONBUS_SKIP_LAUNCHCTL", "1")
+        .env("CONBUS_OPENCODE_BIN", NOT_THERE)
         .env_remove("CONBUS_HOME")
         .env_remove("XDG_STATE_HOME")
         .env_remove("XDG_CONFIG_HOME")

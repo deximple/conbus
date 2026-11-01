@@ -11,12 +11,19 @@ use std::process::Command;
 
 use serde_json::{Value, json};
 
+mod support;
+
+/// A vendor binary that is not there, so `install` and `doctor` do not run the real
+/// `opencode` on every `cargo test`.
+const NOT_THERE: &str = "/nonexistent/conbus-test-vendor";
+
 fn conbus(binary: &Path, home: &Path, args: &[&str]) -> String {
     let out = Command::new(binary)
         .args(args)
         .env("HOME", home)
         // Never the runner's or the developer's launchd.
         .env("CONBUS_SKIP_LAUNCHCTL", "1")
+        .env("CONBUS_OPENCODE_BIN", NOT_THERE)
         .env_remove("CONBUS_HOME")
         .env_remove("XDG_STATE_HOME")
         .env_remove("XDG_CONFIG_HOME")
@@ -244,12 +251,156 @@ fn install_offers_to_replace_the_opencode_plugin_an_older_conbus_wrote() {
     );
 }
 
+#[test]
+fn install_writes_the_plugin_the_opencode_on_this_machine_loads() {
+    // `CONBUS_OPENCODE_BIN` names it, as it does for every other use of that
+    // binary. Asking one that is not there takes the current major.
+    let machine = Machine::new();
+    let built = PathBuf::from(env!("CARGO_BIN_EXE_conbus"));
+    std::fs::create_dir_all(machine.at(".config/opencode")).expect("opencode");
+    conbus(&built, &machine.home, &["install", "--apply"]);
+    let plugin = machine.at(".config/opencode/plugins/conbus.js");
+    let not_there = std::fs::read_to_string(&plugin).expect("the plugin");
+    assert!(not_there.contains("export default {"), "{not_there}");
+
+    let stand_in = machine.at("opencode-1");
+    support::write_executable(&stand_in, "#!/bin/sh\necho 1.18.31\n");
+    // Its first exec can outlast the two seconds `install` gives it on a loaded Mac.
+    assert!(
+        Command::new(&stand_in)
+            .status()
+            .expect("stand-in")
+            .success()
+    );
+    let out = Command::new(&built)
+        .args(["install", "--apply"])
+        .env("HOME", &machine.home)
+        .env("CONBUS_SKIP_LAUNCHCTL", "1")
+        .env("CONBUS_OPENCODE_BIN", &stand_in)
+        .env_remove("CONBUS_HOME")
+        .env_remove("XDG_STATE_HOME")
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("CODEX_HOME")
+        .output()
+        .expect("run conbus");
+    assert!(out.status.success(), "{out:?}");
+
+    let one = std::fs::read_to_string(&plugin).expect("the plugin");
+    assert!(one.contains("export const "), "{one}");
+    assert!(!one.contains("export default {"), "{one}");
+}
+
+/// A stand-in `opencode`, with its first exec out of the way: on a loaded Mac that
+/// alone can outlast the limits these tests are about.
+fn a_stand_in_opencode(machine: &Machine, name: &str, script: &str) -> PathBuf {
+    let stand_in = machine.at(name);
+    support::write_executable(
+        &stand_in,
+        &format!("#!/bin/sh\n[ \"$1\" = warm ] && exit 0\n{script}\n"),
+    );
+    let warmed = Command::new(&stand_in)
+        .arg("warm")
+        .status()
+        .expect("stand-in");
+    assert!(warmed.success());
+    stand_in
+}
+
+fn conbus_beside(built: &Path, home: &Path, opencode: &Path, args: &[&str]) -> String {
+    let out = Command::new(built)
+        .args(args)
+        .env("HOME", home)
+        .env("CONBUS_SKIP_LAUNCHCTL", "1")
+        .env("CONBUS_OPENCODE_BIN", opencode)
+        .env("CONBUS_CODEX_BIN", NOT_THERE)
+        .env("CONBUS_AGY_BIN", NOT_THERE)
+        .env_remove("CONBUS_HOME")
+        .env_remove("XDG_STATE_HOME")
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("CODEX_HOME")
+        .output()
+        .expect("run conbus");
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+fn opencode_hook_line(doctor: &str) -> String {
+    doctor
+        .lines()
+        .find(|line| line.starts_with("hooks") && line.contains("opencode"))
+        .unwrap_or_else(|| panic!("no opencode line:\n{doctor}"))
+        .to_string()
+}
+
+#[test]
+fn install_waits_for_an_opencode_slower_than_doctor_would() {
+    // A person is waiting on this one command, and OpenCode 1.x refuses the 2.x
+    // plugin. A slow answer used to exit 0 and write the wrong one, silently.
+    let machine = Machine::new();
+    let built = PathBuf::from(env!("CARGO_BIN_EXE_conbus"));
+    std::fs::create_dir_all(machine.at(".config/opencode")).expect("opencode");
+    let slow = a_stand_in_opencode(&machine, "opencode-slow", "sleep 3\necho 1.18.31");
+
+    let said = conbus_beside(&built, &machine.home, &slow, &["install", "--apply"]);
+
+    let plugin = std::fs::read_to_string(machine.at(".config/opencode/plugins/conbus.js"))
+        .expect("the plugin");
+    assert!(plugin.contains("export const "), "{said}\n{plugin}");
+    assert!(!said.contains("could not read"), "{said}");
+}
+
+#[test]
+fn install_says_when_it_could_not_read_which_opencode_this_is() {
+    let machine = Machine::new();
+    let built = PathBuf::from(env!("CARGO_BIN_EXE_conbus"));
+    std::fs::create_dir_all(machine.at(".config/opencode")).expect("opencode");
+
+    let said = conbus(&built, &machine.home, &["install", "--apply"]);
+
+    let line = said
+        .lines()
+        .find(|line| line.starts_with("opencode") && line.contains("could not read"))
+        .unwrap_or_else(|| panic!("nothing about the version:\n{said}"));
+    assert!(line.contains("current major"), "{line}");
+}
+
+#[test]
+fn doctor_says_when_it_could_not_read_which_opencode_this_is() {
+    // Its probe gets two seconds. On a loaded machine that was missed by a fresh
+    // 7 ms stand-in, and `doctor` then said `runs` of a plugin OpenCode refuses.
+    let machine = Machine::new();
+    let built = PathBuf::from(env!("CARGO_BIN_EXE_conbus"));
+    std::fs::create_dir_all(machine.at(".config/opencode")).expect("opencode");
+    conbus(&built, &machine.home, &["install", "--apply"]);
+    let hangs = a_stand_in_opencode(&machine, "opencode-hangs", "exec /bin/sleep 30");
+    let two = a_stand_in_opencode(&machine, "opencode-2", "echo 2.2.3");
+    let one = a_stand_in_opencode(&machine, "opencode-1", "echo 1.18.31");
+    let says_nothing = a_stand_in_opencode(&machine, "opencode-odd", "echo something else");
+
+    let unread = opencode_hook_line(&conbus_beside(&built, &machine.home, &hangs, &["doctor"]));
+    let odd = opencode_hook_line(&conbus_beside(
+        &built,
+        &machine.home,
+        &says_nothing,
+        &["doctor"],
+    ));
+    let fine = opencode_hook_line(&conbus_beside(&built, &machine.home, &two, &["doctor"]));
+    let wrong = opencode_hook_line(&conbus_beside(&built, &machine.home, &one, &["doctor"]));
+
+    assert!(!unread.contains("runs"), "{unread}");
+    assert!(unread.contains("could not read"), "{unread}");
+    assert!(unread.contains("did not answer"), "{unread}");
+    assert!(odd.contains("could not read"), "{odd}");
+    assert!(fine.contains("runs"), "{fine}");
+    assert!(wrong.contains("MISMATCH"), "{wrong}");
+}
+
 /// Like `conbus`, but the exit status is the answer — for the refusal paths.
 fn conbus_status(binary: &Path, home: &Path, args: &[&str]) -> (bool, String, String) {
     let out = Command::new(binary)
         .args(args)
         .env("HOME", home)
         .env("CONBUS_SKIP_LAUNCHCTL", "1")
+        .env("CONBUS_OPENCODE_BIN", NOT_THERE)
         .env_remove("CONBUS_HOME")
         .env_remove("XDG_STATE_HOME")
         .env_remove("XDG_CONFIG_HOME")

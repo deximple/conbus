@@ -60,7 +60,7 @@ fn start_daemon_with(home: &Path, env: &[(&str, &std::ffi::OsStr)]) -> Daemon {
 
     let daemon = Daemon(child);
     let socket = home.join("conbus.sock");
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
         if std::os::unix::net::UnixStream::connect(&socket).is_ok() && daemon_stamp_is_settled(home)
         {
@@ -1475,12 +1475,21 @@ fn a_silent_connection_does_not_hold_the_hooks_behind_it() {
     assert_eq!(code, 0, "a hook must never fail the turn");
     assert!(says_nothing(&stdout), "{stdout}");
     assert!(waited < Duration::from_secs(1), "waited {waited:?}");
-    let prompts = log_lines(home.path())
-        .into_iter()
-        .filter(|line| line["event"] == "turn_started")
-        .count();
+    // A hook on a loaded machine can run out its own deadline and spool, which
+    // loses nothing: the next idle tick lands it. Lost is never landing.
+    let prompts = || {
+        log_lines(home.path())
+            .into_iter()
+            .filter(|line| line["event"] == "turn_started")
+            .count()
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while prompts() == 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
     assert_eq!(
-        prompts, 1,
+        prompts(),
+        1,
         "the hook behind a silent connection lost its record after {waited:?}: {stderr}"
     );
     daemon.stop();
