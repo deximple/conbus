@@ -589,7 +589,7 @@ fn append_gaps_at_start_in(
     }
     if !timing.budget_exhausted {
         let export = Instant::now();
-        n += ingest_chat_exports_since(&paths.chat_export(), held, log, since)?;
+        n += ingest_chat_exports_at_start(paths, held, log, since)?;
         timing.chat_export_ms = elapsed_ms(export);
     }
     let transcripts_read = !timing.budget_exhausted && timing.claude_unreadable == 0;
@@ -805,17 +805,42 @@ pub fn chat_export_signature_filtered(dir: &Path, official_only: bool) -> Vec<(S
 /// Official Claude.ai / Desktop export drop folder. Chat-only windows have
 /// no hook; a newer `conversations.json` is the identity-preserving channel.
 pub fn ingest_chat_exports(dir: &Path, held: &[Record], log: &mut SegmentLog) -> io::Result<u64> {
-    ingest_chat_exports_filtered(dir, held, log, false, None)
+    ingest_chat_exports_filtered(dir, held, log, false, None, None)
 }
 
-/// The drop folder at start: only exports written after `since`.
-fn ingest_chat_exports_since(
-    dir: &Path,
+/// The drop folder at start: what was written after `since`, and what it has not
+/// read at this size. An export moved in during a downtime keeps its old write time,
+/// and the watcher's first look at the folder already includes it, so neither would
+/// ever read it. `cache/chat-export-read` says what was read, and without it each
+/// export is read once more, which writes nothing.
+fn ingest_chat_exports_at_start(
+    paths: &Paths,
     held: &[Record],
     log: &mut SegmentLog,
     since: Option<i64>,
 ) -> io::Result<u64> {
-    ingest_chat_exports_filtered(dir, held, log, false, since)
+    let marker = paths.cache_dir().join("chat-export-read");
+    let mut read = ReadSoFar::load(&marker);
+    let before = read.0.clone();
+    let filled = ingest_chat_exports_filtered(
+        &paths.chat_export(),
+        held,
+        log,
+        false,
+        since,
+        Some(&mut read),
+    )?;
+    if read.0 != before {
+        read.save(paths, &marker);
+    }
+    Ok(filled)
+}
+
+/// The size of what a drop-folder entry holds: a folder stands for its export.
+fn export_size(path: &Path) -> i64 {
+    let inner = path.join("conversations.json");
+    let file = if path.is_dir() { &inner } else { path };
+    fs::symlink_metadata(file).map_or(-1, |meta| meta.len() as i64)
 }
 
 /// `~/Downloads` after Privacy → Export data. Only vendor-named zips / JSON.
@@ -824,7 +849,7 @@ pub fn ingest_official_privacy_exports(
     held: &[Record],
     log: &mut SegmentLog,
 ) -> io::Result<u64> {
-    ingest_chat_exports_filtered(dir, held, log, true, None)
+    ingest_chat_exports_filtered(dir, held, log, true, None, None)
 }
 
 fn ingest_chat_exports_filtered(
@@ -833,6 +858,7 @@ fn ingest_chat_exports_filtered(
     log: &mut SegmentLog,
     official_only: bool,
     since: Option<i64>,
+    mut consumed: Option<&mut ReadSoFar>,
 ) -> io::Result<u64> {
     if !dir.is_dir() {
         return Ok(0);
@@ -842,7 +868,12 @@ fn ingest_chat_exports_filtered(
     let mut entries: Vec<PathBuf> = fs::read_dir(dir)?
         .filter_map(|entry| entry.ok().map(|e| e.path()))
         .filter(|path| !official_only || is_official_privacy_export(path))
-        .filter(|path| !untouched_since(path, since))
+        .filter(|path| {
+            !untouched_since(path, since)
+                || consumed.as_deref().is_some_and(|read| {
+                    !read.is_current(&path.to_string_lossy(), export_size(path))
+                })
+        })
         .collect();
     entries.sort();
     for path in entries {
@@ -851,6 +882,9 @@ fn ingest_chat_exports_filtered(
         };
         let outcome = ingest_chat_text(held, &mut written, &text, Some(log))?;
         filled += outcome.records + outcome.gap_records;
+        if let Some(read) = consumed.as_deref_mut() {
+            read.note(&path.to_string_lossy(), export_size(&path));
+        }
     }
     Ok(filled)
 }
@@ -3317,8 +3351,8 @@ mod tests {
         assert!(!is_official_privacy_export(&dir.path().join("random.zip")));
         let mut log =
             SegmentLog::open(machine.paths.log_dir(), Retention::default()).expect("open");
-        let filled =
-            ingest_chat_exports_filtered(dir.path(), &[], &mut log, true, None).expect("ingest");
+        let filled = ingest_chat_exports_filtered(dir.path(), &[], &mut log, true, None, None)
+            .expect("ingest");
         assert!(filled >= 2, "{filled}");
         let all = SegmentLog::scan(machine.paths.log_dir())
             .expect("scan")

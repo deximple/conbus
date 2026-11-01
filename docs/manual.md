@@ -529,7 +529,8 @@ the remembered ranges — run `conbus backfill --gaps` after one.
 
 **Claude.ai conversations** have no hooks in the desktop app. Export your data
 from Claude.ai (Settings → Privacy → Export data) and drop the zip (or
-`conversations.json`) into `~/.conbus/chat-export/`; the recorder picks it up.
+`conversations.json`) into `~/.conbus/chat-export/`; the recorder picks it up, at
+the next start if it is down, whatever the file's date.
 `conbus backfill --chat-export PATH` reads one from anywhere and, with
 `--apply` and the recorder stopped, writes it. Organisations using Claude's
 Inference hooks can point them at `conbus hook --inference-listen`

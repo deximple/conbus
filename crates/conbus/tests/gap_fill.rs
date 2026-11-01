@@ -2522,3 +2522,76 @@ fn a_marker_garbled_or_left_over_is_read_as_nothing_and_replaced() {
     );
     assert!(!home.join("cache/gap-since").exists());
 }
+
+fn chat(uuid: &str, messages: &[(&str, &str, &str)]) -> Value {
+    json!({"uuid": uuid, "name": "n", "created_at": T0, "chat_messages":
+        messages.iter()
+            .map(|(id, sender, text)| json!({"uuid": id, "sender": sender, "text": text, "created_at": T0}))
+            .collect::<Vec<_>>()})
+}
+
+/// An export last written a month ago, as one moved into the folder keeps that time.
+fn an_old_export(path: &Path, conversation: &str, text: &str) {
+    let export = json!([chat(
+        conversation,
+        &[("m1", "human", text), ("m2", "assistant", "a1")]
+    )]);
+    std::fs::write(path, export.to_string()).expect("write");
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .expect("open")
+        .set_modified(std::time::SystemTime::now() - Duration::from_secs(30 * 86400))
+        .expect("mtime");
+}
+
+#[test]
+fn an_export_moved_in_during_a_downtime_is_read() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let daemon = start(home);
+    hook(home, &prompt(S, "p0", "before"));
+    stop(daemon);
+    newer_records_arrive(home);
+    std::fs::create_dir_all(home.join("chat-export")).expect("dir");
+    an_old_export(
+        &home.join("chat-export/conversations.json"),
+        "11111111-2222-4333-8444-555555555555",
+        "from the export",
+    );
+
+    stop(start(home));
+
+    assert!(
+        log_lines(home)
+            .iter()
+            .any(|record| record["prompt"]["text"] == "from the export"),
+        "never read"
+    );
+}
+
+#[test]
+fn an_export_read_once_is_not_read_again_at_every_start() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let daemon = start(home);
+    hook(home, &prompt(S, "p0", "before"));
+    stop(daemon);
+    std::fs::create_dir_all(home.join("chat-export")).expect("dir");
+    let path = home.join("chat-export/conversations.json");
+    an_old_export(&path, "11111111-2222-4333-8444-555555555555", "said once");
+    stop(start(home));
+    let said = |text: &str| {
+        log_lines(home)
+            .iter()
+            .any(|record| record["prompt"]["text"] == text)
+    };
+    assert!(said("said once"));
+
+    // The same size and the same old time: nothing says it changed, so a read of it
+    // is all that could bring this conversation in.
+    an_old_export(&path, "22222222-2222-4333-8444-555555555555", "said twce");
+    stop(start(home));
+
+    assert!(!said("said twce"), "read again");
+}

@@ -487,7 +487,8 @@ conbus install --apply     # 레코더를 다시 켭니다
 
 **Claude.ai 대화**는 데스크톱 앱에 훅이 없습니다. Claude.ai에서 데이터를
 내보내고(Settings → Privacy → Export data) 그 zip(또는 `conversations.json`)을
-`~/.conbus/chat-export/`에 넣으면 레코더가 가져갑니다.
+`~/.conbus/chat-export/`에 넣으면 레코더가 가져갑니다. 레코더가 꺼져 있었다면 파일 날짜와
+상관없이 다음 시작 때 가져갑니다.
 `conbus backfill --chat-export PATH`는 어디에 있는 파일이든 읽고, `--apply`를 붙이고
 레코더를 멈춘 상태에서는 기록합니다. Claude의 Inference hooks를 쓰는 조직은 그것을
 `conbus hook --inference-listen`(기본 `127.0.0.1:8787`)에 연결해 대화를 실시간으로
