@@ -573,7 +573,7 @@ impl Daemon {
         let refusal = self.refusal.get_or_insert_with(|| {
             // The daemon's own stderr, because the hook's goes to a vendor that
             // swallows it. Once per outage: a full disk has no room for more.
-            note!("the log refused a write ({refused}); holding records in memory until it stops");
+            note!("the log refused a write ({refused}); keeping what it refuses until it stops");
             Refusal {
                 since: Timestamp::now(),
                 first_error: refused.clone(),
@@ -2097,13 +2097,15 @@ fn shed_orphans(daemon: &mut Daemon, paths: &Paths) {
     }
 }
 
+/// As [`let_go`], under the reason `classify` already files as an orphan.
 fn give_up_on_an_orphan(paths: &Paths, file: &Path, detail: &str) {
-    crate::drops::record_in(
-        Some(paths),
-        &crate::drops::Dropped::new("spooled hook still has no conversation (orphan)")
-            .with_detail(detail),
-    );
-    let _ = std::fs::remove_file(file);
+    if std::fs::remove_file(file).is_ok() {
+        crate::drops::record_in(
+            Some(paths),
+            &crate::drops::Dropped::new("spooled hook still has no conversation (orphan)")
+                .with_detail(detail),
+        );
+    }
 }
 
 #[cfg(test)]
