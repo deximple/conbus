@@ -2,7 +2,7 @@
 //! daemon is still preparing meets a refused or absent socket at once,
 //! instead of waiting 500 ms on a listener that cannot answer.
 
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 fn bin() -> &'static str {
@@ -71,6 +71,17 @@ fn the_socket_answers_only_once_the_stamp_says_serving() {
 
 const SESSION: &str = "ea1d23e9-bb83-4df5-9a73-a6a12e138d85";
 
+/// A daemon that goes with its test, however the test ends. One a failed assert
+/// left behind would run on for good, over a root that has been deleted.
+struct Daemon(Child);
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 fn daemon_in(home: &std::path::Path) -> Command {
     let mut command = Command::new(bin());
     command
@@ -94,7 +105,7 @@ fn stamped_pid(home: &std::path::Path) -> Option<u64> {
 /// Read a daemon's stderr until it says it is waiting for another recorder, or
 /// until it has nothing more to say. A sleep here would pass on a build that
 /// writes early whenever macOS is slow to start a freshly built binary.
-fn until_it_says_it_waits(child: &mut std::process::Child) {
+fn until_it_says_it_waits(child: &mut Child) {
     use std::io::{BufRead, BufReader};
     let stderr = child.stderr.take().expect("stderr is piped");
     let (said, heard) = std::sync::mpsc::channel();
@@ -205,8 +216,8 @@ fn a_second_daemon_writes_nothing_before_it_gives_up() {
     // fill gaps and drain the spool, and only then did `bind` refuse it: one
     // record, one duplicate sequence number, and a doctor reading a dead pid.
     let home = tempfile::tempdir().expect("tempdir");
-    let mut live = daemon_in(home.path()).spawn().expect("daemon");
-    wait_serving(home.path(), live.id());
+    let live = Daemon(daemon_in(home.path()).spawn().expect("daemon"));
+    wait_serving(home.path(), live.0.id());
     hook(home.path(), &prompt("p0", "first"));
     transcript_with_a_gap(home.path());
     let before = records(home.path()).len();
@@ -219,12 +230,12 @@ fn a_second_daemon_writes_nothing_before_it_gives_up() {
         home.path(),
         &prompt("p1", "after the second daemon gave up"),
     );
-    let _ = live.kill();
-    let _ = live.wait();
+    let live_pid = live.0.id();
+    drop(live);
 
     assert!(!status.success(), "it did not become the recorder");
     assert_eq!(wrote, 0, "it wrote to a log it does not own");
-    assert_eq!(stamp, Some(u64::from(live.id())), "it took the live stamp");
+    assert_eq!(stamp, Some(u64::from(live_pid)), "it took the live stamp");
     let mut seqs: Vec<u64> = records(home.path())
         .iter()
         .filter_map(|record| record["seq"].as_u64())
@@ -238,8 +249,8 @@ fn a_second_daemon_writes_nothing_before_it_gives_up() {
 #[test]
 fn a_prepare_run_by_hand_beside_a_live_recorder_writes_nothing() {
     let home = tempfile::tempdir().expect("tempdir");
-    let mut live = daemon_in(home.path()).spawn().expect("daemon");
-    wait_serving(home.path(), live.id());
+    let live = Daemon(daemon_in(home.path()).spawn().expect("daemon"));
+    wait_serving(home.path(), live.0.id());
     hook(home.path(), &prompt("p0", "first"));
     transcript_with_a_gap(home.path());
     let before = records(home.path()).len();
@@ -250,8 +261,7 @@ fn a_prepare_run_by_hand_beside_a_live_recorder_writes_nothing() {
         .expect("prepare");
 
     let wrote = records(home.path()).len() - before;
-    let _ = live.kill();
-    let _ = live.wait();
+    drop(live);
     assert!(!status.success(), "there is already a recorder here");
     assert_eq!(wrote, 0, "it wrote beside the live recorder");
 }
@@ -262,26 +272,25 @@ fn a_start_waits_out_a_daemon_that_is_on_its_way_out() {
     // still be there when the new one starts. Giving up at once would cost a
     // restart under the service manager; taking over would be two writers.
     let home = tempfile::tempdir().expect("tempdir");
-    let mut old = daemon_in(home.path()).spawn().expect("old");
-    wait_serving(home.path(), old.id());
-    let old_pid = old.id();
+    let old = Daemon(daemon_in(home.path()).spawn().expect("old"));
+    wait_serving(home.path(), old.0.id());
+    let old_pid = old.0.id();
 
-    let mut new = daemon_in(home.path())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("new");
-    until_it_says_it_waits(&mut new);
+    let mut new = Daemon(
+        daemon_in(home.path())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("new"),
+    );
+    until_it_says_it_waits(&mut new.0);
     assert_eq!(
         stamped_pid(home.path()),
         Some(u64::from(old_pid)),
         "the new daemon stamped before the old one had gone"
     );
-    let _ = old.kill();
-    let _ = old.wait();
+    drop(old);
 
-    wait_serving(home.path(), new.id());
-    let _ = new.kill();
-    let _ = new.wait();
+    wait_serving(home.path(), new.0.id());
 }
 
 #[test]
@@ -292,18 +301,19 @@ fn an_older_daemon_that_takes_no_lock_is_still_waited_for() {
     let older = std::os::unix::net::UnixListener::bind(home.path().join("conbus.sock"))
         .expect("an older daemon's socket");
 
-    let mut new = daemon_in(home.path())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("new");
-    until_it_says_it_waits(&mut new);
+    let mut new = Daemon(
+        daemon_in(home.path())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("new"),
+    );
+    until_it_says_it_waits(&mut new.0);
     let stamped_early = stamped_pid(home.path());
     let wrote_early = home.path().join("log").exists();
     drop(older);
 
-    wait_serving(home.path(), new.id());
-    let _ = new.kill();
-    let _ = new.wait();
+    wait_serving(home.path(), new.0.id());
+    drop(new);
     assert_eq!(stamped_early, None, "it stamped beside a serving daemon");
     assert!(!wrote_early, "it opened the log beside a serving daemon");
 }
@@ -313,17 +323,15 @@ fn the_claim_goes_with_the_daemon_however_it_dies() {
     // Killed, not asked: nothing gets to clean up a lock file, so the file
     // staying behind must not be what says somebody is here.
     let home = tempfile::tempdir().expect("tempdir");
-    let mut first = daemon_in(home.path()).spawn().expect("first");
-    wait_serving(home.path(), first.id());
-    let _ = first.kill();
-    let _ = first.wait();
+    let first = Daemon(daemon_in(home.path()).spawn().expect("first"));
+    wait_serving(home.path(), first.0.id());
+    drop(first);
 
     let started = Instant::now();
-    let mut second = daemon_in(home.path()).spawn().expect("second");
-    wait_serving(home.path(), second.id());
+    let second = Daemon(daemon_in(home.path()).spawn().expect("second"));
+    wait_serving(home.path(), second.0.id());
     let waited = started.elapsed();
-    let _ = second.kill();
-    let _ = second.wait();
+    drop(second);
     assert!(
         waited < Duration::from_secs(4),
         "a dead daemon's claim held the next one up for {waited:?}"
