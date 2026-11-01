@@ -1049,10 +1049,14 @@ case $sub in
         ;;
 
     start)
+        # The swap guard decides before any file check: a rehearsal under
+        # the real HOME refuses even where no conbus is installed at all —
+        # dying on a missing binary would be the wrong verdict for the
+        # condition the guard exists to catch.
+        mode=$(swap_mode start)
         [ -n "$from" ] || refuse "start wants --from <candidate-binary>"
         [ -x "$from" ] || die "candidate is not an executable: $from"
         [ -x "$bin" ] || die "no installed conbus at $bin — canary only covers an install.sh install"
-        mode=$(swap_mode start)
         if blackout_active; then
             if [ "$BLACKOUT_REASON" = unparseable ]; then
                 refuse "start: CONBUS_CANARY_BLACKOUT='${CONBUS_CANARY_BLACKOUT:-}' is unparseable — treated as active, not swapping"
