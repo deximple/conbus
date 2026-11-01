@@ -6,6 +6,12 @@ the entry says so when it does.
 
 ## [Unreleased]
 
+### Fixed
+
+- A Cursor tool call or completed turn from an unbound session no longer takes a
+  conversation reserved for a directed hop. Only the next prompt in that checkout
+  takes the seat, as the hop's own comment always said.
+
 ## [1.0.0-rc.3] — 2026-11-01
 
 ### Fixed

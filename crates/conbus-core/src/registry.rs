@@ -360,10 +360,16 @@ impl Registry {
         // A directed hop to a leg without a bus-owned warm has no vendor
         // session yet. The next real prompt in that checkout sits on the
         // conversation that was handed off, instead of minting a twin.
-        let bus_id = match self.take_seat(&key.harness, observed.workspace.as_deref()) {
-            Some(bus_id) => bus_id,
-            None => BusId::mint(),
-        };
+        //
+        // A prompt, and nothing else. Cursor's proof above says a session is
+        // real, not that it is the one the person sent here: a tool call from
+        // a session already at work in that checkout would take the seat, and
+        // the binding would outlive every restart. A fresh id is a recoverable
+        // disappointment; the wrong one is not.
+        let seat = matches!(observed.event, Event::TurnStarted { .. })
+            .then(|| self.take_seat(&key.harness, observed.workspace.as_deref()))
+            .flatten();
+        let bus_id = seat.unwrap_or_else(BusId::mint);
         self.bound.insert(key.clone(), bus_id);
         let observed = self
             .candidates
@@ -1064,6 +1070,94 @@ mod tests {
 
         assert_ne!(seated, a, "a contested seat must not hand out the first");
         assert_ne!(seated, b, "nor the second");
+    }
+
+    /// A hop to Cursor in `/repo`, seen from the conversation it leaves, and a
+    /// Cursor session nobody has bound yet.
+    fn a_seat_waiting_in_the_checkout(registry: &mut Registry) -> (BusId, SessionKey) {
+        let Disposition::Write { bus_id, .. } =
+            registry.observe(&key(), Observed::bare(prompt("work")))
+        else {
+            panic!("mint");
+        };
+        let mut routed = Observed::bare(Event::Routed {
+            next: Harness::CURSOR.into(),
+            hop: crate::event::Hop::HandedOff,
+            reason: "ordered".into(),
+            code_freshness: None,
+            provenance: None,
+        });
+        routed.workspace = Some("/repo".into());
+        registry.observe(&key(), routed);
+        (
+            bus_id,
+            SessionKey::new(Harness::new(Harness::CURSOR), "someone-else"),
+        )
+    }
+
+    #[test]
+    fn a_strangers_tool_call_does_not_take_a_seat_meant_for_the_next_prompt() {
+        // A directed hop reserves a seat for the next prompt in a checkout. A
+        // Cursor session already working there is not that prompt, and the
+        // binding it took would survive every restart after it.
+        let mut registry = Registry::new();
+        let (handed_off, stranger) = a_seat_waiting_in_the_checkout(&mut registry);
+        let mut tool = Observed::bare(Event::ToolUse {
+            tool: "Read".into(),
+            tool_use_id: None,
+            duration_ms: None,
+            input: Body::kept("i"),
+            outcome: crate::event::ToolOutcome::Succeeded {
+                output: Body::kept("o"),
+            },
+        });
+        tool.workspace = Some("/repo".into());
+
+        let Disposition::Write { bus_id, .. } = registry.observe(&stranger, tool) else {
+            panic!("a Cursor tool call mints");
+        };
+
+        assert_ne!(bus_id, handed_off, "a tool call took the seat");
+    }
+
+    #[test]
+    fn a_strangers_ended_turn_does_not_take_a_seat_either() {
+        let mut registry = Registry::new();
+        let (handed_off, stranger) = a_seat_waiting_in_the_checkout(&mut registry);
+        let mut ended = Observed::bare(Event::TurnEnded {
+            state: TurnState::Complete,
+            assistant_message: None,
+            tokens: None,
+        });
+        ended.workspace = Some("/repo".into());
+
+        let Disposition::Write { bus_id, .. } = registry.observe(&stranger, ended) else {
+            panic!("a Cursor completed turn mints");
+        };
+
+        assert_ne!(bus_id, handed_off, "a completed turn took the seat");
+    }
+
+    #[test]
+    fn the_seat_a_tool_call_passed_over_is_still_there_for_the_prompt() {
+        let mut registry = Registry::new();
+        let (handed_off, stranger) = a_seat_waiting_in_the_checkout(&mut registry);
+        let mut tool = Observed::bare(Event::ToolRequested {
+            tool: "Read".into(),
+            tool_use_id: None,
+            input: Body::kept("{}"),
+        });
+        tool.workspace = Some("/repo".into());
+        registry.observe(&stranger, tool);
+
+        let arriving = SessionKey::new(Harness::new(Harness::CURSOR), "the-handed-off-one");
+        let mut first = Observed::bare(prompt("continue"));
+        first.workspace = Some("/repo".into());
+        let Disposition::Write { bus_id, .. } = registry.observe(&arriving, first) else {
+            panic!("a prompt claims the seat");
+        };
+
+        assert_eq!(bus_id, handed_off);
     }
 
     #[test]
