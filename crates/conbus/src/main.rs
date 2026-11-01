@@ -7,6 +7,7 @@ mod appserver;
 mod arena;
 mod backfill;
 mod build_info;
+mod checkpoint;
 mod cli;
 mod code;
 mod daemon;

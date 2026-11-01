@@ -10,12 +10,40 @@
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 
+use serde::{Deserialize, Serialize};
+
 use crate::event::{Event, Harness, VendorAgentId, VendorTurnId};
 use crate::ids::BusId;
 use crate::record::Record;
 
+/// serde_json map keys must be strings; `SessionKey` and `(String, String)`
+/// are not. Encode those maps as a flat list of key/value pairs instead.
+mod serde_pairs {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::collections::HashMap;
+    use std::hash::Hash;
+
+    pub(super) fn serialize<K, V, S>(map: &HashMap<K, V>, s: S) -> Result<S::Ok, S::Error>
+    where
+        K: Serialize + Eq + Hash,
+        V: Serialize,
+        S: Serializer,
+    {
+        map.iter().collect::<Vec<_>>().serialize(s)
+    }
+
+    pub(super) fn deserialize<'de, K, V, D>(d: D) -> Result<HashMap<K, V>, D::Error>
+    where
+        K: Deserialize<'de> + Eq + Hash,
+        V: Deserialize<'de>,
+        D: Deserializer<'de>,
+    {
+        Ok(Vec::<(K, V)>::deserialize(d)?.into_iter().collect())
+    }
+}
+
 /// A vendor session, namespaced by the harness that named it.
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
 pub struct SessionKey {
     pub harness: Harness,
     pub vendor_session_id: String,
@@ -37,7 +65,7 @@ impl SessionKey {
 /// batch but did not carry the same correlator — the vendor sends none on a
 /// session start. Sharing one stamp across the batch would invent that
 /// correlation.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct Observed {
     pub vendor_turn_id: Option<VendorTurnId>,
     pub vendor_agent_id: Option<VendorAgentId>,
@@ -82,15 +110,16 @@ pub enum Disposition {
 /// identity is known. Two conversations claiming the same leg in the same
 /// checkout is exactly the case where it is not, so the seat holds nobody
 /// rather than the last writer.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 enum Seat {
     Claimed(BusId),
     Contested,
 }
 
 /// The vendor-session-to-conversation map. Lives in the daemon's memory.
-#[derive(Default)]
+#[derive(Default, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct Registry {
+    #[serde(with = "serde_pairs")]
     bound: HashMap<SessionKey, BusId>,
     /// Session starts seen but not yet proven real, kept so that a conversation
     /// can log where it began once its first prompt arrives.
@@ -105,10 +134,12 @@ pub struct Registry {
     /// milliseconds, and a burst of session starts lands inside a single one,
     /// which makes eviction order arbitrary. That was not a guess; it turned a
     /// test red.
+    #[serde(with = "serde_pairs")]
     candidates: HashMap<SessionKey, (u64, Observed)>,
     remembered: u64,
     /// A hop to a catalog leg that cannot keep a warm session. The next
     /// unbound prompt in that checkout claims this conversation.
+    #[serde(with = "serde_pairs")]
     pending: HashMap<(String, String), Seat>,
 }
 
@@ -117,7 +148,7 @@ pub struct Registry {
 /// [`Registry::restore`] folds a collected slice with it. The daemon folds a
 /// streaming scan instead, so that rebuilding its state at start does not cost
 /// as much memory as the log itself.
-#[derive(Default)]
+#[derive(Default, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct Restoring {
     registry: Registry,
     /// Sessions a record mirrored live has claimed; a reconstruction binds only

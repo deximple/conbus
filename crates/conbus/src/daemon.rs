@@ -24,6 +24,7 @@ use conbus_core::registry::{Disposition, Observed, Registry, SessionKey};
 use conbus_core::retention::Retention;
 use conbus_core::segment::{Scan, SegmentLog};
 
+use crate::checkpoint;
 use crate::harden;
 use crate::wire::{Request, Response};
 
@@ -1081,6 +1082,18 @@ pub fn prepare(paths: &Paths, retention: Retention) -> io::Result<()> {
     // No core dump of a process holding every prompt on the machine.
     let _ = harden::harden();
     let t0 = std::time::Instant::now();
+    // A checkpoint that covers the log's tip means a prepare already ran its
+    // fills and repairs up to exactly this byte: running them again is a
+    // no-op, so the scan itself is the only thing left to skip. A transcript
+    // that arrived in the margin window during downtime is the cost — it is
+    // picked up by the next cold start, or `conbus backfill --gaps`.
+    if let Some(state) = checkpoint::load_prepare(paths) {
+        let tip = SegmentLog::coverage(paths.log_dir()).ok().flatten();
+        if tip.as_ref() == Some(&state.covered) {
+            note!("prepare: checkpoint covers the log tip — scan, fills and repairs skipped");
+            return Ok(());
+        }
+    }
     let mut scan =
         SegmentLog::scan_meta(paths.log_dir(), Some(&paths.cache_dir())).unwrap_or_else(|err| {
             note!(
@@ -1110,7 +1123,15 @@ pub fn prepare(paths: &Paths, retention: Retention) -> io::Result<()> {
     let t_gaps = t0.elapsed() - t_scan;
     match repair_splits(&scan.records, &mut log) {
         Ok(0) => {}
-        Ok(n) => note!("aliased {n} split conversation pair(s)"),
+        Ok(n) => {
+            note!("aliased {n} split conversation pair(s)");
+            // The appended `aliased` records are part of the log the
+            // checkpoint claims to cover — the fold must see them too.
+            let (written, _) =
+                SegmentLog::tail(paths.log_dir(), n as usize * 2, |_| true).unwrap_or_default();
+            scan.records
+                .extend(written.iter().map(conbus_core::segment::meta));
+        }
         Err(err) => note!("split alias skipped ({err})"),
     }
     note!(
@@ -1119,6 +1140,12 @@ pub fn prepare(paths: &Paths, retention: Retention) -> io::Result<()> {
         t_gaps.as_millis(),
         (t0.elapsed() - t_scan - t_gaps).as_millis()
     );
+    // The serving daemon loads this instead of folding the whole log itself:
+    // this process's heap was already grown by the scan and dies with it.
+    let folded = checkpoint::fold(&scan.records, scan.defects.len() as u64);
+    if let Err(err) = checkpoint::save(paths, folded) {
+        note!("checkpoint not written ({err}); the daemon will fold the log itself");
+    }
     Ok(())
 }
 
@@ -1162,17 +1189,39 @@ fn restore(paths: &Paths, retention: Retention) -> io::Result<(SegmentLog, Resto
     let mut registry = conbus_core::registry::Restoring::default();
     let mut chapters = HashMap::new();
     let mut records = 0;
-    let folded = SegmentLog::scan_meta_each(paths.log_dir(), Some(&paths.cache_dir()), |record| {
-        registry.absorb(&record);
-        Chapter::apply(&mut chapters, &record);
-        records += 1;
-    });
+    let mut unreadable = 0;
+    // The start-up child already folded the log and wrote the checkpoint —
+    // fold only what landed after its covered point, and this process's heap
+    // never holds the churn of a full fold at all.
+    let folded = match checkpoint::load(paths) {
+        Some(loaded) => {
+            registry = loaded.restoring;
+            chapters = loaded.chapters;
+            records = loaded.records as usize;
+            unreadable = loaded.unreadable as usize;
+            SegmentLog::scan_meta_after(
+                paths.log_dir(),
+                Some(&paths.cache_dir()),
+                &loaded.covered,
+                |record| {
+                    registry.absorb(&record);
+                    Chapter::apply(&mut chapters, &record);
+                    records += 1;
+                },
+            )
+        }
+        None => SegmentLog::scan_meta_each(paths.log_dir(), Some(&paths.cache_dir()), |record| {
+            registry.absorb(&record);
+            Chapter::apply(&mut chapters, &record);
+            records += 1;
+        }),
+    };
     let restored = match folded {
         Ok(defects) => Restored {
             registry: registry.finish(),
             chapters,
             records,
-            unreadable: defects.len(),
+            unreadable: unreadable + defects.len(),
         },
         Err(err) => {
             note!(
@@ -1870,6 +1919,115 @@ mod tests {
         assert_eq!(restored.records, written);
         assert_eq!(restored.unreadable, 0);
         assert_eq!(restored.chapters.len(), 1, "one conversation");
+    }
+
+    #[test]
+    fn a_checkpoint_plus_its_delta_restores_what_a_full_fold_would() {
+        // The checkpoint answers for the log up to a byte position; records
+        // appended after it still fold on top. What must not change is the
+        // "live outranks reconstructed" rule — a backfilled record in the
+        // delta for a session the checkpoint already saw live keeps the live
+        // conversation, because `seen_live` rides in the payload.
+        let home = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::from_env(home.path().join("bus").to_str(), None, None).expect("paths");
+        let live_bus = {
+            let log = SegmentLog::open(paths.log_dir(), Retention::default()).expect("open");
+            let mut daemon = Daemon::new(log, Registry::new(), HashMap::new());
+            daemon.handle(request(Event::TurnStarted {
+                author: None,
+                prompt: Body::kept("hello"),
+            }));
+            daemon.handle(request(Event::TurnEnded {
+                state: TurnState::Complete,
+                assistant_message: None,
+                tokens: None,
+            }));
+            SegmentLog::scan(paths.log_dir()).expect("scan").records[0].bus_id
+        };
+        let scan = SegmentLog::scan_meta(paths.log_dir(), Some(&paths.cache_dir())).expect("scan");
+        checkpoint::save(
+            &paths,
+            checkpoint::fold(&scan.records, scan.defects.len() as u64),
+        )
+        .expect("save");
+
+        // Records appended after the checkpoint's byte position: a split
+        // (the same session live under a second conversation), the `aliased`
+        // pair a split repair would have written, and a backfill
+        // reconstruction of the same session arriving last.
+        let twin = BusId::mint();
+        let backfilled_bus = BusId::mint();
+        let mut log = SegmentLog::open(paths.log_dir(), Retention::default()).expect("open");
+        let source = |session: &str, backfilled_from: Option<&str>| Source {
+            harness: Harness::new(Harness::CLAUDE_CODE),
+            harness_version: None,
+            vendor_session_id: Some(session.to_string()),
+            workspace: Some("/repo".into()),
+            entrypoint: None,
+            backfilled_from: backfilled_from.map(String::from),
+            profile: None,
+        };
+        let entry = |bus_id: BusId, source: Source, event: Event| Entry {
+            bus_id,
+            observed_at: None,
+            source,
+            vendor_turn_id: None,
+            vendor_agent_id: None,
+            hook_id: None,
+            spooled_at: None,
+            event,
+        };
+        log.append(entry(
+            twin,
+            source("abc123", None),
+            Event::TurnStarted {
+                author: None,
+                prompt: Body::kept("a second live leg"),
+            },
+        ))
+        .expect("append");
+        log.append(entry(
+            live_bus,
+            source("abc123", None),
+            Event::Aliased { also: twin },
+        ))
+        .expect("append");
+        log.append(entry(
+            twin,
+            source("abc123", None),
+            Event::Aliased { also: live_bus },
+        ))
+        .expect("append");
+        log.append(entry(
+            backfilled_bus,
+            source("abc123", Some("claude_transcript")),
+            Event::TurnEnded {
+                state: TurnState::Complete,
+                assistant_message: None,
+                tokens: None,
+            },
+        ))
+        .expect("append");
+        drop(log);
+
+        let (_log, via_checkpoint) = restore(&paths, Retention::default()).expect("restore");
+        unsafe { std::env::set_var("CONBUS_NO_CHECKPOINT", "1") };
+        let (_log, full) = restore(&paths, Retention::default()).expect("restore");
+        unsafe { std::env::remove_var("CONBUS_NO_CHECKPOINT") };
+
+        assert_eq!(via_checkpoint.registry, full.registry);
+        assert_eq!(via_checkpoint.chapters, full.chapters);
+        assert_eq!(via_checkpoint.records, full.records);
+        assert_eq!(via_checkpoint.unreadable, full.unreadable);
+        // The reason `seen_live` is in the payload at all: the delta's live
+        // twin legitimately rebinding, then its backfill reconstruction being
+        // folded away instead of stealing the binding back.
+        let key = SessionKey::new(Harness::new(Harness::CLAUDE_CODE), "abc123".to_string());
+        assert_eq!(
+            via_checkpoint.registry.bus_id(&key),
+            Some(twin),
+            "the last live record binds; the reconstruction folds away",
+        );
     }
 
     #[test]
