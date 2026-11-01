@@ -266,7 +266,10 @@ pub fn summary(paths: &Paths) -> Summary {
             continue;
         }
         let gloss = classify(reason);
-        match families.iter_mut().find(|(g, t, _)| *g == gloss && t == reason) {
+        match families
+            .iter_mut()
+            .find(|(g, t, _)| *g == gloss && t == reason)
+        {
             Some((_, _, n)) => *n += 1,
             None => families.push((gloss, reason.to_string(), 1)),
         }
