@@ -800,8 +800,8 @@ What each part is for:
 - **`--verify` comes first,** while the recorder is still running, so a disk that is
   unplugged or misnamed stops the block with nothing changed.
 - **The recorder has to stop.** A recorder left running after its log is deleted
-  starts a new log at the same segment name, and a restore keeps any segment the log
-  already has, so it would keep that new file over the real one. `conbus doctor` says
+  starts a new log, and a restore keeps any segment the log already has, so it would
+  keep that new file over the real one. `conbus doctor` says
   `socket … not answering` once it has stopped. The block prints that line, and stops
   there if it says anything else. `launchctl` and `systemctl` complaining that nothing
   was running is fine.

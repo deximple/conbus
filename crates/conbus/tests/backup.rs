@@ -108,8 +108,13 @@ impl World {
                     .env_remove("XDG_STATE_HOME");
             }
         }
+        // `install` and `uninstall` run here, and these would point them at the real
+        // settings and service files, whatever HOME says.
         command
             .env("HOME", &self.home)
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("CODEX_HOME")
+            .env_remove("CLAUDE_CONFIG_DIR")
             .env("CONBUS_SKIP_LAUNCHCTL", "1")
             .env("CONBUS_AGY_BIN", "/nonexistent/x")
             .env("CONBUS_CODEX_BIN", "/nonexistent/x")
