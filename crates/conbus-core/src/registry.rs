@@ -129,6 +129,9 @@ pub struct Registry {
     /// A hop to a catalog leg that cannot keep a warm session. The next
     /// unbound prompt in that checkout claims this conversation.
     pending: HashMap<(String, String), Waiting>,
+    /// Sessions the log holds more for than a flushed session start. What comes
+    /// first after that start is what minted them.
+    spoken: HashSet<SessionKey>,
 }
 
 /// A registry being rebuilt from the log, one record at a time.
@@ -142,9 +145,6 @@ pub struct Restoring {
     /// Sessions a record mirrored live has claimed; a reconstruction binds only
     /// the rest (see [`Registry::restore`]).
     seen_live: HashSet<SessionKey>,
-    /// Sessions the log has shown only a flushed session start for: what comes
-    /// next is what minted them.
-    only_started: HashSet<SessionKey>,
 }
 
 impl Restoring {
@@ -161,29 +161,9 @@ impl Restoring {
         if !reconstructed {
             self.seen_live.insert(key.clone());
         }
-        self.replay_a_mint_on_proof(&key, record, reconstructed);
         self.registry.bound.insert(key, record.bus_id);
         self.registry.alias_warm_leg(record.bus_id, &record.event);
-        self.registry.note_route_record(record);
-    }
-
-    /// A session minted on Cursor's proof gave up the seat waiting in its checkout
-    /// (see [`Registry::observe`]), and the log has to say so again at every
-    /// restart: otherwise the seat comes back from its `routed` record. Such a
-    /// session's first record is that proof, behind any session start it flushed.
-    fn replay_a_mint_on_proof(&mut self, key: &SessionKey, record: &Record, reconstructed: bool) {
-        let first = !self.registry.bound.contains_key(key) || self.only_started.contains(key);
-        if matches!(record.event, Event::SessionCandidate { .. }) {
-            if first {
-                self.only_started.insert(key.clone());
-            }
-            return;
-        }
-        self.only_started.remove(key);
-        if first && !reconstructed && Registry::cursor_proof(key, &record.event) {
-            self.registry
-                .release_seat(&key.harness, record.source.workspace.as_deref());
-        }
+        self.registry.note_written(record);
     }
 
     /// The registry the records folded so far describe.
@@ -265,17 +245,51 @@ impl Registry {
             .retain(|_, waiting| !matches!(waiting.seat, Seat::Claimed(id) if id == bus_id));
     }
 
-    /// `at` is when the hop happened: now on the live path, the log's `ts` on a
-    /// restore, so a restart does not give a seat a new day.
-    fn note_route(&mut self, bus_id: BusId, observed: &Observed, at: Timestamp) {
-        let Event::Routed { next, .. } = &observed.event else {
+    /// What a record does to the seats, once it is in the log.
+    ///
+    /// The one definition, called for each record a daemon writes and for each one
+    /// a restart reads back, so the two cannot disagree. A hop the log refused never
+    /// gets here, so it costs nobody a seat, and a seat's day runs from the same
+    /// `ts` either way, so a restart gives it no new one.
+    pub fn note_written(&mut self, record: &Record) {
+        let Some(session) = &record.source.vendor_session_id else {
             return;
         };
+        self.note_route(record);
+        // The leg has arrived, so this conversation is waiting for nobody there.
+        if matches!(
+            record.event,
+            Event::TurnStarted { .. } | Event::TurnEnded { .. }
+        ) {
+            self.pending.retain(|(harness, _), waiting| {
+                !(matches!(waiting.seat, Seat::Claimed(id) if id == record.bus_id)
+                    && harness == record.source.harness.as_str())
+            });
+        }
+        if matches!(record.event, Event::SessionCandidate { .. }) {
+            return;
+        }
+        // A session's first record past any start it flushed is what minted it,
+        // and a mint uses up the seat in its checkout: see `observe`.
+        let key = SessionKey::new(record.source.harness.clone(), session.clone());
+        let minted = matches!(record.event, Event::TurnStarted { .. })
+            || Self::cursor_proof(&key, &record.event);
+        if self.spoken.insert(key) && minted && record.source.backfilled_from.is_none() {
+            self.release_seat(&record.source.harness, record.source.workspace.as_deref());
+        }
+    }
+
+    fn note_route(&mut self, record: &Record) {
+        let Event::Routed { next, .. } = &record.event else {
+            return;
+        };
+        let (bus_id, at) = (record.bus_id, record.ts);
         self.clear_pending_bus(bus_id);
         if !Self::needs_seat(next) {
             return;
         }
-        let Some(workspace) = observed
+        let Some(workspace) = record
+            .source
             .workspace
             .as_deref()
             .and_then(Self::normalize_workspace)
@@ -310,28 +324,6 @@ impl Registry {
                     });
                 }
             }
-        }
-    }
-
-    fn note_route_record(&mut self, record: &Record) {
-        self.note_route(
-            record.bus_id,
-            &Observed {
-                vendor_turn_id: record.vendor_turn_id.clone(),
-                vendor_agent_id: record.vendor_agent_id.clone(),
-                workspace: record.source.workspace.clone(),
-                event: record.event.clone(),
-            },
-            record.ts,
-        );
-        if matches!(
-            record.event,
-            Event::TurnStarted { .. } | Event::TurnEnded { .. }
-        ) {
-            self.pending.retain(|(harness, _), waiting| {
-                !(matches!(waiting.seat, Seat::Claimed(id) if id == record.bus_id)
-                    && harness == record.source.harness.as_str())
-            });
         }
     }
 
@@ -397,7 +389,6 @@ impl Registry {
         // compact, and fork.
         if let Some(bus_id) = self.bound.get(key).copied() {
             self.alias_warm_leg(bus_id, &observed.event);
-            self.note_route(bus_id, &observed, Timestamp::now());
             return Disposition::Write {
                 bus_id,
                 observed: vec![observed],
@@ -1131,7 +1122,7 @@ mod tests {
                 provenance: None,
             });
             routed.workspace = Some("/repo".into());
-            registry.observe(who, routed);
+            landed(&mut registry, who, routed);
         }
 
         let cursor = SessionKey::new(Harness::new(Harness::CURSOR), "composer-1");
@@ -1147,6 +1138,57 @@ mod tests {
 
     /// A hop to Cursor in `/repo`, seen from the conversation it leaves, and a
     /// Cursor session nobody has bound yet.
+    /// A record as the log holds what `session` said under this conversation.
+    fn as_written(session: &SessionKey, bus_id: BusId, one: Observed) -> Record {
+        Record {
+            schema_version: SCHEMA_VERSION,
+            seq: 0,
+            ts: Timestamp::now(),
+            bus_id,
+            vendor_turn_id: one.vendor_turn_id,
+            vendor_agent_id: one.vendor_agent_id,
+            hook_id: None,
+            spooled_at: None,
+            source: Source {
+                harness: session.harness.clone(),
+                harness_version: None,
+                vendor_session_id: Some(session.vendor_session_id.clone()),
+                workspace: one.workspace,
+                entrypoint: None,
+                backfilled_from: None,
+                profile: None,
+            },
+            event: one.event,
+        }
+    }
+
+    /// What the daemon does with an event: observe it, write what that says, and
+    /// tell the registry what reached the log. Returns what was written.
+    fn landed_records(
+        registry: &mut Registry,
+        session: &SessionKey,
+        observed: Observed,
+    ) -> Vec<Record> {
+        let Disposition::Write { bus_id, observed } = registry.observe(session, observed) else {
+            return Vec::new();
+        };
+        let written: Vec<Record> = observed
+            .into_iter()
+            .map(|one| as_written(session, bus_id, one))
+            .collect();
+        for record in &written {
+            registry.note_written(record);
+        }
+        written
+    }
+
+    fn landed(registry: &mut Registry, session: &SessionKey, observed: Observed) -> BusId {
+        landed_records(registry, session, observed)
+            .last()
+            .expect("this one writes")
+            .bus_id
+    }
+
     fn a_seat_waiting_in_the_checkout(registry: &mut Registry) -> (BusId, SessionKey) {
         let Disposition::Write { bus_id, .. } =
             registry.observe(&key(), Observed::bare(prompt("work")))
@@ -1161,7 +1203,7 @@ mod tests {
             provenance: None,
         });
         routed.workspace = Some("/repo".into());
-        registry.observe(&key(), routed);
+        landed(registry, &key(), routed);
         (
             bus_id,
             SessionKey::new(Harness::new(Harness::CURSOR), "someone-else"),
@@ -1216,10 +1258,7 @@ mod tests {
         let key = SessionKey::new(Harness::new(Harness::CURSOR), session);
         let mut first = Observed::bare(prompt("unrelated work"));
         first.workspace = Some("/repo".into());
-        let Disposition::Write { bus_id, .. } = registry.observe(&key, first) else {
-            panic!("a prompt mints or sits");
-        };
-        bus_id
+        landed(registry, &key, first)
     }
 
     fn a_tool_call_in_the_checkout() -> Observed {
@@ -1421,18 +1460,10 @@ mod tests {
         let mut start = Observed::bare(session_start());
         start.workspace = Some("/repo".into());
         assert_eq!(live.observe(&arrived, start), Disposition::Deferred);
-        let Disposition::Write {
-            bus_id: minted,
-            observed,
-        } = live.observe(&arrived, a_tool_call_in_the_checkout())
-        else {
-            panic!("a tool call mints");
-        };
-        assert_eq!(observed.len(), 2, "the start it flushed, then the proof");
+        let written = landed_records(&mut live, &arrived, a_tool_call_in_the_checkout());
+        assert_eq!(written.len(), 2, "the start it flushed, then the proof");
         let mut records = vec![a_routed_record(handed_off)];
-        records.extend(observed.into_iter().enumerate().map(|(n, one)| {
-            cursor_logged(n as u64 + 1, minted, &arrived.vendor_session_id, one.event)
-        }));
+        records.extend(written);
 
         let mut restored = Registry::restore(&records);
 
@@ -1529,6 +1560,213 @@ mod tests {
     }
 
     #[test]
+    fn a_proof_behind_a_start_that_landed_alone_releases_the_seat_live_too() {
+        // A flushed start landed, its proof did not, and the daemon restarted. The
+        // drained proof finds the session bound, so it mints nothing, and the next
+        // replay would still call it the mint. What was written decides, both ways.
+        let handed_off = BusId::mint();
+        let minted = BusId::mint();
+        let started = [
+            a_routed_record(handed_off),
+            cursor_logged(1, minted, "arrived", session_start()),
+        ];
+        let mut live = Registry::restore(&started);
+        let arrived = SessionKey::new(Harness::new(Harness::CURSOR), "arrived");
+        landed(&mut live, &arrived, a_tool_call_in_the_checkout());
+        let mut replayed = Registry::restore(&[
+            a_routed_record(handed_off),
+            cursor_logged(1, minted, "arrived", session_start()),
+            cursor_logged(2, minted, "arrived", a_tool_event()),
+        ]);
+
+        assert_ne!(
+            the_next_prompt_in_the_checkout(&mut replayed, "a-stranger"),
+            handed_off,
+            "replay"
+        );
+        assert_ne!(
+            the_next_prompt_in_the_checkout(&mut live, "a-stranger"),
+            handed_off,
+            "live: a stranger took the seat"
+        );
+    }
+
+    #[test]
+    fn a_contested_seat_a_prompt_used_up_is_used_up_after_a_restart_too() {
+        // Live, the prompt clears the contest and the next hop's seat works. A
+        // replay that kept the contest lost that handoff at every restart.
+        let (a, b, c, minted) = (BusId::mint(), BusId::mint(), BusId::mint(), BusId::mint());
+        let mut replayed = Registry::restore(&[
+            a_routed_record(a),
+            a_routed_record(b),
+            cursor_logged(
+                2,
+                minted,
+                "somebody",
+                prompt("mints: the seat is contested"),
+            ),
+            a_routed_record(c),
+        ]);
+
+        assert_eq!(
+            the_next_prompt_in_the_checkout(&mut replayed, "the-one-c-sent"),
+            c
+        );
+    }
+
+    #[test]
+    fn a_leg_already_here_ends_a_second_hop_live_as_in_replay() {
+        // Live, a stranger would sit on the conversation, and that binding is for
+        // good. Only a replay used to see that the leg had already arrived.
+        let mut live = Registry::new();
+        let (a, arrived) = a_seat_waiting_in_the_checkout(&mut live);
+        let in_repo = |event: Event| {
+            let mut one = Observed::bare(event);
+            one.workspace = Some("/repo".into());
+            one
+        };
+        assert_eq!(landed(&mut live, &arrived, in_repo(prompt("go on"))), a);
+        landed(
+            &mut live,
+            &key(),
+            in_repo(Event::Routed {
+                next: Harness::CURSOR.into(),
+                hop: crate::event::Hop::HandedOff,
+                reason: "ordered again".into(),
+                code_freshness: None,
+                provenance: None,
+            }),
+        );
+        landed(&mut live, &arrived, in_repo(prompt("still here")));
+
+        assert_ne!(
+            the_next_prompt_in_the_checkout(&mut live, "a-stranger"),
+            a,
+            "a stranger sits on a conversation whose Cursor leg is already here"
+        );
+    }
+
+    #[test]
+    fn an_observed_hop_that_never_reached_the_log_changes_no_seat() {
+        // What a refusal leaves: observed, and never written. It costs nobody a
+        // seat, and a restart would not have heard of it anyway.
+        let mut registry = Registry::new();
+        let (handed_off, _) = a_seat_waiting_in_the_checkout(&mut registry);
+        let other = SessionKey::new(Harness::new(Harness::CLAUDE_CODE), "vendor-def");
+        registry.observe(&other, Observed::bare(prompt("other work")));
+        let mut refused = Observed::bare(Event::Routed {
+            next: Harness::CURSOR.into(),
+            hop: crate::event::Hop::HandedOff,
+            reason: "the log refused this".into(),
+            code_freshness: None,
+            provenance: None,
+        });
+        refused.workspace = Some("/repo".into());
+        registry.observe(&other, refused);
+
+        assert_eq!(
+            the_next_prompt_in_the_checkout(&mut registry, "the-handed-off-one"),
+            handed_off
+        );
+    }
+
+    /// A small generator, so a failure names a seed and runs the same way again.
+    struct Dice(u64);
+
+    impl Dice {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 >> 16) % n
+        }
+    }
+
+    #[test]
+    fn the_live_path_and_a_restart_agree_on_the_seats() {
+        // An earlier form of this, run 40,000 times by hand, found every class of
+        // disagreement the two paths had. A refused hop is in here, a mint whose
+        // record never lands is not: that session is bound in memory and nowhere
+        // else, and it lands later or the daemon goes.
+        const SEQUENCES: usize = 400;
+        const STEPS: usize = 24;
+        let mut dice = Dice(0x5eed_c0de_0bad_f00d);
+        let checkouts = ["/repo", "/another-repo"];
+        for sequence in 0..SEQUENCES {
+            let mut live = Registry::new();
+            let mut log: Vec<Record> = Vec::new();
+            let hoppers: Vec<SessionKey> = (0..3)
+                .map(|n| SessionKey::new(Harness::new(Harness::CLAUDE_CODE), format!("hopper-{n}")))
+                .collect();
+            for hopper in &hoppers {
+                log.extend(landed_records(
+                    &mut live,
+                    hopper,
+                    Observed::bare(prompt("work")),
+                ));
+            }
+            let mut story = Vec::new();
+            for step in 0..STEPS {
+                let hopper = &hoppers[dice.below(3) as usize];
+                let cursor = SessionKey::new(
+                    Harness::new(Harness::CURSOR),
+                    format!("cursor-{}", dice.below(4)),
+                );
+                let workspace = checkouts[dice.below(2) as usize];
+                let with_workspace = |event: Event| Observed {
+                    workspace: Some(workspace.into()),
+                    ..Observed::bare(event)
+                };
+                let roll = dice.below(8);
+                story.push((
+                    roll,
+                    hopper.vendor_session_id.clone(),
+                    cursor.vendor_session_id.clone(),
+                    workspace,
+                ));
+                let routed = || {
+                    with_workspace(Event::Routed {
+                        next: Harness::CURSOR.into(),
+                        hop: crate::event::Hop::HandedOff,
+                        reason: "ordered".into(),
+                        code_freshness: None,
+                        provenance: None,
+                    })
+                };
+                match roll {
+                    0 | 1 => log.extend(landed_records(&mut live, hopper, routed())),
+                    // Refused: observed and never written.
+                    2 => {
+                        live.observe(hopper, routed());
+                    }
+                    3 | 4 => log.extend(landed_records(
+                        &mut live,
+                        &cursor,
+                        with_workspace(prompt("go on")),
+                    )),
+                    5 => log.extend(landed_records(
+                        &mut live,
+                        &cursor,
+                        with_workspace(a_tool_event()),
+                    )),
+                    6 => log.extend(landed_records(
+                        &mut live,
+                        &cursor,
+                        with_workspace(session_start()),
+                    )),
+                    // A restart: what comes next runs on what was read back.
+                    _ => live = Registry::restore(&log),
+                }
+                assert_eq!(
+                    live.pending,
+                    Registry::restore(&log).pending,
+                    "sequence {sequence} step {step}: {story:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn one_conversation_hopping_twice_keeps_its_seat() {
         // The companion guard: the contested rule must not fire on a
         // conversation that simply hops to the same leg again, which would
@@ -1549,7 +1787,7 @@ mod tests {
                 provenance: None,
             });
             routed.workspace = Some("/repo".into());
-            registry.observe(&claude, routed);
+            landed(&mut registry, &claude, routed);
         }
 
         let cursor = SessionKey::new(Harness::new(Harness::CURSOR), "composer-2");
@@ -1580,7 +1818,7 @@ mod tests {
             provenance: None,
         });
         routed.workspace = Some("/repo".into());
-        registry.observe(&claude, routed);
+        landed(&mut registry, &claude, routed);
 
         let cursor = SessionKey::new(Harness::new(Harness::CURSOR), "new-composer");
         let mut first = Observed::bare(prompt("continue"));

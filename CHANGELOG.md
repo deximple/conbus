@@ -13,6 +13,11 @@ the entry says so when it does.
   hop's own comment always said. Such a call also gives the seat up, including
   across a restart, so a stranger's later prompt cannot take it instead: both
   sessions hold fresh ids.
+- A daemon and a restart now work out seats the same way, from the records in the
+  log. A hop the log refused no longer costs anyone a seat or leaves one behind, a
+  prompt that used up a contested seat stays used up after a restart, and a leg
+  that has arrived ends a second hop live as well as in a replay, so a stranger
+  cannot sit on that conversation.
 - A seat reserved for a directed hop now lasts a day, counted from the `routed`
   record. A hop nobody followed up used to hold it for ever, and an unrelated prompt
   days later bound to the conversation for good. A hop followed up after a day gets
