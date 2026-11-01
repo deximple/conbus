@@ -1117,14 +1117,17 @@ pub fn prepare(paths: &Paths, retention: Retention) -> io::Result<()> {
     }
     if gap_timing.budget_exhausted {
         // The socket serving matters more than finishing the fill: the
-        // skipped part lands on the next start or `conbus backfill --gaps`.
-        note!("gap fill hit its start budget; the rest lands on a later fill");
+        // skipped range is remembered in `cache/gap-since` and resumed on
+        // the next start, or filled now by `conbus backfill --gaps`.
+        note!(
+            "gap fill hit its start budget; the skipped range is held in cache/gap-since and resumed on the next start"
+        );
     }
     note!(
         "prepare breakdown: meta scan {} ms, gap fill {} ms \
          (claude: walk {} ms, read {} files {} MB in {} ms; \
          codex: walk {} ms, app-server {} ms, thread/list {} pages {} ms, \
-         list_turns {}/{} threads {} ms{}; chat export {} ms), split repair {} ms",
+         list_turns {}/{} threads {} ms{}; chat export {} ms), split repair {} ms{}{}",
         t_scan.as_millis(),
         t_gaps.as_millis(),
         gap_timing.claude_walk_ms,
@@ -1144,7 +1147,20 @@ pub fn prepare(paths: &Paths, retention: Retention) -> io::Result<()> {
             .map(|err| format!(", first error: {err}"))
             .unwrap_or_default(),
         gap_timing.chat_export_ms,
-        (t0.elapsed() - t_scan - t_gaps).as_millis()
+        (t0.elapsed() - t_scan - t_gaps).as_millis(),
+        if gap_timing.codex_layout_unknown {
+            format!(
+                "; codex rollout names unrecognised ({} files) — fell back to thread/list",
+                gap_timing.codex_unknown_files
+            )
+        } else {
+            String::new()
+        },
+        if gap_timing.gap_marker_garbled {
+            "; gap-since marker unreadable — ignored"
+        } else {
+            ""
+        },
     );
     Ok(())
 }

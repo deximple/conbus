@@ -350,9 +350,16 @@ pub struct GapTiming {
     /// rather than a silent zero.
     pub list_turns_err: Option<String>,
     pub chat_export_ms: u64,
-    /// The start budget cut the fill short; whatever was left lands on the
-    /// next start or through `conbus backfill --gaps`.
+    /// The start budget cut the fill short; the deferred range is held in
+    /// `cache/gap-since` and resumed on the next start.
     pub budget_exhausted: bool,
+    /// A `gap-since` marker that did not parse was ignored for this fill.
+    pub gap_marker_garbled: bool,
+    /// `sessions/` held files but none shaped like a rollout — the layout
+    /// changed under the build; `thread/list` was the fallback.
+    pub codex_layout_unknown: bool,
+    /// Files under `sessions/` whose names were not rollout names.
+    pub codex_unknown_files: u64,
 }
 
 /// How long a start may spend filling gaps before it stops and serves.
@@ -363,7 +370,7 @@ fn gap_budget() -> std::time::Duration {
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .map(std::time::Duration::from_millis)
-        .unwrap_or(std::time::Duration::from_secs(2))
+        .unwrap_or(std::time::Duration::from_secs(15))
 }
 
 fn elapsed_ms(at: std::time::Instant) -> u64 {
@@ -375,6 +382,17 @@ pub fn append_gaps_at_start(
     held: &[Record],
     log: &mut SegmentLog,
 ) -> io::Result<(u64, GapTiming)> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    append_gaps_at_start_in(paths, held, log, gap_budget(), home.as_deref())
+}
+
+fn append_gaps_at_start_in(
+    paths: &Paths,
+    held: &[Record],
+    log: &mut SegmentLog,
+    budget: std::time::Duration,
+    home: Option<&Path>,
+) -> io::Result<(u64, GapTiming)> {
     // Only what changed after the log's newest record can hold a turn that
     // happened while no daemon was listening. Reading every transcript the log
     // had ever bound took ten seconds with a warm cache and 71 after a reboot
@@ -382,10 +400,26 @@ pub fn append_gaps_at_start(
     // bound, so every hook in that window timed out. Earlier downtimes were
     // filled by earlier starts; `conbus backfill --gaps` still reads them all.
     let mut timing = GapTiming::default();
-    let deadline = Instant::now() + gap_budget();
-    let since = newest_unix(held).map(|newest| newest - GAP_MARGIN_SECS);
+    let deadline = Instant::now() + budget;
+    // A fill the budget cut short leaves `cache/gap-since` holding the
+    // effective since it stopped at, so the next start resumes the range
+    // rather than losing it to a newer `newest`. A fill that finishes
+    // deletes the marker; a garbled one is ignored and said so.
+    let marker = paths.cache_dir().join("gap-since");
+    let remembered = std::fs::read_to_string(&marker)
+        .ok()
+        .and_then(|text| text.trim().parse::<conbus_core::clock::Timestamp>().ok())
+        .and_then(|ts| {
+            conbus_core::clock::Timestamp::from_unix_seconds(0).map(|epoch| ts.seconds_since(epoch))
+        });
+    if std::fs::read_to_string(&marker).is_ok() && remembered.is_none() {
+        timing.gap_marker_garbled = true;
+    }
+    let since = newest_unix(held)
+        .map(|newest| newest - GAP_MARGIN_SECS)
+        .map(|fresh| remembered.map_or(fresh, |old| old.min(fresh)));
     let mut n = 0;
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+    if let Some(home) = home {
         let transcripts = home.join(".claude").join("projects");
         if transcripts.is_dir() {
             let walk = Instant::now();
@@ -414,6 +448,36 @@ pub fn append_gaps_at_start(
         let export = Instant::now();
         n += ingest_chat_exports_since(&paths.chat_export(), held, log, since)?;
         timing.chat_export_ms = elapsed_ms(export);
+    }
+    if timing.budget_exhausted {
+        // The cut-short range outlives this start: next start resumes it.
+        let write = since
+            .map(|fresh| remembered.map_or(fresh, |old| old.min(fresh)))
+            .and_then(conbus_core::clock::Timestamp::from_unix_seconds);
+        if let Some(when) = write {
+            let temp = paths
+                .cache_dir()
+                .join(format!(".gap-since.{}.tmp", std::process::id()));
+            let _ = std::fs::create_dir_all(paths.cache_dir());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                let mut options = std::fs::OpenOptions::new();
+                options.write(true).create_new(true).mode(0o600);
+                if options
+                    .open(&temp)
+                    .and_then(|mut f| {
+                        std::io::Write::write_all(&mut f, when.to_string().as_bytes())
+                    })
+                    .and_then(|_| std::fs::rename(&temp, &marker))
+                    .is_err()
+                {
+                    let _ = std::fs::remove_file(&temp);
+                }
+            }
+        }
+    } else {
+        let _ = std::fs::remove_file(&marker);
     }
     Ok((n, timing))
 }
@@ -584,8 +648,11 @@ fn fill_live_codex_gaps(
     // `list_turns` would only refuse. When the directories cannot be walked
     // at all the ask falls back to `thread/list` as before.
     let walk = Instant::now();
-    let mut recent = codex_threads_touched_since(&known.live_codex, since);
+    let mut unknown = 0;
+    let mut recent = codex_threads_touched_since(&known.live_codex, since, &mut unknown);
     timing.codex_walk_ms = elapsed_ms(walk);
+    timing.codex_unknown_files = unknown;
+    timing.codex_layout_unknown = recent.is_none() && unknown > 0;
     if recent.as_ref().is_some_and(|recent| recent.is_empty()) {
         return Ok(0);
     }
@@ -705,23 +772,31 @@ fn threads_updated_since(
 fn codex_threads_touched_since(
     sessions: &HashSet<BusId>,
     since: Option<i64>,
+    unknown: &mut u64,
 ) -> Option<Vec<BusId>> {
     let since = since?;
     let home = std::env::var_os("CODEX_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))?;
-    codex_threads_touched_since_in(&home, sessions, since)
+    codex_threads_touched_since_in(&home, sessions, since, unknown)
 }
 
 fn codex_threads_touched_since_in(
     codex_home: &Path,
     sessions: &HashSet<BusId>,
     since: i64,
+    unknown: &mut u64,
 ) -> Option<Vec<BusId>> {
     let mut touched = HashMap::new();
     let sessions_dir = codex_home.join("sessions");
     for dir in [sessions_dir.clone(), codex_home.join("archived_sessions")] {
-        collect_rollout_mtimes(&dir, 6, &mut touched);
+        collect_rollout_mtimes(&dir, 6, &mut touched, unknown);
+    }
+    // Files are here but none parse as a rollout — the vendor changed the
+    // layout under the build, and a silent empty list would mean "no
+    // threads". `thread/list` is the fallback that cannot miss them.
+    if touched.is_empty() && *unknown > 0 {
+        return None;
     }
     if touched.is_empty() && !sessions_dir.is_dir() {
         return None;
@@ -750,7 +825,12 @@ fn rollout_thread_id(name: &str) -> Option<BusId> {
 /// Latest mtime per thread id under `dir`, recursing no deeper than `depth`
 /// — `sessions/` nests three levels of date buckets, and the cap keeps a
 /// pathological tree from stalling a start.
-fn collect_rollout_mtimes(dir: &Path, depth: u8, touched: &mut HashMap<BusId, i64>) {
+fn collect_rollout_mtimes(
+    dir: &Path,
+    depth: u8,
+    touched: &mut HashMap<BusId, i64>,
+    unknown: &mut u64,
+) {
     if depth == 0 {
         return;
     }
@@ -760,10 +840,11 @@ fn collect_rollout_mtimes(dir: &Path, depth: u8, touched: &mut HashMap<BusId, i6
     for entry in entries.filter_map(Result::ok) {
         let path = entry.path();
         if path.is_dir() {
-            collect_rollout_mtimes(&path, depth - 1, touched);
+            collect_rollout_mtimes(&path, depth - 1, touched, unknown);
             continue;
         }
         let Some(id) = entry.file_name().to_str().and_then(rollout_thread_id) else {
+            *unknown += 1;
             continue;
         };
         if let Some(mtime) = modified_unix(&path) {
@@ -1876,16 +1957,172 @@ mod tests {
         // `gone` names its file through the archived name rather than
         // sessions/: the map still carries the thread id.
         let mut bound = HashSet::from([old, fresh, gone]);
-        let asked =
-            codex_threads_touched_since_in(home.path(), &bound, 1_500).expect("sessions dir read");
+        let mut unknown = 0;
+        let asked = codex_threads_touched_since_in(home.path(), &bound, 1_500, &mut unknown)
+            .expect("sessions dir read");
         // Asked about in most-recently-touched order.
         assert_eq!(asked, vec![gone, fresh]);
         // A thread with no file anywhere cannot be hydrated by the
         // app-server — it is out rather than asked.
         bound.insert(BusId::mint());
-        let asked =
-            codex_threads_touched_since_in(home.path(), &bound, 1_500).expect("sessions dir read");
+        let asked = codex_threads_touched_since_in(home.path(), &bound, 1_500, &mut unknown)
+            .expect("sessions dir read");
         assert_eq!(asked, vec![gone, fresh]);
+    }
+
+    /// A transcript the log missed while `home/.claude/projects` holds it.
+    fn claude_transcript(home: &Path, session: &str) {
+        let project = home
+            .join(".claude")
+            .join("projects")
+            .join("-Applications-conbus");
+        fs::create_dir_all(&project).expect("project dir");
+        fs::write(
+            project.join(format!("{session}.jsonl")),
+            format!(
+                "{{\"type\":\"user\",\"sessionId\":\"{session}\",\"timestamp\":\"2026-08-31T09:33:02.222Z\",\
+                 \"version\":\"2.1.241\",\"cwd\":\"/Applications/conbus\",\"entrypoint\":\"cli\",\
+                 \"promptId\":\"P1\",\"message\":{{\"role\":\"user\",\"content\":\"Reply with OK\"}}}}\n\
+                 {{\"type\":\"assistant\",\"sessionId\":\"{session}\",\"timestamp\":\"2026-08-31T09:33:03.000Z\",\
+                 \"version\":\"2.1.241\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\
+                 \"text\":\"OK\"}}]}}}}\n"
+            ),
+        )
+        .expect("write transcript");
+    }
+
+    /// A live record at `when`, so the start fill has a `newest` to hang
+    /// `since` on.
+    fn live_at(machine: &Machine, when: conbus_core::clock::Timestamp, session: &str) {
+        let mut log =
+            SegmentLog::open(machine.paths.log_dir(), Retention::default()).expect("open");
+        log.append(Entry {
+            bus_id: BusId::mint(),
+            observed_at: Some(when),
+            source: Source {
+                harness: Harness::new(Harness::CLAUDE_CODE),
+                harness_version: None,
+                vendor_session_id: Some(session.into()),
+                workspace: Some("/Applications/conbus".into()),
+                entrypoint: None,
+                backfilled_from: None,
+                profile: None,
+            },
+            vendor_turn_id: None,
+            vendor_agent_id: None,
+            hook_id: None,
+            spooled_at: None,
+            event: Event::TurnStarted {
+                author: None,
+                prompt: Body::kept("a live prompt the transcript does not hold"),
+            },
+        })
+        .expect("append");
+    }
+
+    fn held(machine: &Machine) -> Vec<Record> {
+        SegmentLog::scan(machine.paths.log_dir())
+            .expect("scan")
+            .records
+    }
+
+    #[test]
+    fn a_fill_cut_short_resumes_its_range_on_the_next_start() {
+        let machine = machine();
+        let home = tempfile::tempdir().expect("tempdir");
+        claude_transcript(home.path(), SESSION);
+        let epoch = conbus_core::clock::Timestamp::from_unix_seconds(0).expect("epoch");
+        let now = conbus_core::clock::Timestamp::now().seconds_since(epoch);
+        // The log's newest record is around now: the first start's effective
+        // since (now - margin) includes the transcript by mtime.
+        live_at(
+            &machine,
+            conbus_core::clock::Timestamp::from_unix_seconds(now).expect("ts"),
+            SESSION,
+        );
+        let mut log =
+            SegmentLog::open(machine.paths.log_dir(), Retention::default()).expect("open");
+        let held_now = held(&machine);
+        // A zero budget cuts the fill before the first file: nothing is
+        // appended, and the marker holds the range that was skipped.
+        let (appended, timing) = append_gaps_at_start_in(
+            &machine.paths,
+            &held_now,
+            &mut log,
+            std::time::Duration::ZERO,
+            Some(home.path()),
+        )
+        .expect("fill");
+        assert!(timing.budget_exhausted, "a zero budget must exhaust");
+        assert_eq!(appended, 0);
+        let marker = machine.paths.cache_dir().join("gap-since");
+        assert!(marker.exists(), "the deferred range is remembered");
+        // Time passes: a new live record makes the fresh since (newest -
+        // margin) later than the transcript's mtime — without the marker the
+        // skipped file is filtered out forever.
+        live_at(
+            &machine,
+            conbus_core::clock::Timestamp::from_unix_seconds(now + GAP_MARGIN_SECS + 3600)
+                .expect("ts"),
+            "live-b",
+        );
+        let held_later = held(&machine);
+        let (appended, timing) = append_gaps_at_start_in(
+            &machine.paths,
+            &held_later,
+            &mut log,
+            std::time::Duration::from_secs(60),
+            Some(home.path()),
+        )
+        .expect("resume fill");
+        assert!(appended > 0, "the deferred range is resumed");
+        assert!(!timing.budget_exhausted);
+        assert!(!marker.exists(), "a finished fill clears the marker");
+        let after = records_on_disk(&machine);
+        // A third fill has nothing left: the deferred turns landed exactly
+        // once.
+        let held_third = held(&machine);
+        let (third, _) = append_gaps_at_start_in(
+            &machine.paths,
+            &held_third,
+            &mut log,
+            std::time::Duration::from_secs(60),
+            Some(home.path()),
+        )
+        .expect("third fill");
+        assert_eq!(third, 0, "resumed turns are appended exactly once");
+        assert_eq!(records_on_disk(&machine), after);
+    }
+
+    #[test]
+    fn a_codex_layout_with_no_rollouts_falls_back_to_the_rpc() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let bound = HashSet::from([SESSION.parse::<BusId>().expect("uuid")]);
+        // Files are present but none are rollout names: the layout changed
+        // under the build, so an empty list would be a silent stop.
+        let dir = home
+            .path()
+            .join("sessions")
+            .join("2026")
+            .join("11")
+            .join("01");
+        fs::create_dir_all(&dir).expect("dirs");
+        fs::write(dir.join("foo.jsonl"), "{}\n").expect("file");
+        let mut unknown = 0;
+        assert_eq!(
+            codex_threads_touched_since_in(home.path(), &bound, 1_500, &mut unknown),
+            None,
+            "unrecognised files mean the walk cannot be trusted"
+        );
+        assert_eq!(unknown, 1);
+        // An empty sessions/ still means "no threads".
+        let empty = tempfile::tempdir().expect("tempdir");
+        fs::create_dir_all(empty.path().join("sessions")).expect("dir");
+        let mut unknown = 0;
+        assert_eq!(
+            codex_threads_touched_since_in(empty.path(), &bound, 1_500, &mut unknown),
+            Some(vec![])
+        );
     }
 
     #[test]
@@ -1893,7 +2130,7 @@ mod tests {
         let home = tempfile::tempdir().expect("tempdir");
         let bound = HashSet::from([SESSION.parse::<BusId>().expect("uuid")]);
         assert_eq!(
-            codex_threads_touched_since_in(home.path(), &bound, 1_500),
+            codex_threads_touched_since_in(home.path(), &bound, 1_500, &mut 0),
             None
         );
     }
