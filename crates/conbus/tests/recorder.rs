@@ -1114,6 +1114,35 @@ fn a_drop_is_recorded_where_doctor_can_find_it() {
 }
 
 #[test]
+fn a_log_deleted_under_a_running_daemon_goes_on_recording() {
+    // The daemon holds the open segment, so writing to it goes on succeeding after
+    // a stray `rm`. Every hook reported success, and a restart found nothing.
+    let home = tempfile::tempdir().expect("tempdir");
+    let daemon = start_daemon(home.path());
+    let prompt = |text: &str, id: &str| {
+        format!(
+            r#"{{"session_id":"s","hook_event_name":"UserPromptSubmit","prompt":"{text}","prompt_id":"{id}"}}"#
+        )
+    };
+    run_hook(home.path(), &prompt("before", "T0"), &[]);
+    let log_dir = home.path().join("log");
+    std::fs::remove_dir_all(&log_dir).expect("rm -r");
+
+    run_hook(home.path(), &prompt("after", "T1"), &[]);
+    daemon.stop();
+
+    let scan = conbus_core::segment::SegmentLog::scan(&log_dir).expect("scan");
+    assert!(
+        scan.records.iter().any(|record| record
+            .vendor_turn_id
+            .as_ref()
+            .is_some_and(|id| id.as_str() == "T1")),
+        "a prompt after the delete reached nothing: {:?}",
+        scan.records
+    );
+}
+
+#[test]
 fn doctor_reports_a_log_it_cannot_append_to() {
     // The failure the check exists for: a daemon that answers and cannot write
     // looks identical to a healthy one. Probing the directory instead of the
