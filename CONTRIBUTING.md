@@ -14,7 +14,9 @@ Thank you for looking. A few things make a change easy to take:
   `cargo clippy --workspace --all-targets --locked -- -D warnings` and
   `cargo test --workspace --locked` (with `CONBUS_SKIP_LAUNCHCTL=1` and a
   throwaway `CONBUS_HOME`), plus `sh scripts/check-public-safe.sh` and
-  `sh scripts/check-docs.sh`. CI runs the same on macOS and Linux.
+  `sh scripts/check-docs.sh`. CI runs the same on macOS and Linux. After an
+  `agy` upgrade, also run `bash scripts/check-no-browser.sh target/debug/conbus`
+  on a Mac: CI has no `agy`.
 - **Nothing private.** No prompts, replies, paths from your machine, or
   anything from `~/.conbus` in code, fixtures, issues or commits. Fixtures are
   redacted (`/Users/USER/...`, fake ids).

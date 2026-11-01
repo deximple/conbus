@@ -16,7 +16,7 @@ check saw.
 | Grok | 1.0.71 | yes | (fixture 1.0.3) | yes | `StopFailure` | not run | Both registrations fire; only Grok's own copy is recorded. `StopCancelled` recorded from this release; the shutdown `Stop` ignored |
 | Cursor (IDE) | unverified | | | | | n/a | The IDE is not installed on the test Mac; last verified 3.19 (fixtures) |
 | cursor-agent | 2026.10.19 | **no** | yes | **no** | — | n/a | In `-p` mode only `sessionStart`, `preToolUse`, `postToolUse` and `sessionEnd` fire, so there are no turn records and no tokens; tool calls mint the conversation |
-| agy | 1.4.12 | — | — | — | `agy -p /usage` | — | Usage read only |
+| agy | 1.4.12 | — | — | — | `agy -p /usage` | — | Usage read only, after `agy models` shows a login |
 
 Platform: one universal binary, signed with conbus's Developer ID and
 notarized; recorder under launchd.

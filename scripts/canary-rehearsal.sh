@@ -71,6 +71,7 @@ write_fake() {
         echo "{\"day\":\"2026-11-01\",\"harness\":\"codex\",\"tool_denials\":0,\"repeated\":0}"'
     cat >"$path" <<EOF
 #!/bin/sh
+case "\$1" in doctor|quota|status) echo "\${CONBUS_AGY_BIN:-unset}" >>"$tmp/agy-bin.seen" ;; esac
 case "\$1" in
     --version) echo "conbus 0.0.0-$tag ($tag)" ;;
     doctor) $doctor ;;
@@ -86,6 +87,11 @@ EOF
 }
 
 # --- fixtures ---------------------------------------------------------------
+
+# `agy models` as the real path asks it: with no login, and with one.
+printf '#!/bin/sh\nexit 1\n' >"$tmp/agy-no-login"
+printf '#!/bin/sh\nexit 0\n' >"$tmp/agy-signed-in"
+chmod 755 "$tmp/agy-no-login" "$tmp/agy-signed-in"
 
 write_fake 01d old "$install_dir/conbus"          # the installed "0.2.8"
 write_fake beef live "$tmp/stage/conbus-good"        # a healthy candidate
@@ -130,6 +136,7 @@ run_real() {
     env -u CONBUS_HOME -u XDG_STATE_HOME -u CONBUS_SKIP_LAUNCHCTL \
         -u CONBUS_CANARY_REHEARSAL \
         HOME="$home" CONBUS_CANARY_TEST_REAL_HOME="$home" \
+        CONBUS_AGY_BIN="${real_path_agy:-$tmp/agy-no-login}" \
         CONBUS_CANARY_SERVING_LIMIT=${SERVING_LIMIT:-30} \
         bash "$canary" "$@"
 }
@@ -764,5 +771,16 @@ expect 1 "$code" "rollback refuses when conbus.rollback is missing"
 code=0
 run start --from "$tmp/stage/nonexistent" >/dev/null 2>&1 || code=$?
 expect 1 "$code" "start refuses a missing candidate"
+
+# A real build under this throwaway HOME would ask an agy that is not signed
+# in, and a build older than the sign-in check opens a browser tab doing it.
+expect_file "$tmp/agy-bin.seen" "the fakes saw doctor run"
+expect 0 "$(grep -cv '^/usr/bin/false$' "$tmp/agy-bin.seen")" "no doctor in a rehearsal can reach a real agy"
+
+# The real path asks agy instead, because the installed build may be that old.
+# With no login, as above, doctor gets none. With one, doctor keeps it.
+: >"$tmp/agy-bin.seen"
+real_path_agy=$tmp/agy-signed-in run_real status >/dev/null 2>&1 || true
+expect_grep "^$tmp/agy-signed-in\$" "$tmp/agy-bin.seen" "a signed-in agy stays for doctor on the real path"
 
 echo "rehearsal: all checks passed"

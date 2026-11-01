@@ -86,7 +86,7 @@ Anything that leaves goes through a program the person already runs:
   log into a session of the person's own agent. That agent's vendor receives
   them as context. `CONBUS_BRIEFING=off` stops briefings. Hops and summaries
   happen only when triggered.
-- **Vendor CLIs and `gh`.** Quota comes from `agy -p /usage`,
+- **Vendor CLIs and `gh`.** Quota comes from `agy models` and `agy -p /usage`,
   `codex app-server` and Claude Code's status line. To decide a hop, conbus
   asks `git` and `gh` about the folder's pull request. Each of these tools
   uses its own login, which conbus never reads.
