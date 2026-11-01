@@ -1268,7 +1268,7 @@ pub fn doctor(paths: &Paths) -> io::Result<()> {
         ),
     }
 
-    let scan = SegmentLog::scan(paths.log_dir())?;
+    let scan = SegmentLog::scan_meta(paths.log_dir(), Some(&paths.cache_dir()))?;
     let conversations: std::collections::HashSet<_> =
         scan.records.iter().map(|r| r.bus_id).collect();
     println!(
@@ -1415,7 +1415,7 @@ fn hop_history(records: &[Record], limit: usize) -> Vec<String> {
 
 /// The control plane. Not a chat: rules, quota, hop history, cost.
 pub fn status(paths: &Paths) -> io::Result<()> {
-    let scan = SegmentLog::scan(paths.log_dir())?;
+    let scan = SegmentLog::scan_meta(paths.log_dir(), Some(&paths.cache_dir()))?;
     let meter = conbus_core::meter::Meter::fold(&scan.records);
     println!("{ROUTING_RULES}");
     let now = std::time::SystemTime::now()
