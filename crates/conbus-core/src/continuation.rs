@@ -348,6 +348,11 @@ pub fn replay(records: &[Record], home: Option<&str>) -> Replay {
 
     let mut out = Replay::default();
     let mut live: HashMap<BusId, Candidate> = HashMap::new();
+    // `live` only grows — `Candidate::apply` inserts, never removes — so a
+    // bus's membership is fixed at first sight and the workspace it indexes
+    // by is the whole-log one, not the candidate's own. Without it, every
+    // opening prompt scans every conversation seen so far.
+    let mut live_by_workspace: HashMap<String, HashSet<BusId>> = HashMap::new();
     let mut asked: HashSet<BusId> = HashSet::new();
 
     for record in by_time {
@@ -357,16 +362,14 @@ pub fn replay(records: &[Record], home: Option<&str>) -> Replay {
             // handing over every conversation on the machine is what turns a
             // replay into a quadratic one.
             let candidates: Vec<Candidate> = match workspace.as_deref() {
-                Some(workspace) => live
-                    .values()
-                    .filter(|candidate| {
-                        candidate.bus_id != record.bus_id
-                            && workspace_of.get(&candidate.bus_id).map(String::as_str)
-                                == Some(workspace)
-                    })
-                    .map(|candidate| Candidate {
+                Some(workspace) => live_by_workspace
+                    .get(workspace)
+                    .into_iter()
+                    .flatten()
+                    .filter(|bus_id| **bus_id != record.bus_id)
+                    .map(|bus_id| Candidate {
                         workspace: Some(workspace.to_string()),
-                        ..candidate.clone()
+                        ..live[bus_id].clone()
                     })
                     .collect(),
                 None => Vec::new(),
@@ -402,7 +405,14 @@ pub fn replay(records: &[Record], home: Option<&str>) -> Replay {
             };
             *out.verdicts.entry(name).or_default() += 1;
         }
+        let fresh = !live.contains_key(&record.bus_id);
         Candidate::apply(&mut live, record);
+        if fresh && let Some(workspace) = workspace_of.get(&record.bus_id) {
+            live_by_workspace
+                .entry(workspace.clone())
+                .or_default()
+                .insert(record.bus_id);
+        }
     }
     out
 }
