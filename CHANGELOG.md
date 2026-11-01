@@ -6,6 +6,12 @@ the entry says so when it does.
 
 ## [Unreleased]
 
+### Fixed
+
+- `log --tail N --bus-id ID` now follows aliases, as a full read does. It used to
+  match the id alone, so a split conversation showed part of itself. Naming a
+  conversation now costs one pass over the cache; a plain `--tail` is unchanged.
+
 ## [1.0.0-rc.3] — 2026-11-01
 
 ### Fixed
