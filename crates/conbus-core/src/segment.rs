@@ -46,6 +46,42 @@ fn segment_paths(dir: &Path) -> io::Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
+/// Write the whole line, or as near as can be managed to none of it.
+///
+/// A caller may try the same line again every few seconds while a disk is full,
+/// and each try that got partway would otherwise leave one more unreadable line
+/// in the log for good. What is cut back here is only what this call wrote:
+/// never a record, and never reached by a reader as anything but a torn tail.
+fn write_or_cut_back(file: &mut File, line: &[u8]) -> io::Result<()> {
+    let mut written = 0;
+    while written < line.len() {
+        match file.write(&line[written..]) {
+            Ok(0) => {
+                let err = io::Error::from(io::ErrorKind::WriteZero);
+                cut_back(file, written);
+                return Err(err);
+            }
+            Ok(n) => written += n,
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+            Err(err) => {
+                cut_back(file, written);
+                return Err(err);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Best effort: reopening heals whatever this could not remove.
+fn cut_back(file: &File, written: usize) {
+    if written == 0 {
+        return;
+    }
+    if let Ok(meta) = file.metadata() {
+        let _ = file.set_len(meta.len().saturating_sub(written as u64));
+    }
+}
+
 /// Close an unterminated last line left by a crash.
 ///
 /// Without this the next append is glued onto the torn line and both records
@@ -242,13 +278,13 @@ impl SegmentLog {
         line.push('\n');
 
         let current = self.segment_for(line.len() as u64)?;
-        if let Err(err) = current.file.write_all(line.as_bytes()) {
-            // A short write — a full disk is the ordinary cause — leaves part
-            // of the line on disk with no newline. Appending onto that glues
-            // the next record to the wreck and loses both. Drop the handle so
-            // the next append reopens the segment, which heals the tail and
-            // recomputes the size from the file rather than from what we meant
-            // to write.
+        if let Err(err) = write_or_cut_back(&mut current.file, line.as_bytes()) {
+            // A short write — a full disk is the ordinary cause — can leave part
+            // of the line on disk with no newline if it could not be cut back.
+            // Appending onto that glues the next record to the wreck and loses
+            // both. Drop the handle so the next append reopens the segment,
+            // which heals the tail and recomputes the size from the file rather
+            // than from what we meant to write.
             self.current = None;
             return Err(err);
         }

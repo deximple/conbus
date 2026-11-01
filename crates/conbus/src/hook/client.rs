@@ -312,8 +312,17 @@ pub fn run_in(
         }
         other => other,
     };
+    // An Inference frame takes a verdict and nothing else, whichever way the
+    // record went: Claude hook JSON would fail the Chat turn Anthropic is holding.
+    let answered = |reply: String| {
+        if inference {
+            hook::inference::ALLOW.to_string()
+        } else {
+            reply
+        }
+    };
     match result {
-        Ok(_) if inference => Ok(hook::inference::ALLOW.to_string()),
+        Ok(reply) => Ok(answered(reply)),
         Err(dropped) => {
             // Zero loss across restarts: a failure a restart explains is
             // written to the spool and still answered silently — it is not a
@@ -321,19 +330,24 @@ pub fn run_in(
             if spoolable(&dropped.reason)
                 && let Ok(reply) = spool(paths, &request)
             {
-                return Ok(reply);
+                return Ok(answered(reply));
+            }
+            // No room for a spool file either, which is what a really full disk
+            // does. The daemon still has it in memory, so this is not a loss.
+            if held_by_the_daemon(&dropped.reason) {
+                return Ok(answered(silent_reply(harness).to_string()));
             }
             Err(dropped)
         }
-        other => other,
     }
 }
 
-/// The failures a daemon restart explains: nothing to connect to, a reply
+/// The failures a later daemon can put right: nothing to connect to, a reply
 /// that never came or could not be read, a session whose binding died with
-/// the old daemon, or a refusal that names the protocol — a newer hook can
-/// wait for a daemon that speaks it. Any other refusal or a retention
-/// `Withheld` is a real decision, and the drop stands.
+/// the old daemon, a refusal that names the protocol — a newer hook can wait
+/// for a daemon that speaks it — or a log that would not take the record, such
+/// as a full disk. Any other refusal or a retention `Withheld` is a real
+/// decision, and the drop stands.
 fn spoolable(reason: &str) -> bool {
     reason.starts_with("no daemon on ")
         || reason.starts_with("could not bound the daemon call:")
@@ -341,7 +355,23 @@ fn spoolable(reason: &str) -> bool {
         || reason.starts_with("no reply from the daemon:")
         || reason.starts_with("unreadable reply ")
         || reason.starts_with("no conversation for this session")
-        || (reason.starts_with("the daemon refused the record:") && reason.contains("protocol v"))
+        || (reason.starts_with("the daemon refused the record:")
+            && (reason.contains("protocol v") || refused_by_the_log(reason)))
+}
+
+/// The daemon read the request and the log would not take it. `lost` is what
+/// the daemon says when it could not keep it, and what any build before this
+/// one says; `held` is what it says when it has.
+fn refused_by_the_log(reason: &str) -> bool {
+    reason.contains(" record(s) written, ") && (reason.contains(" lost: ") || held(reason))
+}
+
+fn held(reason: &str) -> bool {
+    reason.contains(" held: ")
+}
+
+fn held_by_the_daemon(reason: &str) -> bool {
+    reason.starts_with("the daemon refused the record:") && held(reason)
 }
 
 /// Write the request beside the socket for the next daemon to drain, if the
@@ -784,6 +814,60 @@ mod tests {
         assert!(spoolable(
             "could not bound the daemon call: Invalid argument (os error 22)"
         ));
+    }
+
+    #[test]
+    fn a_log_that_refuses_a_record_is_not_a_decision_about_the_record() {
+        assert!(spoolable(
+            "the daemon refused the record: 0 record(s) written, 1 lost: \
+             No space left on device (os error 28)"
+        ));
+        assert!(spoolable(
+            "the daemon refused the record: 1 record(s) written, 1 held: \
+             Permission denied (os error 13)"
+        ));
+    }
+
+    #[test]
+    fn a_session_nobody_named_is_still_a_decision() {
+        let refused = format!("the daemon refused the record: {}", hook::NO_SESSION);
+        assert!(!spoolable(&refused));
+        assert!(!held_by_the_daemon(&refused));
+    }
+
+    #[test]
+    fn a_hold_is_not_reported_as_a_loss_but_a_loss_still_is() {
+        assert!(held_by_the_daemon(
+            "the daemon refused the record: 0 record(s) written, 1 held: \
+             No space left on device (os error 28)"
+        ));
+        assert!(!held_by_the_daemon(
+            "the daemon refused the record: 0 record(s) written, 1 lost: \
+             No space left on device (os error 28)"
+        ));
+    }
+
+    #[test]
+    fn a_spooled_inference_frame_still_answers_with_a_verdict() {
+        // Anthropic is holding a Chat turn on this reply. Claude's control
+        // object is not a verdict, and the spool used to answer with it.
+        let home = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::from_env(home.path().to_str(), None, None).expect("paths");
+        std::fs::write(
+            home.path().join("daemon.build"),
+            r#"{"build":"t","pid":1,"started":"2026-11-01T00:00:00.000Z","retention":"full"}"#,
+        )
+        .expect("stamp");
+        let frame = include_str!("../../tests/fixtures/claude_inference_hook_prompt.json");
+
+        let reply =
+            run_in(Some(&paths), Harness::CLAUDE_CODE, &mut frame.as_bytes()).expect("spooled");
+
+        assert_eq!(reply, hook::inference::ALLOW);
+        let spooled = std::fs::read_dir(paths.spool_dir())
+            .expect("the spool exists")
+            .count();
+        assert_eq!(spooled, 1, "and the frame was kept");
     }
 
     #[test]
