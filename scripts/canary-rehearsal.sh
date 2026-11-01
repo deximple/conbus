@@ -227,7 +227,11 @@ live_sha=""
 [ -f "$live_bin" ] && live_sha=$(shasum -a 256 "$live_bin" | awk '{print $1}')
 code=0
 env -u CONBUS_HOME -u XDG_STATE_HOME HOME="$real_home" CONBUS_CANARY_REHEARSAL=1 \
-    bash "$canary" start --from "$tmp/stage/conbus-good" >/dev/null 2>&1 || code=$?
+    bash "$canary" start --from "$tmp/stage/conbus-good" >"$tmp/realhome.out" 2>&1 || code=$?
+if [ "${code:-0}" != 2 ]; then
+    say "diagnostic: real_home='$real_home' pw='$(env -u HOME bash -c 'cd ~ && pwd -P' 2>/dev/null)'"
+    sed 's/^/  canary: /' "$tmp/realhome.out" | head -8
+fi
 expect 2 "$code" "REHEARSAL under the real HOME refuses (exit 2)"
 if [ -n "$live_sha" ]; then
     expect "$live_sha" "$(shasum -a 256 "$live_bin" | awk '{print $1}')" \
