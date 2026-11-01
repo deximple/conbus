@@ -178,3 +178,12 @@ were among them (the fifth is the memory agent, which has no thread).
 plan did not reproduce on 0.152.1's app-server. `turns` on a `thread/list`
 item is always `[]`; the turns come from `thread/turns/list` only. Records
 recovered this way are stamped `backfilled_from: codex_thread`.
+
+## 0.166.0 — `codex exec` fires hooks
+
+The non-interactive runner fires the same hook lifecycle as the TUI
+(SessionStart, UserPromptSubmit, PreToolUse, Stop, SessionEnd) when hook
+trust is bypassed: `--dangerously-bypass-hook-trust` skips the prompt, the
+project must be trusted via `-c`, and `-c 'mcp_servers={}'` keeps a throwaway
+run from starting real servers. A policy-enabled run produces a real
+PreToolUse, which `codex_0.166.0.jsonl` carries alongside a plain session.

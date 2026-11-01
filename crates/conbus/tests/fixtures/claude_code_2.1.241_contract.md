@@ -241,3 +241,9 @@ an ordinary refusal is visible. conbus records it as `permission_asked`, not as 
 ### SessionEnd
 
     reason:p6b()
+
+### 2.1.316
+
+    `effort` now also rides on `Stop` (and the tool events), not only on
+    `UserPromptSubmit` — `effort.level` values like `xhigh` appear anywhere in
+    the turn. PostToolBatch still lands between PostToolUse and Stop.

@@ -700,6 +700,21 @@ fn run_forward(command: &str, stdin: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// agy 1.4.12's /usage reply: SUCCESS status, groups carrying weekly and
+    /// five-hour buckets — "75% used" on the 5h, "50% used" on the weekly.
+    #[test]
+    fn agy_1_4_12_usage_parses() {
+        let value: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/agy_1.4.12_usage.json"))
+                .expect("fixture is json");
+        let quota = parse_agy(&value).expect("agy 1.4.12 parses");
+        let five = quota.primary.expect("a five-hour window");
+        let week = quota.secondary.expect("a weekly window");
+        assert_eq!(five.minutes, 300);
+        assert_eq!(five.used_percent, 75);
+        assert_eq!(week.used_percent, 50);
+    }
+
     use super::*;
 
     /// The reply captured on 2026-09-03, account id and timestamps aside.
