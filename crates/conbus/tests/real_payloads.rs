@@ -377,3 +377,100 @@ fn codexs_memory_agent_is_a_session_of_its_own_with_no_transcript() {
     assert_eq!(record["trigger"], "startup");
     assert_eq!(record["workspace"], "/Users/user/.codex/memories");
 }
+
+/// Feed every payload of a fixture through `conbus hook` on a live daemon and
+/// collect the segment's records. Sessions are minted in file order, exactly
+/// as the vendor fired them.
+fn replay_fixture(fixture: &str, harness: &str) -> Vec<serde_json::Value> {
+    let home = tempfile::tempdir().expect("tempdir");
+    let bin = env!("CARGO_BIN_EXE_conbus");
+    let mut daemon = Command::new(bin)
+        .arg("daemon")
+        .env("CONBUS_HOME", home.path())
+        .env("HOME", home.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn daemon");
+    wait_until_serving(home.path());
+
+    for line in fixture.lines().filter(|line| !line.is_empty()) {
+        let mut child = Command::new(bin)
+            .arg("hook")
+            .arg("--harness")
+            .arg(harness)
+            .env("CONBUS_HOME", home.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn hook");
+        use std::io::Write;
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin")
+            .write_all(line.as_bytes())
+            .expect("write");
+        child.wait().expect("hook exit");
+    }
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+
+    std::fs::read_to_string(home.path().join("log").join("segment-00000000.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_str(line).expect("record is json"))
+        .collect()
+}
+
+#[test]
+fn claude_2_1_316_payloads_normalise() {
+    let records = replay_fixture(
+        include_str!("fixtures/claude_code_2.1.316.jsonl"),
+        "claude_code",
+    );
+    let kinds: Vec<&str> = records.iter().filter_map(|r| r["event"].as_str()).collect();
+    // Two sessions; the second ran a tool — pre, post, and the batch echo.
+    assert!(
+        kinds.contains(&"turn_started"),
+        "a prompt reached the log: {kinds:?}"
+    );
+    assert!(
+        kinds.iter().any(|k| k.contains("tool")),
+        "the tool events reached the log: {kinds:?}"
+    );
+    assert!(
+        records.iter().all(|r| r["workspace"].is_string()),
+        "every record keeps its checkout"
+    );
+}
+
+#[test]
+fn codex_0_166_payloads_normalise_including_a_real_pretooluse() {
+    let records = replay_fixture(include_str!("fixtures/codex_0.166.0.jsonl"), "codex");
+    let kinds: Vec<&str> = records.iter().filter_map(|r| r["event"].as_str()).collect();
+    assert!(kinds.contains(&"turn_started"), "a prompt: {kinds:?}");
+    assert!(
+        kinds.iter().any(|k| k.contains("tool")),
+        "the real PreToolUse reached the log: {kinds:?}"
+    );
+}
+
+#[test]
+fn cursor_agent_2026_10_19_payloads_normalise() {
+    let records = replay_fixture(
+        include_str!("fixtures/cursor_agent_2026.10.19.jsonl"),
+        "cursor",
+    );
+    assert!(
+        !records.is_empty(),
+        "the agent print-mode session wrote something"
+    );
+    let kinds: Vec<&str> = records.iter().filter_map(|r| r["event"].as_str()).collect();
+    assert!(
+        kinds.iter().any(|k| k.contains("tool")),
+        "the tool events reached the log: {kinds:?}"
+    );
+}

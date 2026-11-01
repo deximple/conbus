@@ -34,3 +34,10 @@ on this machine (the hook was failing the *mapping*, not the reply). Cursor's
 `beforeSubmitPrompt` does not take Claude's `hookSpecificOutput`. Official
 inject is `sessionStart` → `additional_context`. The bus briefs that event
 and records `beforeSubmitPrompt` so the conversation can mint.
+
+## cursor-agent 2026.10.19 — print mode
+
+`cursor-agent -p` fires `sessionStart`, `preToolUse`, `beforeShellExecution`,
+`afterShellExecution`, `postToolUse`, `sessionEnd` only — no
+`beforeSubmitPrompt`, `afterAgentResponse`, or `stop`. It ignores a
+project's `.claude/settings.json`; hooks come from its own registration.
