@@ -1,10 +1,12 @@
-//! `conbus auth` — when a sign-in tab pops up, name what asked for it.
+//! `conbus auth` — when a sign-in tab pops up, answer with evidence whose it is.
 //!
-//! Operators have guessed at conbus every time a vendor's OAuth page opened.
-//! One was ours (an unattended `agy -p` probe — since removed); another was
-//! Codex.app's Playwright MCP bridge. This command answers three questions:
-//! whether conbus needs a login at all (never), what each vendor's state is,
-//! and — given the URL that opened — whose page it is and which process asked.
+//! Operators have guessed at conbus every time a vendor's sign-in page opened.
+//! One was ours (an unattended `agy -p` probe); another was Codex.app's
+//! Playwright MCP bridge. This command says whether conbus needs a login at all
+//! (never), what each vendor's state is, and, given the address that opened,
+//! whose page it is and whether conbus is above the process it calls back to. An
+//! answer with nothing behind it is worse than none, so it says `cannot tell`
+//! whenever it did not check.
 //!
 //! It blocks nothing and fixes nothing: it reads state and points at the
 //! vendor's own sign-in flow. Exit 0 regardless of vendor state — recording
@@ -30,6 +32,20 @@ const TOKEN_FILES: &[&str] = &[
     ".config/opencode/opencode.json",
 ];
 
+/// What runs with nobody at the keyboard. Automatic overflow lands on Codex or
+/// Claude only (`attach::overflow`); the other legs open on a person's order.
+const BACKGROUND: &str = "the recorder runs `codex app-server` (gap fill at start; quota and \
+`thread/start` on a hop), `claude -p` (a warm hop) and `gh` (a hop's pull request lookup). A hop \
+then opens the app it lands on: `open -b` for Codex or Claude and, on a person's order, `cursor \
+-n`, or on a Mac `osascript` for a terminal leg. conbus asks for no sign-in of its own; any of \
+these vendors may ask for theirs";
+
+const CODEX_NEEDED_FOR: &str = "for quota, gap fill, hop";
+const AGY_NEEDED_FOR: &str = "`conbus quota` and `conbus auth` ask it, `auth` with `agy models` \
+alone; a hop to it or `conbus run` starts it as a session; recording is unaffected";
+const GH_NEEDED_FOR: &str = "for hop's pull request lookup";
+const CANNOT_BE_TOLD: &str = "its sign-in could not be told";
+
 /// One line of the `auth` table.
 struct Row {
     name: &'static str,
@@ -37,124 +53,113 @@ struct Row {
     why: &'static str,
 }
 
-fn probe_rows() -> Vec<Row> {
-    let mut rows = vec![
-        Row {
-            name: "conbus",
-            status: "needs no login of its own".into(),
-            why: "and recording needs none",
-        },
-        Row {
-            name: "background",
-            status: "nothing conbus runs on its own".into(),
-            why: "asks a vendor to sign in",
-        },
-    ];
+fn note(name: &'static str, status: &str) -> Row {
+    Row {
+        name,
+        status: status.into(),
+        why: "",
+    }
+}
 
-    // Codex is asked through its own read: an `authentication` refusal is
-    // the logged-out answer, anything else is not a clean no.
-    let codex = match crate::quota::read() {
-        Ok(_) => ("signed in", "for quota, gap fill, hop"),
+/// A vendor this command does not ask, and what conbus runs it for.
+fn not_checked(name: &'static str, why: &'static str) -> Row {
+    Row {
+        name,
+        status: "not checked".into(),
+        why,
+    }
+}
+
+fn probe_rows() -> Vec<Row> {
+    vec![
+        note(
+            "conbus",
+            "needs no login of its own, and recording needs none",
+        ),
+        note("background", BACKGROUND),
+        note("measured", verdict::MEASURED),
+        codex_row(),
+        agy_row(),
+        gh_row(),
+        not_checked(
+            "claude",
+            "a warm hop and `summary` run `claude -p`, and `conbus run` starts it",
+        ),
+        not_checked(
+            "cursor",
+            "hooks, and `cursor -n` opens it when a hop lands there; `conbus run` starts its agent",
+        ),
+        not_checked(
+            "grok",
+            "hooks, and on a Mac `osascript` opens it when a hop lands there; `conbus run` starts it",
+        ),
+        not_checked(
+            "opencode",
+            "hooks, and on a Mac `osascript` opens it when a hop lands there; `conbus run` starts it; `doctor` runs `opencode --version`",
+        ),
+    ]
+}
+
+/// Codex is asked through its own read: an `authentication` refusal is the
+/// logged-out answer, anything else is not a clean no.
+fn codex_row() -> Row {
+    let (status, why) = match crate::quota::read() {
+        Ok(_) => ("signed in".to_string(), CODEX_NEEDED_FOR),
         Err(err)
             if err
                 .to_string()
                 .to_ascii_lowercase()
                 .contains("authentication") =>
         {
-            ("AUTH_REQUIRED", "for quota, gap fill, hop")
+            ("AUTH_REQUIRED".to_string(), CODEX_NEEDED_FOR)
         }
-        Err(err) => {
-            rows.push(Row {
-                name: "codex",
-                status: format!("SKIP — {err}"),
-                why: "its sign-in could not be told",
-            });
-            ("", "")
-        }
-    };
-    if !codex.0.is_empty() {
-        rows.push(Row {
-            name: "codex",
-            status: codex.0.into(),
-            why: codex.1,
-        });
-    }
-
-    // `agy models` only — never `-p`, which opens OAuth when logged out.
-    let agy = match crate::quota::agy_signed_in(&crate::quota::agy_binary(), Duration::from_secs(5))
-    {
-        Ok(()) => (
-            "signed in",
-            "for its quota line only; recording is unaffected",
+        Err(err) => (
+            format!("SKIP — {}", shown(&err.to_string())),
+            CANNOT_BE_TOLD,
         ),
+    };
+    Row {
+        name: "codex",
+        status,
+        why,
+    }
+}
+
+/// `agy models` only — never `-p`, which opens OAuth when logged out.
+fn agy_row() -> Row {
+    let asked = crate::quota::agy_signed_in(&crate::quota::agy_binary(), Duration::from_secs(5));
+    let (status, why) = match asked {
+        Ok(()) => ("signed in".to_string(), AGY_NEEDED_FOR),
         Err(crate::quota::AgyNotAsked::AuthRequired) => (
-            "AUTH_REQUIRED",
-            "for its quota line only; recording is unaffected; run `agy` to sign in",
+            "AUTH_REQUIRED, run `agy` to sign in".to_string(),
+            AGY_NEEDED_FOR,
         ),
         Err(crate::quota::AgyNotAsked::Skip(why)) => {
-            rows.push(Row {
-                name: "agy",
-                status: format!("SKIP — {why}"),
-                why: "its sign-in could not be told",
-            });
-            ("", "")
+            (format!("SKIP — {}", shown(&why)), AGY_NEEDED_FOR)
         }
     };
-    if !agy.0.is_empty() {
-        rows.push(Row {
-            name: "agy",
-            status: agy.0.into(),
-            why: agy.1,
-        });
+    Row {
+        name: "agy",
+        status,
+        why,
     }
-
-    let gh = gh_status();
-    rows.push(Row {
-        name: "gh",
-        status: gh.0,
-        why: gh.1,
-    });
-    rows.extend([
-        Row {
-            name: "claude",
-            status: "not checked".into(),
-            why: "conbus runs it only for `summary` and a warm hop",
-        },
-        Row {
-            name: "cursor",
-            status: "not used".into(),
-            why: "hooks only",
-        },
-        Row {
-            name: "grok",
-            status: "not used".into(),
-            why: "hooks only",
-        },
-        Row {
-            name: "opencode",
-            status: "not used".into(),
-            why: "hooks only",
-        },
-    ]);
-    rows
 }
 
 /// `gh auth status`, five seconds. Exit 0 means a token exists; anything
 /// else is reported, never a refusal of the command itself.
-fn gh_status() -> (String, &'static str) {
+fn gh_row() -> Row {
     let bin = std::env::var("CONBUS_GH").unwrap_or_else(|_| "gh".into());
     let mut command = std::process::Command::new(bin);
-    command
-        .args(["auth", "status"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    match crate::code::output_within(command, Duration::from_secs(5)) {
-        Ok(output) if output.status.success() => {
-            ("signed in".into(), "for hop's pull request lookup")
-        }
-        Ok(_) => ("not signed in".into(), "for hop's pull request lookup"),
-        Err(err) => (format!("SKIP — {err}"), "its sign-in could not be told"),
+    command.args(["auth", "status"]);
+    let (status, why) = match crate::code::output_within(command, Duration::from_secs(5)) {
+        Ok(output) if output.status.success() => ("signed in".to_string(), GH_NEEDED_FOR),
+        Ok(_) => ("not signed in".to_string(), GH_NEEDED_FOR),
+        Err(err) => (format!("SKIP — {}", shown(&err)), CANNOT_BE_TOLD),
+    };
+    Row {
+        name: "gh",
+        status,
+        why,
     }
 }
 
@@ -392,7 +397,10 @@ pub fn run(paths: &Paths, url: Option<&str>, html: Option<String>, open: bool) -
         return Ok(());
     }
     for row in &rows {
-        println!("{:<9} {}  {}", row.name, row.status, row.why);
+        println!(
+            "{}",
+            format!("{:<10} {}  {}", row.name, row.status, row.why).trim_end()
+        );
     }
     Ok(())
 }
