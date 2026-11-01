@@ -15,8 +15,12 @@ the entry says so when it does.
   line. A spooled entry goes with a drop line only once the file is seven days old
   and the log has refused for seven days without one write working. Only a hook's
   request is held: `conbus hop` and a lease are told the write failed, and it stays
-  failed, seat included. A short write no longer leaves a torn line. A spooled
-  Inference frame still answers `allow`.
+  failed. A short write no longer leaves a torn line. A spooled Inference frame
+  still answers `allow`. A record only in memory is lost if the recorder stops before
+  the log takes it, so `conbus doctor` says on its `writable` line when the log is
+  refusing and how many are at risk, by asking the daemon. A nearly full disk that
+  takes short records and refuses a long one leaves no drop line while nothing has
+  waited or been lost, and `daemon.log` hears about it at most every ten minutes.
 - A hook that connects to a daemon just as it closes now spools its record instead
   of dropping it. On macOS that failure shows up as `could not bound the daemon
   call`, which is a restart like any other.

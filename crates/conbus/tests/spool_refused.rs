@@ -508,3 +508,203 @@ fn a_refused_entry_stops_the_pass_and_nothing_behind_it_is_read() {
     assert!(still_there, "the pass went on past the refusal: {said}");
     assert_eq!(said, "");
 }
+
+/// A daemon under `ulimit -f blocks`, as a nearly full disk limits it. Its hooks and
+/// `doctor` are not limited.
+fn start_with_little_room(home: &Path, blocks: u64) -> Daemon {
+    let limited = Command::new("/bin/sh")
+        .args([
+            "-c",
+            "trap '' XFSZ; ulimit -f \"$1\"; exec \"$2\" daemon 2>>\"$3\"",
+            "sh",
+        ])
+        .arg(blocks.to_string())
+        .arg(bin())
+        .arg(home.join("daemon.err"))
+        .env("CONBUS_HOME", home)
+        .env("HOME", home)
+        .env("CONBUS_SKIP_LAUNCHCTL", "1")
+        .env("CONBUS_CODEX_BIN", "/nonexistent/codex")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("daemon under a limit");
+    let daemon = Daemon(limited);
+    let socket = home.join("conbus.sock");
+    until("it serves", || {
+        std::os::unix::net::UnixStream::connect(&socket).is_ok()
+    });
+    daemon
+}
+
+fn doctor(home: &Path) -> String {
+    let out = Command::new(bin())
+        .arg("doctor")
+        .env("CONBUS_HOME", home)
+        .env("HOME", home)
+        .env("CONBUS_SKIP_LAUNCHCTL", "1")
+        .env("CONBUS_CODEX_BIN", "/nonexistent/codex")
+        .env("CONBUS_AGY_BIN", "/usr/bin/false")
+        .env("CONBUS_OPENCODE_BIN", "/nonexistent/opencode")
+        .output()
+        .expect("doctor");
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+fn writable_line(said: &str) -> String {
+    said.lines()
+        .find(|line| line.starts_with("writable"))
+        .unwrap_or_default()
+        .to_string()
+}
+
+#[test]
+fn doctor_says_so_while_the_log_is_refusing() {
+    // The drop line comes only once a write has worked. This is when a person can
+    // still act, and on a full disk nothing else says it.
+    let home = tempfile::tempdir().expect("tempdir");
+    a_log_with_one_turn(home.path());
+    let daemon = start_with_little_room(home.path(), 2);
+    let long = "x".repeat(4 * 1024);
+    prompt(home.path(), "p1", &long);
+    until("it has been refused", || !spooled(home.path()).is_empty());
+
+    let said = doctor(home.path());
+    stop(daemon);
+
+    let writable = writable_line(&said);
+    assert!(writable.contains("REFUSING since"), "{writable}");
+    assert!(
+        writable.contains("1 record(s) held, all with a copy in the spool"),
+        "{writable}"
+    );
+}
+
+#[test]
+fn doctor_says_what_only_memory_holds_and_what_that_risks() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let segment = a_log_with_one_turn(home.path());
+    let spool = home.path().join("spool");
+    std::fs::write(&spool, "").expect("in the way");
+    chmod(&segment, 0o400);
+    let daemon = start(home.path());
+    for n in 0..5 {
+        prompt(home.path(), &format!("h{n}"), "only in memory");
+    }
+    let before = std::fs::metadata(&segment).expect("meta").len();
+
+    let said = doctor(home.path());
+
+    let after = std::fs::metadata(&segment).expect("meta").len();
+    let no_line_yet = drops(home.path());
+    chmod(&segment, 0o600);
+    std::fs::remove_file(&spool).expect("out of the way");
+    until("they land", || {
+        (0..5).all(|n| turns(home.path(), &format!("h{n}")) == 1)
+    });
+    stop(daemon);
+    let writable = writable_line(&said);
+    assert!(
+        writable.contains("5 record(s) in memory only, lost if the recorder stops"),
+        "{writable}"
+    );
+    assert!(
+        writable.contains("free space, do not restart it"),
+        "{writable}"
+    );
+    assert_eq!(before, after, "asking wrote to the log");
+    assert_eq!(no_line_yet, "", "asking wrote a drop line");
+}
+
+#[test]
+fn doctor_says_nothing_of_the_kind_while_the_log_is_fine() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let daemon = start(home.path());
+    prompt(home.path(), "p0", "nothing is wrong");
+
+    let said = doctor(home.path());
+    stop(daemon);
+
+    assert_eq!(writable_line(&said), "writable  appendable");
+}
+
+#[test]
+fn an_older_daemon_that_cannot_answer_is_no_information_and_no_failure() {
+    // What a build before this one says to any line it cannot read as a request.
+    use std::io::{BufRead, BufReader};
+    let home = tempfile::tempdir().expect("tempdir");
+    a_log_with_one_turn(home.path());
+    let socket = home.path().join("conbus.sock");
+    let _ = std::fs::remove_file(&socket);
+    let listener = std::os::unix::net::UnixListener::bind(&socket).expect("older daemon");
+    let older = std::thread::spawn(move || {
+        let mut asked = Vec::new();
+        for _ in 0..4 {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return asked;
+            };
+            let _ = stream.set_read_timeout(Some(Duration::from_millis(300)));
+            let mut line = String::new();
+            let _ = BufReader::new(stream.try_clone().expect("clone")).read_line(&mut line);
+            if !line.is_empty() {
+                asked.push(line);
+                let _ = writeln!(
+                    stream,
+                    "{}",
+                    serde_json::json!({"status": "failed",
+                        "error": "unreadable request: missing field `harness` at line 1"})
+                );
+                break;
+            }
+        }
+        asked
+    });
+
+    let said = doctor(home.path());
+
+    let asked = older.join().expect("older daemon");
+    assert_eq!(writable_line(&said), "writable  appendable", "{said}");
+    assert_eq!(asked.len(), 1, "it did ask: {said}");
+    assert!(asked[0].contains("health"), "{asked:?}");
+    assert!(
+        !asked[0].contains("\"pv\""),
+        "it must not read as a newer hook: {asked:?}"
+    );
+}
+
+#[test]
+fn a_long_spooled_entry_on_a_nearly_full_disk_is_no_outage_per_hook() {
+    // Each tick the long entry was refused, which opened an "outage", and the next
+    // short hook fit, which "ended" it: one drop line per hook saying nothing had
+    // happened, and two notes. Past the cap, that kept real lines from being read.
+    let home = tempfile::tempdir().expect("tempdir");
+    a_log_with_one_turn(home.path());
+    prompt(home.path(), "long", &"L".repeat(60_000));
+    assert_eq!(spooled(home.path()).len(), 1);
+    let daemon = start_with_little_room(home.path(), 8);
+    for n in 0..4 {
+        prompt(home.path(), &format!("s{n}"), "short one");
+        past_a_drain();
+    }
+    let said = drops(home.path());
+    stop(daemon);
+
+    assert_eq!(said, "", "nothing waited and nothing was lost");
+    for n in 0..4 {
+        assert_eq!(
+            turns(home.path(), &format!("s{n}")),
+            1,
+            "the short ones fit"
+        );
+    }
+    assert_eq!(
+        spooled(home.path()).len(),
+        1,
+        "the long one is still waiting"
+    );
+    let notes = std::fs::read_to_string(home.path().join("daemon.err")).expect("daemon.err");
+    for kind in ["the log refused a write", "the log takes writes again"] {
+        assert_eq!(notes.matches(kind).count(), 1, "{kind}:\n{notes}");
+    }
+}
