@@ -187,9 +187,8 @@ fn close_to_owner(path: &std::path::Path) {
 #[cfg(not(unix))]
 fn close_to_owner(_path: &std::path::Path) {}
 
-fn append(paths: &Paths, dropped: &Dropped) {
-    let file = drops_file(paths);
-    rotate_if_full(paths, &file);
+/// A new log is 0600 from the moment it exists.
+fn open_for_append(file: &std::path::Path) -> std::io::Result<fs::File> {
     let mut options = OpenOptions::new();
     options.create(true).append(true);
     #[cfg(unix)]
@@ -197,7 +196,13 @@ fn append(paths: &Paths, dropped: &Dropped) {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let Ok(mut handle) = options.open(&file) else {
+    options.open(file)
+}
+
+fn append(paths: &Paths, dropped: &Dropped) {
+    let file = drops_file(paths);
+    rotate_if_full(paths, &file);
+    let Ok(mut handle) = open_for_append(&file) else {
         return;
     };
     // A file an older build left 0644 is closed through this handle: whichever
@@ -684,6 +689,17 @@ mod tests {
     fn mode_of(path: &std::path::Path) -> u32 {
         use std::os::unix::fs::PermissionsExt;
         std::fs::metadata(path).expect("stat").permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_new_log_is_created_owner_only() {
+        let dir = home();
+        let file = dir.path().join("drops.jsonl");
+
+        drop(open_for_append(&file).expect("open"));
+
+        assert_eq!(mode_of(&file), 0o600);
     }
 
     #[cfg(unix)]
