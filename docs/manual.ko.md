@@ -547,7 +547,7 @@ conbus arena link --from ~/src/shop --to ~/src/shop-admin
 | --- | --- | --- |
 | *(설정 안 함)* | 남김 | 쓰지 않음 — 크기만 |
 | `full` | 남김 | 남김(본문마다 16 KiB에서 자름) |
-| `encrypted_tools` | 남김 | 로그인 키체인에 있는 키로 AES-256-GCM 봉인. `conbus log --reveal`로 엽니다 |
+| `encrypted_tools` | 남김 | 로그인 키체인에 있는 키로 AES-256-GCM 봉인. `conbus log --reveal`로 엽니다. 스풀을 거친 툴 호출은 크기만 남습니다. 봉인은 레코더만 할 수 있기 때문이며, `doctor`의 `drops`에 집계됩니다 |
 | `ephemeral` | 아무것도 쓰지 않음 | 아무것도 쓰지 않음 |
 
 어느 수준에서든 16 KiB보다 긴 본문 하나는 로그에서 잘리고, 원래 크기가 함께

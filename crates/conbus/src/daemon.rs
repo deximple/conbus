@@ -560,7 +560,10 @@ impl Daemon {
                 Ok(written) => {
                     self.report_refusal();
                     return match written {
-                        Some(record) => Landing::Written(Box::new(record)),
+                        Some(record) => {
+                            self.count_a_lost_seal(&record);
+                            Landing::Written(Box::new(record))
+                        }
                         None => Landing::Withheld,
                     };
                 }
@@ -622,6 +625,7 @@ impl Daemon {
                         refusal.landed += 1;
                     }
                     if let Some(record) = written {
+                        self.count_a_lost_seal(&record);
                         self.after_landing(record, held.declared);
                     }
                 }
@@ -656,6 +660,39 @@ impl Daemon {
         self.follow_through(bus_id, &source, &mut written, &mut seqs, declared);
     }
 
+    /// `encrypted_tools` promises a sealed body. One that reached the log elided
+    /// is lost for good, so it gets a line where `doctor` will show it. Mostly
+    /// these came through the spool, where the hook has no key and will not store
+    /// plaintext, and the rest are a Keychain that would not answer.
+    fn count_a_lost_seal(&self, record: &Record) {
+        if self.log.retention() != Retention::EncryptedTools
+            || !conbus_core::seal::seals_here()
+            || !conbus_core::retention::elided_tool_body(&record.event)
+        {
+            return;
+        }
+        let session: String = record
+            .source
+            .vendor_session_id
+            .as_deref()
+            .unwrap_or_default()
+            .chars()
+            .take(8)
+            .collect();
+        self.write_drop(
+            &crate::drops::Dropped::new("tool bodies elided, not sealed")
+                .with_detail(format!("{} for session {session}", kind_of(&record.event))),
+        );
+    }
+
+    fn write_drop(&self, dropped: &crate::drops::Dropped) {
+        let paths = self
+            .arena_root
+            .as_deref()
+            .and_then(|root| Paths::from_env(root.to_str(), None, None).ok());
+        crate::drops::record_in(paths.as_ref(), dropped);
+    }
+
     /// Say how the outage went, now there may be room to. Without this the only
     /// trace of a full disk is a line in `daemon.log`, if that landed.
     fn report_refusal(&mut self) {
@@ -672,14 +709,7 @@ impl Daemon {
         } else {
             "the log refused writes for a while"
         };
-        let paths = self
-            .arena_root
-            .as_deref()
-            .and_then(|root| Paths::from_env(root.to_str(), None, None).ok());
-        crate::drops::record_in(
-            paths.as_ref(),
-            &crate::drops::Dropped::new(reason).with_detail(told),
-        );
+        self.write_drop(&crate::drops::Dropped::new(reason).with_detail(told));
     }
 
     /// Fold what was written into the state the next briefing reads.
@@ -1866,6 +1896,14 @@ fn let_go(paths: &Paths, file: &Path, reason: String, detail: String) {
     }
 }
 
+/// An event's kind, as the log names it.
+fn kind_of(event: &Event) -> String {
+    serde_json::to_value(event)
+        .ok()
+        .and_then(|v| v.get("event").and_then(|k| k.as_str().map(String::from)))
+        .unwrap_or_else(|| "unknown".into())
+}
+
 /// What a spooled request this build cannot parse was and whose it was, in the
 /// shape every other spool drop gives. Identifiers, never content.
 fn named_by(text: &str) -> String {
@@ -1958,10 +1996,7 @@ fn drain_spool(daemon: &mut Daemon, paths: &Paths) {
                 // The same shape the hook's own drop carried: the event and
                 // the session, so a ghost session's end can be told from a
                 // lost tool call.
-                let kind = serde_json::to_value(&request.event)
-                    .ok()
-                    .and_then(|v| v.get("event").and_then(|k| k.as_str().map(String::from)))
-                    .unwrap_or_else(|| "unknown".into());
+                let kind = kind_of(&request.event);
                 let session: String = request.vendor_session_id.chars().take(8).collect();
                 let key = SessionKey::new(request.harness.clone(), &request.vendor_session_id);
                 let waits = mid_turn(&request.event);

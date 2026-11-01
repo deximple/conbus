@@ -8,6 +8,10 @@ the entry says so when it does.
 
 ### Fixed
 
+- Under `encrypted_tools`, a tool body that reached the log elided rather than
+  sealed now leaves a drop line, so `doctor` shows it. Spooled tool bodies are still
+  elided, because sealing in a hook would mean reading the key there. A Keychain
+  that would not answer is counted the same way.
 - A tool event that arrives before its session has a conversation now waits in the
   spool for up to a day for the prompt that binds it, up to 8 MiB, instead of being
   deleted at the next two-second tick. Whether it survived used to come down to

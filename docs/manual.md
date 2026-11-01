@@ -602,7 +602,7 @@ The socket path must stay under 104 bytes; `doctor` tells you if a
 | --- | --- | --- |
 | *(unset)* | kept | not written — only their size |
 | `full` | kept | kept (each body clipped at 16 KiB) |
-| `encrypted_tools` | kept | sealed with AES-256-GCM under a key in your login Keychain; `conbus log --reveal` opens them. On Linux there is no OS key store and conbus keeps none of its own, so bodies are elided, not sealed |
+| `encrypted_tools` | kept | sealed with AES-256-GCM under a key in your login Keychain; `conbus log --reveal` opens them. A tool call that went through the spool keeps only its size, because only the recorder can seal; `doctor` counts these under `drops`. On Linux there is no OS key store and conbus keeps none of its own, so bodies are elided, not sealed |
 | `ephemeral` | nothing is written | nothing is written |
 
 At every level, a single body longer than 16 KiB is clipped in the log and
