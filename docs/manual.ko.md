@@ -522,6 +522,7 @@ conbus arena link --from ~/src/shop --to ~/src/shop-admin
 | `drops.jsonl` | 기록하지 못한 이벤트와 그 이유 |
 | `daemon.log` | 레코더 자신의 메시지. 시각이 찍혀 있습니다 |
 | `daemon.build` | 지금 도는 레코더가 어떤 빌드인지 |
+| `daemon.lock` | 비어 있는 파일. 도는 레코더가 여기에 잠금을 걸어 두 번째 데몬이 아무것도 쓰지 못하게 합니다 |
 | `conbus.sock` | 레코더의 소켓(모드 `0600`) |
 | `quota/` | 마지막 쿼터 판독값 |
 | `takeover.json` | `conbus run`을 기다리는 hop이 있을 때만 |

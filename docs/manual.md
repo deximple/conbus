@@ -564,6 +564,7 @@ folder's facts visible in another.
 | `drops.jsonl` | events that could not be recorded, and why |
 | `daemon.log` | the recorder's own messages, timestamped |
 | `daemon.build` | which build the running recorder is |
+| `daemon.lock` | empty; the running recorder holds a lock on it, so a second daemon writes nothing |
 | `conbus.sock` | the recorder's socket (mode `0600`) |
 | `quota/` | the last quota readings |
 | `takeover.json` | a hop waiting for `conbus run`, while one is |
