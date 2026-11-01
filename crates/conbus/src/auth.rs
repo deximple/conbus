@@ -15,12 +15,11 @@ use std::time::Duration;
 
 use conbus_core::paths::Paths;
 
+mod ancestry;
 mod url;
+mod verdict;
 
-use url::{Address, BRIDGE_SCHEME, PAGES, UNKNOWN_PAGE};
-
-/// Query parameters that may carry the listen port the page connects back to.
-const PORT_PARAMS: &[&str] = &["mcpRelayUrl", "redirect_uri", "redirect_url", "callback"];
+use url::{Address, BRIDGE_SCHEME, CALLBACK_PARAMS, PAGES, UNKNOWN_PAGE};
 
 /// Vendor config files a URL's `token=` may have been copied from. Their
 /// contents are never printed — only which file held the value.
@@ -159,74 +158,18 @@ fn gh_status() -> (String, &'static str) {
     }
 }
 
-/// The listen port the page will reach back to, when a known parameter
-/// carries one.
-fn page_port(address: &Address<'_>) -> Option<u16> {
-    for value in address.values(PORT_PARAMS) {
-        // First `:` after the last `/` of the scheme — `ws://host:PORT/x`
-        // and `http://localhost:PORT/callback` both land the port before
-        // the next `/` or end.
-        let digits: String = value
-            .chars()
-            .skip_while(|c| *c != ':')
-            .skip(1)
-            .skip_while(|c| *c != ':')
-            .skip(1)
-            .take_while(|c| c.is_ascii_digit())
-            .collect();
-        if let Ok(port) = digits.parse::<u16>() {
-            return Some(port);
-        }
-    }
-    None
+/// What of `text` may reach a terminal: printable characters, and `?` for the
+/// rest. Vendor error text and process names come from outside.
+fn shown(text: &str) -> String {
+    text.chars()
+        .map(|c| if printable(c) { c } else { '?' })
+        .collect()
 }
 
-/// Who is listening on `port`, as an ancestry chain `App > parent > pid-comm`,
-/// through `lsof` + `ps`. No arguments are ever printed — process names only.
-fn port_ancestry(port: u16) -> Option<(Vec<String>, bool)> {
-    let output = std::process::Command::new("lsof")
-        .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-t"])
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return Some((Vec::new(), false));
-    }
-    let pid = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .next()
-        .and_then(|l| l.trim().parse::<u32>().ok())?;
-    let mut chain = Vec::new();
-    let mut current = pid;
-    for _ in 0..8 {
-        let line = std::process::Command::new("ps")
-            .args(["-o", "ppid=,comm=", "-p", &current.to_string()])
-            .stdin(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .output()
-            .ok()?;
-        let text = String::from_utf8_lossy(&line.stdout);
-        let line = text.trim();
-        if line.is_empty() {
-            break;
-        }
-        let (ppid, comm) = line.split_once(' ').unwrap_or((line, ""));
-        chain.push(comm.trim().to_string());
-        let Ok(parent) = ppid.trim().parse::<u32>() else {
-            break;
-        };
-        if parent == 0 || parent == current {
-            break;
-        }
-        current = parent;
-    }
-    // `comm` can carry the full path; only the binary's own name counts —
-    // a *directory* named conbus-* does not make the page ours.
-    let ours = chain
-        .iter()
-        .any(|name| name.rsplit('/').next().unwrap_or(name) == "conbus");
-    Some((chain, ours))
+/// ASCII that prints, and letters and digits beyond it. Nothing else: no control
+/// character, no line break, no bidirectional override.
+fn printable(c: char) -> bool {
+    matches!(c, ' '..='~') || (!c.is_ascii() && c.is_alphanumeric())
 }
 
 /// Whether `token` appears in one of the vendor config files — existence
@@ -274,39 +217,10 @@ fn describe_url(url: &str) -> String {
         out.push_str(&format!("token     {}\n", token_origin(&token)));
     }
 
-    let port = address.as_ref().and_then(page_port);
-    let ancestry = port.and_then(port_ancestry);
-    match (port, &ancestry) {
-        (Some(_), Some((chain, _))) if !chain.is_empty() => {
-            out.push_str(&format!("process   {}\n", chain.join(" > ")));
-        }
-        (Some(port), Some(_)) => {
-            out.push_str(&format!("process   no process holds port {port} now\n"));
-        }
-        (Some(_), None) => {
-            out.push_str("process   cannot tell — lsof is not there\n");
-        }
-        (None, _) => {
-            out.push_str("process   no port in the URL to look up\n");
-        }
-    }
-
-    match &ancestry {
-        Some((chain, ours)) if !chain.is_empty() => {
-            if *ours {
-                out.push_str("conbus    yes: conbus is in this page's process ancestry\n");
-            } else {
-                out.push_str(
-                    "conbus    no: nothing in this page's ancestry is conbus, and conbus starts no server for its reads\n",
-                );
-            }
-        }
-        Some(_) => {
-            out.push_str("conbus    cannot tell — the process that opened it is gone\n");
-        }
-        None => {
-            out.push_str("conbus    cannot tell — no process to inspect\n");
-        }
+    let callbacks = address.as_ref().map(Address::callbacks).unwrap_or_default();
+    for line in verdict::describe(&callbacks) {
+        out.push_str(&line);
+        out.push('\n');
     }
 
     if page.is_some_and(|page| page.scheme == BRIDGE_SCHEME) {
@@ -323,6 +237,7 @@ fn describe_url(url: &str) -> String {
 /// `conbus auth --html [PATH]`: one self-contained page — banner, the same
 /// table, and a paste box that classifies a URL entirely offline.
 fn write_html(path: &std::path::Path, rows: &[Row]) -> io::Result<()> {
+    let callback_params_json = serde_json::json!(CALLBACK_PARAMS);
     let pages_json = serde_json::Value::Array(
         PAGES
             .iter()
@@ -384,7 +299,7 @@ input[type=text] {{ width: 34em; max-width: 90%; font: inherit; padding: .4em; }
 <div id="verdict"></div>
 <script>
 var PAGES = {pages_json};
-var PORT_PARAMS = ["mcpRelayUrl","redirect_uri","redirect_url","callback"];
+var CALLBACK_PARAMS = {callback_params_json};
 function parsed(text) {{
   try {{ return new URL(text); }} catch (e) {{ return null; }}
 }}
@@ -401,20 +316,35 @@ function pageOf(address) {{
   }}
   return "unknown page";
 }}
+function isLoopback(host) {{
+  return host === "localhost" || host === "[::1]" || /^127\.\d+\.\d+\.\d+$/.test(host) ||
+    /^\[::ffff:7f[0-9a-f]{{2}}:[0-9a-f]{{1,4}}\]$/.test(host);
+}}
+function callbackOf(value) {{
+  var hasScheme = value.indexOf("://") >= 0;
+  if (!hasScheme && !/^[^\/?#\\]*:\d+([\/?#]|$)/.test(value)) return null;
+  return parsed(hasScheme ? value : "http://" + value);
+}}
 function look() {{
   var address = parsed(document.getElementById("url").value.trim());
-  var kind = pageOf(address), port = "";
+  var ports = [], elsewhere = false;
   if (address) {{
-    PORT_PARAMS.forEach(function (name) {{
-      var value = address.searchParams.get(name);
-      var m = value && value.match(/^[^:]*:\/\/[^:/]+:(\d+)/);
-      if (m) port = m[1];
+    CALLBACK_PARAMS.forEach(function (name) {{
+      address.searchParams.getAll(name).forEach(function (value) {{
+        var callback = callbackOf(value);
+        if (!callback) return;
+        if (!isLoopback(callback.hostname.toLowerCase())) elsewhere = true;
+        else if (callback.port && ports.indexOf(callback.port) < 0) ports.push(callback.port);
+      }});
     }});
   }}
-  var out = "this      " + kind + "\n";
-  out += port ? "process   lsof -nP -iTCP:" + port + " -sTCP:LISTEN -t   # then: ps -o ppid=,comm= -p <pid>\n"
-              : "process   no port in the URL to look up\n";
-  out += "conbus    check the chain: any 'conbus' in it means this page is ours (conbus opens none)";
+  var out = "this      " + pageOf(address) + "\n";
+  ports.forEach(function (port) {{
+    out += "process   lsof -nP -iTCP:" + port + " -sTCP:LISTEN -t   # then: ps -o ppid=,comm= -p <pid>, up to the root\n";
+  }});
+  if (elsewhere) out += "process   its callback is on another host, so this machine's processes say nothing about it\n";
+  if (!ports.length && !elsewhere) out += "process   the URL names no callback to look up\n";
+  out += "conbus    this page cannot see processes; pbpaste | conbus auth --url - gives the verdict";
   document.getElementById("verdict").textContent = out;
 }}
 </script>

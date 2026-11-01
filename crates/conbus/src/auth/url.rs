@@ -81,6 +81,49 @@ impl Page {
     }
 }
 
+/// Query parameters that may name where the page calls back to.
+pub(super) const CALLBACK_PARAMS: &[&str] =
+    &["mcpRelayUrl", "redirect_uri", "redirect_url", "callback"];
+
+/// Where a page calls back to, as far as it matters here: a port on another
+/// machine says nothing about this machine's processes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum Callback {
+    Local(u16),
+    LocalNoPort,
+    Remote,
+}
+
+/// `ws://127.0.0.1:1234/`, `http://[::1]:1234/cb`, or a bare `localhost:1234/cb`.
+/// A value with no scheme counts only with a port: `callback=someFunction` is a
+/// name, not an address.
+fn callback(value: &str) -> Option<Callback> {
+    let (rest, has_scheme) = match value.split_once("://") {
+        Some((scheme, rest)) => valid_scheme(scheme).then_some((rest, true))?,
+        None => (value, false),
+    };
+    let (host, port, _) = authority(rest)?;
+    match (loopback(&host), port) {
+        (true, Some(port)) => Some(Callback::Local(port)),
+        (_, None) if !has_scheme => None,
+        (true, None) => Some(Callback::LocalNoPort),
+        (false, _) => Some(Callback::Remote),
+    }
+}
+
+/// Exactly `localhost`, or an address that is loopback. Nothing that merely
+/// starts like one: `127.0.0.1.evil.example` is a name.
+fn loopback(host: &str) -> bool {
+    use std::net::IpAddr;
+    host == "localhost"
+        || host.parse::<IpAddr>().is_ok_and(|ip| match ip {
+            IpAddr::V4(v4) => v4.is_loopback(),
+            IpAddr::V6(v6) => {
+                v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+            }
+        })
+}
+
 /// `www.cursor.com` under `cursor.com`, but not `notcursor.com` and not
 /// `.cursor.com`: the boundary is a dot with a label in front of it.
 fn subdomain(host: &str, page: &Page) -> bool {
@@ -115,6 +158,19 @@ impl<'a> Address<'a> {
 
     pub fn page(&self) -> Option<&'static Page> {
         PAGES.iter().find(|page| page.serves(self))
+    }
+
+    /// Each distinct place the page says it calls back to.
+    pub fn callbacks(&self) -> Vec<Callback> {
+        self.values(CALLBACK_PARAMS)
+            .iter()
+            .filter_map(|value| callback(value))
+            .fold(Vec::new(), |mut found, callback| {
+                if !found.contains(&callback) {
+                    found.push(callback);
+                }
+                found
+            })
     }
 
     /// The decoded values of the query parameters in `wanted`, in order. Every
@@ -280,6 +336,50 @@ mod tests {
         ] {
             assert!(Address::parse(text).is_none(), "{text:?}");
         }
+    }
+
+    #[test]
+    fn a_callback_is_local_only_when_its_host_is_loopback() {
+        for (value, want) in [
+            ("ws://127.0.0.1:1234/x", Some(Callback::Local(1234))),
+            ("ws://127.9.9.9:1234/x", Some(Callback::Local(1234))),
+            ("http://LOCALHOST:1234", Some(Callback::Local(1234))),
+            ("http://[::1]:1234/", Some(Callback::Local(1234))),
+            ("http://[::ffff:127.0.0.1]:1/", Some(Callback::Local(1))),
+            ("localhost:1234/cb", Some(Callback::Local(1234))),
+            ("127.0.0.1:1234", Some(Callback::Local(1234))),
+            ("http://u:9@localhost:1234/", Some(Callback::Local(1234))),
+            ("http://localhost/cb", Some(Callback::LocalNoPort)),
+            ("https://example.com:1234/", Some(Callback::Remote)),
+            ("http://u:9@example.com/", Some(Callback::Remote)),
+            ("http://127.0.0.1.example.com:1/", Some(Callback::Remote)),
+            ("http://localhost.example.com:1/", Some(Callback::Remote)),
+            ("http://0.0.0.0:1/", Some(Callback::Remote)),
+            ("http://[2001:db8::1]:1/", Some(Callback::Remote)),
+            ("example.com:1234/cb", Some(Callback::Remote)),
+            ("someFunction", None),
+            ("localhost/cb", None),
+            ("/cb", None),
+            ("", None),
+            ("urn:ietf:wg:oauth:2.0:oob", None),
+            ("1ttp://localhost:1/", None),
+            ("http://localhost:port/", None),
+            ("http%3A%2F%2Flocalhost%3A1", None),
+        ] {
+            assert_eq!(callback(value), want, "{value}");
+        }
+    }
+
+    #[test]
+    fn the_same_callback_twice_is_one_callback() {
+        let address = Address::parse(
+            "https://x.example/?redirect_uri=http://127.0.0.1:1/a&callback=http://localhost:1/b&redirect_url=http://127.0.0.1:2/",
+        )
+        .expect("parse");
+        assert_eq!(
+            address.callbacks(),
+            [Callback::Local(1), Callback::Local(2)]
+        );
     }
 
     #[test]

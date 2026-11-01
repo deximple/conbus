@@ -377,6 +377,48 @@ fn the_pages_script_names_pages_the_way_the_command_does() {
 }
 
 #[test]
+fn the_pages_script_looks_up_only_a_port_on_this_machine() {
+    let (_root, page) = a_page();
+    let page_says = |url: &str| page_script_says(&page, &[url]).remove(0);
+
+    for (value, port) in [
+        ("http%3A%2F%2F127.0.0.1%3A59999%2Fcb", 59999),
+        ("http%3A%2F%2Flocalhost%3A59999%2Fcb", 59999),
+        ("http%3A%2F%2F%5B%3A%3A1%5D%3A59999%2Fcb", 59999),
+        ("localhost%3A59999%2Fcb", 59999),
+        ("http%3A%2F%2Fuser%3A1234%40127.0.0.1%3A9%2Fcb", 9),
+    ] {
+        let said = page_says(&format!(
+            "https://accounts.google.com/o/oauth2/auth?redirect_uri={value}&token=SECRET3"
+        ));
+        assert!(said.contains(&format!("-iTCP:{port} ")), "{value}: {said}");
+        assert!(!said.contains("SECRET3"), "{said}");
+    }
+
+    for value in [
+        "https%3A%2F%2Fother.example%3A1%2Fcb",
+        "http%3A%2F%2F127.0.0.1.other.example%3A1%2F",
+        "http%3A%2F%2F10.0.0.1%3A1%2F",
+    ] {
+        let said = page_says(&format!("https://evil.example/?redirect_uri={value}"));
+        assert!(!said.contains("lsof"), "{value}: {said}");
+        assert!(said.contains("another host"), "{value}: {said}");
+        assert!(!said.contains("other.example"), "{said}");
+    }
+
+    let said = page_says("https://example.net/?q=<img src=x onerror=alert(1)>&token=SECRET1");
+    assert!(
+        !said.contains("onerror") && !said.contains("SECRET1"),
+        "{said}"
+    );
+
+    // The page cannot see processes, so it gives no verdict of its own.
+    let said = page_says("https://accounts.google.com/");
+    assert!(!said.contains("conbus opens none"), "{said}");
+    assert!(said.contains("conbus auth --url -"), "{said}");
+}
+
+#[test]
 fn a_bad_percent_in_the_pages_script_does_not_lose_the_verdict() {
     let (_root, page) = a_page();
 
@@ -387,6 +429,452 @@ fn a_bad_percent_in_the_pages_script_does_not_lose_the_verdict() {
 
     assert!(said[0].contains("Google"), "the verdict: {}", said[0]);
     assert!(!said[0].contains("SECRET2"), "{}", said[0]);
+}
+
+/// Stand-ins for `lsof` and `ps` that answer from a table, so a verdict can be
+/// pinned without the machine's real processes. `lsof` also keeps its calls.
+struct ProcessTable {
+    dir: tempfile::TempDir,
+    lsof_calls: std::path::PathBuf,
+}
+
+impl ProcessTable {
+    /// `listeners` hold every port asked about. `processes` is pid, ppid, name;
+    /// a pid not in it is one `ps` no longer finds.
+    fn new(listeners: &[u32], processes: &[(u32, u32, &str)]) -> Self {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let lsof_calls = dir.path().join("lsof.calls");
+        let pids: String = listeners.iter().map(|pid| format!("{pid}\n")).collect();
+        let found = if listeners.is_empty() { 1 } else { 0 };
+        support::write_executable(
+            &dir.path().join("lsof"),
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >>'{}'\nprintf '%s' '{pids}'\nexit {found}\n",
+                lsof_calls.display()
+            ),
+        );
+        let arms: String = processes
+            .iter()
+            .map(|(pid, ppid, name)| format!("  {pid}) echo '{ppid} {name}' ;;\n"))
+            .collect();
+        support::write_executable(
+            &dir.path().join("ps"),
+            &format!(
+                "#!/bin/sh\nwhile [ $# -gt 1 ]; do shift; done\ncase $1 in\n{arms}  *) exit 1 ;;\nesac\n"
+            ),
+        );
+        ProcessTable { dir, lsof_calls }
+    }
+
+    /// `conbus auth --url` with these stand-ins first on PATH.
+    fn ask(&self, url: &str) -> String {
+        let root = tempfile::tempdir().expect("tempdir");
+        let path = format!(
+            "{}:{}",
+            self.dir.path().display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let output = conbus(root.path())
+            .args(["auth", "--url", url])
+            .env("PATH", path)
+            .output()
+            .expect("run auth --url");
+        assert!(
+            output.status.success(),
+            "{url}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    fn lsof_calls(&self) -> String {
+        std::fs::read_to_string(&self.lsof_calls).unwrap_or_default()
+    }
+}
+
+/// The address the bridge opens: a relay on a loopback port.
+fn bridge_url(port: u16) -> String {
+    format!(
+        "chrome-extension://mmlmfjhmonkocbjadbfplnigmagldckm/connect.html?mcpRelayUrl=ws%3A%2F%2F127.0.0.1%3A{port}%2F"
+    )
+}
+
+/// What a walked-up listener under Codex.app looks like.
+const CODEX_TREE: &[(u32, u32, &str)] = &[
+    (4242, 4000, "/opt/node/bin/node"),
+    (4000, 3000, "codex"),
+    (3000, 1, "/Applications/Codex.app/Contents/MacOS/Codex"),
+    (1, 0, "/sbin/launchd"),
+];
+
+fn verdict(stdout: &str) -> &str {
+    let lines: Vec<&str> = stdout
+        .lines()
+        .filter(|l| l.starts_with("conbus "))
+        .collect();
+    assert_eq!(lines.len(), 1, "one verdict line: {stdout}");
+    lines[0]
+}
+
+#[test]
+fn no_takes_a_listener_walked_all_the_way_to_the_root() {
+    let table = ProcessTable::new(&[4242], CODEX_TREE);
+
+    let stdout = table.ask(&bridge_url(55407));
+
+    assert!(verdict(&stdout).starts_with("conbus    no:"), "{stdout}");
+    assert!(
+        stdout.contains("process   port 55407: pid 4242: node > codex > Codex > launchd"),
+        "the walk it rests on, names only: {stdout}"
+    );
+    assert!(table.lsof_calls().contains("-iTCP:55407"), "{stdout}");
+}
+
+#[test]
+fn no_says_what_a_walk_cannot_see() {
+    // A process that outlived what started it hangs from the root, and so does
+    // an app `open` started: neither shows who asked. And every conbus read
+    // starts `codex app-server`, so "starts no server" was false as written.
+    let table = ProcessTable::new(&[4242], CODEX_TREE);
+
+    let stdout = table.ask(&bridge_url(55407));
+
+    assert!(!stdout.contains("starts no server"), "{stdout}");
+    let limit = stdout
+        .lines()
+        .find(|line| line.starts_with("limit "))
+        .unwrap_or_else(|| panic!("no limit line: {stdout}"));
+    for word in ["outlived", "`open`", "`osascript`", "`codex app-server`"] {
+        assert!(limit.contains(word), "{word} in {limit}");
+    }
+    let measured = stdout
+        .lines()
+        .find(|line| line.starts_with("measured "))
+        .unwrap_or_else(|| panic!("no measured line: {stdout}"));
+    for word in [
+        "Codex 0.166",
+        "`thread/list`",
+        "`thread/start`",
+        "unmeasured",
+    ] {
+        assert!(measured.contains(word), "{word} in {measured}");
+    }
+}
+
+#[test]
+fn conbus_far_above_the_listener_is_still_yes() {
+    // The walk used to stop at eight levels, without a word, and say `no`.
+    let names: Vec<String> = (0..11).map(|level| format!("level{level}")).collect();
+    let mut tree: Vec<(u32, u32, &str)> = names
+        .iter()
+        .enumerate()
+        .map(|(level, name)| (100 + level as u32, 101 + level as u32, name.as_str()))
+        .collect();
+    tree.push((111, 112, "/somewhere/bin/conbus"));
+    tree.push((112, 1, "launcher"));
+    tree.push((1, 0, "/sbin/launchd"));
+    let table = ProcessTable::new(&[100], &tree);
+
+    let stdout = table.ask(&bridge_url(55407));
+
+    assert!(verdict(&stdout).starts_with("conbus    yes:"), "{stdout}");
+    assert!(
+        stdout.contains("level10 > conbus > launcher > launchd"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn every_listener_on_the_port_is_walked() {
+    // Two listeners on one port, the conbus one second: only the first used to
+    // be walked, and the answer was `no`.
+    let table = ProcessTable::new(
+        &[4242, 777],
+        &[
+            (4242, 1, "/opt/node/bin/node"),
+            (777, 776, "python3"),
+            (776, 1, "conbus"),
+            (1, 0, "/sbin/launchd"),
+        ],
+    );
+
+    let stdout = table.ask(&bridge_url(55407));
+
+    assert!(verdict(&stdout).starts_with("conbus    yes:"), "{stdout}");
+    assert!(stdout.contains("pid 4242: node > launchd"), "{stdout}");
+    assert!(
+        stdout.contains("pid 777: python3 > conbus > launchd"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn only_the_name_of_the_binary_makes_a_process_conbus() {
+    for (name, yes) in [
+        ("conbus", true),
+        ("/home/someone/.local/bin/conbus", true),
+        ("conbus.next", true),
+        ("conbus-scratch", true),
+        ("notconbus", false),
+        ("conbusd", false),
+        ("/home/someone/conbus/bin/node", false),
+        ("/tmp/conbus-work/node", false),
+    ] {
+        let table = ProcessTable::new(&[50], &[(50, 1, name), (1, 0, "/sbin/launchd")]);
+        let stdout = table.ask(&bridge_url(55407));
+        let want = if yes {
+            "conbus    yes:"
+        } else {
+            "conbus    no:"
+        };
+        assert!(verdict(&stdout).starts_with(want), "{name}: {stdout}");
+    }
+}
+
+#[test]
+fn a_callback_on_another_host_is_not_looked_up_here() {
+    // The port of `another.example` was answered from this machine's process
+    // table, whose listener on that number has nothing to do with it.
+    let table = ProcessTable::new(&[4242], CODEX_TREE);
+
+    for url in [
+        "https://evil.example/login?redirect_uri=https%3A%2F%2Fanother.example%3A55407%2Fcb",
+        "https://evil.example/?redirect_uri=http%3A%2F%2F127.0.0.1.another.example%3A55407%2F",
+        "https://evil.example/?redirect_uri=http%3A%2F%2Flocalhost.another.example%3A55407%2F",
+        "https://evil.example/?redirect_uri=http%3A%2F%2F10.0.0.1%3A55407%2F",
+        "https://evil.example/?redirect_uri=http%3A%2F%2F0.0.0.0%3A55407%2F",
+        "https://evil.example/?redirect_uri=http%3A%2F%2F%5B2001%3Adb8%3A%3A1%5D%3A55407%2F",
+    ] {
+        let stdout = table.ask(url);
+        assert!(
+            verdict(&stdout).starts_with("conbus    cannot tell:"),
+            "{url}: {stdout}"
+        );
+        assert!(stdout.contains("another host"), "{url}: {stdout}");
+        assert!(
+            !stdout.contains("another.example") && !stdout.contains("10.0.0.1"),
+            "a query value is not printed: {stdout}"
+        );
+    }
+    assert_eq!(table.lsof_calls(), "", "no remote port goes to lsof");
+}
+
+#[test]
+fn a_callback_on_this_machine_is_found_however_it_is_written() {
+    for (value, port) in [
+        ("http%3A%2F%2F127.0.0.1%3A55407%2Fcb", 55407),
+        ("http%3A%2F%2F127.0.0.2%3A55407%2Fcb", 55407),
+        ("http%3A%2F%2Flocalhost%3A55407%2Fcb", 55407),
+        ("http%3A%2F%2FLOCALHOST%3A55407", 55407),
+        ("ws%3A%2F%2F127.0.0.1%3A55407", 55407),
+        ("http%3A%2F%2F%5B%3A%3A1%5D%3A55407%2Fcb", 55407),
+        (
+            "http%3A%2F%2F%5B%3A%3Affff%3A127.0.0.1%5D%3A55407%2Fcb",
+            55407,
+        ),
+        ("localhost%3A55407%2Fcb", 55407),
+        ("127.0.0.1%3A55407", 55407),
+        // The number after the userinfo's colon is a password, not a port.
+        ("http%3A%2F%2Fuser%3A1234%40127.0.0.1%3A9%2Fcb", 9),
+    ] {
+        let table = ProcessTable::new(&[4242], CODEX_TREE);
+        let stdout = table.ask(&format!(
+            "https://accounts.google.com/o/oauth2/auth?redirect_uri={value}"
+        ));
+        assert!(
+            table.lsof_calls().contains(&format!("-iTCP:{port} ")),
+            "{value} should ask about {port}: {}",
+            table.lsof_calls()
+        );
+        assert!(
+            verdict(&stdout).starts_with("conbus    no:"),
+            "{value}: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn with_nothing_to_walk_it_cannot_tell_and_says_what_would() {
+    let empty = ProcessTable::new(&[], &[]);
+
+    // No listener on the port.
+    let stdout = empty.ask(&bridge_url(55407));
+    assert!(
+        verdict(&stdout).starts_with("conbus    cannot tell:"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("still waits"), "what would tell: {stdout}");
+
+    // No port in the URL at all, and a callback with none.
+    for url in [
+        "https://accounts.google.com/o/oauth2/auth?client_id=x",
+        "https://accounts.google.com/o/oauth2/auth?redirect_uri=http%3A%2F%2F127.0.0.1%2Fcb",
+        "https://accounts.google.com/o/oauth2/auth?callback=someFunction",
+        "https://accounts.google.com/o/oauth2/auth?redirect_uri=urn%3Aietf%3Awg%3Aoauth%3A2.0%3Aoob",
+    ] {
+        let stdout = empty.ask(url);
+        assert!(
+            verdict(&stdout).starts_with("conbus    cannot tell:"),
+            "{url}: {stdout}"
+        );
+        assert!(stdout.contains("would tell"), "{url}: {stdout}");
+    }
+    assert_eq!(
+        empty.lsof_calls().lines().count(),
+        1,
+        "only the first asked"
+    );
+}
+
+#[test]
+fn with_no_lsof_it_cannot_tell() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let empty = tempfile::tempdir().expect("tempdir");
+
+    let output = conbus(root.path())
+        .args(["auth", "--url", &bridge_url(55407)])
+        .env("PATH", empty.path())
+        .output()
+        .expect("run auth --url");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(output.status.success());
+    assert!(
+        verdict(&stdout).starts_with("conbus    cannot tell:"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("`lsof`"), "what would tell: {stdout}");
+}
+
+#[test]
+fn a_walk_that_cannot_reach_the_root_is_not_a_no() {
+    // A parent `ps` no longer finds, a process that is its own ancestor, and
+    // two that are each other's.
+    for tree in [
+        &[(50, 40, "node")][..],
+        &[(50, 50, "node")][..],
+        &[(50, 40, "node"), (40, 50, "npm")][..],
+    ] {
+        let table = ProcessTable::new(&[50], tree);
+        let stdout = table.ask(&bridge_url(55407));
+        assert!(
+            verdict(&stdout).starts_with("conbus    cannot tell:"),
+            "{tree:?}: {stdout}"
+        );
+        assert!(stdout.contains("before the root"), "{tree:?}: {stdout}");
+    }
+}
+
+#[test]
+fn a_port_with_several_callbacks_needs_all_of_them_clear_for_no() {
+    let table = ProcessTable::new(&[4242], CODEX_TREE);
+    let local = "http%3A%2F%2F127.0.0.1%3A55407%2F";
+    let remote = "https%3A%2F%2Fanother.example%3A1%2F";
+
+    let stdout = table.ask(&format!(
+        "https://x.example/?redirect_uri={local}&callback={remote}"
+    ));
+
+    assert!(
+        verdict(&stdout).starts_with("conbus    cannot tell:"),
+        "{stdout}"
+    );
+}
+
+/// The real `lsof` and `ps`, for what stand-ins cannot pin: the arguments.
+fn have_lsof_and_ps() -> bool {
+    ["lsof", "ps"].iter().all(|name| {
+        Command::new("sh")
+            .args(["-c", &format!("command -v {name}")])
+            .output()
+            .is_ok_and(|output| output.status.success())
+    })
+}
+
+/// A stand-in `codex app-server` that listens on a port of its own and stays
+/// quiet until told to stop, so a conbus read is still waiting on it.
+const LISTENING_CODEX: &str = r#"#!/usr/bin/env python3
+import os, socket, sys, time
+here = os.path.dirname(os.path.abspath(__file__))
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+s.listen(1)
+with open(os.path.join(here, "port.tmp"), "w") as f:
+    f.write(str(s.getsockname()[1]))
+os.rename(os.path.join(here, "port.tmp"), os.path.join(here, "port"))
+deadline = time.time() + 30
+while time.time() < deadline and not os.path.exists(os.path.join(here, "stop")):
+    time.sleep(0.05)
+"#;
+
+#[test]
+fn a_real_listener_under_a_real_conbus_is_yes() {
+    if !have_lsof_and_ps() {
+        return;
+    }
+    let root = tempfile::tempdir().expect("tempdir");
+    let codex_dir = tempfile::tempdir().expect("tempdir");
+    let codex = codex_dir.path().join("codex");
+    support::write_executable(&codex, LISTENING_CODEX);
+    let port_file = codex_dir.path().join("port");
+    let mut quota = conbus(root.path())
+        .arg("quota")
+        .env("CONBUS_CODEX_BIN", &codex)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("run quota");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let port = loop {
+        if let Ok(text) = std::fs::read_to_string(&port_file) {
+            break text.trim().parse::<u16>().expect("port");
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the stand-in never listened"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+
+    let output = conbus(root.path())
+        .args(["auth", "--url", &bridge_url(port)])
+        .output()
+        .expect("run auth --url");
+    std::fs::write(codex_dir.path().join("stop"), "").expect("stop");
+    quota.wait().expect("quota ends with its server");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(verdict(&stdout).starts_with("conbus    yes:"), "{stdout}");
+    assert!(stdout.contains(" > conbus > "), "{stdout}");
+}
+
+#[test]
+fn a_real_listener_is_walked_to_the_root() {
+    if !have_lsof_and_ps() {
+        return;
+    }
+    let root = tempfile::tempdir().expect("tempdir");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+
+    let output = conbus(root.path())
+        .args(["auth", "--url", &bridge_url(port)])
+        .output()
+        .expect("run auth --url");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // This test's own process holds the port, so the line starts with it, and
+    // the walk ends at the root. `yes` is right too when the suite itself runs
+    // under `conbus run`; `cannot tell` is not.
+    let me = std::env::current_exe().expect("exe");
+    let me = me.file_name().expect("name").to_string_lossy();
+    let shown: String = me.chars().take(15).collect();
+    let process = stdout
+        .lines()
+        .find(|line| line.starts_with("process "))
+        .unwrap_or_else(|| panic!("{stdout}"));
+    assert!(process.contains(&format!(": {shown}")), "{stdout}");
+    assert!(!verdict(&stdout).contains("cannot tell"), "{stdout}");
 }
 
 #[test]
