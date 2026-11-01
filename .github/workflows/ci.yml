@@ -37,6 +37,9 @@ jobs:
       - name: public-safe
         run: sh scripts/check-public-safe.sh
 
+      - name: docs agree with the build
+        run: sh scripts/check-docs.sh
+
       - name: Toolchain
         run: |
           rustup toolchain install

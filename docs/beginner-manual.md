@@ -15,9 +15,9 @@ Conbus는 채팅 앱이 아니다. Claude Code / Codex TUI를 그대로 쓰면�
 
 ## 누구에게 맞나
 
-맞다: macOS에서 Claude Code / Codex / Cursor / OpenCode / Grok 등을 메인으로 쓰고, 5시간/주간 퀴터에 자주 걸려 모델을 스위칭해야 하는 경우.
+맞다: macOS나 Linux에서 Claude Code / Codex / Cursor / OpenCode / Grok 등을 메인으로 쓰고, 5시간/주간 쿼터에 자주 걸려 모델을 스위칭해야 하는 경우. Linux에서는 실제 벤더 세션을 아직 검증하지 않았다([지원 표](support-matrix.md)).
 
-아니다: Linux/Windows, 벤더 CLI를 직접 켜는 습관, 훅을 자주 고치는 사람, 세션 파일을 다른 도구로 lossless 이전하려고 하는 사람, 데몬/소켓/trust를 보기 싫은 사람.
+아니다: Windows, 벤더 CLI를 직접 켜는 습관, 훅을 자주 고치는 사람, 세션 파일을 다른 도구로 lossless 이전하려고 하는 사람, 데몬/소켓/trust를 보기 싫은 사람.
 
 자동 hop은 신호가 있을 때만 한다. Claude는 StatusLine stdin의 `rate_limits`(벤더가 이미 채워 넣음)와 `StopFailure`, Codex는 `account/rateLimits/read`, Agy는 `agy -p "/usage" --output-format json`. 우리는 토큰으로 `oauth/usage`를 치지 않는다. Cursor·OpenCode·Grok은 채팅 오더나 `conbus go <leg>`다. Agy는 소스로 overflow → Codex가 되고, 착지는 아니다. TUI `/usage`를 긁지 않는다.
 
@@ -59,7 +59,7 @@ curl -fsSL https://raw.githubusercontent.com/deximple/conbus/main/install.sh | s
 conbus install --apply
 ```
 
-스크립트는 최신 릴리스의 유니버설 바이너리를 받아 SHA-256을 확인하고 `~/.local/bin/conbus`에 옆에 쓴 뒤 `mv`한다. 벤더 설정은 건드리지 않고 `conbus install` 보고만 보여 준다. 저장소가 비공개인 동안은 `gh auth login`으로 접근 권한이 있는 사람만 받을 수 있다.
+스크립트는 최신 릴리스에서 이 OS의 바이너리(Mac은 유니버설, Linux는 x86_64·aarch64 정적 바이너리)를 받아 SHA-256을 확인하고(Mac에서는 Developer ID 서명도 확인한다) `~/.local/bin/conbus`에 옆에 쓴 뒤 `mv`한다. 벤더 설정은 건드리지 않고 `conbus install` 보고만 보여 준다. 저장소가 비공개인 동안은 `gh auth login`으로 접근 권한이 있는 사람만 받을 수 있다.
 
 소스에서 빌드하려면:
 

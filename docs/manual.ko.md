@@ -1,6 +1,6 @@
 # conbus 매뉴얼
 
-이 매뉴얼은 macOS용 **conbus 0.2.9**를 설명합니다. 짧게 훑으려면
+이 매뉴얼은 macOS와 Linux용 **conbus 0.2.9**를 설명합니다. 짧게 훑으려면
 [README](../README.md)를, 릴리스 사이에 무엇이 바뀌었는지는
 [CHANGELOG](../CHANGELOG.md)를 보세요. English: [manual.md](manual.md)
 
@@ -18,8 +18,10 @@
 - [12. 업그레이드](#12-업그레이드)
 - [13. 제거](#13-제거)
 - [14. 문제 해결](#14-문제-해결)
-- [15. 레퍼런스](#15-레퍼런스)
-- [16. 알려진 한계](#16-알려진-한계)
+- [15. 로컬 정책](#15-로컬-정책)
+- [16. Claude Code 프로필: 손으로 바꾸는 두 번째 계정 (experimental)](#16-claude-code-프로필-손으로-바꾸는-두-번째-계정-experimental)
+- [17. 레퍼런스](#17-레퍼런스)
+- [18. 알려진 한계](#18-알려진-한계)
 
 ---
 
@@ -56,8 +58,10 @@ id 아래에 정리됩니다. conbus는 그 로그를 바탕으로 같은 체크
 
 ## 2. 설치하기 전에
 
-- **macOS** (Apple silicon 또는 Intel). conbus는 launchd와 각 벤더의 macOS 앱을
-  씁니다. Linux와 Windows는 아직 지원하지 않습니다.
+- **macOS**(Apple silicon 또는 Intel) 또는 **Linux**(x86_64, aarch64). 레코더는
+  Mac에서는 launchd 에이전트, Linux에서는 systemd 사용자 유닛으로 돕니다. Linux용은
+  정적 musl 바이너리(`conbus-linux-x86_64.tar.gz`, `conbus-linux-aarch64.tar.gz`)이고,
+  `install.sh`가 `uname -m`으로 고릅니다. Windows는 지원하지 않습니다.
 - **에이전트 하나 이상, 자기 바이너리로 이미 로그인된 상태**: Claude Code(`claude`),
   Codex(`codex` 또는 Codex.app), Cursor, Grok Build CLI(`grok`), opencode 중 하나.
   conbus는 대신 로그인하지 않고, 그 자격 증명을 읽지도 않습니다.
@@ -510,6 +514,9 @@ conbus arena link --from ~/src/shop --to ~/src/shop-admin
 | `conbus.sock` | 레코더의 소켓(모드 `0600`) |
 | `quota/` | 마지막 쿼터 판독값 |
 | `takeover.json` | `conbus run`을 기다리는 hop이 있을 때만 |
+| `policy.json` | 직접 쓴 `PreToolUse` 규칙. 없으면 정책이 꺼져 있습니다(15장) |
+| `cache/meta/` | 파생 읽기 캐시. 툴 본문을 SHA-256 요약으로 바꾼 레코드입니다. 지워도 잃는 것이 없습니다 |
+| `spool/` | 레코더가 재시작하는 동안 훅이 맡겨 둔 요청. 다음 레코더가 읽어 기록한 뒤 지웁니다 |
 | `facts.jsonl`, `links.jsonl` | 10장 |
 | `chat-export/` | 넣어 둔 Claude.ai 내보내기 |
 
@@ -575,6 +582,15 @@ conbus에는 서버도, 계정도, 텔레메트리도 없습니다. 기능 세 �
 하지 않습니다.
 
 ---
+
+### `conbus sync` (experimental)
+
+`conbus sync`는 초대받은 서비스에 하루 단위 집계 행(`usage --shareable`이 보여 주는
+것과 같은 숫자, 폴더 이름 없음)만 보내는 클라이언트입니다. 아직 서비스는 없고,
+[RFD 0002](rfd/0002-metadata-sync.md)와 [RFD 0003](rfd/0003-security-design.md)은
+초안입니다. `conbus sync --join INVITE`는 초대를 보여 주기만 하고, `--apply`를 붙여야
+기기 키를 로그인 키체인에 저장합니다. `conbus sync --off`는 서비스에 닿지 않아도 기기
+키를 지웁니다. 로그 자체는 이 기기를 떠나지 않습니다.
 
 ## 12. 업그레이드
 
@@ -660,7 +676,85 @@ conbus uninstall --apply  # 지우기
 
 ---
 
-## 15. 레퍼런스
+## 15. 로컬 정책
+
+데이터 폴더의 `policy.json`은 내가 직접 정하는 `PreToolUse` 결정 목록입니다. 파일이
+없으면 정책은 꺼져 있고, 모든 툴 호출은 벤더가 원래 정하는 대로 지나갑니다. 파일이
+있으면 레코더가 아니라 훅이 호출을 실행하기 전에 규칙과 맞춰 봅니다. 그래서
+레코더가 멈춰 있어도 거부(deny)는 풀리지 않습니다.
+
+```json
+{
+  "version": 1,
+  "rules": [
+    {
+      "harness": "claude_code",
+      "tool": "Bash",
+      "input_contains": ["rm -rf /"],
+      "decision": "deny",
+      "reason": "no agent wipes this disk"
+    }
+  ]
+}
+```
+
+- `harness`는 생략할 수 있습니다. 생략하면 결정을 받는 모든 에이전트, 지금은 Claude
+  Code와 Codex에 적용됩니다. Cursor의 응답 계약에는 결정이 없으므로 Cursor 호출에는
+  적용되지 않습니다.
+- `tool`은 페이로드의 `tool_name`을 그대로 씁니다. `"*"`는 모든 툴입니다.
+- `input_contains`는 부분 문자열 목록입니다. 툴 입력을 압축한 JSON에 하나라도 있으면
+  규칙이 맞습니다. 생략하면 모든 입력이 맞습니다.
+- `decision`은 `deny` 또는 `ask`입니다. `allow`는 일부러 없습니다. 정책은 실행되는
+  것을 조일 수만 있고, 벤더가 띄웠을 확인 창을 없앨 수는 없습니다.
+- `reason`은 사용자에게 보이므로 반드시 써야 하고 비울 수 없습니다.
+
+규칙은 순서대로 모두 맞춰 봅니다. 맞는 `deny`는 맞는 `ask`보다 항상 앞서고, 같은
+결정끼리는 먼저 나온 규칙의 이유가 쓰입니다. 파싱되지 않거나 버전이 다르거나 모르는
+필드가 있는 파일은 아무것도 결정하지 않습니다. 이때 `conbus doctor`가 그렇다고
+말하고, `conbus policy check`는 규칙이나 오류를 출력합니다. `conbus policy test
+--harness claude_code --tool Bash --input '{"command":"ls"}'`는 호출 하나에 파일이
+무엇을 할지 실행하지 않고 보여 줍니다.
+
+결정은 로그에 남지 않습니다. 툴 요청은 늘 그랬듯 남습니다.
+
+## 16. Claude Code 프로필: 손으로 바꾸는 두 번째 계정 (experimental)
+
+Claude Code는 여러 계정을 나란히 쓸 수 있습니다. 프로필 `NAME`은
+`$HOME/.claude-NAME` 디렉터리이고, `CLAUDE_CONFIG_DIR`가 `claude`에게 어느 것을
+쓸지 알려 줍니다. conbus는 정확히 그것만 지원합니다. 내 계정을, 벤더의 로그인 절차로
+로그인해서, 내가 말할 때만 바꿉니다.
+
+```bash
+# 1. 프로필을 만들고 로그인합니다. conbus가 아니라 벤더의 절차입니다:
+CLAUDE_CONFIG_DIR=$HOME/.claude-work claude
+/login
+
+# 2. 같은 훅과 StatusLine 감싸기를 프로필의 settings.json에 등록합니다:
+conbus install --apply --profile work
+
+# 3. 프로필로 실행합니다:
+conbus run claude_code --profile work
+```
+
+프로필 이름은 `[a-z0-9-]+`입니다. `$HOME/.claude-NAME`이 아직 없으면
+`install --profile`은 거절하고 로그인 명령을 보여 줍니다. conbus는 그 디렉터리를
+만들지 않고, 누구도 로그인시키지 않으며, 그 안에서 `settings.json` 말고는 읽지
+않습니다. `uninstall --profile NAME`은 그 파일에서 등록만 걷어 내고 기본 설정은
+건드리지 않습니다.
+
+프로필 세션의 레코드는 출처 스탬프에 `profile`을 담고, 프로필의 StatusLine 판독값은
+따로 저장됩니다. `conbus quota`는 이를 `claude_code@NAME`으로 보여 주므로, 라우팅은
+대화가 실제로 도는 계정의 쿼터를 읽습니다. 백필과 공백 채우기는 기본 프로필에서만
+합니다.
+
+**바꾸는 것은 손으로만 합니다.** 벤더 약관은 사용 한도를 우회하는 것을 금지합니다.
+그래서 conbus는 한도에 걸렸다고 프로필을 바꾸지 않습니다. 어떤 쿼터 신호나 라우트,
+hop도 대화를 내 계정 하나에서 다른 계정으로 옮기지 않습니다. 대화의 마지막 Claude
+구간이 프로필로 돌았다면, 자동 hop은 기본 계정으로 돌아가는 대신 기다리고 그렇다고
+말합니다. `conbus go claude_code`(기본 계정, 내 선택)나 `conbus run claude_code
+--profile NAME` 중에서 고르면 됩니다.
+
+## 17. 레퍼런스
 
 ### 명령
 
@@ -712,9 +806,9 @@ conbus는 가설 하나에서 출발했습니다. 여러 에이전트를 쓰는 
 
 ---
 
-## 16. 알려진 한계
+## 18. 알려진 한계
 
-- macOS 전용입니다.
+- macOS와 Linux만 지원합니다. Linux에서 실제 벤더 세션은 아직 검증하지 않았습니다([지원 표](support-matrix.md)).
 - Claude의 쿼터는 터미널 `claude`의 StatusLine에서만 보입니다.
 - 자동 hop은 아직 실제 쿼터 중단에서 발동한 적이 없습니다.
 - 일부 Cursor 세션은 어느 세션인지 밝히지 않은 툴 이벤트를 보냅니다. conbus는

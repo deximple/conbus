@@ -204,9 +204,10 @@ and `rm -rf ~/.conbus` removes it if you want it gone.
 | `conbus go [HARNESS]` | Hop the current conversation |
 | `conbus run [HARNESS]` | Start a leg in this terminal; hops exec the next one |
 | `conbus backfill [--apply]` | Recover history from before conbus was installed |
-| `conbus summary --bus-id ID` | A model digest from the other vendor |
-| `conbus verdict` | Score a four-week trial; an open window is not a verdict |
+| `conbus summary --bus-id ID` | A model digest from the other vendor (experimental) |
+| `conbus verdict` | Score a four-week trial; an open window is not a verdict (experimental) |
 | `conbus sync [--join INVITE [--apply]] [--off]` | Send closed days' counts to the origin a joined invite names; no host exists yet |
+| `conbus policy check` · `conbus policy test` | The local `PreToolUse` rules in `policy.json` (experimental, off without the file) |
 | `conbus arena fact \| link` | Accept a fact, or link two checkouts |
 | `conbus daemon` · `conbus hook` | The recorder, and the hook it registers |
 | `conbus --version` | Version and the commit it was built from |
