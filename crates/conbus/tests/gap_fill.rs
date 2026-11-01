@@ -1108,3 +1108,84 @@ fn backfill_gaps_says_when_codex_could_not_be_read_and_still_fills_the_rest() {
     assert!(ok, "{said}");
     assert!(said.contains("codex     history unavailable"), "{said}");
 }
+
+const THREADS: [&str; 3] = [
+    "01a19463-0000-7000-8000-000000000001",
+    "01a19463-0000-7000-8000-000000000002",
+    "01a19463-0000-7000-8000-000000000003",
+];
+
+/// A stand-in that answers one thread per call, slowly, so a budget covers only
+/// some of them.
+const SLOW_APP_SERVER: &str = r#"#!/usr/bin/env python3
+import json, sys, time
+for line in sys.stdin:
+    msg = json.loads(line)
+    m = msg.get("method"); i = msg.get("id")
+    if m == "initialize":
+        print(json.dumps({"jsonrpc":"2.0","id":i,"result":{"userAgent":"fake"}}), flush=True)
+    elif m == "thread/turns/list":
+        time.sleep(0.5)
+        t = msg["params"]["threadId"]
+        data = [{"id":"turn-of-"+t,"items":[{"type":"userMessage","content":[{"type":"text","text":"said in "+t}]},{"type":"agentMessage","text":"a"}],
+                 "status":"completed","startedAt":1788368800,"completedAt":1788368801}]
+        print(json.dumps({"jsonrpc":"2.0","id":i,"result":{"data":data,"nextCursor":None}}), flush=True)
+"#;
+
+#[test]
+fn threads_a_budget_cut_off_are_reached_by_later_starts() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let (_stub, fake) = stand_in(SLOW_APP_SERVER);
+    let daemon = start(home);
+    for thread in THREADS {
+        let payload = json!({"session_id": thread, "hook_event_name": "UserPromptSubmit",
+            "prompt": "seen", "turn_id": "seen", "cwd": "/repo", "model": "m",
+            "permission_mode": "default", "transcript_path": null});
+        hook_as(home, "codex", &payload.to_string());
+    }
+    stop(daemon);
+    // The most recently touched thread is asked first, and stays first.
+    let rollouts = home.join(".codex/sessions/2026/11/01");
+    std::fs::create_dir_all(&rollouts).expect("dir");
+    for (age, thread) in THREADS.iter().enumerate() {
+        let path = rollouts.join(format!("rollout-2026-11-01T00-00-00-{thread}.jsonl"));
+        let file = std::fs::File::create(&path).expect("rollout");
+        file.set_modified(std::time::SystemTime::now() - Duration::from_secs(10 + age as u64 * 10))
+            .expect("mtime");
+    }
+
+    let reached = |home: &Path, thread: &str| {
+        log_lines(home)
+            .iter()
+            .any(|record| record["prompt"]["text"] == format!("said in {thread}"))
+    };
+    for _ in 0..8 {
+        let daemon = wait_serving(
+            home,
+            daemon_command(home)
+                .env("CONBUS_CODEX_BIN", &fake)
+                .env("CONBUS_GAP_BUDGET_MS", "1200")
+                .spawn()
+                .expect("daemon"),
+        );
+        stop(daemon);
+        if THREADS.iter().all(|thread| reached(home, thread)) {
+            break;
+        }
+    }
+
+    for thread in THREADS {
+        assert!(reached(home, thread), "{thread} was never reached");
+    }
+    let turns = log_lines(home)
+        .into_iter()
+        .filter(|record| {
+            record["event"] == "turn_started"
+                && record["prompt"]["text"]
+                    .as_str()
+                    .is_some_and(|text| text.starts_with("said in"))
+        })
+        .count();
+    assert_eq!(turns, THREADS.len(), "each thread's turn once");
+}

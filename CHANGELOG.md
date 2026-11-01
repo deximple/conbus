@@ -38,6 +38,9 @@ the entry says so when it does.
   held in `cache/gap-since-codex` until a start can read it, without holding back
   the Claude Code transcripts. `conbus backfill --gaps` now fills live Codex
   threads too, and says when it could not read them.
+- A budget cut can no longer starve the transcripts or threads behind it. What a
+  held range has read is kept in `cache/gap-read`, so the next start goes on from
+  there instead of repeating the same prefix.
 
 ## [1.0.0-rc.3] — 2026-11-01
 
