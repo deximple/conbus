@@ -85,7 +85,7 @@ fn map_bodies(event: &Event, f: impl Fn(&Body) -> Body) -> Event {
 }
 
 /// Replace tool result bodies with their size, leaving conversation alone.
-fn elide_tool_bodies(event: &Event) -> Event {
+pub fn elide_tool_bodies(event: &Event) -> Event {
     match event {
         Event::ToolRequested { .. }
         | Event::PermissionAsked { .. }
@@ -244,6 +244,8 @@ mod tests {
             },
             vendor_turn_id: None,
             vendor_agent_id: None,
+            hook_id: None,
+            spooled_at: None,
             event: Event::ToolUse {
                 tool: "Read".into(),
                 tool_use_id: None,

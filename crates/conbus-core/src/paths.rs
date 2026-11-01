@@ -120,6 +120,12 @@ impl Paths {
         self.root.join("cache")
     }
 
+    /// Hooks that could not reach the daemon: one file per request, drained
+    /// by the next daemon and deleted. In transit, never a second log.
+    pub fn spool_dir(&self) -> PathBuf {
+        self.root.join("spool")
+    }
+
     /// The daemon's control socket.
     pub fn socket(&self) -> PathBuf {
         self.root.join("conbus.sock")

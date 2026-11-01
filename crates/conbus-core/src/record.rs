@@ -54,6 +54,15 @@ pub struct Record {
     /// Set when the record came from a subagent rather than the main thread.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vendor_agent_id: Option<VendorAgentId>,
+    /// The hook's own id for this request, when it carried one. A spool that
+    /// delivers the same hook twice is still one event: the second lands as a
+    /// `repeated` count, never a second record. Absent before the spool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hook_id: Option<String>,
+    /// When the hook first tried to send, from its own clock — a drained
+    /// spool entry keeps the hook's time rather than the daemon's write time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spooled_at: Option<Timestamp>,
     #[serde(flatten)]
     pub source: Source,
     #[serde(flatten)]
@@ -79,6 +88,10 @@ pub struct Entry {
     pub source: Source,
     pub vendor_turn_id: Option<VendorTurnId>,
     pub vendor_agent_id: Option<VendorAgentId>,
+    /// The hook's own id and first-send time, riding through from the request
+    /// — `None` on every 0.2.x path.
+    pub hook_id: Option<String>,
+    pub spooled_at: Option<Timestamp>,
     pub event: Event,
 }
 
@@ -109,6 +122,8 @@ mod tests {
             bus_id: "01996b1e-2c4a-7c31-9d0e-4f2a6b8c1d3e".parse().expect("id"),
             vendor_turn_id: None,
             vendor_agent_id: None,
+            hook_id: None,
+            spooled_at: None,
             source: source(),
             event: Event::TurnStarted {
                 author: None,
@@ -296,6 +311,8 @@ mod tests {
         Record {
             vendor_turn_id: Some(VendorTurnId::new("ed06c859-f62e-418f-96f0-556d61fa97d5")),
             vendor_agent_id: Some(VendorAgentId::new("agent-7")),
+            hook_id: None,
+            spooled_at: None,
             source: Source {
                 backfilled_from: Some(crate::backfill::CLAUDE_TRANSCRIPT.to_string()),
                 ..source()
@@ -442,6 +459,8 @@ mod tests {
         let record = Record {
             vendor_turn_id: Some(VendorTurnId::new("ed06c859-f62e-418f-96f0-556d61fa97d5")),
             vendor_agent_id: Some(VendorAgentId::new("agent-7")),
+            hook_id: None,
+            spooled_at: None,
             ..sample()
         };
 

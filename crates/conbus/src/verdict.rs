@@ -181,6 +181,8 @@ mod tests {
                 .expect("id"),
             vendor_turn_id: None,
             vendor_agent_id: None,
+            hook_id: None,
+            spooled_at: None,
             source: Source {
                 harness: Harness::new(Harness::CLAUDE_CODE),
                 harness_version: None,

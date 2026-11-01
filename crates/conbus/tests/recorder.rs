@@ -809,17 +809,35 @@ fn an_event_the_daemon_cannot_place_is_reported_rather_than_dropped_in_silence()
         log_lines(home.path()).is_empty(),
         "an unplaceable event must not be written"
     );
+    let _ = stderr;
+    // A daemon restart is exactly when an orphan arrives, so the hook spools
+    // it rather than calling it lost on the spot — and the daemon's drain
+    // reports it into the drop log once it stays orphaned, which is where the
+    // "say so" lives now: the event and the session, so a ghost session's end
+    // can be told from a lost tool call when the drop log is read back.
+    let mut last: Option<serde_json::Value> = None;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if let Ok(drops) = std::fs::read_to_string(home.path().join("drops.jsonl")) {
+            last = drops
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .find(|drop| {
+                    drop["detail"]
+                        .as_str()
+                        .is_some_and(|d| d.ends_with("for session s-orphan"))
+                });
+            if last.is_some() {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let last = last.expect("the drained spool reports the unplaceable event");
     assert!(
-        !stderr.is_empty(),
-        "an unplaceable event must say so; silence is how a whole turn disappears"
-    );
-    // And say *what*: the event and the session, so a ghost session's end can
-    // be told from a lost tool call when the drop log is read back.
-    let drops = std::fs::read_to_string(home.path().join("drops.jsonl")).expect("drop log");
-    let last: serde_json::Value =
-        serde_json::from_str(drops.lines().last().expect("a drop")).expect("json");
-    assert_eq!(
-        last["detail"], "Stop for session s-orphan",
+        last["detail"]
+            .as_str()
+            .is_some_and(|d| d.ends_with("for session s-orphan")),
         "the drop must name the event and the session: {last}"
     );
 
@@ -1838,6 +1856,8 @@ fn a_split_left_in_the_log_is_repaired_at_start_by_a_short_lived_child() {
                 },
                 vendor_turn_id: None,
                 vendor_agent_id: None,
+                hook_id: None,
+                spooled_at: None,
                 event: Event::TurnStarted {
                     author: None,
                     prompt: Body::kept("hi"),

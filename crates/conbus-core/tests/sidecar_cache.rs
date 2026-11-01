@@ -29,6 +29,8 @@ fn entry(bus_id: BusId, event: Event) -> Entry {
         source: source(),
         vendor_turn_id: None,
         vendor_agent_id: None,
+        hook_id: None,
+        spooled_at: None,
         event,
     }
 }
@@ -156,6 +158,8 @@ fn entry_record() -> Record {
         source: source(),
         vendor_turn_id: None,
         vendor_agent_id: None,
+        hook_id: None,
+        spooled_at: None,
         event: Event::SessionCandidate { trigger: None },
     }
 }

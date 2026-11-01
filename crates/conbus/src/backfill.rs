@@ -1148,6 +1148,8 @@ mod tests {
             },
             vendor_turn_id: None,
             vendor_agent_id: None,
+            hook_id: None,
+            spooled_at: None,
             event: Event::TurnStarted {
                 author: None,
                 prompt: Body::kept("Reply with OK"),
@@ -1410,6 +1412,8 @@ mod tests {
             },
             vendor_turn_id: None,
             vendor_agent_id: None,
+            hook_id: None,
+            spooled_at: None,
             event: Event::TurnStarted {
                 author: None,
                 prompt: Body::kept("seen live"),

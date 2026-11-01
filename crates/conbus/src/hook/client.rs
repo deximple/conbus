@@ -294,6 +294,10 @@ pub fn run_in(
         profile: (key.harness.as_str() == Harness::CLAUDE_CODE)
             .then(crate::profile::current)
             .flatten(),
+        // One id per request — a UUIDv7, so a spool name sorts in time order.
+        // The daemon answers a re-send Recorded rather than writing it twice.
+        hook_id: Some(conbus_core::ids::BusId::mint().to_string()),
+        spooled_at: None,
         event: observed.event,
     };
     let result = match send_once(harness, &socket, &request, &hook_event_name) {
@@ -310,8 +314,115 @@ pub fn run_in(
     };
     match result {
         Ok(_) if inference => Ok(hook::inference::ALLOW.to_string()),
+        Err(dropped) => {
+            // Zero loss across restarts: a failure a restart explains is
+            // written to the spool and still answered silently — it is not a
+            // drop, because nothing was lost.
+            if spoolable(&dropped.reason)
+                && let Ok(reply) = spool(paths, &request)
+            {
+                return Ok(reply);
+            }
+            Err(dropped)
+        }
         other => other,
     }
+}
+
+/// The failures a daemon restart explains: nothing to connect to, a reply
+/// that never came or could not be read, a session whose binding died with
+/// the old daemon, or a refusal that names the protocol — a newer hook can
+/// wait for a daemon that speaks it. Any other refusal or a retention
+/// `Withheld` is a real decision, and the drop stands.
+fn spoolable(reason: &str) -> bool {
+    reason.starts_with("no daemon on ")
+        || reason.starts_with("could not send the record:")
+        || reason.starts_with("no reply from the daemon:")
+        || reason.starts_with("unreadable reply ")
+        || reason.starts_with("no conversation for this session")
+        || (reason.starts_with("the daemon refused the record:") && reason.contains("protocol v"))
+}
+
+/// Write the request beside the socket for the next daemon to drain, if the
+/// running build's stamp consents to it: a stamp that names a retention means
+/// a 1.0 daemon ran here and the spool it reads is meaningful. `ephemeral`
+/// consents to nothing; `conversation_only` and `encrypted_tools` elide every
+/// tool body before the request lands — the spool holds what the retention
+/// already decided may reach disk. Returns the silent reply the turn still
+/// gets; `Err` leaves the original drop path to run.
+fn spool(paths: &conbus_core::paths::Paths, request: &Request) -> Result<String, ()> {
+    let stamp = std::fs::read_to_string(paths.root().join("daemon.build"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(text.trim()).ok());
+    let Some(retention) = stamp
+        .as_ref()
+        .and_then(|s| s.get("retention"))
+        .and_then(|r| r.as_str())
+    else {
+        return Err(());
+    };
+    if retention == "ephemeral" {
+        return Err(());
+    }
+    let mut request = request.clone();
+    if matches!(retention, "conversation_only" | "encrypted_tools") {
+        request.event = conbus_core::retention::elide_tool_bodies(&request.event);
+    }
+    request.spooled_at = Some(conbus_core::clock::Timestamp::now().to_string());
+    let text = serde_json::to_string(&request).map_err(|_| ())?;
+    if text.len() > 1_048_576 {
+        return Err(());
+    }
+    let dir = paths.spool_dir();
+    std::fs::create_dir_all(&dir).map_err(|_| ())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
+    // The 16 MiB cap counts what is already spooled: a daemon that never
+    // comes back must not grow unbounded.
+    let held: u64 = std::fs::read_dir(&dir)
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter_map(|e| e.metadata().ok())
+                .map(|m| m.len())
+                .sum()
+        })
+        .unwrap_or(0);
+    if held + text.len() as u64 > 16_777_216 {
+        return Err(());
+    }
+    let id = request.hook_id.clone().unwrap_or_else(|| "unknown".into());
+    let target = dir.join(format!("{id}.json"));
+    let temp = dir.join(format!(".{id}.{}.tmp", std::process::id()));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true).mode(0o600);
+        if options
+            .open(&temp)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, text.as_bytes()))
+            .and_then(|_| std::fs::rename(&temp, &target))
+            .is_err()
+        {
+            let _ = std::fs::remove_file(&temp);
+            return Err(());
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        if std::fs::write(&temp, &text)
+            .and_then(|_| std::fs::rename(&temp, &target))
+            .is_err()
+        {
+            let _ = std::fs::remove_file(&temp);
+            return Err(());
+        }
+    }
+    Ok(silent_reply(request.harness.as_str()).to_string())
 }
 
 /// Whether this call is Grok running somebody else's registration of the hook,

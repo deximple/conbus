@@ -65,6 +65,16 @@ pub struct Request {
     /// Code only, and absent on the default profile.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
+    /// The hook's own id for this request — a UUIDv7, so a name sorts in
+    /// time order. The daemon remembers the last few thousand and answers a
+    /// re-sent request Recorded rather than writing it twice; the spool file
+    /// is named for it. Absent on hooks older than the spool.
+    #[serde(default, rename = "hid", skip_serializing_if = "Option::is_none")]
+    pub hook_id: Option<String>,
+    /// When the hook first tried to send this — set on a spooled file so a
+    /// drained request keeps its own time rather than the daemon's.
+    #[serde(default, rename = "spooled", skip_serializing_if = "Option::is_none")]
+    pub spooled_at: Option<String>,
     pub event: Event,
 }
 
@@ -137,6 +147,8 @@ mod tests {
             brief: false,
             provenance: None,
             profile: Some("work".into()),
+            hook_id: Some("01a19463-cbd4-7b50-b819-1c9ecf85ef18".into()),
+            spooled_at: Some("2026-11-01T00:00:00.000Z".into()),
             event: Event::TurnStarted {
                 author: None,
                 prompt: Body::kept("p"),
@@ -160,8 +172,10 @@ mod tests {
                 "event",
                 "harness",
                 "harness_version",
+                "hid",
                 "profile",
                 "pv",
+                "spooled",
                 "vendor_agent_id",
                 "vendor_session_id",
                 "vendor_turn_id",

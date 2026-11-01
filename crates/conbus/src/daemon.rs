@@ -59,6 +59,10 @@ pub struct Daemon {
     arena_root: Option<std::path::PathBuf>,
     /// Official Chat export drop folder. `None` in tests that do not watch.
     chat_watch: Option<ChatWatch>,
+    /// The last 4,096 hook ids written, in arrival order — a spooled request
+    /// that already landed is answered Recorded, not written twice.
+    seen_hooks: std::collections::VecDeque<String>,
+    seen_hook_bus: std::collections::HashMap<String, conbus_core::ids::BusId>,
 }
 
 /// One directory the daemon polls for Chat exports.
@@ -93,6 +97,21 @@ impl Daemon {
             pending_enter: None,
             arena_root: None,
             chat_watch: None,
+            seen_hooks: std::collections::VecDeque::new(),
+            seen_hook_bus: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Remember that this hook id already wrote, under this bus — the last
+    /// 4,096. A drained spool re-sending it gets Recorded, not a second
+    /// record.
+    fn remember_hook(&mut self, hook_id: String, bus_id: conbus_core::ids::BusId) {
+        self.seen_hook_bus.insert(hook_id.clone(), bus_id);
+        self.seen_hooks.push_back(hook_id);
+        while self.seen_hooks.len() > 4096 {
+            if let Some(old) = self.seen_hooks.pop_front() {
+                self.seen_hook_bus.remove(&old);
+            }
         }
     }
 
@@ -227,6 +246,21 @@ impl Daemon {
             };
         }
 
+        // A re-sent request — one the spool delivered after the live copy
+        // already landed — is answered as written, not written twice.
+        if let Some(hook_id) = request.hook_id.as_ref()
+            && let Some(bus_id) = self.seen_hook_bus.get(hook_id)
+        {
+            return Response::Recorded {
+                bus_id: *bus_id,
+                seqs: Vec::new(),
+            };
+        }
+        let hook_id = request.hook_id.clone();
+        let spooled_at = request
+            .spooled_at
+            .as_deref()
+            .and_then(|s| s.parse::<Timestamp>().ok());
         let brief = request.brief;
         let declared = request.provenance;
         let key = SessionKey::new(request.harness.clone(), request.vendor_session_id);
@@ -270,7 +304,13 @@ impl Daemon {
                 // Each observation keeps the correlators its own payload had.
                 // A deferred session start carried none; borrowing the minting
                 // prompt's would fabricate a correlation the vendor did not send.
-                for one in observed {
+                let last = observed.len().saturating_sub(1);
+                for (index, one) in observed.into_iter().enumerate() {
+                    // The hook id rides on the request's own event, not on a
+                    // session start flushed before it — that is a different
+                    // fact, and stamping it with the same id would have the
+                    // fold count it as a re-delivery.
+                    let is_own = index == last;
                     let entry = Entry {
                         bus_id,
                         observed_at: None,
@@ -280,6 +320,8 @@ impl Daemon {
                         },
                         vendor_turn_id: one.vendor_turn_id,
                         vendor_agent_id: one.vendor_agent_id,
+                        hook_id: is_own.then(|| hook_id.clone()).flatten(),
+                        spooled_at: if is_own { spooled_at } else { None },
                         event: one.event,
                     };
                     match self.log.append(entry) {
@@ -316,6 +358,10 @@ impl Daemon {
                 if seqs.is_empty() {
                     return Response::Withheld;
                 }
+                // Written once means a re-send is answered, never rewritten.
+                if let Some(hook_id) = &hook_id {
+                    self.remember_hook(hook_id.clone(), bus_id);
+                }
                 // Not after `/clear`: the person just said "forget it", and
                 // the vendor names that moment on the session start flushed
                 // behind this prompt. And not when the person switched it off.
@@ -346,6 +392,8 @@ impl Daemon {
                             },
                             vendor_turn_id: None,
                             vendor_agent_id: None,
+                            hook_id: None,
+                            spooled_at: None,
                             event,
                         }) {
                             Ok(Some(record)) => {
@@ -699,6 +747,8 @@ impl Daemon {
             source: source.clone(),
             vendor_turn_id: None,
             vendor_agent_id: None,
+            hook_id: None,
+            spooled_at: None,
             event,
         }) {
             Ok(Some(record)) => {
@@ -992,6 +1042,8 @@ fn repair_splits(held: &[Record], log: &mut SegmentLog) -> io::Result<u64> {
                 source: source.clone(),
                 vendor_turn_id: None,
                 vendor_agent_id: None,
+                hook_id: None,
+                spooled_at: None,
                 event: Event::Aliased { also: *other },
             })?;
             log.append(Entry {
@@ -1000,6 +1052,8 @@ fn repair_splits(held: &[Record], log: &mut SegmentLog) -> io::Result<u64> {
                 source,
                 vendor_turn_id: None,
                 vendor_agent_id: None,
+                hook_id: None,
+                spooled_at: None,
                 event: Event::Aliased { also: *canonical },
             })?;
             n += 1;
@@ -1162,6 +1216,9 @@ pub fn serve(paths: &Paths, retention: Retention) -> io::Result<()> {
     let mut daemon = Daemon::new(log, restored.registry, restored.chapters)
         .with_arena(paths.root().to_path_buf())
         .watch_chat_exports(paths);
+    // Anything the last daemon lost to its restart is answered before the
+    // socket exists — these hooks already waited once.
+    drain_spool(&mut daemon, paths);
 
     // Bind only now: a hook that arrives during prepare and restore found no
     // socket (or a refused one) and went straight to its fallback, instead of
@@ -1173,6 +1230,9 @@ pub fn serve(paths: &Paths, retention: Retention) -> io::Result<()> {
         std::thread::sleep(std::time::Duration::from_millis(ms));
     }
     let listener = bind(&paths.socket())?;
+    // A hook that spooled while restore ran is answered as soon as the socket
+    // can report it.
+    drain_spool(&mut daemon, paths);
 
     // Restore grew the heap. Darwin's first `mlockall` is ENOSYS; lock the
     // pages that now hold the bindings and chapters, not the empty start heap.
@@ -1224,6 +1284,7 @@ pub fn serve(paths: &Paths, retention: Retention) -> io::Result<()> {
             continue;
         }
         if n == 0 {
+            drain_spool(&mut daemon, paths);
             if let Err(err) = daemon.absorb_chat_exports() {
                 note!("chat export ingest skipped ({err})");
             }
@@ -1450,6 +1511,74 @@ fn session_was_cleared(written: &[Record]) -> bool {
     })
 }
 
+/// Requests the spool holds, oldest first — the files are named for a UUIDv7,
+/// so a name sort is time order. Each goes through `Daemon::handle`, the one
+/// writer, and is deleted after; a refusal that names a NEWER protocol stays
+/// for a newer daemon, while any other refusal is a drop with the reason.
+fn drain_spool(daemon: &mut Daemon, paths: &Paths) {
+    let Ok(entries) = std::fs::read_dir(paths.spool_dir()) else {
+        return;
+    };
+    let mut files: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .collect();
+    files.sort();
+    for file in files {
+        let request = std::fs::read_to_string(&file)
+            .ok()
+            .and_then(|text| serde_json::from_str::<Request>(text.trim()).ok());
+        match request {
+            None => {
+                crate::drops::record_in(
+                    Some(paths),
+                    &crate::drops::Dropped::new(format!(
+                        "spool entry {} could not be read",
+                        file.display()
+                    )),
+                );
+                let _ = std::fs::remove_file(&file);
+            }
+            Some(request) => {
+                // The same shape the hook's own drop carried: the event and
+                // the session, so a ghost session's end can be told from a
+                // lost tool call.
+                let kind = serde_json::to_value(&request.event)
+                    .ok()
+                    .and_then(|v| v.get("event").and_then(|k| k.as_str().map(String::from)))
+                    .unwrap_or_else(|| "unknown".into());
+                let session: String = request.vendor_session_id.chars().take(8).collect();
+                match daemon.handle(request) {
+                    Response::Failed { ref error } if error.contains("protocol v") => {
+                        // A newer hook wrote this; a newer daemon drains it.
+                    }
+                    Response::Failed { error } => {
+                        crate::drops::record_in(
+                            Some(paths),
+                            &crate::drops::Dropped::new(format!("spooled hook refused: {error}")),
+                        );
+                        let _ = std::fs::remove_file(&file);
+                    }
+                    Response::Orphaned => {
+                        crate::drops::record_in(
+                            Some(paths),
+                            &crate::drops::Dropped::new(
+                                "spooled hook still has no conversation (orphan)",
+                            )
+                            .with_detail(format!("{kind} for session {session}")),
+                        );
+                        let _ = std::fs::remove_file(&file);
+                    }
+                    _ => {
+                        let _ = std::fs::remove_file(&file);
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1466,6 +1595,8 @@ mod tests {
             vendor_session_id: "abc123".into(),
             vendor_turn_id: None,
             vendor_agent_id: None,
+            hook_id: None,
+            spooled_at: None,
             workspace: Some("/repo".into()),
             entrypoint: None,
             brief: true,
@@ -2042,6 +2173,8 @@ mod tests {
             bus_id: BusId::mint(),
             vendor_turn_id: None,
             vendor_agent_id: None,
+            hook_id: None,
+            spooled_at: None,
             source: Source {
                 harness: Harness::new(Harness::CLAUDE_CODE),
                 harness_version: None,

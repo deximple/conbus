@@ -84,6 +84,8 @@ fn codex_history_is_recovered_through_the_app_server_and_a_live_session_is_left_
         },
         vendor_turn_id: None,
         vendor_agent_id: None,
+        hook_id: None,
+        spooled_at: None,
         event: conbus_core::event::Event::TurnStarted {
             author: None,
             prompt: conbus_core::event::Body::kept("seen live"),

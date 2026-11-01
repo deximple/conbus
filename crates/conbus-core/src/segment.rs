@@ -228,6 +228,8 @@ impl SegmentLog {
             bus_id: entry.bus_id,
             vendor_turn_id: entry.vendor_turn_id,
             vendor_agent_id: entry.vendor_agent_id,
+            hook_id: entry.hook_id,
+            spooled_at: entry.spooled_at,
             source: entry.source,
             event: entry.event,
         };
@@ -380,6 +382,8 @@ mod tests {
             source: source(),
             vendor_turn_id: None,
             vendor_agent_id: None,
+            hook_id: None,
+            spooled_at: None,
             event,
         }
     }

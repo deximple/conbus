@@ -226,6 +226,25 @@ pub fn run(apply: bool, profile: Option<&str>) -> io::Result<()> {
     let root = std::env::var_os("CONBUS_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".conbus"));
+    // Hooks in transit are removed, not kept — nothing is draining them now.
+    let spool = root.join("spool");
+    if spool.is_dir() {
+        let waiting = std::fs::read_dir(&spool)
+            .map(|entries| entries.filter_map(Result::ok).count())
+            .unwrap_or(0);
+        if apply {
+            let _ = std::fs::remove_dir_all(&spool);
+            println!(
+                "{:<12} spool — removed ({} entry(ies) were waiting for a daemon)",
+                "data", waiting
+            );
+        } else {
+            println!(
+                "{:<12} spool — {} entry(ies) waiting; would remove with --apply",
+                "data", waiting
+            );
+        }
+    }
     if root.exists() {
         println!(
             "{:<12} {} — kept. It is your log; remove it yourself if you want it gone: rm -rf {}",
