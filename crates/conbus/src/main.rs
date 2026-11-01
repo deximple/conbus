@@ -132,7 +132,7 @@ fn main() -> ExitCode {
             run(|paths| daemon::serve(paths, Retention::from_env()))
         }
         Command::Daemon { prepare: true } => {
-            run(|paths| daemon::prepare(paths, Retention::from_env()))
+            run(|paths| daemon::prepare_command(paths, Retention::from_env()))
         }
         Command::Log { json, filter } => run(|paths| report::log(paths, json, &filter)),
         Command::LogIndex => run(report::log_index),

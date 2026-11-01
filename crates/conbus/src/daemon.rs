@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -985,6 +985,90 @@ fn someone_is_serving(socket: &Path) -> bool {
     }
 }
 
+/// How long a starting daemon waits for the recorder already here to go.
+///
+/// `install --apply` boots the old daemon out and bootstraps the new one, and
+/// the old one can outlive that by a moment. Giving up at once would only cost
+/// a restart under the service manager, which comes back after
+/// `DAEMON_THROTTLE_SECS`, so this does not have to outlast everything, and it
+/// has to stay well inside the 30 s a canary allows the new stamp.
+const CLAIM_WAIT: Duration = Duration::from_secs(5);
+const CLAIM_POLL: Duration = Duration::from_millis(100);
+
+/// Set by a daemon on the `--prepare` child it starts, naming itself: the
+/// parent holds the claim and the child writes under it.
+const PREPARE_FOR: &str = "CONBUS_PREPARE_FOR";
+
+/// Become the one recorder of this root, before anything in it is written.
+///
+/// The socket cannot answer this. It is bound last, so that a hook arriving
+/// during a long start meets a refused socket rather than half a second of a
+/// listener that cannot answer, and until then two daemons would both stamp,
+/// fill gaps and drain. So a lock answers it: `flock` on a file beside the
+/// socket, which the kernel lets go of when the process ends, however it ends.
+/// The file staying behind means nothing.
+///
+/// The socket is still asked, because a daemon of an older build holds no lock
+/// and a rollback or an upgrade can put one here. A volume without `flock`
+/// must not stop recording, so failing to lock is said and walked past: `bind`
+/// still refuses a second listener, as it did before there was a lock.
+fn claim_recorder(paths: &Paths) -> io::Result<Option<fs::File>> {
+    let file = paths.root().join("daemon.lock");
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .open(&file)
+        .map_err(|err| note!("could not open {} ({err}); not locking", file.display()))
+        .ok();
+    let deadline = std::time::Instant::now() + CLAIM_WAIT;
+    let mut said = false;
+    loop {
+        let locked = match lock.as_ref().map(fs::File::try_lock) {
+            None | Some(Ok(())) => true,
+            Some(Err(fs::TryLockError::WouldBlock)) => false,
+            Some(Err(fs::TryLockError::Error(err))) => {
+                note!("could not lock {} ({err}); going on", file.display());
+                true
+            }
+        };
+        if locked && !someone_is_serving(&paths.socket()) {
+            return Ok(lock);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                format!(
+                    "another conbus daemon is the recorder of {}; nothing was written",
+                    paths.root().display()
+                ),
+            ));
+        }
+        if !said {
+            note!(
+                "another daemon is the recorder of {}; waiting up to {CLAIM_WAIT:?} for it to go",
+                paths.root().display()
+            );
+            said = true;
+        }
+        std::thread::sleep(CLAIM_POLL);
+    }
+}
+
+/// `conbus daemon --prepare`. A daemon's own child writes under its parent's
+/// claim; anything else has to take the claim itself first.
+pub fn prepare_command(paths: &Paths, retention: Retention) -> io::Result<()> {
+    let under_parent = std::env::var(PREPARE_FOR)
+        .is_ok_and(|pid| pid == std::os::unix::process::parent_id().to_string());
+    let _claim = if under_parent {
+        None
+    } else {
+        claim_recorder(paths)?
+    };
+    prepare(paths, retention)
+}
+
 /// Bind the control socket, refusing to steal one a live daemon still owns.
 pub fn bind(socket: &Path) -> io::Result<UnixListener> {
     if socket.exists() {
@@ -1172,6 +1256,7 @@ fn prepare_in_child(paths: &Paths, retention: Retention) {
     let status = std::env::current_exe().and_then(|bin| {
         Command::new(bin)
             .args(["daemon", "--prepare"])
+            .env(PREPARE_FOR, std::process::id().to_string())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             // The child's notes belong in the same place as the daemon's.
@@ -1251,6 +1336,9 @@ pub fn serve(paths: &Paths, retention: Retention) -> io::Result<()> {
             paths.root().display()
         );
     }
+    // Nothing below is written until this process knows it is the recorder.
+    // Held until the process ends, so it is never dropped: `serve` only loops.
+    let _claim = claim_recorder(paths)?;
     // The first stamp, before anything long: a daemon that takes a minute to
     // prepare shows "starting" to a doctor, never a dead process — and a hook
     // that arrives early meets a refused socket at once rather than waiting

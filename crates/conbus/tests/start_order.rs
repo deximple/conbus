@@ -68,3 +68,264 @@ fn the_socket_answers_only_once_the_stamp_says_serving() {
     let _ = child.wait();
     assert!(answered, "a stamped-serving daemon must answer its socket");
 }
+
+const SESSION: &str = "ea1d23e9-bb83-4df5-9a73-a6a12e138d85";
+
+fn daemon_in(home: &std::path::Path) -> Command {
+    let mut command = Command::new(bin());
+    command
+        .arg("daemon")
+        .env("CONBUS_HOME", home)
+        .env("HOME", home)
+        .env("CONBUS_SKIP_LAUNCHCTL", "1")
+        .env("CONBUS_CODEX_BIN", "/nonexistent/codex")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    command
+}
+
+fn stamped_pid(home: &std::path::Path) -> Option<u64> {
+    let text = std::fs::read_to_string(home.join("daemon.build")).ok()?;
+    let stamp: serde_json::Value = serde_json::from_str(text.trim()).ok()?;
+    stamp.get("pid")?.as_u64()
+}
+
+/// Read a daemon's stderr until it says it is waiting for another recorder, or
+/// until it has nothing more to say. A sleep here would pass on a build that
+/// writes early whenever macOS is slow to start a freshly built binary.
+fn until_it_says_it_waits(child: &mut std::process::Child) {
+    use std::io::{BufRead, BufReader};
+    let stderr = child.stderr.take().expect("stderr is piped");
+    let (said, heard) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            if line.contains("waiting") {
+                let _ = said.send(());
+            }
+        }
+        let _ = said.send(());
+    });
+    let _ = heard.recv_timeout(Duration::from_secs(30));
+}
+
+/// Wait until this process is the one the stamp says is serving.
+fn wait_serving(home: &std::path::Path, pid: u32) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        if stamped_pid(home) == Some(u64::from(pid)) && serving(home).is_some() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!("pid {pid} never stamped itself serving");
+}
+
+fn hook(home: &std::path::Path, payload: &str) {
+    use std::io::Write;
+    let mut child = Command::new(bin())
+        .args(["hook", "--harness", "claude_code"])
+        .env("CONBUS_HOME", home)
+        .env("HOME", home)
+        .env("CONBUS_SKIP_LAUNCHCTL", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("hook");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(payload.as_bytes())
+        .expect("write");
+    child.wait().expect("wait");
+}
+
+fn prompt(id: &str, text: &str) -> String {
+    serde_json::json!({
+        "session_id": SESSION,
+        "hook_event_name": "UserPromptSubmit",
+        "prompt": text,
+        "prompt_id": id,
+        "cwd": "/repo"
+    })
+    .to_string()
+}
+
+/// Every record on disk, parsed from the segments rather than through a build
+/// of the reader.
+fn records(home: &std::path::Path) -> Vec<serde_json::Value> {
+    let mut paths: Vec<_> = std::fs::read_dir(home.join("log"))
+        .map(|dir| {
+            dir.filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .collect()
+        })
+        .unwrap_or_default();
+    paths.sort();
+    paths
+        .iter()
+        .flat_map(|path| {
+            String::from_utf8_lossy(&std::fs::read(path).unwrap_or_default())
+                .lines()
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .collect::<Vec<serde_json::Value>>()
+        })
+        .collect()
+}
+
+/// A transcript holding a turn the log does not: what a start fills a gap from.
+fn transcript_with_a_gap(home: &std::path::Path) {
+    let dir = home.join(".claude/projects/-repo");
+    std::fs::create_dir_all(&dir).expect("dir");
+    let line = |id: &str, text: &str| {
+        serde_json::json!({
+            "type": "user", "sessionId": SESSION, "timestamp": "2026-11-01T00:00:00.000Z",
+            "version": "2.1.316", "cwd": "/repo", "entrypoint": "cli", "promptId": id,
+            "message": {"role": "user", "content": text}
+        })
+        .to_string()
+    };
+    std::fs::write(
+        dir.join(format!("{SESSION}.jsonl")),
+        [
+            line("p0", "first"),
+            line("gap", "only the transcript holds this"),
+        ]
+        .join("\n")
+            + "\n",
+    )
+    .expect("transcript");
+}
+
+#[test]
+fn a_second_daemon_writes_nothing_before_it_gives_up() {
+    // Hand-started beside a live recorder it used to stamp over the live pid,
+    // fill gaps and drain the spool, and only then did `bind` refuse it: one
+    // record, one duplicate sequence number, and a doctor reading a dead pid.
+    let home = tempfile::tempdir().expect("tempdir");
+    let mut live = daemon_in(home.path()).spawn().expect("daemon");
+    wait_serving(home.path(), live.id());
+    hook(home.path(), &prompt("p0", "first"));
+    transcript_with_a_gap(home.path());
+    let before = records(home.path()).len();
+
+    let status = daemon_in(home.path()).status().expect("second daemon");
+
+    let wrote = records(home.path()).len() - before;
+    let stamp = stamped_pid(home.path());
+    hook(
+        home.path(),
+        &prompt("p1", "after the second daemon gave up"),
+    );
+    let _ = live.kill();
+    let _ = live.wait();
+
+    assert!(!status.success(), "it did not become the recorder");
+    assert_eq!(wrote, 0, "it wrote to a log it does not own");
+    assert_eq!(stamp, Some(u64::from(live.id())), "it took the live stamp");
+    let mut seqs: Vec<u64> = records(home.path())
+        .iter()
+        .filter_map(|record| record["seq"].as_u64())
+        .collect();
+    let total = seqs.len();
+    seqs.sort_unstable();
+    seqs.dedup();
+    assert_eq!(seqs.len(), total, "a sequence number was used twice");
+}
+
+#[test]
+fn a_prepare_run_by_hand_beside_a_live_recorder_writes_nothing() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let mut live = daemon_in(home.path()).spawn().expect("daemon");
+    wait_serving(home.path(), live.id());
+    hook(home.path(), &prompt("p0", "first"));
+    transcript_with_a_gap(home.path());
+    let before = records(home.path()).len();
+
+    let status = daemon_in(home.path())
+        .arg("--prepare")
+        .status()
+        .expect("prepare");
+
+    let wrote = records(home.path()).len() - before;
+    let _ = live.kill();
+    let _ = live.wait();
+    assert!(!status.success(), "there is already a recorder here");
+    assert_eq!(wrote, 0, "it wrote beside the live recorder");
+}
+
+#[test]
+fn a_start_waits_out_a_daemon_that_is_on_its_way_out() {
+    // `install --apply` boots out and then bootstraps, so the old daemon can
+    // still be there when the new one starts. Giving up at once would cost a
+    // restart under the service manager; taking over would be two writers.
+    let home = tempfile::tempdir().expect("tempdir");
+    let mut old = daemon_in(home.path()).spawn().expect("old");
+    wait_serving(home.path(), old.id());
+    let old_pid = old.id();
+
+    let mut new = daemon_in(home.path())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("new");
+    until_it_says_it_waits(&mut new);
+    assert_eq!(
+        stamped_pid(home.path()),
+        Some(u64::from(old_pid)),
+        "the new daemon stamped before the old one had gone"
+    );
+    let _ = old.kill();
+    let _ = old.wait();
+
+    wait_serving(home.path(), new.id());
+    let _ = new.kill();
+    let _ = new.wait();
+}
+
+#[test]
+fn an_older_daemon_that_takes_no_lock_is_still_waited_for() {
+    // The first start of this build meets a daemon of the build before it,
+    // which knows nothing of the lock and answers only on the socket.
+    let home = tempfile::tempdir().expect("tempdir");
+    let older = std::os::unix::net::UnixListener::bind(home.path().join("conbus.sock"))
+        .expect("an older daemon's socket");
+
+    let mut new = daemon_in(home.path())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("new");
+    until_it_says_it_waits(&mut new);
+    let stamped_early = stamped_pid(home.path());
+    let wrote_early = home.path().join("log").exists();
+    drop(older);
+
+    wait_serving(home.path(), new.id());
+    let _ = new.kill();
+    let _ = new.wait();
+    assert_eq!(stamped_early, None, "it stamped beside a serving daemon");
+    assert!(!wrote_early, "it opened the log beside a serving daemon");
+}
+
+#[test]
+fn the_claim_goes_with_the_daemon_however_it_dies() {
+    // Killed, not asked: nothing gets to clean up a lock file, so the file
+    // staying behind must not be what says somebody is here.
+    let home = tempfile::tempdir().expect("tempdir");
+    let mut first = daemon_in(home.path()).spawn().expect("first");
+    wait_serving(home.path(), first.id());
+    let _ = first.kill();
+    let _ = first.wait();
+
+    let started = Instant::now();
+    let mut second = daemon_in(home.path()).spawn().expect("second");
+    wait_serving(home.path(), second.id());
+    let waited = started.elapsed();
+    let _ = second.kill();
+    let _ = second.wait();
+    assert!(
+        waited < Duration::from_secs(4),
+        "a dead daemon's claim held the next one up for {waited:?}"
+    );
+}
