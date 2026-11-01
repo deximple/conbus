@@ -136,6 +136,99 @@ pub fn printed(binary: &Path, home: Option<&Path>, apply: bool) -> io::Result<Pr
     })
 }
 
+/// The managed locations doctor reads, as paths a test can point at a
+/// tempdir — the real `/Library` and `/etc` are never written by conbus and
+/// never touched by a test either.
+#[derive(Clone)]
+pub struct Locations {
+    /// Claude Code's managed settings directory.
+    pub claude_dir: PathBuf,
+    /// Codex's `requirements.toml`.
+    pub codex_requirements: PathBuf,
+    /// Cursor's enterprise hooks file.
+    pub cursor_hooks: PathBuf,
+}
+
+impl Locations {
+    /// The real system paths.
+    pub fn system() -> Self {
+        Locations {
+            claude_dir: PathBuf::from(CLAUDE_MANAGED_DIR),
+            codex_requirements: PathBuf::from(CODEX_REQUIREMENTS),
+            cursor_hooks: PathBuf::from(CURSOR_ENTERPRISE_HOOKS),
+        }
+    }
+}
+
+/// A managed file names the binary inside a hook command; whatever the
+/// format — JSON or TOML — its text then carries both words.
+fn mentions_conbus_hook(text: &str) -> bool {
+    text.contains("conbus") && (text.contains("hook") || text.contains("[hooks"))
+}
+
+/// The `managed` line `doctor` prints: what the organisation's own files
+/// say, read never written. For Claude Code it also reports the
+/// `allowManagedHooksOnly` lock — on with no conbus block means the user
+/// hooks `install --apply` registered will not fire, and doctor must not let
+/// "already registered" read as health there.
+pub fn describe(locations: &Locations) -> String {
+    let mut parts = Vec::new();
+
+    // Claude Code: managed-settings.json plus every drop-in it ships beside.
+    let mut claude_registered: Option<PathBuf> = None;
+    let mut locked = false;
+    let mut claude_present = false;
+    let main_settings = locations.claude_dir.join("managed-settings.json");
+    let mut files = vec![main_settings.clone()];
+    if let Ok(entries) = std::fs::read_dir(locations.claude_dir.join("managed-settings.d")) {
+        let mut dropins: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+        dropins.sort();
+        files.extend(dropins);
+    }
+    for file in files {
+        let Ok(text) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        claude_present = true;
+        if claude_registered.is_none() && mentions_conbus_hook(&text) {
+            claude_registered = Some(file.clone());
+        }
+        if file == main_settings {
+            locked = serde_json::from_str::<Value>(&text)
+                .ok()
+                .and_then(|v| v.get("allowManagedHooksOnly")?.as_bool())
+                .unwrap_or(false);
+        }
+    }
+    let lock = if locked {
+        "allowManagedHooksOnly on"
+    } else {
+        "allowManagedHooksOnly off"
+    };
+    parts.push(match &claude_registered {
+        Some(file) => format!("claude_code: hooks in {} ({lock})", file.display()),
+        None if locked => format!(
+            "claude_code: {lock} and no conbus block — the user-level hooks will not fire"
+        ),
+        None if claude_present => format!("claude_code: managed files present, no conbus block ({lock})"),
+        None => "claude_code: no managed file".to_string(),
+    });
+
+    for (name, path) in [
+        ("codex", &locations.codex_requirements),
+        ("cursor", &locations.cursor_hooks),
+    ] {
+        parts.push(match std::fs::read_to_string(path) {
+            Ok(text) if mentions_conbus_hook(&text) => {
+                format!("{name}: hooks in {}", path.display())
+            }
+            Ok(_) => format!("{name}: {} has no conbus hooks", path.display()),
+            Err(_) => format!("{name}: no managed file"),
+        });
+    }
+    parts.join("; ")
+}
+
 /// `conbus install --managed [--apply]`. Prints, and writes nothing.
 ///
 /// The binary is the one running, made absolute but not resolved: a symlink
@@ -205,6 +298,25 @@ fn shell_safe(path: &str) -> bool {
         .all(|c| c.is_ascii_alphanumeric() || "/._-".contains(c))
 }
 
+/// Whether a non-root account could replace the file at `path` — owner is
+/// not root, or a group/other write bit is set. A managed settings file that
+/// names such a binary lets its owner change what runs under the
+/// organisation's authority, which is the privilege gap managed settings
+/// exist to stop.
+#[cfg(unix)]
+fn writable_by_non_root(path: &Path) -> bool {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    meta.uid() != 0 || meta.permissions().mode() & 0o022 != 0
+}
+
+#[cfg(not(unix))]
+fn writable_by_non_root(_: &Path) -> bool {
+    false
+}
+
 fn warnings(binary: &Path, home: Option<&Path>, apply: bool) -> String {
     let shown = binary.to_string_lossy();
     let in_home = home.is_some_and(|home| home.parent().is_some() && binary.starts_with(home));
@@ -212,6 +324,11 @@ fn warnings(binary: &Path, home: Option<&Path>, apply: bool) -> String {
         format!("{shown} is inside this account's home, and one"),
         "managed file serves every account on every machine. Place the binary where all".into(),
         "of them can run it, such as /usr/local/bin/conbus, and run this from there.".into(),
+    ];
+    let writable_warning = [
+        format!("{shown} is writable by non-root — whoever owns it"),
+        "decides what runs under your organisation's authority. Install it".into(),
+        "as root, mode 0755, in a root-owned directory.".into(),
     ];
     let shell_warning = [
         format!("{shown} has characters a shell splits or expands,"),
@@ -223,6 +340,8 @@ fn warnings(binary: &Path, home: Option<&Path>, apply: bool) -> String {
     ];
     [
         in_home.then(|| section("warning", &home_warning)),
+        (!in_home && writable_by_non_root(binary))
+            .then(|| section("warning", &writable_warning)),
         (!shell_safe(&shown)).then(|| section("warning", &shell_warning)),
         apply.then(|| section("note", &apply_note)),
     ]
@@ -459,6 +578,91 @@ mod tests {
         assert!(
             !rooted.guidance.contains("warning"),
             "a HOME of / would put every path inside it"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_binary_writable_by_non_root_is_warned_about() {
+        // A managed file runs the binary it names under the organisation's
+        // authority. A binary a non-root account can overwrite turns that
+        // file into a privilege grant, so `install --managed` says so.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let binary = dir.path().join("conbus");
+        std::fs::write(&binary, b"#!").expect("binary");
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod");
+
+        let out = printed(&binary, None, false).expect("print");
+
+        assert!(
+            out.guidance.contains("non-root"),
+            "a user-owned binary must be warned about: {}",
+            out.guidance
+        );
+    }
+
+    #[test]
+    fn managed_files_report_what_they_actually_say() {
+        // Path injection: the Locations a doctor line reads are parameters,
+        // so the real /Library and /etc are never touched from a test.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let claude = dir.path().join("claude");
+        let dropins = claude.join("managed-settings.d");
+        std::fs::create_dir_all(&dropins).expect("dirs");
+        std::fs::write(
+            claude.join("managed-settings.json"),
+            r#"{"allowManagedHooksOnly": true, "theme": "dark"}"#,
+        )
+        .expect("managed settings");
+        std::fs::write(
+            dropins.join("conbus.json"),
+            serde_json::to_string(&claude_code_block(Path::new(FLEET))).expect("json"),
+        )
+        .expect("drop-in");
+        let locations = Locations {
+            claude_dir: claude.clone(),
+            codex_requirements: dir.path().join("no-such.toml"),
+            cursor_hooks: dir.path().join("no-such.json"),
+        };
+
+        let text = describe(&locations);
+
+        assert!(text.contains("claude_code"), "{text}");
+        assert!(text.contains("conbus"), "{text}");
+        assert!(
+            text.contains("allowManagedHooksOnly on"),
+            "the lock state is reported: {text}"
+        );
+        assert!(text.contains("codex"), "{text}");
+        assert!(
+            !text.contains("will not fire"),
+            "hooks registered under the lock do fire: {text}"
+        );
+    }
+
+    #[test]
+    fn the_lock_with_no_conbus_block_says_user_hooks_will_not_fire() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let claude = dir.path().join("claude");
+        std::fs::create_dir_all(&claude).expect("dir");
+        std::fs::write(
+            claude.join("managed-settings.json"),
+            r#"{"allowManagedHooksOnly": true}"#,
+        )
+        .expect("managed settings");
+        let locations = Locations {
+            claude_dir: claude,
+            codex_requirements: dir.path().join("no-such.toml"),
+            cursor_hooks: dir.path().join("no-such.json"),
+        };
+
+        let text = describe(&locations);
+
+        assert!(
+            text.contains("will not fire"),
+            "the lock with no managed conbus block must be loud: {text}"
         );
     }
 

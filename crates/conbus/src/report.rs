@@ -1261,6 +1261,12 @@ pub fn doctor(paths: &Paths) -> io::Result<()> {
         }
         None => println!("hooks     no HOME to read registrations from"),
     }
+    // The organisation's own files, read as they are: on a locked fleet the
+    // user-level lines above are not the truth of what will fire.
+    println!(
+        "managed   {}",
+        crate::install::managed::describe(&crate::install::managed::Locations::system())
+    );
     // Chat LAM hard-disables hooks. The official export is the identity-
     // preserving channel; the daemon ingests this folder on start and
     // whenever a newer file lands.
