@@ -857,7 +857,11 @@ fn a_fill_the_log_refused_keeps_its_range() {
     transcript(
         home,
         S,
-        &[user(S, "p0", "before"), user(S, "p1", "missed"), reply(S, "a1")],
+        &[
+            user(S, "p0", "before"),
+            user(S, "p1", "missed"),
+            reply(S, "a1"),
+        ],
     );
     let segment = home.join("log/segment-00000000.jsonl");
     // A read-only segment stands in for ENOSPC.
