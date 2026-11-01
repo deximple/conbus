@@ -291,6 +291,34 @@ fn a_turn_end_with_no_conversation_goes_at_once() {
 }
 
 #[test]
+fn an_orphan_that_cannot_be_removed_has_not_gone_and_says_nothing_yet() {
+    // On a full disk the file going is what makes room for the line, so the line
+    // comes second, and only if the file really went.
+    use std::os::unix::fs::PermissionsExt;
+    let home = tempfile::tempdir().expect("tempdir");
+    let daemon = start(home.path());
+    hook(home.path(), &tool_call("tu"));
+    stop(daemon);
+    let entries = spooled(home.path());
+    assert_eq!(entries.len(), 1);
+    age(&entries[0], DAY + Duration::from_secs(60));
+    let dir = home.path().join("spool");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).expect("close");
+
+    let daemon = start(home.path());
+    past_a_drain();
+    let still_there = entries[0].exists();
+    let said_early = drops(home.path());
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("open");
+    until("it goes", || spooled(home.path()).is_empty());
+    stop(daemon);
+
+    assert!(still_there);
+    assert_eq!(said_early, "", "it had not gone");
+    assert_eq!(drops(home.path()).lines().count(), 1);
+}
+
+#[test]
 fn a_waiting_event_is_not_read_again_on_every_tick() {
     // A spool holding thousands of these reads them all every two seconds, in
     // front of every hook behind it. Rewriting the file is how to see whether it
