@@ -64,6 +64,9 @@ jobs:
       - name: test
         run: cargo test --workspace --locked --no-fail-fast
 
+      - name: canary rehearsal
+        run: bash scripts/canary-rehearsal.sh
+
   linux:
     runs-on: ubuntu-24.04
     timeout-minutes: 40

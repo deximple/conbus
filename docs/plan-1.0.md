@@ -266,7 +266,7 @@ AGENTS.md의 "SQLite는 파생" 항목에 사이드카와 스풀을 추가해 �
 **M7.0 `devin/m7.0-scripts`** (0:30)
 
 - `scripts/shadow-replay.sh OLD NEW CLONE`: S1 비교를 재현 가능하게.
-- `scripts/canary.sh {preflight,start,status,verdict,rollback}`: 7절대로. **진짜 `HOME`이고 `CONBUS_SKIP_LAUNCHCTL`이 없을 때만 실제로 교체한다.** 그 외에는 `CONBUS_CANARY_REHEARSAL=1`을 요구하고 launchctl을 건너뛴다. 금지 시간대는 `CONBUS_CANARY_BLACKOUT` 환경 변수로 받는다(값은 저장소에 넣지 않는다).
+- `scripts/canary.sh {preflight,status,verdict,start,restart,rollback}`: 7절대로. **진짜 `HOME`이고 `CONBUS_SKIP_LAUNCHCTL`이 없을 때만 실제로 교체한다.** 그 외에는 `CONBUS_CANARY_REHEARSAL=1`을 요구하고 launchctl을 건너뛴다. 금지 시간대는 `CONBUS_CANARY_BLACKOUT` 환경 변수로 받는다(값은 저장소에 넣지 않는다). 형식은 `HH:MM-HH:MM`(매일, 자정 넘김 허용), `[요일] HH:MM-HH:MM [Zone]`(`Mon-Fri 09:00-15:30 Asia/Seoul` 같은), `<epoch>-<epoch>` 셋 중 하나다. 어느 것으로도 파싱되지 않는 값은 금지 시간대로 간주해 닫힌다(안전 쪽 실패).
 - 임시 `HOME` + `CONBUS_SKIP_LAUNCHCTL=1`로 예행 연습한다.
 
 **RC**
@@ -302,9 +302,9 @@ AGENTS.md의 "SQLite는 파생" 항목에 사이드카와 스풀을 추가해 �
 
 1. `preflight`: S1~S5 증거 존재, 서명본 sha 대조, `TeamIdentifier`, 롤백 복사본, plist 백업, 금지 시간대 확인. **새 바이너리로 라이브 루트에 사이드카를 미리 빌드한다**(`cache/`만 쓴다). 안 그러면 첫 시작이 수 분 걸려 아래 확인이 매번 실패한다.
 2. `mv -f conbus.new conbus && conbus install --apply` (kickstart 아님, HANDOFF 참고).
-3. 자동 확인: build = daemon build, serving ≤ 5 s, 훅 왕복, 드롭 증가 0. 하나라도 실패하면 **자동 롤백**.
+3. 자동 확인: build = daemon build, `CONBUS_CANARY_SERVING_LIMIT`(기본 30초) 안에 새 pid가 serving, 훅 왕복(`hooks` 행이 전부 `runs`), 드롭 사유 증가 0. 하나라도 실패하면 **자동 롤백**. 시작→serving 5초 목표는 롤백 조건이 아니라 `verdict` 판정 항목이다(현재 측정치가 5초 위라 매번 되돌리는 셈이 된다).
 
-**계획된 재시작**: 1일 차와 6일 차에 `conbus install --apply`.
+**계획된 재시작**: 1일 차와 6일 차에 `canary.sh restart`(`install --apply`를 돌리고 serving ms·새 드롭 수를 `~/.conbus/canary.json`에 기록 — `verdict`가 이 항목들을 계획된 것으로 제외한다).
 
 **통과 조건** (`canary.sh verdict`가 교체 시각 이후 로그로 계산):
 
@@ -393,7 +393,7 @@ Copilot CLI 어댑터(설치·실 payload 필요), Gemini CLI 어댑터, 프롬�
 | M6 | 완료 | #98 #103 | `check-docs.sh` 초록(0.2.9, 명령 19개). site 테스트 6/6(vitest) | `check-docs.sh`가 첫 실행에서 실제 누락 4건을 잡았다(README·한국어 매뉴얼에 `policy`, 두 매뉴얼에 `sync`). 한국어 매뉴얼은 Linux 미지원이라고 적혀 있던 것을 고치고 정책·프로필·sync 절을 넣었다. 랜딩은 `site/` 하나로 합치고 `docs/www/`를 지웠다. site는 `site/**` 경로 필터 CI로만 돌고 배포하지 않았다 |
 | M7 | 완료 | #108 #109 | `v1.0.0-rc.1` 태그 게시, `pre=true`·`draft=false`, `latest`는 v0.2.9 유지. 릴리스 드라이런 3타깃 초록 | canary.sh·shadow-replay.sh·canary-rehearsal.sh(#108). RC PR #109: 버전 범프·Cargo.lock·CHANGELOG·매뉴얼 헤드라인 |
 | S1–S5 | 완료 | #110 | S1: 0.2.8↔RC 읽기 차이는 `tokens_*` 키·새 doctor 항목뿐, 캐시 유무 동일; RC가 969,129레코드 전수 읽고 0.2.8이 RC 기록을 역방향으로 읽음. S3 스톰 10/10 무손실. S4 Colima ARM64 왕복. S5 TLS 왕복 | S2 실세션 패리티(claude·codex 각 4==4; grok 프로젝트 훅 없음·cursor 미인증·opencode 비대화형 이벤트 없음 — 한계로 기록). S5가 refserver의 와이어 불일치 3건(`day_closed`, `accepted` 형상, 장치 id 형식)을 잡아 시험 하니스를 고쳤다(#110) |
-| Canary | 준비 완료 | #110 | 리허설 전 항목 통과(스왑·롤백·블랙아웃·verdict 12행). preflight에 후보 서명·hardened runtime·해시 검사 추가 | 라이브 교체는 하지 않음. RC 바이너리는 ad-hoc 서명이라(서명 자격 부재, evidence/rc-sign.log) 운영자가 `sign-release.sh`로 재서명 뒤 `canary.sh start --from` 실행 — operator-todo.md에 절차 |
+| Canary | 준비 완료 | #110 #113 | `canary.sh`를 §7 계약대로 재작성: start가 preflight를 먼저 돌리고, 교체 뒤 serving·build·훅 왕복·드롭 검사 실패 시 자동 롤백. `restart` 서브커맨드와 `canary.json` 창 기록 추가. verdict가 재시작 분류·패리티·RSS·시간 예산을 실제로 계산. 리허설이 CI gate에서 돈다 | 라이브 교체는 하지 않음. RC 바이너리는 Developer ID 서명·공증 완료 — 운영자가 `canary.sh start --from`으로 시작 (operator-todo.md에 절차) |
 | 1.0.0 | | | | |
 
 ### 변경 기록
