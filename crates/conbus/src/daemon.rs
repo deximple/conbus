@@ -1526,8 +1526,14 @@ fn drain_spool(daemon: &mut Daemon, paths: &Paths) {
         .collect();
     files.sort();
     for file in files {
-        let request = std::fs::read_to_string(&file)
-            .ok()
+        // Only what a hook writes: a regular file no larger than the hook's own
+        // 1 MiB cap. A link or an oversized file is nobody's spooled request,
+        // and following or loading it would read whatever it points at.
+        let regular = std::fs::symlink_metadata(&file)
+            .is_ok_and(|meta| meta.file_type().is_file() && meta.len() <= 1_048_576);
+        let request = regular
+            .then(|| std::fs::read_to_string(&file).ok())
+            .flatten()
             .and_then(|text| serde_json::from_str::<Request>(text.trim()).ok());
         match request {
             None => {
