@@ -30,6 +30,13 @@ the entry says so when it does.
 - Building from source needs Rust 1.99.1, pinned in `rust-toolchain.toml`;
   CI reads the same file.
 
+### Fixed
+
+- OpenCode 2.x is recorded again. It refuses the plugin 1.x loads, so nothing
+  reached the log from OpenCode after it moved to 2.0. `conbus install` now
+  writes the plugin the installed OpenCode loads (asking `opencode --version`),
+  `install --apply` replaces the other one, and `doctor` names a mismatch.
+
 ### Security
 
 - `conbus hook --inference-listen` refuses an address that is not loopback.

@@ -927,11 +927,24 @@ fn report_hooks(home: &Path) {
     if !crate::install::vendor_present("opencode", home) {
         println!("hooks     {:<12} not installed here", "opencode");
     } else if crate::install::opencode_plugin_registered(home) {
-        println!(
-            "hooks     {:<12} runs — {} plugin",
-            "opencode",
-            crate::install::opencode_plugin_path(home).display()
-        );
+        let loads = crate::install::opencode_plugin_api();
+        match crate::install::opencode_plugin_api_in_place(home) {
+            Some(written) if written != loads => println!(
+                "hooks     {:<12} MISMATCH — {} is written for OpenCode {}, which this OpenCode does not load; run `conbus install --apply`",
+                "opencode",
+                crate::install::opencode_plugin_path(home).display(),
+                if written == crate::install::PluginApi::V1 {
+                    "1.x"
+                } else {
+                    "2.x"
+                }
+            ),
+            _ => println!(
+                "hooks     {:<12} runs — {} plugin",
+                "opencode",
+                crate::install::opencode_plugin_path(home).display()
+            ),
+        }
     } else {
         println!(
             "hooks     {:<12} MISSING plugin — run `conbus install --apply`",
