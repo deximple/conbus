@@ -1,6 +1,6 @@
 //! The recorder daemon: one socket, one registry, one append-only log.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::fd::AsRawFd;
@@ -63,6 +63,73 @@ pub struct Daemon {
     /// that already landed is answered Recorded, not written twice.
     seen_hooks: std::collections::VecDeque<String>,
     seen_hook_bus: std::collections::HashMap<String, conbus_core::ids::BusId>,
+    /// What the log refused, oldest first, until it takes writes again.
+    held: VecDeque<Held>,
+    held_bytes: usize,
+    /// The outage the queue above belongs to, once there is one.
+    refusal: Option<Refusal>,
+    /// When `daemon.log` last heard about the log refusing, and about it taking
+    /// writes again. A nearly full disk can do both on every hook.
+    refusal_noted_at: Option<std::time::Instant>,
+    recovery_noted_at: Option<std::time::Instant>,
+}
+
+/// The most the daemon keeps in memory for a log that refuses it: the spool's
+/// own cap, so a full disk costs no more than a long restart would.
+const HELD_MAX_BYTES: usize = 16 * 1024 * 1024;
+
+/// How long a record waits for a log that keeps refusing it, in memory or in the
+/// spool. Long enough for a person to find a full disk and free some, and short
+/// enough that something which will never land does not sit there for good.
+const REFUSED_LIFE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// How often `daemon.log` hears about each of those, however often they happen.
+const REFUSAL_NOTE_EVERY: Duration = Duration::from_secs(10 * 60);
+
+/// Whether it is time for another line of this kind, and if so, that it was said.
+fn time_to_note(last: &mut Option<std::time::Instant>) -> bool {
+    let due = last.is_none_or(|at| at.elapsed() >= REFUSAL_NOTE_EVERY);
+    if due {
+        *last = Some(std::time::Instant::now());
+    }
+    due
+}
+
+/// A record the log would not take.
+///
+/// In memory because on a really full disk nothing else is left: not the spool
+/// file, and not the drop line that would say so. The hook still tries to spool
+/// its copy, which is what survives this daemon dying, and the hook id makes the
+/// two of them one record.
+struct Held {
+    entry: Entry,
+    declared: Option<HopProvenance>,
+    bytes: usize,
+    since: std::time::Instant,
+}
+
+/// One stretch of the log refusing writes, for the trace it leaves afterwards.
+struct Refusal {
+    since: Timestamp,
+    /// The same moment on the clock a held record uses. Not `since`: a week with
+    /// the lid shut is a week on the wall, and nobody had a chance to free a disk.
+    began: std::time::Instant,
+    first_error: String,
+    landed: u64,
+    /// Past the memory cap, or held for longer than `REFUSED_LIFE`. A hook may
+    /// still have spooled one of these, so this is not a count of certain loss.
+    not_held: u64,
+}
+
+/// What became of one record on its way to the log.
+enum Landing {
+    Written(Box<Record>),
+    Withheld,
+    /// Refused, and now in `Daemon::held`.
+    Held(String),
+    /// Refused, and not kept here: the spool file still has it, or there was no
+    /// room left to hold it.
+    Refused(String),
 }
 
 /// One directory the daemon polls for Chat exports.
@@ -99,6 +166,11 @@ impl Daemon {
             chat_watch: None,
             seen_hooks: std::collections::VecDeque::new(),
             seen_hook_bus: std::collections::HashMap::new(),
+            held: VecDeque::new(),
+            held_bytes: 0,
+            refusal: None,
+            refusal_noted_at: None,
+            recovery_noted_at: None,
         }
     }
 
@@ -210,8 +282,16 @@ impl Daemon {
         chapters
     }
 
-    /// Record one observed event.
+    /// Record one observed event, for a hook waiting on the answer.
     pub fn handle(&mut self, request: Request) -> Response {
+        // Behind whatever the log refused earlier, so it keeps arrival order.
+        self.land_held();
+        self.record(request, true)
+    }
+
+    /// Record one event. `keep` says a refused one is held in memory, which a
+    /// drained entry does not want: its file is already the durable copy.
+    fn record(&mut self, request: Request, keep: bool) -> Response {
         // A newer hook may carry envelope fields this build does not know, and
         // dropping them silently is exactly the class of bug this refuses to
         // repeat. Upgrading conbus leaves the old daemon running until someone
@@ -300,7 +380,9 @@ impl Daemon {
                 let first_prompt = !self.chapters.contains_key(&bus_id);
                 let mut seqs = Vec::with_capacity(observed.len());
                 let mut written: Vec<Record> = Vec::with_capacity(observed.len());
-                let mut errors = Vec::new();
+                let mut held = 0;
+                let mut lost = 0;
+                let mut error = String::new();
                 // Each observation keeps the correlators its own payload had.
                 // A deferred session start carried none; borrowing the minting
                 // prompt's would fabricate a correlation the vendor did not send.
@@ -324,35 +406,42 @@ impl Daemon {
                         spooled_at: if is_own { spooled_at } else { None },
                         event: one.event,
                     };
-                    match self.log.append(entry) {
-                        Ok(Some(record)) => {
+                    // Only a hook has a spool copy and a caller who will not try
+                    // again. `conbus hop` and a lease are told the write failed,
+                    // and holding them would make that untrue later. A flushed
+                    // session start has no other copy anywhere: the request that
+                    // carried it is a different event.
+                    let keep_it = (keep && hook_id.is_some()) || !is_own;
+                    match self.land_or_keep(entry, declared, keep_it) {
+                        Landing::Written(record) => {
                             seqs.push(record.seq);
-                            written.push(record);
+                            written.push(*record);
                         }
-                        Ok(None) => {}
+                        Landing::Withheld => {}
                         // Keep going. Returning here would abandon the events
-                        // behind this one untried and report two losses as one,
-                        // and the prompt that minted the conversation is often
-                        // the one behind a flushed session start.
-                        Err(err) => errors.push(err.to_string()),
+                        // behind this one untried, and the prompt that minted
+                        // the conversation is often the one behind a flushed
+                        // session start.
+                        Landing::Held(err) => {
+                            held += 1;
+                            error = err;
+                        }
+                        Landing::Refused(err) => {
+                            lost += 1;
+                            error = err;
+                        }
                     }
                 }
-                if !errors.is_empty() {
-                    // The daemon's own stderr, because the hook's goes to a
-                    // vendor that swallows it.
-                    note!(
-                        "{} of {} record(s) refused by the log: {}",
-                        errors.len(),
-                        errors.len() + seqs.len(),
-                        errors.join("; ")
-                    );
+                if held + lost > 0 {
+                    // What did land still happened.
+                    self.remember(&written);
+                    let (count, word) = if lost > 0 {
+                        (held + lost, "lost")
+                    } else {
+                        (held, "held")
+                    };
                     return Response::Failed {
-                        error: format!(
-                            "{} record(s) written, {} lost: {}",
-                            seqs.len(),
-                            errors.len(),
-                            errors.join("; ")
-                        ),
+                        error: format!("{} record(s) written, {count} {word}: {error}", seqs.len()),
                     };
                 }
                 if seqs.is_empty() {
@@ -437,6 +526,216 @@ impl Daemon {
 }
 
 impl Daemon {
+    /// Hand one entry to the log, or keep it if the log will not take it.
+    fn land_or_keep(
+        &mut self,
+        entry: Entry,
+        declared: Option<HopProvenance>,
+        keep: bool,
+    ) -> Landing {
+        let refused = match &self.refusal {
+            // Still refusing, as of the last try: trying again per record only
+            // gets this one written ahead of the ones that came first.
+            Some(refusal) if !self.held.is_empty() => refusal.first_error.clone(),
+            _ => match self.log.append(entry.clone()) {
+                Ok(written) => {
+                    // It waited, on disk: a drained entry the log refused until now.
+                    if let Some(refusal) = self.refusal.as_mut()
+                        && entry.spooled_at.is_some()
+                        && written.is_some()
+                    {
+                        refusal.landed += 1;
+                    }
+                    self.report_refusal();
+                    return match written {
+                        Some(record) => Landing::Written(Box::new(record)),
+                        None => Landing::Withheld,
+                    };
+                }
+                Err(err) => err.to_string(),
+            },
+        };
+        // The daemon's own stderr, because the hook's goes to a vendor that swallows
+        // it. Not per outage: a nearly full disk has one per hook.
+        if self.refusal.is_none() && time_to_note(&mut self.refusal_noted_at) {
+            note!("the log refused a write ({refused}); keeping what it refuses until it stops");
+        }
+        let refusal = self.refusal.get_or_insert_with(|| Refusal {
+            since: Timestamp::now(),
+            began: std::time::Instant::now(),
+            first_error: refused.clone(),
+            landed: 0,
+            not_held: 0,
+        });
+        if !keep {
+            return Landing::Refused(refused);
+        }
+        let bytes = serde_json::to_vec(&entry.event).map_or(0, |event| event.len());
+        if self.held_bytes + bytes > HELD_MAX_BYTES {
+            refusal.not_held += 1;
+            return Landing::Refused(refused);
+        }
+        self.held_bytes += bytes;
+        self.held.push_back(Held {
+            entry: Entry {
+                // When it first tried, as a spooled entry says. `ts` stays the
+                // time it reached the log.
+                spooled_at: entry.spooled_at.or_else(|| Some(Timestamp::now())),
+                ..entry
+            },
+            declared,
+            bytes,
+            since: std::time::Instant::now(),
+        });
+        Landing::Held(refused)
+    }
+
+    /// Give the log what it refused, oldest first, until it refuses again.
+    fn land_held(&mut self) {
+        let mut took_one = false;
+        while let Some(front) = self.held.front() {
+            let landed = self.log.append(front.entry.clone());
+            let expired = front.since.elapsed() >= REFUSED_LIFE;
+            if landed.is_err() && !expired {
+                return;
+            }
+            let Some(held) = self.held.pop_front() else {
+                return;
+            };
+            self.held_bytes -= held.bytes;
+            let refusal = self.refusal.as_mut();
+            match landed {
+                Ok(written) => {
+                    took_one = true;
+                    if let Some(refusal) = refusal {
+                        refusal.landed += 1;
+                    }
+                    if let Some(record) = written {
+                        self.after_landing(record, held.declared);
+                    }
+                }
+                Err(_) => {
+                    if let Some(refusal) = refusal {
+                        refusal.not_held += 1;
+                    }
+                }
+            }
+        }
+        // Only a write that worked says the outage is over. A queue can also be
+        // empty because nothing was ever put in it, or because it expired.
+        if took_one {
+            self.report_refusal();
+        }
+    }
+
+    /// What `record` does behind a write, for one that went in late. No briefing
+    /// and no chat order: the hook that sent it stopped waiting long ago.
+    fn after_landing(&mut self, record: Record, declared: Option<HopProvenance>) {
+        let bus_id = record.bus_id;
+        let source = Source {
+            workspace: None,
+            ..record.source.clone()
+        };
+        if let Some(hook_id) = &record.hook_id {
+            self.remember_hook(hook_id.clone(), bus_id);
+            self.remove_spool_copy(hook_id);
+        }
+        let mut written = vec![record];
+        let mut seqs = Vec::new();
+        self.remember(&written);
+        self.follow_through(bus_id, &source, &mut written, &mut seqs, declared);
+    }
+
+    /// A held record's other copy, gone as soon as the first one lands.
+    ///
+    /// Leaving it to the drain would rest the outage on the 4,096 ids remembered,
+    /// and a long outage is more than that: each copy found past them is written
+    /// again and pushes out the id of the next. A hook still writing its copy as
+    /// this runs finds nothing to race: its id is among the newest, so the drain
+    /// answers the file without writing it.
+    fn remove_spool_copy(&self, hook_id: &str) {
+        if let Some(copy) = self.spool_copy(hook_id) {
+            let _ = fs::remove_file(copy);
+        }
+    }
+
+    /// Where the hook spools its copy of a request. The id came over a socket, and
+    /// only a file directly in the spool is ever a hook's copy.
+    fn spool_copy(&self, hook_id: &str) -> Option<PathBuf> {
+        let paths = self.root_paths()?;
+        let name = format!("{hook_id}.json");
+        (Path::new(&name).file_name() == Some(std::ffi::OsStr::new(&name)))
+            .then(|| paths.spool_dir().join(name))
+    }
+
+    /// How many held records have nothing on disk behind them.
+    fn only_in_memory(&self) -> u64 {
+        let on_disk = |held: &Held| {
+            held.entry
+                .hook_id
+                .as_deref()
+                .and_then(|hook_id| self.spool_copy(hook_id))
+                .is_some_and(|copy| fs::symlink_metadata(copy).is_ok())
+        };
+        self.held.iter().filter(|held| !on_disk(held)).count() as u64
+    }
+
+    /// What `doctor` asks about. Reads memory and stats the spool, and writes
+    /// nothing: on a full disk it could not, and a landing is not what was asked.
+    fn health(&self) -> crate::wire::Health {
+        crate::wire::Health {
+            refusing_since: self
+                .refusal
+                .as_ref()
+                .map(|refusal| refusal.since.to_string()),
+            held: self.held.len() as u64,
+            in_memory_only: self.only_in_memory(),
+        }
+    }
+
+    fn root_paths(&self) -> Option<Paths> {
+        self.arena_root
+            .as_deref()
+            .and_then(|root| Paths::from_env(root.to_str(), None, None).ok())
+    }
+
+    /// Whether the log has been refusing, without one write working, for `life`.
+    fn refusing_for(&self, life: Duration) -> bool {
+        self.refusal
+            .as_ref()
+            .is_some_and(|refusal| refusal.began.elapsed() >= life)
+    }
+
+    /// Say how the outage went, now there may be room to. Without this the only
+    /// trace of a full disk is a line in `daemon.log`, if that landed.
+    fn report_refusal(&mut self) {
+        let Some(refusal) = self.refusal.take() else {
+            return;
+        };
+        let told = format!(
+            "{} record(s) waited and landed, {} could not be kept, since {}: {}",
+            refusal.landed, refusal.not_held, refusal.since, refusal.first_error
+        );
+        if time_to_note(&mut self.recovery_noted_at) {
+            note!("the log takes writes again; {told}");
+        }
+        // Nothing waited and nothing was lost. A nearly full disk refuses a long
+        // record and takes the short one behind it, on every hook: that is no
+        // outage to leave a line about, and the long record is still in the spool.
+        if refusal.landed == 0 && refusal.not_held == 0 {
+            return;
+        }
+        let reason = if refusal.not_held > 0 {
+            "the log refused writes for a while and records may be lost"
+        } else {
+            "the log refused writes for a while"
+        };
+        crate::drops::record_in(
+            self.root_paths().as_ref(),
+            &crate::drops::Dropped::new(reason).with_detail(told),
+        );
+    }
+
     /// Fold what was written into the state the next briefing reads.
     fn remember(&mut self, written: &[Record]) {
         for record in written {
@@ -1520,6 +1819,13 @@ fn handle_connection(daemon: &mut Daemon, stream: UnixStream) -> io::Result<()> 
         if line.is_empty() {
             continue;
         }
+        if line == crate::wire::HEALTH_QUESTION {
+            let health = serde_json::to_string(&daemon.health()).map_err(io::Error::other)?;
+            writeln!(writer, "{health}")?;
+            writer.flush()?;
+            served += 1;
+            continue;
+        }
         let response = match serde_json::from_str::<Request>(&line) {
             Ok(request) => daemon.handle(request),
             Err(err) => Response::Failed {
@@ -1568,11 +1874,27 @@ fn session_was_cleared(written: &[Record]) -> bool {
     })
 }
 
+/// A refusal that came from the log rather than from a decision about the
+/// request. The daemon's own wording (`Daemon::record`).
+fn log_refused(error: &str) -> bool {
+    error.contains(" record(s) written, ")
+}
+
+/// Whether this file was written longer ago than `life`.
+fn outlived(file: &Path, life: Duration) -> bool {
+    std::fs::symlink_metadata(file)
+        .and_then(|meta| meta.modified())
+        .is_ok_and(|at| at.elapsed().is_ok_and(|age| age >= life))
+}
+
 /// Requests the spool holds, oldest first — the files are named for a UUIDv7,
-/// so a name sort is time order. Each goes through `Daemon::handle`, the one
+/// so a name sort is time order. Each goes through `Daemon::record`, the one
 /// writer, and is deleted after; a refusal that names a NEWER protocol stays
-/// for a newer daemon, while any other refusal is a drop with the reason.
+/// for a newer daemon, a log that refuses it keeps it until both the file and
+/// the refusal are `REFUSED_LIFE` old, and any other refusal is a drop with the
+/// reason.
 fn drain_spool(daemon: &mut Daemon, paths: &Paths) {
+    daemon.land_held();
     let Ok(entries) = std::fs::read_dir(paths.spool_dir()) else {
         return;
     };
@@ -1612,9 +1934,28 @@ fn drain_spool(daemon: &mut Daemon, paths: &Paths) {
                     .and_then(|v| v.get("event").and_then(|k| k.as_str().map(String::from)))
                     .unwrap_or_else(|| "unknown".into());
                 let session: String = request.vendor_session_id.chars().take(8).collect();
-                match daemon.handle(request) {
+                match daemon.record(request, false) {
                     Response::Failed { ref error } if error.contains("protocol v") => {
                         // A newer hook wrote this; a newer daemon drains it.
+                    }
+                    Response::Failed { error } if log_refused(&error) => {
+                        // Temporary, and this file is the only copy on disk. The
+                        // next tick tries again. Nothing behind it would fare
+                        // any better, so it does not hold the daemon up trying.
+                        // An old file is no reason to give up: a laptop shut for a
+                        // fortnight comes back with its spool, and the log has only
+                        // just refused it. It takes a log that has gone on refusing.
+                        if !(outlived(&file, REFUSED_LIFE) && daemon.refusing_for(REFUSED_LIFE)) {
+                            break;
+                        }
+                        // In this order: on a full disk the file going is what
+                        // makes room for the line that says so.
+                        let _ = std::fs::remove_file(&file);
+                        crate::drops::record_in(
+                            Some(paths),
+                            &crate::drops::Dropped::new(format!("spooled hook refused: {error}"))
+                                .with_detail(format!("{kind} for session {session}")),
+                        );
                     }
                     Response::Failed { error } => {
                         crate::drops::record_in(
@@ -1667,6 +2008,578 @@ mod tests {
             event,
             profile: None,
         }
+    }
+
+    /// A daemon over a log directory that cannot be written yet, because the
+    /// first segment cannot be created in it. Back to `0700`, it can.
+    fn daemon_over_a_closed_log(dir: &Path) -> Daemon {
+        let log = SegmentLog::open(dir, Retention::default()).expect("open");
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o500)).expect("close");
+        Daemon::new(log, Registry::new(), HashMap::new())
+    }
+
+    fn open_the_log(dir: &Path) {
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).expect("open");
+    }
+
+    fn turn(text: &str) -> Event {
+        Event::TurnStarted {
+            author: None,
+            prompt: Body::kept(text),
+        }
+    }
+
+    /// What a hook sends: every request names itself, and only those are held.
+    fn from_a_hook(event: Event) -> Request {
+        Request {
+            hook_id: Some(BusId::mint().to_string()),
+            ..request(event)
+        }
+    }
+
+    fn texts_on_disk(dir: &Path) -> Vec<String> {
+        SegmentLog::scan(dir)
+            .expect("scan")
+            .records
+            .iter()
+            .filter_map(|record| match &record.event {
+                Event::TurnStarted { prompt, .. } => prompt.as_text().map(str::to_string),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A daemon with a root of its own, whose log refuses until `open_the_log`.
+    fn rooted_over_a_closed_log(home: &Path) -> (Daemon, Paths) {
+        let paths = Paths::from_env(home.to_str(), None, None).expect("paths");
+        let daemon = daemon_over_a_closed_log(&paths.log_dir()).with_arena(home.to_path_buf());
+        fs::create_dir_all(paths.spool_dir()).expect("spool");
+        (daemon, paths)
+    }
+
+    /// The file a hook leaves for this request, as it would write it.
+    fn spool_copy_of(paths: &Paths, request: &Request) -> PathBuf {
+        let id = request.hook_id.as_deref().expect("a hook id");
+        let file = paths.spool_dir().join(format!("{id}.json"));
+        let copy = Request {
+            spooled_at: Some(Timestamp::now().to_string()),
+            ..request.clone()
+        };
+        fs::write(&file, serde_json::to_string(&copy).expect("json")).expect("copy");
+        file
+    }
+
+    #[test]
+    fn a_record_the_log_refuses_lands_when_it_stops_refusing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut daemon = daemon_over_a_closed_log(dir.path());
+
+        let response = daemon.handle(from_a_hook(turn("first")));
+        let Response::Failed { error } = response else {
+            panic!("the hook has to hear: {response:?}");
+        };
+        assert!(error.contains("0 record(s) written, 1 held: "), "{error}");
+
+        open_the_log(dir.path());
+        daemon.handle(request(turn("second")));
+
+        let scan = SegmentLog::scan(dir.path()).expect("scan");
+        let texts: Vec<_> = scan
+            .records
+            .iter()
+            .map(|record| match &record.event {
+                Event::TurnStarted { prompt, .. } => prompt.as_text().map(str::to_string),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            [Some("first".to_string()), Some("second".to_string())],
+            "in the order they arrived, and only once each"
+        );
+        assert!(scan.records[0].spooled_at.is_some(), "it says it waited");
+        assert!(scan.records[1].spooled_at.is_none(), "this one did not");
+        let one_conversation = scan.records[0].bus_id == scan.records[1].bus_id;
+        assert!(one_conversation, "a refused mint keeps its conversation");
+    }
+
+    #[test]
+    fn an_outage_is_over_only_when_a_write_has_worked() {
+        // A refused drain keeps its file and holds nothing in memory, so an
+        // empty queue says nothing about the log. Calling that the end of the
+        // outage wrote a line per tick for as long as the disk stayed full.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut daemon = daemon_over_a_closed_log(dir.path());
+
+        daemon.record(request(turn("from the spool")), false);
+        daemon.land_held();
+        assert!(daemon.refusal.is_some(), "the log has not taken anything");
+
+        open_the_log(dir.path());
+        daemon.record(request(turn("from the spool")), false);
+        assert!(daemon.refusal.is_none(), "that write was the proof");
+    }
+
+    #[test]
+    fn a_session_start_flushed_into_a_refusal_is_not_lost_with_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut daemon = daemon_over_a_closed_log(dir.path());
+        daemon.handle(request(Event::SessionCandidate {
+            trigger: Some("startup".into()),
+        }));
+
+        daemon.handle(from_a_hook(turn("the prompt behind it")));
+        open_the_log(dir.path());
+        daemon.handle(request(turn("next")));
+
+        let scan = SegmentLog::scan(dir.path()).expect("scan");
+        assert!(
+            matches!(scan.records[0].event, Event::SessionCandidate { .. }),
+            "{:?}",
+            scan.records
+        );
+        assert_eq!(scan.records.len(), 3);
+    }
+
+    #[test]
+    fn a_hook_id_that_landed_late_is_not_written_again_from_its_spool_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut daemon = daemon_over_a_closed_log(dir.path());
+        let with_id = || Request {
+            hook_id: Some("h1".into()),
+            ..request(turn("held, and spooled too"))
+        };
+
+        daemon.handle(with_id());
+        open_the_log(dir.path());
+        daemon.land_held();
+        let again = daemon.record(
+            Request {
+                spooled_at: Some("2026-11-01T00:00:00.000Z".into()),
+                ..with_id()
+            },
+            false,
+        );
+
+        assert!(matches!(again, Response::Recorded { .. }), "{again:?}");
+        let scan = SegmentLog::scan(dir.path()).expect("scan");
+        assert_eq!(scan.records.len(), 1);
+    }
+
+    #[test]
+    fn a_drained_entry_is_not_held_as_well_while_the_log_refuses() {
+        // Its file is the durable copy. Holding it too would write it twice.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut daemon = daemon_over_a_closed_log(dir.path());
+
+        let response = daemon.record(request(turn("from the spool")), false);
+
+        let Response::Failed { error } = response else {
+            panic!("{response:?}");
+        };
+        assert!(log_refused(&error), "{error}");
+        assert!(daemon.held.is_empty());
+    }
+
+    #[test]
+    fn holding_stops_at_a_cap_and_says_lost() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut daemon = daemon_over_a_closed_log(dir.path());
+        let large = "x".repeat(HELD_MAX_BYTES / 2 + 1);
+
+        let first = daemon.handle(from_a_hook(turn(&large)));
+        let second = daemon.handle(from_a_hook(turn(&large)));
+
+        let Response::Failed { error: first } = first else {
+            panic!("{first:?}");
+        };
+        let Response::Failed { error: second } = second else {
+            panic!("{second:?}");
+        };
+        assert!(first.contains(" held: "), "{first}");
+        assert!(second.contains(" lost: "), "the hook still tries: {second}");
+        assert_eq!(daemon.held.len(), 1);
+    }
+
+    #[test]
+    fn a_quota_stop_that_waited_still_records_its_hop() {
+        // The hook is long gone, but the conversation did stop on a limit.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = SegmentLog::open(dir.path(), Retention::default()).expect("open");
+        let mut daemon = Daemon::new(log, Registry::new(), HashMap::new());
+        daemon.handle(request(turn("work")));
+        // A daemon holding the segment open goes on writing, so this one
+        // loses its handle the way a failed write loses it.
+        let segment = SegmentLog::current_segment(dir.path()).expect("segment");
+        daemon.log = SegmentLog::open(dir.path(), Retention::default()).expect("reopen");
+        fs::set_permissions(&segment, fs::Permissions::from_mode(0o400)).expect("close");
+
+        daemon.handle(from_a_hook(Event::TurnEnded {
+            state: TurnState::InterruptedQuota {
+                reason: "rate_limit".into(),
+            },
+            assistant_message: None,
+            tokens: None,
+        }));
+        assert_eq!(daemon.held.len(), 1);
+        fs::set_permissions(&segment, fs::Permissions::from_mode(0o600)).expect("open");
+        daemon.land_held();
+
+        let scan = SegmentLog::scan(dir.path()).expect("scan");
+        assert!(
+            scan.records
+                .iter()
+                .any(|record| matches!(record.event, Event::Routed { .. })),
+            "{:?}",
+            scan.records
+        );
+    }
+
+    #[test]
+    fn a_first_prompt_that_waited_is_not_briefed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = SegmentLog::open(dir.path(), Retention::default()).expect("open");
+        let mut daemon = Daemon::new(log, Registry::new(), HashMap::new());
+        for text in ["earlier work", "more earlier work"] {
+            daemon.handle(request(turn(text)));
+            daemon.handle(request(Event::TurnEnded {
+                state: TurnState::Complete,
+                assistant_message: Some(Body::kept("done")),
+                tokens: None,
+            }));
+        }
+        let segment = SegmentLog::current_segment(dir.path()).expect("segment");
+        daemon.log = SegmentLog::open(dir.path(), Retention::default()).expect("reopen");
+        fs::set_permissions(&segment, fs::Permissions::from_mode(0o400)).expect("close");
+
+        daemon.handle(Request {
+            vendor_session_id: "a-new-session".into(),
+            ..from_a_hook(turn("a new session during the outage"))
+        });
+        fs::set_permissions(&segment, fs::Permissions::from_mode(0o600)).expect("open");
+        daemon.land_held();
+
+        let scan = SegmentLog::scan(dir.path()).expect("scan");
+        assert!(
+            !scan
+                .records
+                .iter()
+                .any(|record| matches!(record.event, Event::Briefed { .. })),
+            "{:?}",
+            scan.records
+        );
+    }
+
+    /// A log whose one segment refuses the next write, and a daemon that has to
+    /// reopen it, as a failed write would leave it.
+    fn a_daemon_on_a_refusing_segment(dir: &Path) -> (Daemon, PathBuf) {
+        let log = SegmentLog::open(dir, Retention::default()).expect("open");
+        let mut daemon = Daemon::new(log, Registry::new(), HashMap::new());
+        daemon.handle(request(turn("work")));
+        daemon.log = SegmentLog::open(dir, Retention::default()).expect("reopen");
+        let segment = SegmentLog::current_segment(dir).expect("segment");
+        fs::set_permissions(&segment, fs::Permissions::from_mode(0o400)).expect("close");
+        (daemon, segment)
+    }
+
+    fn a_hop_to_cursor() -> Request {
+        Request {
+            brief: false,
+            ..request(Event::Routed {
+                next: Harness::CURSOR.into(),
+                hop: Hop::HandedOff,
+                reason: "typed by hand".into(),
+                code_freshness: None,
+                provenance: None,
+            })
+        }
+    }
+
+    #[test]
+    fn a_hop_refused_to_its_caller_does_not_land_later() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut daemon, segment) = a_daemon_on_a_refusing_segment(dir.path());
+
+        let answer = daemon.handle(a_hop_to_cursor());
+
+        assert!(matches!(answer, Response::Failed { .. }), "{answer:?}");
+        fs::set_permissions(&segment, fs::Permissions::from_mode(0o600)).expect("open");
+        daemon.land_held();
+        let scan = SegmentLog::scan(dir.path()).expect("scan");
+        let routed = scan
+            .records
+            .iter()
+            .filter(|r| matches!(r.event, Event::Routed { .. }))
+            .count();
+        assert_eq!(
+            routed, 0,
+            "the caller was told it was refused, and it landed"
+        );
+    }
+
+    #[test]
+    fn a_lease_refused_to_its_caller_does_not_land_later() {
+        // `conbus hop` reports this as a failure and opens no second thread on it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut daemon, segment) = a_daemon_on_a_refusing_segment(dir.path());
+
+        let answer = daemon.handle(Request {
+            brief: false,
+            ..request(Event::Leased {
+                holder: "warm:thr_refused".into(),
+            })
+        });
+
+        assert!(matches!(answer, Response::Failed { .. }), "{answer:?}");
+        fs::set_permissions(&segment, fs::Permissions::from_mode(0o600)).expect("open");
+        daemon.land_held();
+        let scan = SegmentLog::scan(dir.path()).expect("scan");
+        assert!(
+            !scan
+                .records
+                .iter()
+                .any(|r| matches!(r.event, Event::Leased { .. })),
+            "{:?}",
+            scan.records
+        );
+    }
+
+    #[test]
+    fn a_write_that_works_with_nothing_waiting_leaves_no_line() {
+        // A hop told it failed, then the next write working: nothing waited and
+        // nothing was lost, and a nearly full disk can do this on every hook.
+        let home = tempfile::tempdir().expect("tempdir");
+        let (mut daemon, paths) = rooted_over_a_closed_log(home.path());
+        let refused = daemon.handle(a_hop_to_cursor());
+        assert!(matches!(
+            refused,
+            Response::Orphaned | Response::Failed { .. }
+        ));
+        daemon.record(request(turn("refused, and its file stays")), false);
+        assert!(daemon.refusal.is_some());
+        open_the_log(&paths.log_dir());
+
+        daemon.handle(request(turn("this one fits")));
+
+        assert!(daemon.refusal.is_none(), "that write was the proof");
+        let said = fs::read_to_string(paths.root().join("drops.jsonl")).unwrap_or_default();
+        assert_eq!(said, "");
+    }
+
+    #[test]
+    fn a_drained_entry_that_landed_after_waiting_leaves_the_line() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let (mut daemon, paths) = rooted_over_a_closed_log(home.path());
+        let drained = Request {
+            hook_id: Some(BusId::mint().to_string()),
+            spooled_at: Some(Timestamp::now().to_string()),
+            ..request(turn("from the spool"))
+        };
+        daemon.record(drained.clone(), false);
+        open_the_log(&paths.log_dir());
+
+        daemon.record(drained, false);
+
+        let said = fs::read_to_string(paths.root().join("drops.jsonl")).unwrap_or_default();
+        assert_eq!(said.lines().count(), 1, "{said}");
+        assert!(
+            said.contains("\"reason\":\"the log refused writes for a while\""),
+            "{said}"
+        );
+        assert!(said.contains("1 record(s) waited and landed"), "{said}");
+    }
+
+    #[test]
+    fn a_held_record_that_could_not_be_kept_says_records_may_be_lost() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let (mut daemon, paths) = rooted_over_a_closed_log(home.path());
+        let large = "x".repeat(HELD_MAX_BYTES + 1);
+        daemon.handle(from_a_hook(turn(&large)));
+        open_the_log(&paths.log_dir());
+
+        daemon.handle(request(turn("next")));
+
+        let said = fs::read_to_string(paths.root().join("drops.jsonl")).unwrap_or_default();
+        assert_eq!(said.lines().count(), 1, "{said}");
+        assert!(
+            said.contains(
+                "\"reason\":\"the log refused writes for a while and records may be lost\""
+            ),
+            "{said}"
+        );
+    }
+
+    #[test]
+    fn health_counts_what_has_nothing_on_disk_behind_it() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let (mut daemon, paths) = rooted_over_a_closed_log(home.path());
+        assert_eq!(
+            daemon.health(),
+            crate::wire::Health {
+                refusing_since: None,
+                held: 0,
+                in_memory_only: 0
+            },
+            "nothing is wrong"
+        );
+        let spooled = from_a_hook(turn("with a copy"));
+        let copy = spool_copy_of(&paths, &spooled);
+        daemon.handle(spooled);
+        daemon.handle(from_a_hook(turn("no room for a copy")));
+
+        let health = daemon.health();
+
+        assert_eq!((health.held, health.in_memory_only), (2, 1));
+        assert!(health.refusing_since.is_some());
+        assert!(copy.exists());
+        open_the_log(&paths.log_dir());
+        assert_eq!(daemon.held.len(), 2, "asking lands nothing");
+        assert!(
+            SegmentLog::scan(paths.log_dir())
+                .expect("scan")
+                .records
+                .is_empty(),
+            "and writes nothing"
+        );
+    }
+
+    #[test]
+    fn a_record_does_not_jump_what_the_log_refused_first() {
+        // The log can come back between the queue's last try and the next record,
+        // and a nearly full disk can refuse a long record and take a short one.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut daemon = daemon_over_a_closed_log(dir.path());
+        daemon.handle(from_a_hook(turn("first")));
+        daemon.land_held();
+        assert_eq!(daemon.held.len(), 1, "still refusing");
+        open_the_log(dir.path());
+
+        let second = daemon.record(from_a_hook(turn("second")), true);
+
+        assert!(matches!(second, Response::Failed { .. }), "{second:?}");
+        daemon.land_held();
+        assert_eq!(texts_on_disk(dir.path()), ["first", "second"]);
+    }
+
+    #[test]
+    fn a_record_held_past_its_life_is_let_go_and_counted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut daemon = daemon_over_a_closed_log(dir.path());
+        daemon.handle(from_a_hook(turn("held too long")));
+        daemon.handle(from_a_hook(turn("held just now")));
+        let bytes_of_both = daemon.held_bytes;
+        let first_bytes = daemon.held[0].bytes;
+        daemon.held[0].since = std::time::Instant::now()
+            .checked_sub(REFUSED_LIFE + Duration::from_secs(60))
+            .expect("a week ago");
+
+        daemon.land_held();
+
+        assert_eq!(daemon.held.len(), 1, "only the old one goes");
+        assert_eq!(daemon.held_bytes, bytes_of_both - first_bytes);
+        let not_held = daemon.refusal.as_ref().map(|refusal| refusal.not_held);
+        assert_eq!(not_held, Some(1), "the outage's line will say so");
+        open_the_log(dir.path());
+        daemon.land_held();
+        assert_eq!(texts_on_disk(dir.path()), ["held just now"]);
+    }
+
+    #[test]
+    fn a_held_record_takes_its_spool_copy_with_it_when_it_lands() {
+        // Without a drain in between: the copy is what the dedupe window would
+        // otherwise have to catch, and a long outage is wider than the window.
+        let home = tempfile::tempdir().expect("tempdir");
+        let (mut daemon, paths) = rooted_over_a_closed_log(home.path());
+        let request = from_a_hook(turn("held and spooled"));
+        let copy = spool_copy_of(&paths, &request);
+        daemon.handle(request);
+        assert!(copy.exists(), "it stays while the log refuses");
+
+        open_the_log(&paths.log_dir());
+        daemon.land_held();
+
+        assert!(!copy.exists(), "it would be written twice past the window");
+        assert_eq!(texts_on_disk(&paths.log_dir()), ["held and spooled"]);
+    }
+
+    #[test]
+    fn a_copy_written_after_its_record_landed_is_answered_not_written_again() {
+        // The race: the hook is told `held`, the log comes back, and its file
+        // arrives only after the landing that would have removed it. Its id was
+        // the newest in the queue, so the window still has it, however long the
+        // queue in front of it was.
+        let home = tempfile::tempdir().expect("tempdir");
+        let (mut daemon, paths) = rooted_over_a_closed_log(home.path());
+        let past_the_window = 4_200;
+        for _ in 0..past_the_window {
+            daemon.handle(from_a_hook(turn("held")));
+        }
+        let late = from_a_hook(turn("the newest"));
+        daemon.handle(late.clone());
+        open_the_log(&paths.log_dir());
+        daemon.land_held();
+        assert_eq!(daemon.held.len(), 0);
+
+        let copy = spool_copy_of(&paths, &late);
+        drain_spool(&mut daemon, &paths);
+
+        assert!(!copy.exists(), "the drain still answers it");
+        assert_eq!(texts_on_disk(&paths.log_dir()).len(), past_the_window + 1);
+    }
+
+    #[test]
+    fn a_hook_id_that_is_not_a_file_name_removes_nothing() {
+        // The id comes over the socket. Only a file directly in the spool is
+        // ever a hook's copy.
+        let home = tempfile::tempdir().expect("tempdir");
+        let (mut daemon, paths) = rooted_over_a_closed_log(home.path());
+        let outside = home.path().join("precious.json");
+        fs::write(&outside, "{}").expect("write");
+
+        daemon.handle(Request {
+            hook_id: Some("../precious".into()),
+            ..request(turn("held"))
+        });
+        open_the_log(&paths.log_dir());
+        daemon.land_held();
+
+        assert_eq!(texts_on_disk(&paths.log_dir()), ["held"]);
+        assert!(outside.exists(), "it reached out of the spool");
+    }
+
+    #[test]
+    fn a_refused_entry_goes_only_when_it_and_the_refusal_have_both_lasted() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let (mut daemon, paths) = rooted_over_a_closed_log(home.path());
+        let old = spool_copy_of(&paths, &from_a_hook(turn("written long ago")));
+        // A name sort is time order, and this one comes second.
+        std::thread::sleep(Duration::from_millis(2));
+        let young = spool_copy_of(&paths, &from_a_hook(turn("written just now")));
+        fs::File::options()
+            .write(true)
+            .open(&old)
+            .expect("open")
+            .set_modified(std::time::SystemTime::now() - REFUSED_LIFE - Duration::from_secs(60))
+            .expect("age it");
+
+        drain_spool(&mut daemon, &paths);
+        assert!(
+            old.exists(),
+            "the file is old, but the log only just refused"
+        );
+        let said = || fs::read_to_string(paths.root().join("drops.jsonl")).unwrap_or_default();
+        assert_eq!(said(), "");
+
+        daemon.refusal.as_mut().expect("refusing").began = std::time::Instant::now()
+            .checked_sub(REFUSED_LIFE + Duration::from_secs(60))
+            .expect("a week ago");
+        drain_spool(&mut daemon, &paths);
+
+        assert!(!old.exists(), "a week of refusals, and a week-old file");
+        assert!(young.exists(), "its life is not over");
+        assert!(said().contains("spooled hook refused"), "{}", said());
+        assert!(said().contains("turn_started for session"), "{}", said());
+        open_the_log(&paths.log_dir());
     }
 
     #[test]
