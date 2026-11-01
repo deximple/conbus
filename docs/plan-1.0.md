@@ -202,7 +202,7 @@ M1의 끝: `git cherry -v main devin/unlock`과 파일별 대조로 남은 차�
 | `log --tail 1` | 8.1 s | ≤ 0.2 s |
 | `usage --days 7` | 12.7 s | ≤ 2 s |
 | `doctor` | 22.4 s | ≤ 3 s |
-| 시작 → serving | 약 110 s | ≤ 5 s |
+| 시작 → serving(실제 재시작: 서빙 → 훅 기록 몇 개 → TERM → 재시작) | 약 110 s | ≤ 5 s |
 | 재시작 중 훅 유실 | 0.2.7에서 5 s 창에 5건, 지금 창은 110 s | 0 |
 | 레코더 RSS | 340 MB | ≤ 256 MB |
 
