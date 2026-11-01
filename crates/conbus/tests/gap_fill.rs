@@ -249,3 +249,97 @@ fn a_start_still_fills_what_a_fork_itself_missed() {
             .all(|record| record["bus_id"] == fork && record["vendor_session_id"] == CHILD)
     );
 }
+
+/// A `user` line carrying vendor flags.
+fn flagged(session: &str, id: &str, text: &str, flags: Value) -> String {
+    let mut line: Value = serde_json::from_str(&user(session, id, text)).expect("json");
+    for (key, value) in flags.as_object().expect("flags") {
+        line[key] = value.clone();
+    }
+    line.to_string()
+}
+
+#[test]
+fn a_start_does_not_record_vendor_bookkeeping_as_turns() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let daemon = start(home);
+    hook(home, &prompt(CHILD, "seen", "the prompt the hook saw"));
+    stop(daemon);
+    transcript(
+        home,
+        CHILD,
+        &[
+            user(CHILD, "seen", "the prompt the hook saw"),
+            flagged(
+                CHILD,
+                "m1",
+                "Base directory for this skill",
+                json!({"isMeta": true}),
+            ),
+            flagged(
+                CHILD,
+                "m2",
+                "This session is being continued",
+                json!({"isCompactSummary": true, "isVisibleInTranscriptOnly": true}),
+            ),
+            user(CHILD, "m3", "[Request interrupted by user]"),
+            flagged(
+                CHILD,
+                "m4",
+                "<local-command-caveat>x</local-command-caveat>",
+                json!({"isMeta": true}),
+            ),
+            user(CHILD, "m4", "<command-name>/model</command-name>"),
+            user(
+                CHILD,
+                "m4",
+                "<local-command-stdout>y</local-command-stdout>",
+            ),
+        ],
+    );
+
+    stop(start(home));
+
+    let filled: Vec<Value> = log_lines(home)
+        .into_iter()
+        .filter(|record| record.get("backfilled_from").is_some())
+        .collect();
+    assert!(filled.is_empty(), "{}", show(&filled));
+}
+
+#[test]
+fn a_missed_turn_with_a_skill_body_is_filled_with_its_reply() {
+    // Before, the body was a second prompt under the same id: `missing_from`
+    // saw the id again and dropped the reply behind it.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let daemon = start(home);
+    hook(home, &prompt(CHILD, "seen", "the prompt the hook saw"));
+    stop(daemon);
+    transcript(
+        home,
+        CHILD,
+        &[
+            user(CHILD, "seen", "the prompt the hook saw"),
+            user(CHILD, "missed", "use the skill"),
+            flagged(
+                CHILD,
+                "missed",
+                "Base directory for this skill",
+                json!({"isMeta": true}),
+            ),
+            reply(CHILD, "the skill's answer"),
+        ],
+    );
+
+    stop(start(home));
+
+    let filled: Vec<Value> = log_lines(home)
+        .into_iter()
+        .filter(|record| record.get("backfilled_from").is_some())
+        .collect();
+    assert_eq!(filled.len(), 2, "{}", show(&filled));
+    assert_eq!(filled[0]["prompt"]["text"], "use the skill");
+    assert_eq!(filled[1]["assistant_message"]["text"], "the skill's answer");
+}
