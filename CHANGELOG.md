@@ -18,6 +18,11 @@ the entry says so when it does.
   compaction no longer ends the turn it sits inside. A turn the person
   interrupted now has no ending, as on the live path. Records already in the log
   stay: the log is append-only.
+- Gap fill dedupes on the right keys. A vendor turn id decides, so a missed turn
+  whose words were said before is filled instead of skipped. Every conversation
+  a split session was written under is consulted, so its older turns are not
+  written again. A prompt whose hook was lost is filled even when the turn's other
+  events arrived, without a second ending.
 
 ## [1.0.0-rc.3] — 2026-11-01
 
