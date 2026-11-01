@@ -38,6 +38,11 @@ the entry says so when it does.
 
 ### Fixed
 
+- Grok 1.0.71: a turn that ends without completing (`StopCancelled`: a
+  person interrupting, a declined permission, a turn limit) is recorded as an
+  interrupted turn, and the extra `Stop` Grok fires after the session ends is
+  no longer recorded as a second turn end. `install --apply` registers
+  `StopCancelled`.
 - OpenCode 2.x is recorded again. It refuses the plugin 1.x loads, so nothing
   reached the log from OpenCode after it moved to 2.0. `conbus install` now
   writes the plugin the installed OpenCode loads (asking `opencode --version`),
