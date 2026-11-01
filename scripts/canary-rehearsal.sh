@@ -840,6 +840,60 @@ expect_grep '^UNCHECKED usage-parity' "$tmp/verdict-blind.out" \
 expect_grep '^UNCHECKED twins-repeated' "$tmp/verdict-blind.out" \
     "no in-window rows do not pass twins-repeated"
 
+# C1 — verdict paths the bash -x trace showed the rehearsal never reached
+# (evidence/c1-unrun-lines.md). A day-only --since bounds the window at
+# UTC midnight of that day.
+verdict_fixture
+cat >"$home/.conbus/canary.json" <<EOF
+{"swapped":"$past","prev_build":"01d","candidate_build":"beef","candidate_sha256":"x","restarts":[]}
+EOF
+code=0
+run verdict --since "${past:0:10}" >"$tmp/verdict-since.out" 2>&1 || code=$?
+expect 0 "$code" "--since YYYY-MM-DD completes the same window"
+expect_grep "since ${past:0:10}T00:00:00.000Z" "$tmp/verdict-since.out" \
+    "the day-only --since becomes a UTC midnight boundary"
+
+# Parity has no 0.2.8 side at all when the rollback copy is gone — that is
+# a FAIL, not an agreement of empties.
+verdict_fixture
+cat >"$home/.conbus/canary.json" <<EOF
+{"swapped":"$past","prev_build":"01d","candidate_build":"beef","candidate_sha256":"x","restarts":[]}
+EOF
+rm -f "$rollback_bin"
+code=0
+run verdict >"$tmp/verdict-noroll.out" 2>&1 || code=$?
+expect 1 "$code" "a missing rollback binary fails the parity check"
+expect_grep '^FAIL usage-parity' "$tmp/verdict-noroll.out" \
+    "the missing 0.2.8 side is named"
+
+# A daemon.log without the "(N record(s), N unreadable)" parenthetical
+# falls back to the doctor's own log line for the unreadable count.
+verdict_fixture
+cat >"$home/.conbus/canary.json" <<EOF
+{"swapped":"$past","prev_build":"01d","candidate_build":"beef","candidate_sha256":"x","restarts":[]}
+EOF
+cat >"$home/.conbus/daemon.log" <<EOF
+$(date -u +%Y-%m-%dT%H:%M:%S.000Z) conbus daemon: beef: socket /x/sock log /x/log
+EOF
+code=0
+run verdict >"$tmp/verdict-unread.out" 2>&1 || code=$?
+expect 0 "$code" "the doctor-fallback unreadable count completes the window"
+expect_grep '^PASS unreadable' "$tmp/verdict-unread.out" \
+    "the unreadable count falls back to the doctor's log line"
+
+# A joined machine's sync POSTs are operator-visible, not a silent pass.
+verdict_fixture
+cat >"$home/.conbus/canary.json" <<EOF
+{"swapped":"$past","prev_build":"01d","candidate_build":"beef","candidate_sha256":"x","restarts":[]}
+EOF
+touch "$home/.conbus/sync.json"
+code=0
+run verdict >"$tmp/verdict-sync.out" 2>&1 || code=$?
+expect 0 "$code" "an unchecked sync line does not fail the verdict"
+expect_grep '^UNCHECKED sync' "$tmp/verdict-sync.out" \
+    "a joined machine's POSTs need counting"
+rm -f "$home/.conbus/sync.json"
+
 # A policy file that cannot be a policy decides nothing: zero counted
 # denials over it is not a pass.
 verdict_fixture
