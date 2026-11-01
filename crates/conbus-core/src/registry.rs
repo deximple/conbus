@@ -660,9 +660,9 @@ mod tests {
 
     #[test]
     fn only_cursor_mints_on_a_tool_call() {
-        // The rule is Cursor's alone. Claude Code fires ghost session starts
-        // and a tool call under an unbound Claude session is the ordinary
-        // shape of a daemon restart mid-turn, which must stay an orphan.
+        // The rule is Cursor's alone. Claude Code fires ghost session starts,
+        // and a tool call under an unbound Claude session means its prompt has
+        // not arrived, so it stays an orphan and waits in the spool for one.
         let mut registry = Registry::new();
         let requested = Event::ToolRequested {
             tool: "Read".into(),

@@ -68,10 +68,63 @@ pub struct Daemon {
     held_bytes: usize,
     /// The outage the queue above belongs to, once there is one.
     refusal: Option<Refusal>,
+    /// Spool entries read once and not worth reading again yet. A spool can hold
+    /// thousands of them, and a drain runs in front of every hook behind it.
+    parked: HashMap<PathBuf, Parked>,
     /// When `daemon.log` last heard about the log refusing, and about it taking
     /// writes again. A nearly full disk can do both on every hook.
     refusal_noted_at: Option<std::time::Instant>,
     recovery_noted_at: Option<std::time::Instant>,
+}
+
+/// How long a spooled event waits for its session to get a conversation.
+///
+/// The prompt that would bind it is the next one that session sends, which comes
+/// once the turn in hand is over. A first turn can run for hours, and the person
+/// may come back later still. A day takes in most of that without making a ghost
+/// session's events sit around for long.
+const ORPHAN_LIFE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// The most of the spool's 16 MiB those events may hold. They share it with the
+/// hooks of the next restart, which have somewhere to land straight away.
+const ORPHAN_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
+/// A spool entry that cannot land yet, and what would change that.
+struct Parked {
+    /// The session whose binding would let it land. `None` for an entry only a
+    /// newer build can read, which this daemon's life will not change.
+    session: Option<SessionKey>,
+    /// When its life is over, and it is read one last time.
+    until: std::time::SystemTime,
+    bytes: u64,
+    /// What it is and whose, for the drop line if the quota takes it.
+    detail: String,
+}
+
+impl Parked {
+    fn due(&self, registry: &Registry, now: std::time::SystemTime) -> bool {
+        now >= self.until
+            || self
+                .session
+                .as_ref()
+                .is_some_and(|key| registry.bus_id(key).is_some())
+    }
+
+    /// Parked for what is left of `life`, counted from when the file was written.
+    fn of(file: &Path, session: Option<SessionKey>, life: Duration, detail: String) -> Self {
+        let meta = std::fs::symlink_metadata(file);
+        Parked {
+            session,
+            until: meta
+                .as_ref()
+                .ok()
+                .and_then(|meta| meta.modified().ok())
+                .unwrap_or_else(std::time::SystemTime::now)
+                + life,
+            bytes: meta.map_or(0, |meta| meta.len()),
+            detail,
+        }
+    }
 }
 
 /// The most the daemon keeps in memory for a log that refuses it: the spool's
@@ -170,6 +223,7 @@ impl Daemon {
             held: VecDeque::new(),
             held_bytes: 0,
             refusal: None,
+            parked: HashMap::new(),
             refusal_noted_at: None,
             recovery_noted_at: None,
         }
@@ -1942,8 +1996,8 @@ fn outlived(file: &Path, life: Duration) -> bool {
 /// so a name sort is time order. Each goes through `Daemon::record`, the one
 /// writer, and is deleted after. A log that refuses it keeps it until both the
 /// file and the refusal are `WAITING_LIFE` old, a build that cannot read it keeps
-/// it for `WAITING_LIFE`, and any other refusal is a drop with the
-/// reason.
+/// it for `WAITING_LIFE`, and a session with no conversation yet for
+/// `ORPHAN_LIFE`; any other refusal is a drop with the reason.
 fn drain_spool(daemon: &mut Daemon, paths: &Paths) {
     daemon.land_held();
     let Ok(entries) = std::fs::read_dir(paths.spool_dir()) else {
@@ -1955,7 +2009,16 @@ fn drain_spool(daemon: &mut Daemon, paths: &Paths) {
         .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
         .collect();
     files.sort();
+    // Whatever is no longer in the spool falls out of this along the way.
+    let mut parked = std::mem::take(&mut daemon.parked);
+    let now = std::time::SystemTime::now();
     for file in files {
+        if let Some(entry) = parked.remove(&file)
+            && !entry.due(&daemon.registry, now)
+        {
+            daemon.parked.insert(file, entry);
+            continue;
+        }
         // Only what a hook writes: a regular file no larger than the hook's own
         // 1 MiB cap. A link or an oversized file is nobody's spooled request,
         // and following or loading it would read whatever it points at.
@@ -1982,6 +2045,9 @@ fn drain_spool(daemon: &mut Daemon, paths: &Paths) {
                 if let Some(theirs) = from_a_build_that_can_read_it(text) {
                     if outlived(&file, WAITING_LIFE) {
                         let_go(paths, &file, newer_hook(theirs), named_by(text));
+                    } else {
+                        let parked = Parked::of(&file, None, WAITING_LIFE, named_by(text));
+                        daemon.parked.insert(file, parked);
                     }
                     continue;
                 }
@@ -2003,12 +2069,18 @@ fn drain_spool(daemon: &mut Daemon, paths: &Paths) {
                     .and_then(|v| v.get("event").and_then(|k| k.as_str().map(String::from)))
                     .unwrap_or_else(|| "unknown".into());
                 let session: String = request.vendor_session_id.chars().take(8).collect();
+                let key = SessionKey::new(request.harness.clone(), &request.vendor_session_id);
+                let waits = mid_turn(&request.event);
                 match daemon.record(request, false) {
                     Response::Failed { error } if error.contains("protocol v") => {
                         // A newer hook wrote this; a newer daemon drains it, if
                         // one comes.
+                        let detail = format!("{kind} for session {session}");
                         if outlived(&file, WAITING_LIFE) {
-                            let_go(paths, &file, error, format!("{kind} for session {session}"));
+                            let_go(paths, &file, error, detail);
+                        } else {
+                            let parked = Parked::of(&file, None, WAITING_LIFE, detail);
+                            daemon.parked.insert(file, parked);
                         }
                     }
                     Response::Failed { error } if log_refused(&error) => {
@@ -2031,14 +2103,13 @@ fn drain_spool(daemon: &mut Daemon, paths: &Paths) {
                         let _ = std::fs::remove_file(&file);
                     }
                     Response::Orphaned => {
-                        crate::drops::record_in(
-                            Some(paths),
-                            &crate::drops::Dropped::new(
-                                "spooled hook still has no conversation (orphan)",
-                            )
-                            .with_detail(format!("{kind} for session {session}")),
-                        );
-                        let _ = std::fs::remove_file(&file);
+                        let detail = format!("{kind} for session {session}");
+                        if !waits || outlived(&file, ORPHAN_LIFE) {
+                            give_up_on_an_orphan(paths, &file, &detail);
+                        } else {
+                            let parked = Parked::of(&file, Some(key), ORPHAN_LIFE, detail);
+                            daemon.parked.insert(file, parked);
+                        }
                     }
                     _ => {
                         let _ = std::fs::remove_file(&file);
@@ -2046,6 +2117,68 @@ fn drain_spool(daemon: &mut Daemon, paths: &Paths) {
                 }
             }
         }
+    }
+    shed_orphans(daemon, paths);
+}
+
+/// Whether an event with no conversation yet is worth keeping for the prompt
+/// that would give it one.
+///
+/// Tool events are, because nothing else can bring them back: no transcript
+/// parser recovers a tool record. A turn's end is not. Its words can come back
+/// through gap fill, and landing it a day late would read as the end of whichever
+/// turn is running by then, or start a hop on a limit long since over. A session's
+/// end means no prompt is coming to bind it.
+fn mid_turn(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::ToolRequested { .. }
+            | Event::ToolUse { .. }
+            | Event::ToolDenied { .. }
+            | Event::ToolBatchEnded { .. }
+            | Event::PermissionAsked { .. }
+            | Event::Notified { .. }
+    )
+}
+
+/// Oldest first, until the orphans are back under their share of the spool.
+fn shed_orphans(daemon: &mut Daemon, paths: &Paths) {
+    let orphans = |entry: &Parked| entry.session.is_some();
+    let mut holding: u64 = daemon
+        .parked
+        .values()
+        .filter(|entry| orphans(entry))
+        .map(|entry| entry.bytes)
+        .sum();
+    if holding <= ORPHAN_MAX_BYTES {
+        return;
+    }
+    let mut oldest: Vec<PathBuf> = daemon
+        .parked
+        .iter()
+        .filter(|(_, entry)| orphans(entry))
+        .map(|(file, _)| file.clone())
+        .collect();
+    oldest.sort();
+    for file in oldest {
+        if holding <= ORPHAN_MAX_BYTES {
+            break;
+        }
+        if let Some(entry) = daemon.parked.remove(&file) {
+            holding -= entry.bytes;
+            give_up_on_an_orphan(paths, &file, &entry.detail);
+        }
+    }
+}
+
+/// As [`let_go`], under the reason `classify` already files as an orphan.
+fn give_up_on_an_orphan(paths: &Paths, file: &Path, detail: &str) {
+    if std::fs::remove_file(file).is_ok() {
+        crate::drops::record_in(
+            Some(paths),
+            &crate::drops::Dropped::new("spooled hook still has no conversation (orphan)")
+                .with_detail(detail),
+        );
     }
 }
 
@@ -2298,6 +2431,45 @@ mod tests {
                 .any(|record| matches!(record.event, Event::Routed { .. })),
             "{:?}",
             scan.records
+        );
+    }
+
+    #[test]
+    fn a_late_tool_event_leaves_a_quota_stop_a_quota_stop() {
+        // The next session is told about it first, offered `conbus hop`, and
+        // its `continued` edge depends on it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = SegmentLog::open(dir.path(), Retention::default()).expect("open");
+        let mut daemon = Daemon::new(log, Registry::new(), HashMap::new());
+        let before_the_stop = Timestamp::now().to_string();
+        daemon.handle(request(turn("work")));
+        std::thread::sleep(Duration::from_millis(2));
+        daemon.handle(request(Event::TurnEnded {
+            state: TurnState::InterruptedQuota {
+                reason: "rate_limit".into(),
+            },
+            assistant_message: None,
+            tokens: None,
+        }));
+
+        daemon.handle(Request {
+            hook_id: Some(BusId::mint().to_string()),
+            spooled_at: Some(before_the_stop),
+            ..request(Event::ToolRequested {
+                tool: "Read".into(),
+                tool_use_id: None,
+                input: Body::kept("{}"),
+            })
+        });
+
+        let scan = SegmentLog::scan(dir.path()).expect("scan");
+        let chapter = &daemon.chapters[&scan.records[0].bus_id];
+        assert_eq!(chapter.stopped(), Stopped::Displaced);
+        let restarted = Daemon::chapters(&scan.records);
+        assert_eq!(
+            restarted[&scan.records[0].bus_id].stopped(),
+            Stopped::Displaced,
+            "and a restart folds the same log the same way"
         );
     }
 

@@ -93,6 +93,8 @@ impl Chapter {
                 workspace: None,
                 last_activity: record.ts,
                 last_turn: None,
+                turn_ended_at: None,
+                turn_started_at: None,
                 turns: 0,
                 backfilled: false,
                 live: false,
@@ -562,6 +564,8 @@ mod tests {
                 last_turn: Some(TurnState::InterruptedQuota {
                     reason: "rate_limit".into(),
                 }),
+                turn_ended_at: None,
+                turn_started_at: None,
                 turns: 14,
                 backfilled: false,
                 live: false,

@@ -8,6 +8,18 @@ the entry says so when it does.
 
 ### Fixed
 
+- A tool event that arrives before its session has a conversation now waits in the
+  spool for up to a day for the prompt that binds it, up to 8 MiB, instead of being
+  deleted at the next two-second tick. Whether it survived used to come down to
+  timing. A turn's end or a session's end with no conversation still goes at once.
+  The drop text no longer blames a restart: bindings come back from the log.
+- A record that waited on its way to the log no longer reopens a turn that ended
+  after it. A finished conversation was briefed to the next session as still
+  mid-turn, and a quota stop stopped reading as one, once a late tool event landed
+  behind the turn's end. The fold reads `spooled_at`, which the log already has, so
+  an old log needs no migration. Only a main-thread turn end counts, a record counts
+  as late only if it also reached the log after that end, and a late turn end does
+  not close a turn that started after it.
 - A newer hook's new event kind now waits in the spool for a daemon that can read
   it, as `docs/log-format.md` always said. It used to be refused as unreadable and
   dropped live, and deleted from the spool. It waits up to seven days and then goes

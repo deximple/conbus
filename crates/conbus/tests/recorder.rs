@@ -791,8 +791,7 @@ fn the_hook_never_fails_the_session_when_the_daemon_is_down() {
 
 #[test]
 fn an_event_the_daemon_cannot_place_is_reported_rather_than_dropped_in_silence() {
-    // A tool call or a stop arriving for a session the daemon has no binding
-    // for — the normal shape of a daemon restart mid-turn — belongs to no
+    // A stop arriving for a session the daemon has no binding for belongs to no
     // conversation and cannot start one. It is not written, which is correct;
     // vanishing without a word is not.
     let home = tempfile::tempdir().expect("tempdir");
@@ -811,11 +810,11 @@ fn an_event_the_daemon_cannot_place_is_reported_rather_than_dropped_in_silence()
         "an unplaceable event must not be written"
     );
     let _ = stderr;
-    // A daemon restart is exactly when an orphan arrives, so the hook spools
-    // it rather than calling it lost on the spot — and the daemon's drain
-    // reports it into the drop log once it stays orphaned, which is where the
-    // "say so" lives now: the event and the session, so a ghost session's end
-    // can be told from a lost tool call when the drop log is read back.
+    // The hook spools it rather than calling it lost on the spot, in case its
+    // prompt is in the spool too, and the daemon's drain reports it into the drop
+    // log once it stays orphaned, which is where the "say so" lives now: the
+    // event and the session, so a ghost session's end can be told from a lost
+    // tool call when the drop log is read back.
     let mut last: Option<serde_json::Value> = None;
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
