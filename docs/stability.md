@@ -28,7 +28,6 @@ marks each one `(experimental)`.
 - `policy`
 - `--profile`
 - `arena`
-- `auth`
 - `summary`
 - `verdict`
 - `hook --inference-listen`

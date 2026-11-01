@@ -8,29 +8,38 @@ the entry says so when it does.
 
 ### Added
 
-- `conbus auth` (experimental): which vendor needs a sign-in — conbus itself
-  never does, and recording needs none. `conbus auth --url URL` names whose
-  page opened, the process holding its callback port, and whether anything
-  conbus sits in that ancestry; `conbus auth --html` writes the same as one
-  self-contained page. Query values are never echoed.
+- `conbus auth` (experimental): which vendor needs a sign-in (conbus itself never
+  does, and recording needs none), and what conbus runs with nobody at the
+  keyboard. `pbpaste | conbus auth --url -` names a page from its scheme and host
+  and, when it calls back to a port on this machine, walks every process listening
+  there up to the root. It says `yes` when a process named conbus is in that
+  ancestry, `no` when none is, with what such a walk cannot see, and `cannot tell`
+  otherwise, with what would tell. `--url URL` works too, and warns when the URL
+  has a query, because that is now in shell history. It reads no vendor config. It
+  prints no query value but a callback's port and, as the URL's claim, a `client`
+  name. `--html` writes the table and a paste box as one offline page.
 
 ### Fixed
 
-- A drop log that reached its 4 MiB cap silently recorded nothing: a full
-  `drops.jsonl` is now rotated to `drops.1.jsonl` and a fresh file takes new
-  drops, so a capped log can no longer blind drop accounting. Summaries read
-  both generations and mark counts as floors once rotation has happened, and
-  `the hook payload names no session` now names the payload's field names
-  (never values) so the cause of a flood is visible. `scripts/canary.sh`
-  reads both generations, compares drop reasons by timestamp instead of line
-  offsets, and reports a capped non-rotating log as `UNCHECKED` rather than
-  passing.
-- `doctor`, `status` and `hop` no longer run `agy` at all: only `conbus
-  quota` — a command a person ran — asks the vendor, and caches the reading.
-  `doctor` and `status` show that cache with its age, mark readings over 90
-  minutes as not counted, and say `no reading yet` with none. A hop reads
-  the cache only. `scripts/check-no-browser.sh` now fails if an unattended
-  run creates the vendor's own directory at all.
+- A drop log at its 4 MiB cap silently recorded nothing more. From this build on,
+  a full `drops.jsonl` is rotated to `drops.1.jsonl` and a fresh file takes new
+  drops. One generation is kept, so the rotation before last is gone. Summaries
+  read both generations, say `at least` once a rotation has happened, and lose only
+  the line when a line is torn or holds a byte that is not UTF-8. New drop logs are
+  `0600`. `the hook payload names no session` now names the payload's field names
+  (never values), so the cause of a flood is visible.
+- `scripts/canary.sh` reads both generations and compares drop reasons by
+  timestamp instead of line offsets. On a capped log from a build that does not
+  rotate, its `drops` item says `UNCHECKED` instead of `PASS`. An `UNCHECKED` item
+  does not stop `verdict` passing as a whole, so read those lines.
+- `doctor`, `status` and the quota read behind a hop's decision no longer run
+  `agy`. They read what `conbus quota`, a command a person ran, cached. `doctor` and
+  `status` show the reading with its age; past 90 minutes they say `last read 2h
+  ago, so the numbers are not counted`, and with none, `no reading yet; conbus
+  quota reads it`. `conbus auth` runs `agy models`, never `-p`. A hop to `agy` on a
+  person's order and `conbus run` still start `agy` itself as an interactive
+  session. `scripts/check-no-browser.sh` now fails if `doctor` or `status` leaves
+  the vendor's own `~/.gemini` directory behind.
 
 ## [1.0.0-rc.3] — 2026-11-01
 
