@@ -1130,6 +1130,12 @@ pub fn prepare(paths: &Paths, retention: Retention) -> io::Result<()> {
             "gap fill hit its start budget; the skipped range is held in cache/gap-since and resumed on the next start"
         );
     }
+    if gap_timing.claude_unreadable > 0 {
+        note!(
+            "gap fill could not read {} transcript(s); the range is held in cache/gap-since and resumed on the next start",
+            gap_timing.claude_unreadable
+        );
+    }
     if let Some(why) = &gap_timing.codex_deferred {
         note!(
             "codex gap fill deferred ({why}); the range is held in cache/gap-since-codex and resumed on the next start"

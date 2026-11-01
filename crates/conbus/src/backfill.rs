@@ -372,6 +372,9 @@ pub struct GapTiming {
     /// The start budget cut the fill short; the deferred range is held in
     /// `cache/gap-since` and resumed on the next start.
     pub budget_exhausted: bool,
+    /// Transcripts in range that could not be read. Their range is held in
+    /// `cache/gap-since` too: nothing of them was compared with the log.
+    pub claude_unreadable: u64,
     /// Why the Codex pass did not read everything it was asked to, when it did
     /// not. Its range is held in `cache/gap-since-codex` for the next start.
     pub codex_deferred: Option<String>,
@@ -589,13 +592,14 @@ fn append_gaps_at_start_in(
         n += ingest_chat_exports_since(&paths.chat_export(), held, log, since)?;
         timing.chat_export_ms = elapsed_ms(export);
     }
-    if !timing.budget_exhausted {
+    let transcripts_read = !timing.budget_exhausted && timing.claude_unreadable == 0;
+    if transcripts_read {
         let _ = std::fs::remove_file(&marker);
     }
     if timing.codex_deferred.is_none() {
         let _ = std::fs::remove_file(&codex_marker);
     }
-    if timing.budget_exhausted || timing.codex_deferred.is_some() {
+    if !transcripts_read || timing.codex_deferred.is_some() {
         read.save(paths, &read_marker);
     } else {
         let _ = std::fs::remove_file(&read_marker);
@@ -1742,6 +1746,9 @@ fn append_gaps_files(
         }
         let Ok(text) = fs::read_to_string(file) else {
             *outcome.unread.entry("unreadable file".into()).or_default() += 1;
+            if let Some(start) = start.as_mut() {
+                start.timing.claude_unreadable += 1;
+            }
             continue;
         };
         if let Some(start) = start.as_mut() {

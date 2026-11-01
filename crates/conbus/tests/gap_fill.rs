@@ -2434,3 +2434,43 @@ fn a_fork_whose_first_prompt_hook_was_lost_does_not_record_the_parents_words() {
         show(&all)
     );
 }
+
+#[test]
+fn a_transcript_the_fill_could_not_read_keeps_its_range() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let daemon = start(home);
+    hook(home, &prompt(S, "p0", "before"));
+    stop(daemon);
+    transcript(
+        home,
+        S,
+        &[
+            user(S, "p0", "before"),
+            user(S, "p1", "only the transcript holds this"),
+            reply(S, "a1"),
+        ],
+    );
+    let file = home.join(format!(".claude/projects/-repo/{S}.jsonl"));
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+
+    stop(start(home));
+
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    assert!(
+        home.join("cache/gap-since").exists(),
+        "nothing holds the range"
+    );
+    newer_records_arrive(home);
+    stop(start(home));
+
+    let all = log_lines(home);
+    assert!(
+        all.iter().any(|record| record["vendor_turn_id"] == "p1"),
+        "the turn was lost to the newer record:\n{}",
+        show(&all)
+    );
+    assert!(!home.join("cache/gap-since").exists(), "the marker clears");
+    assert!(!home.join("cache/gap-read").exists());
+}
