@@ -132,6 +132,43 @@ fn appendable(paths: &Paths) -> io::Result<()> {
         .map(|_| ())
 }
 
+/// How long `doctor` waits for the recorder to answer, like every other probe.
+const HEALTH_WAIT: Duration = Duration::from_secs(2);
+
+/// What the running recorder says about the log, if it says anything. No recorder,
+/// one busy past the wait, and an older build that does not know the question all
+/// read as no information, because none of them says anything about the log.
+fn recorder_health(paths: &Paths) -> Option<crate::wire::Health> {
+    use std::io::{BufRead, Write};
+    let mut stream = UnixStream::connect(paths.socket()).ok()?;
+    stream.set_read_timeout(Some(HEALTH_WAIT)).ok()?;
+    stream.set_write_timeout(Some(HEALTH_WAIT)).ok()?;
+    writeln!(stream, "{}", crate::wire::HEALTH_QUESTION).ok()?;
+    let mut reply = String::new();
+    io::BufReader::new(&stream).read_line(&mut reply).ok()?;
+    serde_json::from_str(reply.trim()).ok()
+}
+
+/// The `writable` line. A daemon that is refusing knows more than a probe that can
+/// open the file: on a full disk the open works and the write does not, and the
+/// drop line that would say so comes only once a write has worked.
+fn describe_writable(health: Option<&crate::wire::Health>, appendable: &io::Result<()>) -> String {
+    let Some((since, health)) =
+        health.and_then(|health| health.refusing_since.as_deref().zip(Some(health)))
+    else {
+        return describe_appendable(appendable);
+    };
+    match health.in_memory_only {
+        0 => format!(
+            "REFUSING since {since} — {} record(s) held, all with a copy in the spool; free space and they land",
+            health.held
+        ),
+        only => format!(
+            "REFUSING since {since} — {only} record(s) in memory only, lost if the recorder stops; free space, do not restart it"
+        ),
+    }
+}
+
 fn describe_appendable(result: &io::Result<()>) -> String {
     match result {
         Ok(()) => "appendable".to_string(),
@@ -1296,7 +1333,10 @@ pub fn doctor(paths: &Paths) -> io::Result<()> {
     #[cfg(not(target_os = "macos"))]
     println!("sealing   none — no OS key store; tool bodies are elided, not sealed");
 
-    println!("writable  {}", describe_appendable(&appendable(paths)));
+    println!(
+        "writable  {}",
+        describe_writable(recorder_health(paths).as_ref(), &appendable(paths))
+    );
     // Disk is the one resource the log cannot outlast: say how much it holds
     // and how much is left on its volume, and say it loudly under 10%.
     if let Some(line) = disk_line(paths) {

@@ -165,7 +165,7 @@ Codex는 새 훅을 승인받은 뒤에만 실행합니다. Codex를 한 번 켜
 | `build` | `0.2.8 (<commit>)` |
 | `socket` | `listening` |
 | `daemon` | `build`와 같은 커밋. `DIFFERS`는 바이너리를 바꾸고 데몬을 다시 시작하지 않았다는 뜻입니다 |
-| `writable` | `appendable` |
+| `writable` | `appendable`. `REFUSING`은 로그가 쓰기를 거절하고 있다는 뜻입니다. 공간을 비우고, 레코더를 다시 시작하지 마세요 |
 | `hooks` / `events` | 설치된 에이전트마다 `runs`와 `N/N registered`. 나머지는 `not installed here` |
 | `codex` | `7 hook(s) trusted`. `NOT TRUSTED`는 아직 Codex에서 승인하지 않았다는 뜻입니다 |
 | `last` | 방금 보낸 턴 |
@@ -527,7 +527,7 @@ conbus arena link --from ~/src/shop --to ~/src/shop-admin
 | `takeover.json` | `conbus run`을 기다리는 hop이 있을 때만 |
 | `policy.json` | 직접 쓴 `PreToolUse` 규칙. 없으면 정책이 꺼져 있습니다(15장) |
 | `cache/meta/` | 파생 읽기 캐시. 툴 본문을 SHA-256 요약으로 바꾼 레코드입니다. 지워도 잃는 것이 없습니다 |
-| `spool/` | 레코더가 재시작하는 동안 훅이 맡겨 둔 요청. 다음 레코더가 읽어 기록한 뒤 지웁니다. 디스크가 꽉 차 로그가 받지 못해도 기다리며, 파일이 7일 지났고 로그도 7일 내내 한 번도 받지 못했을 때만 `drops.jsonl`에 남기고 지웁니다 |
+| `spool/` | 레코더가 재시작하는 동안 훅이 맡겨 둔 요청. 다음 레코더가 읽어 기록한 뒤 지웁니다. 디스크가 꽉 차 로그가 받지 못해도 기다리며, 파일이 7일 지났고 로그도 7일 내내 한 번도 받지 못했을 때만 `drops.jsonl`에 남기고 지웁니다. 디스크가 정말로 꽉 차면 스풀에도 쓰지 못해 기록은 레코더의 메모리에만 남고, 로그가 받기 전에 레코더가 멈추면 사라집니다. 그동안 `conbus doctor`의 `writable` 줄이 알려 줍니다 |
 | `facts.jsonl`, `links.jsonl` | 10장 |
 | `chat-export/` | 넣어 둔 Claude.ai 내보내기 |
 

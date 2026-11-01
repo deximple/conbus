@@ -173,7 +173,7 @@ and taking it all back out.
 | `build` | `0.2.8 (<commit>)` |
 | `socket` | `listening` |
 | `daemon` | the same commit as `build`. `DIFFERS` means the binary was replaced and the daemon was not restarted |
-| `writable` | `appendable` |
+| `writable` | `appendable`. `REFUSING` means the log is refusing writes: free space, and do not restart the recorder |
 | `hooks` / `events` | `runs` and `N/N registered` for each installed agent; `not installed here` for the others |
 | `codex` | `7 hook(s) trusted`. `NOT TRUSTED` means you have not approved them in Codex yet |
 | `last` | the turn you just sent |
@@ -235,10 +235,13 @@ next daemon drains it and deletes the file. `doctor` shows `spool` when
 entries wait. Spooled records carry `hook_id` and `spooled_at`, so a
 re-delivered event counts once.
 
-A log that refuses a write, as a full disk or a read-only segment does, does not
-lose the record either. The daemon holds it in memory, up to 16 MiB, and the hook
-spools a copy if there is room. It lands once, in arrival order, when the log
-takes writes again, and `drops.jsonl` then says how long and how many. A spooled
+A log that refuses a write, as a full disk or a read-only segment does, need not
+lose the record. The daemon holds it in memory, up to 16 MiB, and the hook spools a
+copy if there is room. It lands once, in arrival order, when the log takes writes
+again, and `drops.jsonl` then says how long and how many. A record only in memory is
+lost if the recorder stops before the log takes it, and on a really full disk that
+is every record. `conbus doctor` says so on its `writable` line while it lasts: free
+space, and do not restart the recorder. A spooled
 entry is dropped with a line only once the file is seven days old and the log has
 refused for seven days without one write working. One written by a newer build
 that this daemon cannot read yet is dropped with a line after seven days.
