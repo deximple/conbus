@@ -746,7 +746,7 @@ running it.
 
 A decision is not recorded in the log; the tool request is, as it always was.
 
-## 16. Claude Code profiles: a second account, switched by hand
+## 16. Claude Code profiles: a second account, switched by hand (experimental)
 
 Claude Code lets you run more than one account side by side: a profile `NAME`
 is the directory `$HOME/.claude-NAME`, and `CLAUDE_CONFIG_DIR` tells `claude`

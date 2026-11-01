@@ -12,6 +12,9 @@ the entry says so when it does.
   reports them — `tokens_input`, `tokens_output`, `tokens_cache_read`,
   `tokens_cache_write`, today Cursor's `afterAgentResponse` only — and the
   `--shareable` rows carry them per RFD 0002's amendment.
+- Claude Code profiles (experimental): a second account under
+  `CLAUDE_CONFIG_DIR`, switched only by hand — no limit signal, router rule
+  or hop ever moves a conversation between profiles.
 - conbus builds and records on Linux — x86_64 and aarch64 — with the recorder
   as a systemd user unit; where there is no OS key store, tool bodies are
   elided and `sync --join --apply` says so rather than writing one to a file.

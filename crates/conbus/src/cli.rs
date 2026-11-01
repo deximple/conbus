@@ -394,7 +394,8 @@ USAGE:
                                   and the commits HEAD gained (default 7 days);
                                   --json prints one folder per line
     conbus run [claude_code|codex|cursor|agy|opencode|grok]
-                                  same TTY: start a vendor; hop execs the next
+                                  same TTY: start a vendor; hop execs the next;
+                                  --profile NAME (claude_code) is experimental
     conbus arena fact --workspace DIR --claim TEXT --anchor PATH
     conbus arena link --from DIR --to DIR
                                   accept a fact or link workspaces for the pack
