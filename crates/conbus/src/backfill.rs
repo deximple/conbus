@@ -630,7 +630,7 @@ fn write_cache_file(paths: &Paths, target: &Path, text: &str) {
     let temp = paths
         .cache_dir()
         .join(format!(".gap.{}.tmp", std::process::id()));
-    let _ = fs::create_dir_all(paths.cache_dir());
+    let _ = conbus_core::paths::keep_dir_private(&paths.cache_dir());
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;

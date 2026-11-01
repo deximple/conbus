@@ -2474,3 +2474,51 @@ fn a_transcript_the_fill_could_not_read_keeps_its_range() {
     assert!(!home.join("cache/gap-since").exists(), "the marker clears");
     assert!(!home.join("cache/gap-read").exists());
 }
+
+#[test]
+fn the_markers_keep_the_data_roots_modes() {
+    // `docs/stability.md`: directories 0700, files 0600. On a fresh root these are
+    // the first thing to make `cache/`, before any sidecar closes it.
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    a_thread_to_ask(home);
+    std::fs::remove_dir_all(home.join("cache")).ok();
+
+    stop(start(home)); // the app-server cannot start, so the markers stay
+
+    let mode = |path: &Path| {
+        std::fs::metadata(path)
+            .map(|meta| meta.permissions().mode() & 0o777)
+            .unwrap_or(0)
+    };
+    assert_eq!(
+        (
+            mode(&home.join("cache")),
+            mode(&home.join("cache/gap-since-codex")),
+            mode(&home.join("cache/gap-read"))
+        ),
+        (0o700, 0o600, 0o600),
+        "cache, gap-since-codex, gap-read"
+    );
+}
+
+#[test]
+fn a_marker_garbled_or_left_over_is_read_as_nothing_and_replaced() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    a_thread_to_ask(home);
+    std::fs::create_dir_all(home.join("cache")).ok();
+    std::fs::write(home.join("cache/gap-read"), "not\ta number\n\n\t\nx").expect("write");
+    std::fs::write(home.join("cache/gap-since"), "garbled").expect("write");
+    std::fs::write(home.join("cache/gap-since-codex"), "garbled").expect("write");
+
+    stop(start(home));
+
+    let codex = std::fs::read_to_string(home.join("cache/gap-since-codex")).expect("held");
+    assert!(
+        codex.parse::<conbus_core::clock::Timestamp>().is_ok(),
+        "replaced with a time: {codex}"
+    );
+    assert!(!home.join("cache/gap-since").exists());
+}
