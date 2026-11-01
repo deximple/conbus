@@ -1206,7 +1206,7 @@ for line in sys.stdin:
     if m == "initialize":
         print(json.dumps({"jsonrpc":"2.0","id":i,"result":{"userAgent":"fake"}}), flush=True)
     elif m == "thread/turns/list":
-        time.sleep(0.5)
+        time.sleep(0.8)
         t = msg["params"]["threadId"]
         data = [{"id":"turn-of-"+t,"items":[{"type":"userMessage","content":[{"type":"text","text":"said in "+t}]},{"type":"agentMessage","text":"a"}],
                  "status":"completed","startedAt":1788368800,"completedAt":1788368801}]
@@ -1251,7 +1251,9 @@ fn threads_a_budget_cut_off_are_reached_by_later_starts() {
             home,
             daemon_command(home)
                 .env("CONBUS_CODEX_BIN", &fake)
-                .env("CONBUS_GAP_BUDGET_MS", "2000")
+                // Five answers at most, with room for a slow first exec: a stand-in
+                // that answers nothing inside its limit counts as stalled.
+                .env("CONBUS_GAP_BUDGET_MS", "4000")
                 .spawn()
                 .expect("daemon"),
         );
@@ -1351,4 +1353,118 @@ for line in sys.stdin:
         .collect();
     assert_eq!(filled.len(), 1, "\n{}", show(&filled));
     assert_eq!(filled[0]["prompt"]["text"], "the fork's own prompt");
+}
+/// A stand-in that notes each launch and then never answers `initialize`: the
+/// stall `AppServer` documents, from an MCP server it is trying to start.
+fn a_stalled_app_server(home: &Path) -> (tempfile::TempDir, PathBuf, PathBuf) {
+    let launches = home.join("app-server-launches");
+    let script = format!(
+        r#"#!/bin/sh
+echo launched >> {launches:?}
+exec sleep 60
+"#
+    );
+    let (stub, fake) = stand_in(&script);
+    (stub, fake, launches)
+}
+
+fn start_with_stalled_codex(home: &Path, codex: &Path) {
+    let daemon = wait_serving(
+        home,
+        daemon_command(home)
+            .env("CONBUS_CODEX_BIN", codex)
+            // Long enough for a stand-in's first exec, which can take 300 ms.
+            .env("CONBUS_GAP_BUDGET_MS", "1500")
+            .spawn()
+            .expect("daemon"),
+    );
+    stop(daemon);
+}
+
+#[test]
+fn a_stalled_app_server_costs_one_start_not_every_start() {
+    // Eight seconds in the real case, with the socket closed. Keeping the range
+    // must not mean paying that on every restart for as long as Codex is wedged.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let (_stub, fake, launches) = a_stalled_app_server(home);
+    a_live_codex_thread(home);
+
+    start_with_stalled_codex(home, &fake);
+    start_with_stalled_codex(home, &fake);
+    start_with_stalled_codex(home, &fake);
+
+    let launched = std::fs::read_to_string(&launches).unwrap_or_default();
+    assert_eq!(launched.lines().count(), 1, "asked again within the hour");
+    assert!(
+        home.join("cache/gap-since-codex").exists(),
+        "and the range is still held"
+    );
+}
+
+#[test]
+fn a_stalled_app_server_is_asked_again_once_the_back_off_has_passed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let (_stub, fake, launches) = a_stalled_app_server(home);
+    a_live_codex_thread(home);
+    start_with_stalled_codex(home, &fake);
+
+    // Two hours ago, as far as the record of it goes.
+    let read = home.join("cache/gap-read");
+    let held = std::fs::read_to_string(&read).expect("a record of the stall");
+    let epoch = conbus_core::clock::Timestamp::from_unix_seconds(0).expect("epoch");
+    let long_ago = conbus_core::clock::Timestamp::now().seconds_since(epoch) - 2 * 3600;
+    let rewound: Vec<String> = held
+        .lines()
+        .map(|line| match line.split_once('\t') {
+            Some((_, "codex app-server stalled")) => {
+                format!("{long_ago}\tcodex app-server stalled")
+            }
+            _ => line.to_string(),
+        })
+        .collect();
+    std::fs::write(&read, rewound.join("\n") + "\n").expect("rewind");
+
+    start_with_stalled_codex(home, &fake);
+
+    let launched = std::fs::read_to_string(&launches).unwrap_or_default();
+    assert_eq!(launched.lines().count(), 2);
+}
+
+#[test]
+fn an_app_server_that_is_only_missing_is_tried_every_start() {
+    // It costs nothing, and installing Codex should fill the range at the next one.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let (_stub, fake) = stand_in(FAKE_APP_SERVER);
+    a_live_codex_thread(home);
+    stop(start(home)); // the app-server cannot start
+
+    start_with_codex(home, &fake);
+
+    assert!(
+        log_lines(home)
+            .iter()
+            .any(|record| record["vendor_turn_id"] == "t1"),
+        "the next start did not try"
+    );
+}
+
+#[test]
+fn backfill_gaps_by_hand_asks_a_stalled_app_server_regardless() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let (_stub, fake, _launches) = a_stalled_app_server(home);
+    a_live_codex_thread(home);
+    start_with_stalled_codex(home, &fake);
+    let (_stub2, working) = stand_in(FAKE_APP_SERVER);
+
+    let (ok, said) = backfill_gaps(home, &working, true);
+
+    assert!(ok, "{said}");
+    assert!(
+        said.contains("1 thread(s), 1 turn(s), 2 record(s)"),
+        "{said}"
+    );
 }
