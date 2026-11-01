@@ -108,6 +108,9 @@ fn split(buf: &[u8]) -> Option<(String, Vec<u8>)> {
         .lines()
         .find_map(|l| l.strip_prefix("Conbus-Signature: "))
         .map(|v| v.trim().to_string())?;
+    if buf.len() < head_end + 4 + len {
+        return None;
+    }
     let body = buf[head_end + 4..head_end + 4 + len].to_vec();
     Some((signature, body))
 }
