@@ -123,6 +123,8 @@ fn demo_records() -> Vec<Record> {
         bus_id,
         vendor_turn_id: None,
         vendor_agent_id: None,
+        hook_id: None,
+        spooled_at: None,
         source: source(harness),
         event,
     };
@@ -652,6 +654,8 @@ fn lease_only(paths: &Paths, focus: &Focus, holder: &str) -> io::Result<()> {
             vendor_session_id: session,
             vendor_turn_id: None,
             vendor_agent_id: None,
+            hook_id: None,
+            spooled_at: None,
             workspace: focus.workspace.clone(),
             entrypoint: None,
             brief: false,
@@ -733,6 +737,8 @@ fn record_hop(
         vendor_session_id: session,
         vendor_turn_id: None,
         vendor_agent_id: None,
+        hook_id: None,
+        spooled_at: None,
         workspace: focus.workspace.clone(),
         entrypoint: None,
         brief: false,
@@ -860,6 +866,8 @@ mod tests {
             bus_id,
             vendor_turn_id: None,
             vendor_agent_id: None,
+            hook_id: None,
+            spooled_at: None,
             source: conbus_core::event::Source {
                 harness: Harness::new(Harness::CLAUDE_CODE),
                 harness_version: None,
@@ -936,6 +944,8 @@ mod tests {
             bus_id,
             vendor_turn_id: None,
             vendor_agent_id: None,
+            hook_id: None,
+            spooled_at: None,
             source: conbus_core::event::Source {
                 harness: Harness::new(Harness::CODEX),
                 harness_version: None,
@@ -1159,6 +1169,8 @@ mod tests {
             bus_id,
             vendor_turn_id: None,
             vendor_agent_id: None,
+            hook_id: None,
+            spooled_at: None,
             source: conbus_core::event::Source {
                 harness: Harness::new(harness),
                 harness_version: None,
@@ -1278,6 +1290,8 @@ mod tests {
             bus_id,
             vendor_turn_id: None,
             vendor_agent_id: None,
+            hook_id: None,
+            spooled_at: None,
             source: conbus_core::event::Source {
                 harness: Harness::new(harness),
                 harness_version: None,

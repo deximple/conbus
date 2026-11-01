@@ -131,6 +131,8 @@ fn two_agents_in_one_repository(home: &Path, main: &str, worktree: &str) {
                 source: source(harness, workspace),
                 vendor_turn_id: None,
                 vendor_agent_id: None,
+                hook_id: None,
+                spooled_at: None,
                 event,
             })
             .expect("append");

@@ -150,6 +150,8 @@ fn persist(
         vendor_session_id: session,
         vendor_turn_id: None,
         vendor_agent_id: None,
+        hook_id: None,
+        spooled_at: None,
         workspace: last.source.workspace.clone(),
         entrypoint: None,
         brief: false,
@@ -210,6 +212,8 @@ mod tests {
             bus_id,
             vendor_turn_id: None,
             vendor_agent_id: None,
+            hook_id: None,
+            spooled_at: None,
             source: conbus_core::event::Source {
                 harness: Harness::new(Harness::CLAUDE_CODE),
                 harness_version: None,

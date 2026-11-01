@@ -288,6 +288,8 @@ mod tests {
             bus_id: bus_id.parse().expect("id"),
             vendor_turn_id: None,
             vendor_agent_id: None,
+            hook_id: None,
+            spooled_at: None,
             source: Source {
                 harness: Harness::new(harness),
                 harness_version: None,

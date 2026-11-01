@@ -250,6 +250,8 @@ fn a_day_of_work(home: &Path) {
                 source: source.clone(),
                 vendor_turn_id: None,
                 vendor_agent_id: None,
+                hook_id: None,
+                spooled_at: None,
                 event: event.clone(),
             })
             .expect("append");
