@@ -56,6 +56,12 @@ the entry says so when it does.
 
 ### Security
 
+- Releases: a tag without a hyphen is created as a draft and becomes
+  `latest` only after `scripts/sign-release.sh` has replaced the package with
+  the signed one; a `-rc.N` tag is a prerelease. Packages carry build
+  provenance and a CycloneDX bill of materials, `cargo deny` runs on release
+  tags and weekly, and `install.sh` on macOS refuses a release from this
+  repository that is not signed with conbus's Developer ID.
 - `conbus hook --inference-listen` refuses an address that is not loopback.
   The listener authenticates nothing, and it used to bind whatever address it
   was given.
