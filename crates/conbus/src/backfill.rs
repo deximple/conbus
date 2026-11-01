@@ -227,7 +227,10 @@ fn ingest_chat_text(
                         || record.source.vendor_session_id.as_deref() == Some(sid.as_str())
                 })
                 .collect();
-            let missing = missing_from(mine, recovered);
+            let Some(bus) = mine.last().map(|record| record.bus_id) else {
+                continue;
+            };
+            let missing = missing_from(mine, &sid, bus, recovered);
             if missing.is_empty() {
                 if known.live.contains(&session) {
                     outcome.recorded_live += 1;
@@ -515,14 +518,38 @@ fn untouched_since(path: &Path, since: Option<i64>) -> bool {
     }
 }
 
-/// Every record, grouped by conversation, so a lookup per file is not a pass
-/// over the whole log per file.
-fn by_bus(held: &[Record]) -> HashMap<BusId, Vec<&Record>> {
-    let mut grouped: HashMap<BusId, Vec<&Record>> = HashMap::new();
-    for record in held {
-        grouped.entry(record.bus_id).or_default().push(record);
+/// For each session about to be read, the records its turns could already be
+/// in: the conversation a fill would write to, and any other conversation that
+/// names the session, because a split leaves one session's turns under more
+/// than one id. One pass, so a lookup per file is not a pass over the whole log
+/// per file, and nothing is grouped for the sessions a start will not read.
+fn records_of<'a, 's>(
+    held: &'a [Record],
+    targets: &[(&'s str, BusId)],
+) -> HashMap<&'s str, Vec<&'a Record>> {
+    let mut found: HashMap<&'s str, Vec<&'a Record>> = HashMap::new();
+    let mut by_bus: HashMap<BusId, Vec<&'s str>> = HashMap::new();
+    for &(session, bus) in targets {
+        found.entry(session).or_default();
+        by_bus.entry(bus).or_default().push(session);
     }
-    grouped
+    if targets.is_empty() {
+        return found;
+    }
+    for record in held {
+        let named = record.source.vendor_session_id.as_deref();
+        if let Some(records) = named.and_then(|name| found.get_mut(name)) {
+            records.push(record);
+        }
+        for session in by_bus.get(&record.bus_id).into_iter().flatten() {
+            if named != Some(*session)
+                && let Some(records) = found.get_mut(session)
+            {
+                records.push(record);
+            }
+        }
+    }
+    found
 }
 
 /// Vendor Privacy → Export data names the zip `data-export-*.zip`.
@@ -684,19 +711,24 @@ fn fill_live_codex_gaps(
         Some(asked) => asked,
         None => known.live_codex.iter().copied().collect(),
     };
-    let grouped = by_bus(held);
+    let names: Vec<(String, BusId)> = sessions
+        .iter()
+        .filter_map(|session| Some((session.to_string(), *known.live_codex_bus.get(session)?)))
+        .collect();
+    let targets: Vec<(&str, BusId)> = names
+        .iter()
+        .map(|(name, bus)| (name.as_str(), *bus))
+        .collect();
+    let grouped = records_of(held, &targets);
     let mut filled = 0u64;
     let turns_at = Instant::now();
-    for session in &sessions {
+    for &(name, bus_id) in &targets {
         if Instant::now() >= deadline {
             timing.budget_exhausted = true;
             break;
         }
-        let Some(&bus_id) = known.live_codex_bus.get(session) else {
-            continue;
-        };
         timing.list_turns_attempted += 1;
-        let turns = match list_turns(&mut server, &session.to_string()) {
+        let turns = match list_turns(&mut server, name) {
             Ok(turns) => turns,
             Err(err) => {
                 if timing.list_turns_err.is_none() {
@@ -707,11 +739,10 @@ fn fill_live_codex_gaps(
             }
         };
         timing.list_turns_threads += 1;
-        let thread =
-            serde_json::json!({"id": session.to_string(), "sessionId": session.to_string()});
+        let thread = serde_json::json!({"id": name, "sessionId": name});
         let recovered = parse_codex_thread(&thread, &turns);
-        let mine = grouped.get(&bus_id).into_iter().flatten().copied();
-        for entry in missing_from(mine, recovered) {
+        let mine = grouped.get(name).into_iter().flatten().copied();
+        for entry in missing_from(mine, name, bus_id, recovered) {
             if log.append(entry)?.is_some() {
                 filled += 1;
             }
@@ -879,56 +910,100 @@ pub fn fill_gaps(paths: &Paths, transcripts: &Path, apply: bool) -> io::Result<O
 /// Reconstruction never outranks a live record: an already-seen turn stays
 /// the live one. A turn that happened while the daemon was down is written
 /// under the live `bus_id` so a restart does not fork the conversation.
+///
+/// The id decides, wherever there is one. The hook's `prompt_id` is the
+/// transcript's `promptId`: of 7,791 real live prompts, 7,785 are in their
+/// transcript under the same id and none under another, while the words differ
+/// on 2,285 of those, so words are no key for what the hook saw. They stand in
+/// only for a held prompt whose id explains no line of this source, one record
+/// for one turn: one from before the hook carried an id, or a source that numbers
+/// turns its own way, as a Chat export does. The same words with a new id, on a
+/// prompt already explained, are a new turn.
+///
+/// `held` is every record this session's turns could already be in, which may
+/// include another leg's records under the same conversation. Its ids can still
+/// match, and its words are not this session's.
 fn missing_from<'a>(
     held: impl IntoIterator<Item = &'a Record>,
+    session: &str,
+    bus_id: BusId,
     recovered: Recovered,
 ) -> Vec<Entry> {
-    let mut seen_ids = HashSet::new();
-    let mut seen_prompts = HashSet::new();
-    let mut bus_id = None;
+    let listed: HashSet<&str> = recovered
+        .entries
+        .iter()
+        .filter(|entry| matches!(entry.event, Event::TurnStarted { .. }))
+        .filter_map(|entry| entry.vendor_turn_id.as_ref().map(|id| id.as_str()))
+        .collect();
+    let mut started = HashSet::new();
+    let mut ended = HashSet::new();
+    let mut unexplained: HashMap<String, u32> = HashMap::new();
+    let mut said: HashMap<String, u32> = HashMap::new();
     for record in held {
-        bus_id = Some(record.bus_id);
-        if let Some(id) = &record.vendor_turn_id {
-            seen_ids.insert(id.as_str().to_string());
-        }
-        if let Event::TurnStarted { prompt, .. } = &record.event
-            && let Some(text) = prompt_text(prompt)
-        {
-            seen_prompts.insert(text);
-        }
-    }
-    let Some(bus_id) = bus_id else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    let mut keep_open = false;
-    for mut entry in recovered.entries {
-        if matches!(entry.event, Event::SessionCandidate { .. }) {
+        // A subagent's records are its own turn, under the parent's id.
+        if record.vendor_agent_id.is_some() {
             continue;
         }
-        if let Event::TurnStarted { prompt, .. } = &entry.event {
-            let by_id = entry
-                .vendor_turn_id
-                .as_ref()
-                .is_some_and(|id| seen_ids.contains(id.as_str()));
-            let by_prompt = prompt_text(prompt).is_some_and(|text| seen_prompts.contains(&text));
-            keep_open = !by_id && !by_prompt;
+        let id = record.vendor_turn_id.as_ref().map(|id| id.as_str());
+        match &record.event {
+            Event::TurnEnded { .. } => ended.extend(id.map(str::to_string)),
+            Event::TurnStarted { prompt, .. } => {
+                started.extend(id.map(str::to_string));
+                let Some(text) = prompt_text(prompt) else {
+                    continue;
+                };
+                let answers_by_words = id.is_none_or(|id| {
+                    !listed.contains(id)
+                        && record.source.vendor_session_id.as_deref() == Some(session)
+                });
+                if answers_by_words {
+                    *unexplained.entry(text.clone()).or_default() += 1;
+                }
+                *said.entry(text).or_default() += 1;
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    let mut keep_open = false;
+    let mut turn: Option<String> = None;
+    for mut entry in recovered.entries {
+        match &entry.event {
+            Event::SessionCandidate { .. } => continue,
+            Event::TurnStarted { prompt, .. } => {
+                let text = prompt_text(prompt);
+                let id = entry.vendor_turn_id.as_ref().map(|id| id.as_str());
+                let is_held = match id {
+                    Some(id) => started.contains(id) || take_one(&mut unexplained, text),
+                    None => take_one(&mut said, text),
+                };
+                keep_open = !is_held;
+                turn = id.map(str::to_string);
+            }
+            // The hook reported this turn's end and missed its prompt.
+            Event::TurnEnded { .. } if turn.as_ref().is_some_and(|id| ended.contains(id)) => {
+                continue;
+            }
+            _ => {}
         }
         if !keep_open {
             continue;
         }
         entry.bus_id = bus_id;
-        if let Some(id) = &entry.vendor_turn_id {
-            seen_ids.insert(id.as_str().to_string());
-        }
-        if let Event::TurnStarted { prompt, .. } = &entry.event
-            && let Some(text) = prompt_text(prompt)
-        {
-            seen_prompts.insert(text);
-        }
         out.push(entry);
     }
     out
+}
+
+/// Use up one held prompt with these words, if any is left.
+fn take_one(words: &mut HashMap<String, u32>, text: Option<String>) -> bool {
+    match text.and_then(|text| words.get_mut(&text)) {
+        Some(left) if *left > 0 => {
+            *left -= 1;
+            true
+        }
+        _ => false,
+    }
 }
 
 fn prompt_text(body: &Body) -> Option<String> {
@@ -967,7 +1042,6 @@ fn append_gaps_files(
     deadline: Option<Instant>,
 ) -> io::Result<Outcome> {
     let known = known_from(held.iter());
-    let grouped = by_bus(held);
     let mut outcome = Outcome::default();
     if !known.unreadable_live.is_empty() {
         outcome.unread.insert(
@@ -975,21 +1049,22 @@ fn append_gaps_files(
             known.unreadable_live.len() as u64,
         );
     }
-    for file in files {
+    let to_read: Vec<(&PathBuf, &str, BusId)> = files
+        .iter()
+        .filter_map(|file| {
+            let (stem, session) = session_of(file)?;
+            let live_bus = *known.live_bus.get(&session)?;
+            (!untouched_since(file, since)).then_some((file, stem, live_bus))
+        })
+        .collect();
+    let targets: Vec<(&str, BusId)> = to_read.iter().map(|&(_, stem, bus)| (stem, bus)).collect();
+    let grouped = records_of(held, &targets);
+    for (file, stem, live_bus) in to_read {
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             if let Some(t) = timing.as_deref_mut() {
                 t.budget_exhausted = true;
             }
             break;
-        }
-        let Some((stem, session)) = session_of(file) else {
-            continue;
-        };
-        let Some(&live_bus) = known.live_bus.get(&session) else {
-            continue;
-        };
-        if untouched_since(file, since) {
-            continue;
         }
         let Ok(text) = fs::read_to_string(file) else {
             *outcome.unread.entry("unreadable file".into()).or_default() += 1;
@@ -1004,7 +1079,9 @@ fn append_gaps_files(
             *outcome.unread.entry(reason.clone()).or_default() += count;
         }
         let missing = missing_from(
-            grouped.get(&live_bus).into_iter().flatten().copied(),
+            grouped.get(stem).into_iter().flatten().copied(),
+            stem,
+            live_bus,
             recovered,
         );
         if missing.is_empty() {
@@ -1784,12 +1861,238 @@ mod tests {
             &turns,
         );
         let mine: Vec<_> = held.iter().filter(|r| r.bus_id == bus).collect();
-        let missing = missing_from(mine, recovered);
+        let missing = missing_from(mine, live_thread, bus, recovered);
         assert!(
             missing.iter().any(|e| e.bus_id == bus
                 && matches!(&e.event, Event::TurnStarted { prompt, .. } if prompt_text(prompt).as_deref() == Some("from the app"))),
             "{missing:?}"
         );
+    }
+
+    fn live_prompt(
+        session: &str,
+        harness: &str,
+        bus_id: BusId,
+        turn: Option<&str>,
+        text: &str,
+    ) -> Entry {
+        Entry {
+            bus_id,
+            observed_at: None,
+            source: Source {
+                harness: Harness::new(harness),
+                harness_version: None,
+                vendor_session_id: Some(session.into()),
+                workspace: None,
+                entrypoint: None,
+                backfilled_from: None,
+                profile: None,
+            },
+            vendor_turn_id: turn.map(conbus_core::event::VendorTurnId::new),
+            vendor_agent_id: None,
+            hook_id: None,
+            spooled_at: None,
+            event: Event::TurnStarted {
+                author: None,
+                prompt: Body::kept(text),
+            },
+        }
+    }
+
+    /// Append `entries` and read the log back.
+    fn logged(machine: &Machine, entries: Vec<Entry>) -> Vec<Record> {
+        let mut log =
+            SegmentLog::open(machine.paths.log_dir(), Retention::default()).expect("open");
+        for entry in entries {
+            log.append(entry).expect("append");
+        }
+        held(machine)
+    }
+
+    /// One prompt per `(id, words)`, as a transcript of `SESSION` holds them.
+    fn transcript_of(turns: &[(&str, &str)]) -> Recovered {
+        let lines: Vec<String> = turns
+            .iter()
+            .map(|(id, words)| {
+                serde_json::json!({
+                    "type": "user", "sessionId": SESSION, "promptId": id,
+                    "timestamp": "2026-08-31T09:33:02.222Z",
+                    "message": {"role": "user", "content": words}
+                })
+                .to_string()
+            })
+            .collect();
+        parse_claude_transcript(&lines.join("\n"), SESSION, BusId::mint())
+    }
+
+    fn turns_in(missing: &[Entry]) -> Vec<&str> {
+        missing
+            .iter()
+            .filter_map(|entry| match &entry.event {
+                Event::TurnStarted { .. } => entry.vendor_turn_id.as_ref().map(|id| id.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn one_record_with_no_id_answers_for_one_turn_with_its_words() {
+        // A live record from before the hook carried an id can only be matched
+        // by its words, and only once: the same words again are another turn.
+        let machine = machine();
+        let bus = BusId::mint();
+        let records = logged(
+            &machine,
+            vec![live_prompt(
+                SESSION,
+                Harness::CLAUDE_CODE,
+                bus,
+                None,
+                "continue",
+            )],
+        );
+
+        let missing = missing_from(
+            &records,
+            SESSION,
+            bus,
+            transcript_of(&[("p0", "continue"), ("p1", "continue")]),
+        );
+
+        assert_eq!(turns_in(&missing), vec!["p1"]);
+    }
+
+    #[test]
+    fn a_turn_listed_under_another_id_is_not_written_again() {
+        // Two sources can number one turn differently: a Chat hook's request id
+        // against an export's message uuid. A held prompt whose id explains no
+        // line of the source answers by its words, so this is not a second copy.
+        let machine = machine();
+        let bus = BusId::mint();
+        let records = logged(
+            &machine,
+            vec![live_prompt(
+                SESSION,
+                Harness::CLAUDE_CODE,
+                bus,
+                Some("the hook's own id"),
+                "said once",
+            )],
+        );
+
+        let missing = missing_from(
+            &records,
+            SESSION,
+            bus,
+            transcript_of(&[("the source's id", "said once"), ("p2", "said once")]),
+        );
+
+        assert_eq!(turns_in(&missing), vec!["p2"], "one record, one turn");
+    }
+
+    #[test]
+    fn a_prompt_an_id_explains_cannot_also_answer_by_its_words() {
+        let machine = machine();
+        let bus = BusId::mint();
+        let records = logged(
+            &machine,
+            vec![live_prompt(
+                SESSION,
+                Harness::CLAUDE_CODE,
+                bus,
+                Some("p0"),
+                "continue",
+            )],
+        );
+
+        let missing = missing_from(
+            &records,
+            SESSION,
+            bus,
+            transcript_of(&[("p0", "continue"), ("p1", "continue")]),
+        );
+
+        assert_eq!(turns_in(&missing), vec!["p1"]);
+    }
+
+    #[test]
+    fn the_same_words_on_another_leg_do_not_hide_a_missed_turn() {
+        // A hop puts two vendor sessions under one conversation. What the other
+        // leg was told is not a record of this leg's turn.
+        let machine = machine();
+        let bus = BusId::mint();
+        let records = logged(
+            &machine,
+            vec![live_prompt(
+                "another-leg",
+                Harness::CODEX,
+                bus,
+                Some("its-turn"),
+                "continue",
+            )],
+        );
+
+        let missing = missing_from(&records, SESSION, bus, transcript_of(&[("p1", "continue")]));
+
+        assert_eq!(turns_in(&missing), vec!["p1"]);
+    }
+
+    #[test]
+    fn a_line_with_no_id_is_matched_by_its_words_against_any_prompt() {
+        let machine = machine();
+        let bus = BusId::mint();
+        let records = logged(
+            &machine,
+            vec![live_prompt(
+                SESSION,
+                Harness::CLAUDE_CODE,
+                bus,
+                Some("p0"),
+                "said once",
+            )],
+        );
+        let recovered = parse_claude_transcript(
+            &serde_json::json!({"type": "user", "sessionId": SESSION,
+                "message": {"role": "user", "content": "said once"}})
+            .to_string(),
+            SESSION,
+            BusId::mint(),
+        );
+
+        assert!(missing_from(&records, SESSION, bus, recovered).is_empty());
+    }
+
+    #[test]
+    fn a_chat_turn_seen_live_is_not_copied_from_an_export_and_a_second_saying_is() {
+        let machine = machine();
+        let chat = "00000000-1111-2222-3333-444444444444";
+        let bus: BusId = chat.parse().expect("uuid");
+        let records = logged(
+            &machine,
+            vec![live_prompt(
+                chat,
+                Harness::CLAUDE_CHAT,
+                bus,
+                Some("request-1"),
+                "hello",
+            )],
+        );
+        let export = r#"{"conversations": [{
+            "uuid": "00000000-1111-2222-3333-444444444444",
+            "chat_messages": [
+                {"uuid": "m1", "sender": "human", "text": "hello", "created_at": "2026-09-06T12:00:00.000Z"},
+                {"uuid": "m2", "sender": "assistant", "text": "hi", "created_at": "2026-09-06T12:01:00.000Z"},
+                {"uuid": "m3", "sender": "human", "text": "hello", "created_at": "2026-09-06T12:02:00.000Z"},
+                {"uuid": "m4", "sender": "assistant", "text": "hi again", "created_at": "2026-09-06T12:03:00.000Z"}
+            ]
+        }]}"#;
+        let mut log =
+            SegmentLog::open(machine.paths.log_dir(), Retention::default()).expect("open");
+
+        let outcome = ingest_chat_text(&records, export, Some(&mut log)).expect("ingest");
+
+        assert_eq!(outcome.gap_turns, 1, "the second saying only");
+        assert_eq!(outcome.gap_records, 2);
     }
 
     #[test]

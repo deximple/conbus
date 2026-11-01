@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 
 const PARENT: &str = "9b24e37f-0000-4000-8000-000000000001";
 const CHILD: &str = "437e9522-0000-4000-8000-000000000002";
+const S: &str = "ea1d23e9-bb83-4df5-9a73-a6a12e138d85";
 const T0: &str = "2026-11-01T00:00:00.000Z";
 
 fn bin() -> &'static str {
@@ -342,4 +343,134 @@ fn a_missed_turn_with_a_skill_body_is_filled_with_its_reply() {
     assert_eq!(filled.len(), 2, "{}", show(&filled));
     assert_eq!(filled[0]["prompt"]["text"], "use the skill");
     assert_eq!(filled[1]["assistant_message"]["text"], "the skill's answer");
+}
+
+#[test]
+fn a_missed_turn_is_filled_even_when_its_words_were_said_before() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let daemon = start(home);
+    hook(home, &prompt(S, "p0", "continue"));
+    hook(home, &ended(S, "p0", "first reply"));
+    stop(daemon);
+    transcript(
+        home,
+        S,
+        &[
+            user(S, "p0", "continue"),
+            reply(S, "first reply"),
+            user(S, "p1", "continue"),
+            reply(S, "the reply only the transcript holds"),
+        ],
+    );
+
+    stop(start(home));
+
+    let all = log_lines(home);
+    assert!(
+        all.iter().any(|record| record["vendor_turn_id"] == "p1"),
+        "p1 missing:\n{}",
+        show(&all)
+    );
+    let replies = all
+        .iter()
+        .filter(|record| record["event"] == "turn_ended")
+        .count();
+    assert_eq!(replies, 2, "{}", show(&all));
+}
+
+/// One vendor session recorded under two conversations, the way a split leaves
+/// it.
+fn split_session(home: &Path, session: &str, turns: [(&str, &str); 2]) {
+    use conbus_core::event::{Body, Event, Harness, Source, VendorTurnId};
+    use conbus_core::ids::BusId;
+    use conbus_core::record::Entry;
+    use conbus_core::retention::Retention;
+    use conbus_core::segment::SegmentLog;
+
+    let mut log = SegmentLog::open(home.join("log"), Retention::default()).expect("open");
+    for (bus, (id, text)) in [BusId::mint(), BusId::mint()].into_iter().zip(turns) {
+        log.append(Entry {
+            bus_id: bus,
+            observed_at: None,
+            source: Source {
+                harness: Harness::new(Harness::CLAUDE_CODE),
+                harness_version: None,
+                vendor_session_id: Some(session.into()),
+                workspace: Some("/repo".into()),
+                entrypoint: None,
+                backfilled_from: None,
+                profile: None,
+            },
+            vendor_turn_id: Some(VendorTurnId::new(id)),
+            vendor_agent_id: None,
+            hook_id: None,
+            spooled_at: None,
+            event: Event::TurnStarted {
+                author: None,
+                prompt: Body::kept(text),
+            },
+        })
+        .expect("append");
+    }
+}
+
+#[test]
+fn a_split_session_does_not_get_its_older_turns_filled_again() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    split_session(
+        home,
+        S,
+        [("p0", "under the first id"), ("p1", "under the second id")],
+    );
+    transcript(
+        home,
+        S,
+        &[
+            user(S, "p0", "under the first id"),
+            user(S, "p1", "under the second id"),
+        ],
+    );
+
+    stop(start(home));
+
+    let again: Vec<Value> = log_lines(home)
+        .into_iter()
+        .filter(|record| record["vendor_turn_id"] == "p0")
+        .collect();
+    assert_eq!(again.len(), 1, "\n{}", show(&again));
+}
+
+#[test]
+fn a_prompt_whose_hook_was_lost_is_filled_without_a_second_ending() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let daemon = start(home);
+    hook(home, &prompt(S, "p0", "seen"));
+    // The prompt hook never arrived; the turn's ending did.
+    hook(home, &ended(S, "p1", "the reply the hook saw"));
+    stop(daemon);
+    transcript(
+        home,
+        S,
+        &[
+            user(S, "p0", "seen"),
+            user(S, "p1", "the prompt only the transcript holds"),
+            reply(S, "the reply the hook saw"),
+        ],
+    );
+
+    stop(start(home));
+
+    let all = log_lines(home);
+    let started = all
+        .iter()
+        .filter(|record| record["event"] == "turn_started" && record["vendor_turn_id"] == "p1")
+        .count();
+    let endings = all
+        .iter()
+        .filter(|record| record["event"] == "turn_ended")
+        .count();
+    assert_eq!((started, endings), (1, 1), "\n{}", show(&all));
 }
