@@ -274,7 +274,7 @@ pub fn summary(paths: &Paths) -> Summary {
             None => families.push((gloss, reason.to_string(), 1)),
         }
     }
-    families.sort_by(|a, b| b.2.cmp(&a.2));
+    families.sort_by_key(|a| std::cmp::Reverse(a.2));
     Summary {
         count: lines.len(),
         transient,
