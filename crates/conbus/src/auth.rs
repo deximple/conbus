@@ -203,19 +203,13 @@ fn describe_url(url: &str) -> String {
     let kind = page.map_or(UNKNOWN_PAGE, |page| page.label);
     out.push_str(&format!("this      {kind}\n"));
 
-    // `client` may be a JSON blob whose `name` is the only safe value to
-    // echo — the rest of the query stays unprinted.
     let value_of = |name: &str| {
         address
             .as_ref()
             .and_then(|address| address.values(&[name]).into_iter().next())
     };
     if let Some(client) = value_of("client") {
-        let name = serde_json::from_str::<serde_json::Value>(&client)
-            .ok()
-            .and_then(|v| v.get("name").and_then(|n| n.as_str()).map(str::to_string))
-            .unwrap_or_else(|| "a client it does not name".into());
-        out.push_str(&format!("asked by  {name}\n"));
+        out.push_str(&format!("url says  {}\n", url::client_claim(&client)));
     }
 
     if let Some(token) = value_of("token") {
