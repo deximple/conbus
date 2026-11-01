@@ -40,7 +40,10 @@ else `~/.conbus`.
   - `encrypted_tools` seals tool bodies with AES-256-GCM, under a key in the
     login Keychain (service `sh.conbus`, account `log-kek`). On Linux there is
     no OS key store and conbus keeps no file-based key, so `encrypted_tools`
-    elides tool bodies instead of sealing them; `conbus doctor` says so.
+    elides tool bodies instead of sealing them; `conbus doctor` says so. On
+    macOS too, a tool call that went through the spool keeps only its size: a
+    hook never reads the key and the spool never holds plaintext. `doctor` counts
+    these under `drops`.
   - `ephemeral` writes nothing.
 
   Any single body is clipped at 16 KiB.

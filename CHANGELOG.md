@@ -8,6 +8,19 @@ the entry says so when it does.
 
 ### Fixed
 
+- Under `encrypted_tools`, a tool body that reached the log elided rather than
+  sealed is now counted, and `doctor` shows the total under `drops`. One line,
+  `tool bodies elided, not sealed`, says how many since the last: at the end of a
+  drain pass that added to the count, otherwise at most every ten minutes, and on
+  shutdown, so a restart with a full spool cannot fill the drop log. Spooled tool
+  bodies are still elided, because sealing in a hook would mean reading the key
+  there. A Keychain that does not answer is counted the same way.
+- A recorder asked to stop now lands what the log will take first, for up to five
+  seconds, and leaves `the recorder stopped with records it could not land` for what
+  it could not, with no copy on disk. A record only in memory used to go with no
+  trace. It also goes when asked with a client still talking.
+- `doctor` no longer puts an orphan down to a restart. Bindings come back from the
+  log, so it is a session whose prompt hook never reached the recorder.
 - A tool event that arrives before its session has a conversation now waits in the
   spool for up to a day for the prompt that binds it, up to 8 MiB, instead of being
   deleted at the next two-second tick. Whether it survived used to come down to

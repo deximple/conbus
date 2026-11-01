@@ -708,3 +708,184 @@ fn a_long_spooled_entry_on_a_nearly_full_disk_is_no_outage_per_hook() {
         assert_eq!(notes.matches(kind).count(), 1, "{kind}:\n{notes}");
     }
 }
+
+/// Ask it to go, as launchd and systemd do, and say what it died of.
+fn ask_to_go(mut daemon: Daemon) -> Option<i32> {
+    use std::os::unix::process::ExitStatusExt;
+    // SAFETY: a plain kill(2) on a child this test still holds, so the pid is its.
+    unsafe { libc::kill(daemon.0.id() as libc::pid_t, libc::SIGTERM) };
+    daemon.0.wait().expect("wait").signal()
+}
+
+/// `hooks` answered with nowhere on disk to put a copy, on a log that refuses.
+fn only_in_memory(home: &Path, hooks: usize) -> (Daemon, PathBuf) {
+    let segment = a_log_with_one_turn(home);
+    std::fs::write(home.join("spool"), "").expect("in the way");
+    chmod(&segment, 0o400);
+    let daemon = start(home);
+    for n in 0..hooks {
+        prompt(home, &format!("h{n}"), "only in memory");
+    }
+    (daemon, segment)
+}
+
+fn only_in_memory_lines(home: &Path) -> usize {
+    records(home)
+        .iter()
+        .filter(|record| record["prompt"]["text"] == "only in memory")
+        .count()
+}
+
+#[test]
+fn a_sigterm_lands_what_the_log_would_take_before_it_goes() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let (daemon, segment) = only_in_memory(home.path(), 5);
+    chmod(&segment, 0o600);
+
+    let died_of = ask_to_go(daemon);
+
+    assert_eq!(
+        only_in_memory_lines(home.path()),
+        5,
+        "every hook was answered, and the log would have taken them"
+    );
+    assert_eq!(died_of, Some(libc::SIGTERM), "it still dies of the signal");
+    assert!(
+        !drops(home.path()).contains("could not land"),
+        "{}",
+        drops(home.path())
+    );
+}
+
+#[test]
+fn a_sigterm_says_what_it_could_not_land() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let (daemon, segment) = only_in_memory(home.path(), 5);
+
+    let died_of = ask_to_go(daemon);
+    chmod(&segment, 0o600);
+
+    assert_eq!(only_in_memory_lines(home.path()), 0);
+    assert_eq!(died_of, Some(libc::SIGTERM), "it still dies of the signal");
+    let said = drops(home.path());
+    let line: serde_json::Value = serde_json::from_str(said.trim()).expect("one line");
+    assert_eq!(
+        line["reason"],
+        "the recorder stopped with records it could not land"
+    );
+    assert_eq!(line["detail"], "5 record(s) lost");
+    let doctor = doctor(home.path());
+    assert!(
+        doctor.contains("5× the recorder stopped with records it could not land"),
+        "{doctor}"
+    );
+}
+
+#[test]
+fn a_sigterm_with_copies_in_the_spool_loses_nothing_and_says_nothing() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let segment = a_log_with_one_turn(home.path());
+    chmod(&segment, 0o400);
+    let daemon = start(home.path());
+    for n in 0..5 {
+        prompt(home.path(), &format!("h{n}"), "only in memory");
+    }
+    assert_eq!(spooled(home.path()).len(), 5);
+
+    ask_to_go(daemon);
+
+    assert_eq!(drops(home.path()), "", "the next daemon has all of them");
+    chmod(&segment, 0o600);
+    let daemon = start(home.path());
+    until("the spool drains", || spooled(home.path()).is_empty());
+    stop(daemon);
+    assert_eq!(only_in_memory_lines(home.path()), 5);
+}
+
+#[test]
+fn a_daemon_goes_when_asked_even_with_a_client_still_talking() {
+    // Hooks do not behave like this, so only a service manager's SIGKILL bounded it.
+    let home = tempfile::tempdir().expect("tempdir");
+    let mut daemon = start(home.path());
+    let mut stream =
+        std::os::unix::net::UnixStream::connect(home.path().join("conbus.sock")).expect("connect");
+    let line = serde_json::json!({
+        "pv": 6, "harness": "claude_code", "vendor_session_id": "x", "workspace": "/repo",
+        "event": {"event": "session_candidate"}
+    })
+    .to_string()
+        + "\n";
+    let mut reader = std::io::BufReader::new(stream.try_clone().expect("clone"));
+    // SAFETY: a plain kill(2) on a child this test still holds.
+    unsafe { libc::kill(daemon.0.id() as libc::pid_t, libc::SIGTERM) };
+    let asked = Instant::now();
+    let mut gone = false;
+    while asked.elapsed() < Duration::from_secs(6) {
+        let mut reply = String::new();
+        if stream.write_all(line.as_bytes()).is_err()
+            || std::io::BufRead::read_line(&mut reader, &mut reply).unwrap_or(0) == 0
+        {
+            gone = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let gone = gone || daemon.0.try_wait().expect("try_wait").is_some();
+    assert!(gone, "still serving 6 s after SIGTERM");
+}
+
+#[test]
+fn a_daemon_goes_when_asked_without_serving_the_connections_queued_behind_it() {
+    // Each of these costs the daemon its whole silence bound, 200 ms, so waiting
+    // them all out would take 20 s.
+    let home = tempfile::tempdir().expect("tempdir");
+    let mut daemon = start(home.path());
+    let socket = home.path().join("conbus.sock");
+    let queued: Vec<_> = (0..100)
+        .map(|_| std::os::unix::net::UnixStream::connect(&socket).expect("connect"))
+        .collect();
+
+    // SAFETY: a plain kill(2) on a child this test still holds.
+    unsafe { libc::kill(daemon.0.id() as libc::pid_t, libc::SIGTERM) };
+    let asked = Instant::now();
+    while asked.elapsed() < Duration::from_secs(10) && daemon.0.try_wait().expect("try").is_none() {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let waited = asked.elapsed();
+    drop(queued);
+
+    assert!(
+        waited < Duration::from_secs(10),
+        "it served the queue first: still there after {waited:?}"
+    );
+}
+
+#[test]
+fn a_drain_stops_between_files_when_asked() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let segment = a_log_with_one_turn(home.path());
+    let spool = home.path().join("spool");
+    std::fs::create_dir_all(&spool).expect("spool");
+    const FILES: usize = 40_000;
+    for n in 0..FILES {
+        let id = format!("01a19463-cbd4-7b50-b819-{n:012}");
+        let entry = serde_json::json!({
+            "pv": 6, "harness": "claude_code", "vendor_session_id": SESSION,
+            "vendor_turn_id": format!("t{n}"), "workspace": "/repo", "hid": id,
+            "spooled": "2026-11-01T00:00:00.000Z",
+            "event": {"event": "turn_started", "prompt": {"kind": "kept", "text": "x"}}
+        });
+        std::fs::write(spool.join(format!("{id}.json")), entry.to_string()).expect("entry");
+    }
+    chmod(&segment, 0o400);
+    let daemon = start(home.path());
+    chmod(&segment, 0o600);
+    until("the pass began", || spooled(home.path()).len() < FILES);
+
+    ask_to_go(daemon);
+
+    assert!(
+        !spooled(home.path()).is_empty(),
+        "a service manager waited out all {FILES} files"
+    );
+}

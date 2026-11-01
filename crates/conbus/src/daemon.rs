@@ -8,6 +8,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::Duration;
 
 use conbus_core::clock::Timestamp;
@@ -71,10 +72,26 @@ pub struct Daemon {
     /// Spool entries read once and not worth reading again yet. A spool can hold
     /// thousands of them, and a drain runs in front of every hook behind it.
     parked: HashMap<PathBuf, Parked>,
+    lost_seals: LostSeals,
     /// When `daemon.log` last heard about the log refusing, and about it taking
     /// writes again. A nearly full disk can do both on every hook.
     refusal_noted_at: Option<std::time::Instant>,
     recovery_noted_at: Option<std::time::Instant>,
+}
+
+/// How often a count of lost seals is written when no drain pass adds to it.
+/// That is the live path, a Keychain that will not answer, which can go on for as
+/// long as the machine runs.
+const LOST_SEALS_EVERY: Duration = Duration::from_secs(10 * 60);
+
+/// Tool bodies that reached the log elided where `encrypted_tools` promises a
+/// seal. Counted and not logged one by one: a restart with a full spool would
+/// fill the drop log with these, and past its cap the next real drop has no line.
+#[derive(Default)]
+struct LostSeals {
+    /// How many since the last line that said so.
+    unsaid: u64,
+    said_at: Option<std::time::Instant>,
 }
 
 /// How long a spooled event waits for its session to get a conversation.
@@ -224,6 +241,7 @@ impl Daemon {
             held_bytes: 0,
             refusal: None,
             parked: HashMap::new(),
+            lost_seals: LostSeals::default(),
             refusal_noted_at: None,
             recovery_noted_at: None,
         }
@@ -592,7 +610,10 @@ impl Daemon {
                     }
                     self.report_refusal();
                     return match written {
-                        Some(record) => Landing::Written(Box::new(record)),
+                        Some(record) => {
+                            self.count_a_lost_seal(&record);
+                            Landing::Written(Box::new(record))
+                        }
                         None => Landing::Withheld,
                     };
                 }
@@ -636,8 +657,16 @@ impl Daemon {
 
     /// Give the log what it refused, oldest first, until it refuses again.
     fn land_held(&mut self) {
+        self.land_held_until(None);
+    }
+
+    /// As [`Daemon::land_held`], stopping at `limit` if there is one.
+    fn land_held_until(&mut self, limit: Option<std::time::Instant>) {
         let mut took_one = false;
         while let Some(front) = self.held.front() {
+            if limit.is_some_and(|limit| std::time::Instant::now() >= limit) {
+                break;
+            }
             let landed = self.log.append(front.entry.clone());
             let expired = front.since.elapsed() >= WAITING_LIFE;
             if landed.is_err() && !expired {
@@ -655,6 +684,7 @@ impl Daemon {
                         refusal.landed += 1;
                     }
                     if let Some(record) = written {
+                        self.count_a_lost_seal(&record);
                         self.after_landing(record, held.declared);
                     }
                 }
@@ -688,6 +718,60 @@ impl Daemon {
         let mut seqs = Vec::new();
         self.remember(&written);
         self.follow_through(bus_id, &source, &mut written, &mut seqs, declared);
+    }
+
+    /// `encrypted_tools` promises a sealed body. One that reached the log elided
+    /// is lost for good, so it is counted, and `doctor` shows the total. Mostly
+    /// these came through the spool, where the hook has no key and will not store
+    /// plaintext, and the rest are a Keychain that would not answer.
+    fn count_a_lost_seal(&mut self, record: &Record) {
+        if self.log.retention() == Retention::EncryptedTools
+            && conbus_core::seal::seals_here()
+            && conbus_core::retention::elided_tool_body(&record.event)
+        {
+            self.lost_seals.unsaid += 1;
+        }
+    }
+
+    /// Say what has been counted, as one line however many it is.
+    fn say_lost_seals(&mut self) {
+        let unsaid = std::mem::take(&mut self.lost_seals.unsaid);
+        if unsaid > 0 {
+            self.write_drop(
+                &crate::drops::Dropped::new(crate::drops::LOST_SEALS)
+                    .with_detail(crate::drops::seals_detail(unsaid)),
+            );
+            self.lost_seals.said_at = Some(std::time::Instant::now());
+        }
+    }
+
+    /// At the end of a drain pass: now if the pass added to the count, or if the
+    /// last line was long enough ago.
+    fn say_lost_seals_after_a_pass(&mut self, counted_before: u64) {
+        let due = self
+            .lost_seals
+            .said_at
+            .is_none_or(|at| at.elapsed() >= LOST_SEALS_EVERY);
+        if due || self.lost_seals.unsaid > counted_before {
+            self.say_lost_seals();
+        }
+    }
+
+    /// Say what goes with this daemon: held records with nothing on disk behind
+    /// them. Best effort: on a really full disk this line has nowhere to go either.
+    fn say_what_it_could_not_land(&self) {
+        let lost = self.only_in_memory();
+        if lost > 0 {
+            note!("stopping with {lost} record(s) the log would not take");
+            self.write_drop(
+                &crate::drops::Dropped::new(crate::drops::STOPPED_HOLDING)
+                    .with_detail(crate::drops::stopped_detail(lost)),
+            );
+        }
+    }
+
+    fn write_drop(&self, dropped: &crate::drops::Dropped) {
+        crate::drops::record_in(self.root_paths().as_ref(), dropped);
     }
 
     /// A held record's other copy, gone as soon as the first one lands.
@@ -774,10 +858,7 @@ impl Daemon {
         } else {
             "the log refused writes for a while"
         };
-        crate::drops::record_in(
-            self.root_paths().as_ref(),
-            &crate::drops::Dropped::new(reason).with_detail(told),
-        );
+        self.write_drop(&crate::drops::Dropped::new(reason).with_detail(told));
     }
 
     /// Fold what was written into the state the next briefing reads.
@@ -1663,7 +1744,13 @@ pub fn serve(paths: &Paths, retention: Retention) -> io::Result<()> {
     );
 
     listener.set_nonblocking(true)?;
+    // Only now: nothing before this point has anything to say on its way out, and
+    // a daemon asked to go in the middle of a long start should simply go.
+    listen_for_shutdown();
     loop {
+        if let Some(signal) = asked_to_go() {
+            go_as_asked(&mut daemon, signal);
+        }
         let mut fds = [libc::pollfd {
             fd: listener.as_raw_fd(),
             events: libc::POLLIN,
@@ -1692,6 +1779,9 @@ pub fn serve(paths: &Paths, retention: Retention) -> io::Result<()> {
                         note!("connection failed: {err}");
                     }
                     drain_pending(&mut daemon);
+                    if asked_to_go().is_some() {
+                        break;
+                    }
                 }
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
                 Err(err) => {
@@ -1701,6 +1791,59 @@ pub fn serve(paths: &Paths, retention: Retention) -> io::Result<()> {
             }
         }
     }
+}
+
+/// The signal a service manager or a person asked this daemon to go with.
+static GOING: AtomicI32 = AtomicI32::new(0);
+
+extern "C" fn note_the_signal(signal: libc::c_int) {
+    GOING.store(signal, Ordering::Relaxed);
+}
+
+/// Hear SIGTERM and SIGINT rather than die of them where they land, so what only
+/// memory holds can still be said. The loop looks after every connection, and a
+/// poll in progress returns early because `SA_RESTART` is not set.
+fn listen_for_shutdown() {
+    for signal in [libc::SIGTERM, libc::SIGINT] {
+        // SAFETY: the handler only stores to an atomic, which is async-signal-safe,
+        // and `action` is fully initialised before the call reads it.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = note_the_signal as *const () as usize;
+            libc::sigemptyset(&mut action.sa_mask);
+            if libc::sigaction(signal, &action, std::ptr::null_mut()) != 0 {
+                note!(
+                    "could not listen for signal {signal}: {}",
+                    io::Error::last_os_error()
+                );
+            }
+        }
+    }
+}
+
+fn asked_to_go() -> Option<libc::c_int> {
+    match GOING.load(Ordering::Relaxed) {
+        0 => None,
+        signal => Some(signal),
+    }
+}
+
+/// How long a daemon asked to go spends landing what it holds. A service manager
+/// will not wait for ever, and what is left is said rather than lost in silence.
+const LANDING_ON_THE_WAY_OUT: Duration = Duration::from_secs(5);
+
+/// Land what the log will take, say what is left, then die of the signal that was
+/// sent. launchd and systemd read a signal death, so what they see does not change.
+fn go_as_asked(daemon: &mut Daemon, signal: libc::c_int) -> ! {
+    daemon.land_held_until(Some(std::time::Instant::now() + LANDING_ON_THE_WAY_OUT));
+    daemon.say_lost_seals();
+    daemon.say_what_it_could_not_land();
+    // SAFETY: restoring the default action and raising a signal touch no memory.
+    unsafe {
+        libc::signal(signal, libc::SIG_DFL);
+        libc::raise(signal);
+    }
+    std::process::exit(128 + signal)
 }
 
 /// Hand off everything the connection queued, without waiting for any of it.
@@ -1863,29 +2006,28 @@ fn handle_connection(daemon: &mut Daemon, stream: UnixStream) -> io::Result<()> 
         if line.is_empty() {
             continue;
         }
-        if line == crate::wire::HEALTH_QUESTION {
-            let health = serde_json::to_string(&daemon.health()).map_err(io::Error::other)?;
-            writeln!(writer, "{health}")?;
-            writer.flush()?;
-            served += 1;
-            continue;
-        }
-        let response = match serde_json::from_str::<Request>(&line) {
-            Ok(request) => daemon.handle(request),
-            Err(err) => match from_a_build_that_can_read_it(&line) {
-                Some(theirs) => refuse_a_newer_hook(theirs),
-                None => Response::Failed {
-                    error: format!("unreadable request: {err}"),
+        let reply = if line == crate::wire::HEALTH_QUESTION {
+            serde_json::to_string(&daemon.health())
+        } else {
+            let response = match serde_json::from_str::<Request>(&line) {
+                Ok(request) => daemon.handle(request),
+                Err(err) => match from_a_build_that_can_read_it(&line) {
+                    Some(theirs) => refuse_a_newer_hook(theirs),
+                    None => Response::Failed {
+                        error: format!("unreadable request: {err}"),
+                    },
                 },
-            },
+            };
+            serde_json::to_string(&response)
         };
-        writeln!(
-            writer,
-            "{}",
-            serde_json::to_string(&response).map_err(io::Error::other)?
-        )?;
+        writeln!(writer, "{}", reply.map_err(io::Error::other)?)?;
         writer.flush()?;
         served += 1;
+        // A client that keeps talking must not hold off a service manager. What it
+        // has been answered for is written, and what it sends next finds no daemon.
+        if asked_to_go().is_some() {
+            break;
+        }
     }
     Ok(())
 }
@@ -1971,6 +2113,14 @@ fn let_go(paths: &Paths, file: &Path, reason: String, detail: String) {
     }
 }
 
+/// An event's kind, as the log names it.
+fn kind_of(event: &Event) -> String {
+    serde_json::to_value(event)
+        .ok()
+        .and_then(|v| v.get("event").and_then(|k| k.as_str().map(String::from)))
+        .unwrap_or_else(|| "unknown".into())
+}
+
 /// What a spooled request this build cannot parse was and whose it was, in the
 /// shape every other spool drop gives. Identifiers, never content.
 fn named_by(text: &str) -> String {
@@ -1999,6 +2149,12 @@ fn outlived(file: &Path, life: Duration) -> bool {
 /// it for `WAITING_LIFE`, and a session with no conversation yet for
 /// `ORPHAN_LIFE`; any other refusal is a drop with the reason.
 fn drain_spool(daemon: &mut Daemon, paths: &Paths) {
+    let counted_before = daemon.lost_seals.unsaid;
+    drain_pass(daemon, paths);
+    daemon.say_lost_seals_after_a_pass(counted_before);
+}
+
+fn drain_pass(daemon: &mut Daemon, paths: &Paths) {
     daemon.land_held();
     let Ok(entries) = std::fs::read_dir(paths.spool_dir()) else {
         return;
@@ -2013,6 +2169,11 @@ fn drain_spool(daemon: &mut Daemon, paths: &Paths) {
     let mut parked = std::mem::take(&mut daemon.parked);
     let now = std::time::SystemTime::now();
     for file in files {
+        // The files stay, and the next daemon reads them. A service manager
+        // asking this one to go should not wait out a spool of thousands.
+        if asked_to_go().is_some() {
+            break;
+        }
         if let Some(entry) = parked.remove(&file)
             && !entry.due(&daemon.registry, now)
         {
@@ -2064,10 +2225,7 @@ fn drain_spool(daemon: &mut Daemon, paths: &Paths) {
                 // The same shape the hook's own drop carried: the event and
                 // the session, so a ghost session's end can be told from a
                 // lost tool call.
-                let kind = serde_json::to_value(&request.event)
-                    .ok()
-                    .and_then(|v| v.get("event").and_then(|k| k.as_str().map(String::from)))
-                    .unwrap_or_else(|| "unknown".into());
+                let kind = kind_of(&request.event);
                 let session: String = request.vendor_session_id.chars().take(8).collect();
                 let key = SessionKey::new(request.harness.clone(), &request.vendor_session_id);
                 let waits = mid_turn(&request.event);
@@ -2471,6 +2629,124 @@ mod tests {
             Stopped::Displaced,
             "and a restart folds the same log the same way"
         );
+    }
+
+    #[test]
+    fn landing_on_the_way_out_stops_at_its_limit_and_what_is_left_is_said() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let (mut daemon, paths) = rooted_over_a_closed_log(home.path());
+        for n in 0..3 {
+            daemon.handle(from_a_hook(turn(&format!("held {n}"))));
+        }
+        open_the_log(&paths.log_dir());
+
+        daemon.land_held_until(Some(std::time::Instant::now()));
+        assert_eq!(daemon.held.len(), 3, "the limit has already passed");
+        assert!(texts_on_disk(&paths.log_dir()).is_empty());
+
+        daemon.say_what_it_could_not_land();
+        let said = fs::read_to_string(paths.root().join("drops.jsonl")).expect("the line");
+        let line: serde_json::Value = serde_json::from_str(said.trim()).expect("one line");
+        assert_eq!(
+            line["reason"],
+            "the recorder stopped with records it could not land"
+        );
+        assert_eq!(line["detail"], "3 record(s) lost");
+    }
+
+    #[test]
+    fn landing_on_the_way_out_lands_what_the_log_takes_within_its_limit() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let (mut daemon, paths) = rooted_over_a_closed_log(home.path());
+        for n in 0..3 {
+            daemon.handle(from_a_hook(turn(&format!("held {n}"))));
+        }
+        open_the_log(&paths.log_dir());
+
+        daemon.land_held_until(Some(std::time::Instant::now() + LANDING_ON_THE_WAY_OUT));
+        daemon.say_what_it_could_not_land();
+
+        assert_eq!(texts_on_disk(&paths.log_dir()).len(), 3);
+        let said = fs::read_to_string(paths.root().join("drops.jsonl")).unwrap_or_default();
+        assert!(!said.contains("could not land"), "{said}");
+        assert!(
+            said.contains("the log refused writes for a while"),
+            "{said}"
+        );
+    }
+
+    #[test]
+    fn a_record_with_a_spool_copy_is_not_called_lost() {
+        // The next daemon drains it.
+        let home = tempfile::tempdir().expect("tempdir");
+        let (mut daemon, paths) = rooted_over_a_closed_log(home.path());
+        let spooled = from_a_hook(turn("with a copy"));
+        spool_copy_of(&paths, &spooled);
+        daemon.handle(spooled);
+
+        daemon.say_what_it_could_not_land();
+
+        open_the_log(&paths.log_dir());
+        let said = fs::read_to_string(paths.root().join("drops.jsonl")).unwrap_or_default();
+        assert_eq!(said, "");
+    }
+
+    #[test]
+    fn lost_seals_are_said_when_a_pass_adds_to_them_or_after_ten_minutes() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let (mut daemon, paths) = rooted_over_a_closed_log(home.path());
+        open_the_log(&paths.log_dir());
+        let said = || {
+            fs::read_to_string(paths.root().join("drops.jsonl"))
+                .unwrap_or_default()
+                .lines()
+                .map(String::from)
+                .collect::<Vec<_>>()
+        };
+
+        // Nothing to say is nothing said, however long it has been.
+        drain_spool(&mut daemon, &paths);
+        assert!(said().is_empty());
+
+        // A first count goes out at the next pass.
+        daemon.lost_seals.unsaid = 2;
+        drain_spool(&mut daemon, &paths);
+        assert_eq!(said().len(), 1);
+        assert!(
+            said()[0].contains("\"detail\":\"2 tool event(s)\""),
+            "{:?}",
+            said()
+        );
+
+        // The live path counts between passes, and that waits.
+        daemon.lost_seals.unsaid = 5;
+        drain_spool(&mut daemon, &paths);
+        assert_eq!(said().len(), 1, "inside the ten minutes");
+        assert_eq!(daemon.lost_seals.unsaid, 5, "and not forgotten");
+
+        // A pass that adds to it does not.
+        let before = daemon.lost_seals.unsaid;
+        daemon.lost_seals.unsaid += 1;
+        daemon.say_lost_seals_after_a_pass(before);
+        assert_eq!(said().len(), 2);
+        assert!(
+            said()[1].contains("\"detail\":\"6 tool event(s)\""),
+            "{:?}",
+            said()
+        );
+
+        // And nor does ten minutes.
+        daemon.lost_seals.unsaid = 7;
+        daemon.lost_seals.said_at = std::time::Instant::now().checked_sub(LOST_SEALS_EVERY);
+        drain_spool(&mut daemon, &paths);
+        assert_eq!(said().len(), 3);
+        assert!(
+            said()[2].contains("\"detail\":\"7 tool event(s)\""),
+            "{:?}",
+            said()
+        );
+        drain_spool(&mut daemon, &paths);
+        assert_eq!(said().len(), 3, "nothing since");
     }
 
     #[test]

@@ -247,7 +247,10 @@ copy if there is room. It lands once, in arrival order, when the log takes write
 again, and `drops.jsonl` then says how long and how many. A record only in memory is
 lost if the recorder stops before the log takes it, and on a really full disk that
 is every record. `conbus doctor` says so on its `writable` line while it lasts: free
-space, and do not restart the recorder. A spooled
+space, and do not restart the recorder. Asked to stop, it first lands what the log
+will take, for up to five seconds, and leaves a line in `drops.jsonl` for what it
+could not, if there is room for one. A killed or crashed recorder has no such chance.
+A spooled
 entry is dropped with a line only once the file is seven days old and the log has
 refused for seven days without one write working. One written by a newer build
 that this daemon cannot read yet is dropped with a line after seven days.
@@ -606,7 +609,7 @@ The socket path must stay under 104 bytes; `doctor` tells you if a
 | --- | --- | --- |
 | *(unset)* | kept | not written — only their size |
 | `full` | kept | kept (each body clipped at 16 KiB) |
-| `encrypted_tools` | kept | sealed with AES-256-GCM under a key in your login Keychain; `conbus log --reveal` opens them. On Linux there is no OS key store and conbus keeps none of its own, so bodies are elided, not sealed |
+| `encrypted_tools` | kept | sealed with AES-256-GCM under a key in your login Keychain; `conbus log --reveal` opens them. A tool call that went through the spool keeps only its size, because only the recorder can seal; `doctor` counts these under `drops`. On Linux there is no OS key store and conbus keeps none of its own, so bodies are elided, not sealed |
 | `ephemeral` | nothing is written | nothing is written |
 
 At every level, a single body longer than 16 KiB is clipped in the log and
