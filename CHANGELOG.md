@@ -6,6 +6,12 @@ the entry says so when it does.
 
 ## [Unreleased]
 
+### Fixed
+
+- `conbus log | head -1` and the like no longer end in a panic. A command whose
+  reader went away exits 141, as if SIGPIPE had ended it, and prints nothing. A
+  hook that cannot print exits 0, because it must never fail the turn it answers.
+
 ## [1.0.0-rc.3] — 2026-11-01
 
 ### Fixed

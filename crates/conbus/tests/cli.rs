@@ -3,6 +3,7 @@
 //! ran and failed, 2 it was not a command at all. `hook` always exits 0: it
 //! answers a turn, not an operator.
 
+use std::io::Write;
 use std::process::{Command, Stdio};
 
 fn bin() -> &'static str {
@@ -97,4 +98,61 @@ fn the_hook_exits_zero_even_on_a_flag_it_does_not_know() {
     // is still just a payload to answer.
     let (code, _, _) = run(&["hook", "--bogus-flag"]);
     assert_eq!(code, 0, "conbus hook always exits 0");
+}
+
+/// A pipe nobody is reading: the first write to it fails with `Broken pipe`.
+fn a_pipe_with_no_reader() -> Stdio {
+    let (reader, writer) = std::io::pipe().expect("pipe");
+    drop(reader);
+    Stdio::from(writer)
+}
+
+#[test]
+fn a_reader_that_went_away_is_not_a_crash() {
+    // `conbus log | head -1` is ordinary use. `println!` panics on the closed
+    // pipe, so this printed a panic and a backtrace hint and exited 101, where a
+    // Unix tool exits as if SIGPIPE had ended it.
+    let out = Command::new(bin())
+        .arg("--version")
+        .stdout(a_pipe_with_no_reader())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run");
+
+    assert_eq!(out.status.code(), Some(141));
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "");
+}
+
+#[test]
+fn a_hook_whose_reader_went_away_does_not_fail_the_turn() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let mut child = Command::new(bin())
+        .args(["hook", "--harness", "claude_code"])
+        .env("CONBUS_HOME", home.path())
+        .env("HOME", home.path())
+        .env("CONBUS_SKIP_LAUNCHCTL", "1")
+        .stdin(Stdio::piped())
+        .stdout(a_pipe_with_no_reader())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(br#"{"session_id":"s","hook_event_name":"UserPromptSubmit","prompt":"x"}"#)
+        .expect("write");
+
+    let out = child.wait_with_output().expect("wait");
+
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a hook must never fail the turn"
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("panicked"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
