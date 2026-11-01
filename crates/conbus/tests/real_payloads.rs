@@ -32,11 +32,12 @@ fn payload(hook_event_name: &str) -> serde_json::Value {
 
 /// Wait until the daemon serves, not merely until its socket exists.
 ///
-/// It binds before it repairs and folds the log, so a hook that connects in
-/// between waits on a daemon that is not answering yet, gives up at its 500ms
-/// deadline, and drops the record — which on a busy CI runner is often enough
-/// that "a segment must exist" failed. The build stamp gains its hardening
-/// fields once restore is done, the same signal `recorder.rs` waits for.
+/// The stamp is rewritten three times — at bind, after hardening, and once
+/// serving is marked, which is the last write before the accept loop. A hook
+/// that connects earlier can still outwait the daemon inside its 500ms reply
+/// deadline and spool instead, which on a busy CI runner is often enough that
+/// "a segment must exist" failed. `serving` is the signal `recorder.rs` waits
+/// for too.
 fn wait_until_serving(home: &std::path::Path) {
     let socket = home.join("conbus.sock");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -44,7 +45,7 @@ fn wait_until_serving(home: &std::path::Path) {
         let settled = std::fs::read_to_string(home.join("daemon.build"))
             .ok()
             .and_then(|text| serde_json::from_str::<serde_json::Value>(text.trim()).ok())
-            .is_some_and(|stamp| stamp.get("memory_locked").is_some());
+            .is_some_and(|stamp| stamp.get("serving").is_some());
         if settled && std::os::unix::net::UnixStream::connect(&socket).is_ok() {
             return;
         }
