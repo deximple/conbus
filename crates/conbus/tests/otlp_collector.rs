@@ -108,10 +108,23 @@ const METRICS: [(&str, &str, bool, &str, Option<&str>); 20] = [
 struct Collector {
     child: Child,
     received: PathBuf,
+    port: u16,
 }
 
 impl Collector {
-    fn start(binary: &Path, dir: &Path, port: u16) -> Collector {
+    /// `port` can only be probed by freeing it first; when another process
+    /// takes it before the collector binds, start over with a fresh one.
+    fn start(binary: &Path, dir: &Path) -> Collector {
+        for attempt in 0..5 {
+            if let Some(collector) = Self::try_start(binary, dir, free_port()) {
+                return collector;
+            }
+            assert!(attempt < 4, "the port kept being taken between probes");
+        }
+        unreachable!()
+    }
+
+    fn try_start(binary: &Path, dir: &Path, port: u16) -> Option<Collector> {
         let received = dir.join("received.jsonl");
         let config = dir.join("config.yaml");
         std::fs::write(
@@ -133,17 +146,25 @@ impl Collector {
             .stderr(log)
             .spawn()
             .expect("start the collector");
-        let collector = Collector { child, received };
+        let mut collector = Collector {
+            child,
+            received,
+            port,
+        };
         let deadline = Instant::now() + Duration::from_secs(20);
         while TcpStream::connect(("127.0.0.1", port)).is_err() {
-            assert!(
-                Instant::now() < deadline,
-                "the collector did not listen on {port}; see {}",
-                dir.join("collector.log").display()
-            );
+            if Instant::now() >= deadline {
+                let _ = collector.child.kill();
+                let _ = collector.child.wait();
+                eprintln!(
+                    "the collector did not listen on {port}; see {}",
+                    dir.join("collector.log").display()
+                );
+                return None;
+            }
             std::thread::sleep(Duration::from_millis(100));
         }
-        collector
+        Some(collector)
     }
 
     /// Stop it the way an operator would, so the file exporter writes out
@@ -346,12 +367,11 @@ fn a_real_collector_keeps_every_point_as_shareable_printed_it() {
         .expect("set CONBUS_OTELCOL to an OpenTelemetry Collector binary");
     let home = tempfile::tempdir().expect("tempdir");
     a_day_of_work(home.path());
-    let port = free_port();
-    let collector = Collector::start(&binary, home.path(), port);
+    let collector = Collector::start(&binary, home.path());
 
     let output = Command::new(env!("CARGO_BIN_EXE_conbus"))
         .args(["usage", "--json", "--shareable", "--day", DAY, "--otlp"])
-        .arg(format!("http://127.0.0.1:{port}"))
+        .arg(format!("http://127.0.0.1:{}", collector.port))
         .env("CONBUS_HOME", home.path())
         .output()
         .expect("run conbus usage");

@@ -981,17 +981,31 @@ fn an_inference_hook_frame_attaches_claude_chat_and_allows() {
 fn an_inference_listen_post_attaches_claude_chat() {
     let home = tempfile::tempdir().expect("tempdir");
     let daemon = start_daemon(home.path());
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-    let addr = listener.local_addr().expect("addr").to_string();
-    drop(listener);
-    let mut child = Command::new(bin())
-        .args(["hook", "--inference-listen", &addr])
-        .env("CONBUS_HOME", home.path())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("listen");
+    // The listener needs a free port, which can only be probed by letting a
+    // port go — and another process can take it before the child binds. The
+    // child exits in that case, so retry with a fresh port until one sticks.
+    let (mut child, addr) = {
+        let mut attempt = 0;
+        loop {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            let addr = listener.local_addr().expect("addr").to_string();
+            drop(listener);
+            let mut child = Command::new(bin())
+                .args(["hook", "--inference-listen", &addr])
+                .env("CONBUS_HOME", home.path())
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("listen");
+            std::thread::sleep(Duration::from_millis(150));
+            if child.try_wait().expect("wait").is_none() {
+                break (child, addr);
+            }
+            attempt += 1;
+            assert!(attempt < 10, "the port kept being taken between probes");
+        }
+    };
     let frame = include_str!("fixtures/claude_inference_hook_prompt.json");
     let deadline = Instant::now() + Duration::from_secs(3);
     let mut reply = String::new();

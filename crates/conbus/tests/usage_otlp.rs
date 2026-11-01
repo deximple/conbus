@@ -254,14 +254,35 @@ fn a_url_the_pipe_does_not_speak_is_refused_before_anything_is_printed_or_sent()
     assert_eq!(nobody.kind(), std::io::ErrorKind::WouldBlock);
 }
 
+/// A port that is provably closed for the whole test: a connect is refused,
+/// and binding it needs a privilege this test does not have — so no other
+/// process can take the port the way a freed ephemeral one can be between
+/// a probe and the connect.
+fn closed_port() -> u16 {
+    use std::io::ErrorKind;
+    for port in [
+        1u16, 9, 13, 17, 19, 23, 25, 37, 42, 87, 95, 98, 110, 119, 123, 135, 139, 143,
+    ] {
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+        let refused = matches!(
+            std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(200)),
+            Err(err) if err.kind() == ErrorKind::ConnectionRefused
+        );
+        if !refused {
+            continue;
+        }
+        if std::net::TcpListener::bind(addr).is_err() {
+            return port;
+        }
+    }
+    panic!("no privileged port is both refused and unbindable here")
+}
+
 #[test]
 fn a_collector_that_is_not_there_is_an_error_and_a_non_zero_exit() {
     let home = tempfile::tempdir().expect("home");
     a_day_of_work(home.path());
-    let port = {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        listener.local_addr().expect("addr").port()
-    };
+    let port = closed_port();
 
     let out = usage(
         home.path(),
