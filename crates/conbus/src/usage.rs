@@ -529,4 +529,56 @@ mod tests {
             assert!(!line.contains("secret plan"), "{line}");
         }
     }
+
+    /// The keys 1.x promises (`docs/stability.md`): added to, never renamed or
+    /// removed. A new key fails this test until it is added here on purpose.
+    const ROW_KEYS: [&str; 27] = [
+        "account_stops",
+        "attendance",
+        "briefings",
+        "conversations",
+        "day",
+        "harness",
+        "hops",
+        "limit_episodes",
+        "limit_stops",
+        "other_stops",
+        "permission_asks",
+        "recovered",
+        "repeated",
+        "request_faults",
+        "subagents",
+        "tokens_cache_read",
+        "tokens_cache_write",
+        "tokens_input",
+        "tokens_output",
+        "tool_calls",
+        "tool_denials",
+        "tool_failures",
+        "tool_interrupts",
+        "tool_ms",
+        "turns",
+        "user_stops",
+        "vendor_errors",
+    ];
+
+    fn keys(line: &str) -> Vec<String> {
+        let row: serde_json::Value = serde_json::from_str(line).expect("a row");
+        let mut keys: Vec<String> = row.as_object().expect("object").keys().cloned().collect();
+        keys.sort();
+        keys
+    }
+
+    #[test]
+    fn the_json_rows_keep_their_keys() {
+        let mut local: Vec<&str> = ROW_KEYS.to_vec();
+        local.push("workspace");
+        local.sort_unstable();
+        for line in render_json(&week()).expect("json") {
+            assert_eq!(keys(&line), local, "usage --json: {line}");
+        }
+        for line in render_shareable(&week()).expect("shareable") {
+            assert_eq!(keys(&line), ROW_KEYS, "usage --shareable: {line}");
+        }
+    }
 }
