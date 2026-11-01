@@ -36,6 +36,9 @@ the entry says so when it does.
 - `docs/log-format.md` documents a log line, the event kinds, bodies, and the
   rules for change: additions only in 1.x, older records always read, newer
   ones reported rather than guessed at, and what a rollback reads.
+- `docs/stability.md` says what 1.x keeps — commands, exit codes, machine
+  output keys, OTLP names, the log format, the data root, the hook contract —
+  and what stays experimental; `--help` marks the experimental surfaces.
 - Building from source needs Rust 1.99.1, pinned in `rust-toolchain.toml`;
   CI reads the same file.
 
