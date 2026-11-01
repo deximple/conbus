@@ -476,10 +476,12 @@ conbus install --apply     # 레코더를 다시 켭니다
 채워집니다. Claude Code 트랜스크립트, Codex 스레드, 채팅 내보내기에서 가져옵니다.
 시작 시 이 작업에는 최대 15초를 씁니다(`CONBUS_GAP_BUDGET_MS`로 바꿀 수 있습니다).
 예산이 부족해 다 채우지 못한 범위는 `cache/gap-since`에 기억했다가 다음 시작 때
-이어서 채우고, `daemon.log`에도 남깁니다. `conbus backfill --gaps`는 같은 빈틈을
-시간 제한 없이 필요할 때 채우며, Claude Code에 대해 전체 기록에 걸쳐 동작합니다.
-`--apply`를 붙이면 이것 역시 레코더를 멈춰야 합니다. `cache/`를 지우면 기억한
-범위도 사라지므로 그 뒤에는 `conbus backfill --gaps`를 실행하세요.
+이어서 채우고, `daemon.log`에도 남깁니다. `codex app-server`가 시작되지 않거나
+응답을 멈춰 Codex 단계가 돌지 못하면 그 범위는 `cache/gap-since-codex`에 따로
+기억합니다. `conbus backfill --gaps`는 같은 빈틈을 시간 제한 없이 필요할 때
+채우며, Claude Code와 Codex에 대해 전체 기록에 걸쳐 동작합니다. `--apply`를
+붙이면 이것 역시 레코더를 멈춰야 합니다. `cache/`를 지우면 기억한 범위도
+사라지므로 그 뒤에는 `conbus backfill --gaps`를 실행하세요.
 
 **Claude.ai 대화**는 데스크톱 앱에 훅이 없습니다. Claude.ai에서 데이터를
 내보내고(Settings → Privacy → Export data) 그 zip(또는 `conversations.json`)을

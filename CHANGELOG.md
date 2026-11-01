@@ -34,6 +34,10 @@ the entry says so when it does.
   conversation in a chat export looked new and was appended again. The fill now
   skips that start and keeps its range for the next one, as it does when the log
   refuses a write part way through.
+- A Codex pass that could not run no longer loses its fill range. The range is
+  held in `cache/gap-since-codex` until a start can read it, without holding back
+  the Claude Code transcripts. `conbus backfill --gaps` now fills live Codex
+  threads too, and says when it could not read them.
 
 ## [1.0.0-rc.3] — 2026-11-01
 

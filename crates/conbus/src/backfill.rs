@@ -59,6 +59,10 @@ pub struct Outcome {
     pub gap_sessions: u64,
     pub gap_turns: u64,
     pub gap_records: u64,
+    /// The same, for live Codex threads, through the app-server.
+    pub gap_codex_threads: u64,
+    pub gap_codex_turns: u64,
+    pub gap_codex_records: u64,
 }
 
 /// How long the app-server gets for the whole enumeration. Hundreds of
@@ -131,13 +135,20 @@ pub fn run_gaps(paths: &Paths, apply: bool) -> io::Result<()> {
         .map(PathBuf::from)
         .ok_or_else(|| io::Error::other("no HOME to read history from"))?;
     let transcripts = home.join(".claude").join("projects");
-    let outcome = fill_gaps(paths, &transcripts, apply)?;
+    let outcome = fill_gaps(paths, &transcripts, apply, true)?;
 
     println!("history   {}", transcripts.display());
     println!(
         "gaps      {} conversation(s), {} turn(s), {} record(s)",
         outcome.gap_sessions, outcome.gap_turns, outcome.gap_records
     );
+    match &outcome.codex_unavailable {
+        Some(why) => println!("codex     history unavailable — {why}"),
+        None => println!(
+            "codex     {} thread(s), {} turn(s), {} record(s)",
+            outcome.gap_codex_threads, outcome.gap_codex_turns, outcome.gap_codex_records
+        ),
+    }
     println!("not read  {}", summarise_unread(&outcome.unread));
     if apply {
         println!("written to {}", paths.log_dir().display());
@@ -358,6 +369,9 @@ pub struct GapTiming {
     /// The start budget cut the fill short; the deferred range is held in
     /// `cache/gap-since` and resumed on the next start.
     pub budget_exhausted: bool,
+    /// Why the Codex pass did not read everything it was asked to, when it did
+    /// not. Its range is held in `cache/gap-since-codex` for the next start.
+    pub codex_deferred: Option<String>,
     /// A `gap-since` marker that did not parse was ignored for this fill.
     pub gap_marker_garbled: bool,
     /// `sessions/` held files but none shaped like a rollout — the layout
@@ -410,14 +424,23 @@ fn append_gaps_at_start_in(
     // effective since it stopped at, so the next start resumes the range
     // rather than losing it to a newer `newest`. A fill that finishes
     // deletes the marker; a garbled one is ignored and said so.
+    //
+    // The Codex pass keeps its own marker, because it can fail for as long as
+    // the app-server cannot start, and the transcripts must not pay for that: a
+    // shared one would have every start read further back into them.
     let marker = paths.cache_dir().join("gap-since");
+    let codex_marker = paths.cache_dir().join("gap-since-codex");
     let remembered = read_since(&marker);
-    if marker.exists() && remembered.is_none() {
+    let codex_remembered = read_since(&codex_marker);
+    if (marker.exists() && remembered.is_none())
+        || (codex_marker.exists() && codex_remembered.is_none())
+    {
         timing.gap_marker_garbled = true;
     }
     let since = newest_unix(held)
         .map(|newest| newest - GAP_MARGIN_SECS)
         .map(|fresh| remembered.map_or(fresh, |old| old.min(fresh)));
+    let codex_since = since.map(|since| codex_remembered.map_or(since, |old| old.min(since)));
     let mut n = 0;
     if let Some(home) = home {
         let transcripts = home.join(".claude").join("projects");
@@ -442,8 +465,23 @@ fn append_gaps_at_start_in(
     // Codex.app burns the same account and never hits CLI hooks. Official
     // thread/turns/list on threads we already bound fills those turns under
     // the live `bus_id` — not a second conversation.
-    if !timing.budget_exhausted {
-        n += fill_live_codex_gaps(held, log, since, &paths.spool_dir(), &mut timing, deadline)?;
+    if timing.budget_exhausted {
+        timing.codex_deferred = Some("the transcripts used the start's budget".to_string());
+    } else {
+        let server_limit = deadline
+            .checked_duration_since(Instant::now())
+            .unwrap_or(std::time::Duration::ZERO)
+            .min(std::time::Duration::from_secs(8));
+        n += fill_live_codex_gaps(
+            held,
+            Some(&mut *log),
+            codex_since,
+            &paths.spool_dir(),
+            &mut timing,
+            deadline,
+            server_limit,
+        )?
+        .records;
     }
     if !timing.budget_exhausted {
         let export = Instant::now();
@@ -457,6 +495,13 @@ fn append_gaps_at_start_in(
         }
     } else {
         let _ = std::fs::remove_file(&marker);
+    }
+    match (&timing.codex_deferred, codex_since) {
+        (None, _) => {
+            let _ = std::fs::remove_file(&codex_marker);
+        }
+        (Some(_), Some(since)) => write_since(paths, &codex_marker, since),
+        (Some(_), None) => {}
     }
     Ok((n, timing))
 }
@@ -690,18 +735,37 @@ fn ingest_chat_exports_filtered(
     Ok(filled)
 }
 
+/// What the Codex pass found, whether or not it wrote any of it.
+#[derive(Default, Debug)]
+struct CodexFill {
+    threads: u64,
+    turns: u64,
+    records: u64,
+    /// Threads the app-server said no about. Asking again gets the same answer,
+    /// so these do not hold the range.
+    refused: u64,
+}
+
 /// Official app-server only. Live Codex threads the recorder already bound.
+///
+/// `log` is `None` for a dry run, and `server_limit` is how long the app-server
+/// may live: seconds at a start, which has a socket waiting, and minutes by hand.
+/// A pass that could not read what it was asked to says why in
+/// `timing.codex_deferred`, because the range it leaves behind is not covered by
+/// any later start unless something holds it.
 fn fill_live_codex_gaps(
     held: &[Record],
-    log: &mut SegmentLog,
+    mut log: Option<&mut SegmentLog>,
     since: Option<i64>,
     spool: &Path,
     timing: &mut GapTiming,
     deadline: Instant,
-) -> io::Result<u64> {
+    server_limit: std::time::Duration,
+) -> io::Result<CodexFill> {
+    let mut fill = CodexFill::default();
     let known = known_from(held.iter());
     if known.live_codex.is_empty() {
-        return Ok(0);
+        return Ok(fill);
     }
     // Rollout mtimes answer the same question `thread/list` does — the
     // app-server's `updatedAt` for a thread is its rollout file's mtime —
@@ -716,19 +780,23 @@ fn fill_live_codex_gaps(
     timing.codex_unknown_files = unknown;
     timing.codex_layout_unknown = recent.is_none() && unknown > 0;
     if recent.as_ref().is_some_and(|recent| recent.is_empty()) {
-        return Ok(0);
+        return Ok(fill);
     }
     // Restart must not wait out the 10-minute backfill budget: the socket
     // is already bound, so a wedged initialize leaves every hook as EAGAIN.
     // The gap budget is the tighter bound of the two.
-    let remaining = deadline
-        .checked_duration_since(Instant::now())
-        .unwrap_or(std::time::Duration::ZERO)
-        .min(std::time::Duration::from_secs(8));
+    if server_limit.is_zero() {
+        timing.budget_exhausted = true;
+        timing.codex_deferred = Some("no time left in the start's budget".to_string());
+        return Ok(fill);
+    }
     let start = Instant::now();
-    let mut server = match AppServer::start(remaining) {
+    let mut server = match AppServer::start(server_limit) {
         Ok(server) => server,
-        Err(_) => return Ok(0),
+        Err(err) => {
+            timing.codex_deferred = Some(err.to_string());
+            return Ok(fill);
+        }
     };
     timing.codex_start_ms = elapsed_ms(start);
     // When the rollout walk could not answer, one `thread/list` pass says
@@ -755,22 +823,28 @@ fn fill_live_codex_gaps(
         .map(|(name, bus)| (name.as_str(), *bus))
         .collect();
     let grouped = records_of(held, &targets);
-    let mut filled = 0u64;
     let turns_at = Instant::now();
     for &(name, bus_id) in &targets {
         if Instant::now() >= deadline {
             timing.budget_exhausted = true;
+            timing.codex_deferred = Some("the start's budget ran out".to_string());
             break;
         }
         timing.list_turns_attempted += 1;
         let turns = match list_turns(&mut server, name) {
             Ok(turns) => turns,
             Err(err) => {
+                let why = err.to_string();
                 if timing.list_turns_err.is_none() {
-                    let why = err.to_string();
                     timing.list_turns_err = Some(why.chars().take(120).collect());
                 }
-                continue;
+                if crate::appserver::is_refusal(&err) {
+                    fill.refused += 1;
+                    continue;
+                }
+                // Nothing behind it will answer either.
+                timing.codex_deferred = Some(why);
+                break;
             }
         };
         timing.list_turns_threads += 1;
@@ -778,14 +852,27 @@ fn fill_live_codex_gaps(
         let recovered = parse_codex_thread(&thread, &turns);
         let mine = grouped.get(name).into_iter().flatten().copied();
         let missing = missing_from(mine, name, bus_id, recovered);
-        for entry in not_on_its_way(missing, spool, name, bus_id) {
-            if log.append(entry)?.is_some() {
-                filled += 1;
+        let missing = not_on_its_way(missing, spool, name, bus_id);
+        if !missing.is_empty() {
+            fill.threads += 1;
+            fill.turns += missing
+                .iter()
+                .filter(|entry| matches!(entry.event, Event::TurnStarted { .. }))
+                .count() as u64;
+        }
+        for entry in missing {
+            match log.as_deref_mut() {
+                Some(log) => {
+                    if log.append(entry)?.is_some() {
+                        fill.records += 1;
+                    }
+                }
+                None => fill.records += 1,
             }
         }
     }
     timing.list_turns_ms = elapsed_ms(turns_at);
-    Ok(filled)
+    Ok(fill)
 }
 
 /// Threads `thread/list` says were updated at or after `since`, or `None`
@@ -836,12 +923,14 @@ fn threads_updated_since(
 /// there is none, so asking could never return turns anyway (most sessions
 /// in a long-lived log have no file on this disk). `None` when neither
 /// directory could be walked, leaving the caller its `thread/list` fallback.
+/// With no `since` every thread with a rollout is asked, which is what a fill by
+/// hand wants.
 fn codex_threads_touched_since(
     sessions: &HashSet<BusId>,
     since: Option<i64>,
     unknown: &mut u64,
 ) -> Option<Vec<BusId>> {
-    let since = since?;
+    let since = since.unwrap_or(i64::MIN);
     let home = std::env::var_os("CODEX_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))?;
@@ -923,10 +1012,17 @@ fn collect_rollout_mtimes(
     }
 }
 
-/// Read live sessions' official transcripts and, when `apply`, append the
-/// turns the log does not already hold. Refuses to write while a daemon is
-/// listening — the daemon fills the same gaps itself on restart.
-pub fn fill_gaps(paths: &Paths, transcripts: &Path, apply: bool) -> io::Result<Outcome> {
+/// Read live sessions' official transcripts and, when `codex`, their Codex
+/// threads, and when `apply` append the turns the log does not already hold.
+/// Refuses to write while a daemon is listening — the daemon fills the same gaps
+/// itself on restart. `codex` is a parameter for the reason it is one on
+/// [`recover`].
+pub fn fill_gaps(
+    paths: &Paths,
+    transcripts: &Path,
+    apply: bool,
+    codex: bool,
+) -> io::Result<Outcome> {
     if apply && std::os::unix::net::UnixStream::connect(paths.socket()).is_ok() {
         return Err(io::Error::other(format!(
             "a daemon is listening on {}; it fills gaps on restart, and writing \
@@ -938,7 +1034,29 @@ pub fn fill_gaps(paths: &Paths, transcripts: &Path, apply: bool) -> io::Result<O
     let mut log = apply
         .then(|| SegmentLog::open(paths.log_dir(), Retention::default()))
         .transpose()?;
-    append_gaps(transcripts, &held, log.as_mut(), None, &paths.spool_dir())
+    let mut outcome = append_gaps(transcripts, &held, log.as_mut(), None, &paths.spool_dir())?;
+    if codex {
+        let mut timing = GapTiming::default();
+        let fill = fill_live_codex_gaps(
+            &held,
+            log.as_mut(),
+            None,
+            &paths.spool_dir(),
+            &mut timing,
+            Instant::now() + CODEX_DEADLINE,
+            CODEX_DEADLINE,
+        )?;
+        outcome.gap_codex_threads = fill.threads;
+        outcome.gap_codex_turns = fill.turns;
+        outcome.gap_codex_records = fill.records;
+        outcome.codex_unavailable = timing.codex_deferred;
+        if fill.refused > 0 {
+            outcome
+                .unread
+                .insert("thread/turns/list refused".into(), fill.refused);
+        }
+    }
+    Ok(outcome)
 }
 
 /// Turns the official transcript has that the live log does not.
@@ -1823,7 +1941,7 @@ mod tests {
         transcript_two_turns(&machine, SESSION);
         let bus = live_bus(&machine);
 
-        let outcome = fill_gaps(&machine.paths, &machine.transcripts, true).expect("fill");
+        let outcome = fill_gaps(&machine.paths, &machine.transcripts, true, false).expect("fill");
 
         assert_eq!(outcome.gap_sessions, 1);
         assert_eq!(outcome.gap_turns, 1);
@@ -1910,7 +2028,7 @@ mod tests {
         recorded_live(&machine, SESSION);
         transcript(&machine, SESSION);
 
-        let outcome = fill_gaps(&machine.paths, &machine.transcripts, true).expect("fill");
+        let outcome = fill_gaps(&machine.paths, &machine.transcripts, true, false).expect("fill");
 
         assert_eq!(outcome.gap_sessions, 0);
         assert_eq!(records_on_disk(&machine), 1);
@@ -1923,7 +2041,7 @@ mod tests {
         transcript_two_turns(&machine, SESSION);
         let _daemon = UnixListener::bind(machine.paths.socket()).expect("listen");
 
-        let refused = fill_gaps(&machine.paths, &machine.transcripts, true);
+        let refused = fill_gaps(&machine.paths, &machine.transcripts, true, false);
 
         assert!(refused.is_err());
         assert_eq!(records_on_disk(&machine), 1);
@@ -2235,7 +2353,7 @@ mod tests {
         transcript_two_turns(&machine, SESSION);
         in_the_spool(&machine, "a", SESSION, "P2", "the turn the daemon missed");
 
-        let outcome = fill_gaps(&machine.paths, &machine.transcripts, true).expect("fill");
+        let outcome = fill_gaps(&machine.paths, &machine.transcripts, true, false).expect("fill");
 
         assert_eq!(outcome.gap_records, 0);
         assert_eq!(records_on_disk(&machine), 1);
@@ -2254,7 +2372,7 @@ mod tests {
             "the turn the daemon missed",
         );
 
-        let outcome = fill_gaps(&machine.paths, &machine.transcripts, true).expect("fill");
+        let outcome = fill_gaps(&machine.paths, &machine.transcripts, true, false).expect("fill");
 
         assert_eq!(outcome.gap_records, 2);
     }
@@ -2277,7 +2395,7 @@ mod tests {
         fs::rename(spool.join("real.json"), &elsewhere).expect("move");
         std::os::unix::fs::symlink(&elsewhere, spool.join("real.json")).expect("link");
 
-        let outcome = fill_gaps(&machine.paths, &machine.transcripts, true).expect("fill");
+        let outcome = fill_gaps(&machine.paths, &machine.transcripts, true, false).expect("fill");
 
         assert_eq!(outcome.gap_records, 2);
     }

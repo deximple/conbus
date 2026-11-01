@@ -63,6 +63,15 @@ pub fn path_for_vendor() -> OsString {
         .unwrap_or_else(|_| std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into()))
 }
 
+/// How an answer that is an error starts. The server is up and said no, which
+/// is a different thing from a server that stopped answering.
+const REFUSED: &str = "codex app-server refused";
+
+/// Whether this error is the server saying no, rather than the server gone.
+pub fn is_refusal(err: &io::Error) -> bool {
+    err.to_string().starts_with(REFUSED)
+}
+
 pub struct AppServer {
     child: Arc<Mutex<Child>>,
     stdin: ChildStdin,
@@ -163,9 +172,7 @@ impl AppServer {
                 continue;
             }
             if let Some(error) = message.get("error") {
-                return Err(io::Error::other(format!(
-                    "codex app-server refused {method}: {error}"
-                )));
+                return Err(io::Error::other(format!("{REFUSED} {method}: {error}")));
             }
             return Ok(message["result"].clone());
         }
