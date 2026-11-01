@@ -52,15 +52,26 @@ pub fn seals_detail(count: u64) -> String {
     format!("{count} tool event(s)")
 }
 
+/// The reason for records a daemon was asked to stop with, the log having refused
+/// them and nothing on disk having a copy.
+pub const STOPPED_HOLDING: &str = "the recorder stopped with records it could not land";
+
+/// What a [`STOPPED_HOLDING`] line says after its reason.
+pub fn stopped_detail(count: u64) -> String {
+    format!("{count} record(s) lost")
+}
+
 /// How many drops one line of the log stands for.
 fn drops_in(reason: &str, value: &serde_json::Value) -> usize {
-    if reason != LOST_SEALS {
-        return 1;
-    }
+    let suffix = match reason {
+        LOST_SEALS => " tool event(s)",
+        STOPPED_HOLDING => " record(s) lost",
+        _ => return 1,
+    };
     value
         .get("detail")
         .and_then(|detail| detail.as_str())
-        .and_then(|detail| detail.strip_suffix(" tool event(s)"))
+        .and_then(|detail| detail.strip_suffix(suffix))
         .and_then(|count| count.parse().ok())
         .unwrap_or(1)
 }
@@ -560,6 +571,25 @@ mod tests {
         assert!(rendered.contains("43001 recorded"), "{rendered}");
         assert!(
             rendered.contains("43000× tool bodies elided, not sealed"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn records_a_recorder_stopped_with_are_reported_as_what_the_line_counted() {
+        let dir = home();
+        let paths = paths_at(dir.path());
+        append(
+            &paths,
+            &Dropped::new(STOPPED_HOLDING).with_detail(stopped_detail(18)),
+        );
+
+        let summary = summary(&paths);
+
+        assert_eq!(summary.count, 18);
+        let rendered = describe(&summary);
+        assert!(
+            rendered.contains("18× the recorder stopped with records it could not land"),
             "{rendered}"
         );
     }

@@ -15,6 +15,10 @@ the entry says so when it does.
   shutdown, so a restart with a full spool cannot fill the drop log. Spooled tool
   bodies are still elided, because sealing in a hook would mean reading the key
   there. A Keychain that does not answer is counted the same way.
+- A recorder asked to stop now lands what the log will take first, for up to five
+  seconds, and leaves `the recorder stopped with records it could not land` for what
+  it could not, with no copy on disk. A record only in memory used to go with no
+  trace. It also goes when asked with a client still talking.
 - `doctor` no longer puts an orphan down to a restart. Bindings come back from the
   log, so it is a session whose prompt hook never reached the recorder.
 - A tool event that arrives before its session has a conversation now waits in the

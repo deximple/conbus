@@ -247,7 +247,10 @@ copy if there is room. It lands once, in arrival order, when the log takes write
 again, and `drops.jsonl` then says how long and how many. A record only in memory is
 lost if the recorder stops before the log takes it, and on a really full disk that
 is every record. `conbus doctor` says so on its `writable` line while it lasts: free
-space, and do not restart the recorder. A spooled
+space, and do not restart the recorder. Asked to stop, it first lands what the log
+will take, for up to five seconds, and leaves a line in `drops.jsonl` for what it
+could not, if there is room for one. A killed or crashed recorder has no such chance.
+A spooled
 entry is dropped with a line only once the file is seven days old and the log has
 refused for seven days without one write working. One written by a newer build
 that this daemon cannot read yet is dropped with a line after seven days.

@@ -657,8 +657,16 @@ impl Daemon {
 
     /// Give the log what it refused, oldest first, until it refuses again.
     fn land_held(&mut self) {
+        self.land_held_until(None);
+    }
+
+    /// As [`Daemon::land_held`], stopping at `limit` if there is one.
+    fn land_held_until(&mut self, limit: Option<std::time::Instant>) {
         let mut took_one = false;
         while let Some(front) = self.held.front() {
+            if limit.is_some_and(|limit| std::time::Instant::now() >= limit) {
+                break;
+            }
             let landed = self.log.append(front.entry.clone());
             let expired = front.since.elapsed() >= WAITING_LIFE;
             if landed.is_err() && !expired {
@@ -746,6 +754,19 @@ impl Daemon {
             .is_none_or(|at| at.elapsed() >= LOST_SEALS_EVERY);
         if due || self.lost_seals.unsaid > counted_before {
             self.say_lost_seals();
+        }
+    }
+
+    /// Say what goes with this daemon: held records with nothing on disk behind
+    /// them. Best effort: on a really full disk this line has nowhere to go either.
+    fn say_what_it_could_not_land(&self) {
+        let lost = self.only_in_memory();
+        if lost > 0 {
+            note!("stopping with {lost} record(s) the log would not take");
+            self.write_drop(
+                &crate::drops::Dropped::new(crate::drops::STOPPED_HOLDING)
+                    .with_detail(crate::drops::stopped_detail(lost)),
+            );
         }
     }
 
@@ -1807,10 +1828,16 @@ fn asked_to_go() -> Option<libc::c_int> {
     }
 }
 
-/// Say what is left, then die of the signal that was sent. launchd and systemd
-/// read a signal death, so what they see does not change.
+/// How long a daemon asked to go spends landing what it holds. A service manager
+/// will not wait for ever, and what is left is said rather than lost in silence.
+const LANDING_ON_THE_WAY_OUT: Duration = Duration::from_secs(5);
+
+/// Land what the log will take, say what is left, then die of the signal that was
+/// sent. launchd and systemd read a signal death, so what they see does not change.
 fn go_as_asked(daemon: &mut Daemon, signal: libc::c_int) -> ! {
+    daemon.land_held_until(Some(std::time::Instant::now() + LANDING_ON_THE_WAY_OUT));
     daemon.say_lost_seals();
+    daemon.say_what_it_could_not_land();
     // SAFETY: restoring the default action and raising a signal touch no memory.
     unsafe {
         libc::signal(signal, libc::SIG_DFL);
@@ -1979,29 +2006,28 @@ fn handle_connection(daemon: &mut Daemon, stream: UnixStream) -> io::Result<()> 
         if line.is_empty() {
             continue;
         }
-        if line == crate::wire::HEALTH_QUESTION {
-            let health = serde_json::to_string(&daemon.health()).map_err(io::Error::other)?;
-            writeln!(writer, "{health}")?;
-            writer.flush()?;
-            served += 1;
-            continue;
-        }
-        let response = match serde_json::from_str::<Request>(&line) {
-            Ok(request) => daemon.handle(request),
-            Err(err) => match from_a_build_that_can_read_it(&line) {
-                Some(theirs) => refuse_a_newer_hook(theirs),
-                None => Response::Failed {
-                    error: format!("unreadable request: {err}"),
+        let reply = if line == crate::wire::HEALTH_QUESTION {
+            serde_json::to_string(&daemon.health())
+        } else {
+            let response = match serde_json::from_str::<Request>(&line) {
+                Ok(request) => daemon.handle(request),
+                Err(err) => match from_a_build_that_can_read_it(&line) {
+                    Some(theirs) => refuse_a_newer_hook(theirs),
+                    None => Response::Failed {
+                        error: format!("unreadable request: {err}"),
+                    },
                 },
-            },
+            };
+            serde_json::to_string(&response)
         };
-        writeln!(
-            writer,
-            "{}",
-            serde_json::to_string(&response).map_err(io::Error::other)?
-        )?;
+        writeln!(writer, "{}", reply.map_err(io::Error::other)?)?;
         writer.flush()?;
         served += 1;
+        // A client that keeps talking must not hold off a service manager. What it
+        // has been answered for is written, and what it sends next finds no daemon.
+        if asked_to_go().is_some() {
+            break;
+        }
     }
     Ok(())
 }
@@ -2603,6 +2629,66 @@ mod tests {
             Stopped::Displaced,
             "and a restart folds the same log the same way"
         );
+    }
+
+    #[test]
+    fn landing_on_the_way_out_stops_at_its_limit_and_what_is_left_is_said() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let (mut daemon, paths) = rooted_over_a_closed_log(home.path());
+        for n in 0..3 {
+            daemon.handle(from_a_hook(turn(&format!("held {n}"))));
+        }
+        open_the_log(&paths.log_dir());
+
+        daemon.land_held_until(Some(std::time::Instant::now()));
+        assert_eq!(daemon.held.len(), 3, "the limit has already passed");
+        assert!(texts_on_disk(&paths.log_dir()).is_empty());
+
+        daemon.say_what_it_could_not_land();
+        let said = fs::read_to_string(paths.root().join("drops.jsonl")).expect("the line");
+        let line: serde_json::Value = serde_json::from_str(said.trim()).expect("one line");
+        assert_eq!(
+            line["reason"],
+            "the recorder stopped with records it could not land"
+        );
+        assert_eq!(line["detail"], "3 record(s) lost");
+    }
+
+    #[test]
+    fn landing_on_the_way_out_lands_what_the_log_takes_within_its_limit() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let (mut daemon, paths) = rooted_over_a_closed_log(home.path());
+        for n in 0..3 {
+            daemon.handle(from_a_hook(turn(&format!("held {n}"))));
+        }
+        open_the_log(&paths.log_dir());
+
+        daemon.land_held_until(Some(std::time::Instant::now() + LANDING_ON_THE_WAY_OUT));
+        daemon.say_what_it_could_not_land();
+
+        assert_eq!(texts_on_disk(&paths.log_dir()).len(), 3);
+        let said = fs::read_to_string(paths.root().join("drops.jsonl")).unwrap_or_default();
+        assert!(!said.contains("could not land"), "{said}");
+        assert!(
+            said.contains("the log refused writes for a while"),
+            "{said}"
+        );
+    }
+
+    #[test]
+    fn a_record_with_a_spool_copy_is_not_called_lost() {
+        // The next daemon drains it.
+        let home = tempfile::tempdir().expect("tempdir");
+        let (mut daemon, paths) = rooted_over_a_closed_log(home.path());
+        let spooled = from_a_hook(turn("with a copy"));
+        spool_copy_of(&paths, &spooled);
+        daemon.handle(spooled);
+
+        daemon.say_what_it_could_not_land();
+
+        open_the_log(&paths.log_dir());
+        let said = fs::read_to_string(paths.root().join("drops.jsonl")).unwrap_or_default();
+        assert_eq!(said, "");
     }
 
     #[test]
