@@ -44,7 +44,60 @@ pub fn normalize(json: &str) -> Result<Normalized, HookError> {
     if !object.contains_key("cwd") {
         alias(object, "workspaceRoot", "cwd");
     }
+    let event = object
+        .get("hook_event_name")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let reason = object
+        .get("reason")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    // 1.0.71 fires a second `Stop` after `SessionEnd`, with reason `shutdown`
+    // and no prompt id. It names no turn and ends none.
+    if event == "Stop" && reason.as_deref() == Some("shutdown") && !object.contains_key("prompt_id")
+    {
+        return Ok(Normalized::Ignored {
+            hook_event_name: event,
+        });
+    }
+    // `StopCancelled` runs instead of `Stop` when a turn ends without
+    // completing. It is a `Stop` with an outcome: read it as one, then say how
+    // it ended.
+    if event == "StopCancelled" {
+        object.insert("hook_event_name".into(), Value::String("Stop".into()));
+        let normalized = claude_code::normalize(&Harness::new(Harness::GROK), &value.to_string())?;
+        return Ok(cancelled(
+            normalized,
+            reason.unwrap_or_else(|| "unknown".into()),
+        ));
+    }
     claude_code::normalize(&Harness::new(Harness::GROK), &value.to_string())
+}
+
+/// A person stopping the turn is `InterruptedUser`; any other reason Grok
+/// gives (`max_turns`, `no_progress`, `hook_stopped`, `unknown`) is kept
+/// verbatim as a policy interruption.
+fn cancelled(normalized: Normalized, reason: String) -> Normalized {
+    let Normalized::Event {
+        key, mut observed, ..
+    } = normalized
+    else {
+        return normalized;
+    };
+    if let conbus_core::event::Event::TurnEnded { state, .. } = &mut observed.event {
+        *state = match reason.as_str() {
+            "user_interrupt" | "permission_rejected" | "permission_cancelled" => {
+                conbus_core::event::TurnState::InterruptedUser
+            }
+            _ => conbus_core::event::TurnState::InterruptedPolicy { reason },
+        };
+    }
+    Normalized::Event {
+        key,
+        hook_event_name: "StopCancelled".into(),
+        observed,
+    }
 }
 
 fn alias(object: &mut Map<String, Value>, from: &str, to: &str) {
@@ -100,5 +153,62 @@ mod tests {
             panic!("event");
         };
         assert_eq!(key.harness.as_str(), Harness::CLAUDE_CODE);
+    }
+
+    /// Grok 1.0.71 as captured on 2026-11-01: after `SessionEnd` it fires a
+    /// second `Stop` with `reason: "shutdown"` and no prompt id.
+    const SHUTDOWN_STOP: &str = r#"{
+        "hookEventName": "Stop", "hook_event_name": "Stop",
+        "sessionId": "grok-sess", "session_id": "grok-sess",
+        "reason": "shutdown", "stopHookActive": false, "stop_hook_active": false,
+        "cwd": "/repo", "workspaceRoot": "/repo"
+    }"#;
+
+    fn cancelled(reason: &str) -> String {
+        format!(
+            r#"{{"hookEventName":"StopCancelled","hook_event_name":"StopCancelled",
+            "sessionId":"grok-sess","session_id":"grok-sess","promptId":"turn-1",
+            "reason":"{reason}","cwd":"/repo"}}"#
+        )
+    }
+
+    #[test]
+    fn grok_s_stop_at_shutdown_is_not_a_turn_end() {
+        // It follows the session's end and names no turn; read as a `Stop` it
+        // wrote a second `turn_ended` after every `session_ended`.
+        assert!(matches!(
+            normalize(&Harness::new(Harness::GROK), SHUTDOWN_STOP).expect("ok"),
+            Normalized::Ignored { .. }
+        ));
+    }
+
+    #[test]
+    fn a_grok_turn_that_ends_without_completing_is_recorded() {
+        // `StopCancelled` runs instead of `Stop` when a turn ends without
+        // completing (Grok's hook docs). A person stopping it is the only
+        // vendor signal anywhere that says so; anything else is the vendor's
+        // own reason, kept verbatim.
+        let state = |reason: &str| match normalize(&Harness::new(Harness::GROK), &cancelled(reason))
+            .expect("ok")
+        {
+            Normalized::Event { observed, .. } => match observed.event {
+                Event::TurnEnded { state, .. } => state,
+                other => panic!("{other:?}"),
+            },
+            other => panic!("{other:?}"),
+        };
+        for person in [
+            "user_interrupt",
+            "permission_rejected",
+            "permission_cancelled",
+        ] {
+            assert_eq!(state(person), TurnState::InterruptedUser, "{person}");
+        }
+        assert_eq!(
+            state("max_turns"),
+            TurnState::InterruptedPolicy {
+                reason: "max_turns".into()
+            }
+        );
     }
 }
