@@ -227,6 +227,12 @@ Reads that never print a tool body run against a derived cache of digested
 records under `~/.conbus/cache/`; it is rebuilt automatically on the first
 read and `conbus log index` builds it explicitly. Deleting `cache/` loses
 nothing. `CONBUS_NO_CACHE=1` reads the segments directly, as 0.2.x did.
+
+When a hook cannot reach the daemon — a restart, a crashed recorder — it
+writes its request to `~/.conbus/spool/` instead of losing the turn; the
+next daemon drains it and deletes the file. `doctor` shows `spool` when
+entries wait. Spooled records carry `hook_id` and `spooled_at`, so a
+re-delivered event counts once.
 ```
 
 **Counting it:** `conbus usage` folds the log into what your agents did, per

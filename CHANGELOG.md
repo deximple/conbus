@@ -31,6 +31,13 @@ the entry says so when it does.
   and `doctor` says so. `conbus policy check` lists the effective rules and
   `conbus policy test` runs them against one call.
 
+### Fixed
+
+- A recorder restart no longer drops hooks: a hook that cannot reach the
+  daemon writes its request to `<root>/spool/` (consent comes from the
+  daemon's stamp and its retention), the next daemon drains it through the
+  same writer, and a re-delivered `hook_id` counts once in usage.
+
 ### Changed
 
 - Building from source needs Rust 1.99.1, pinned in `rust-toolchain.toml`;

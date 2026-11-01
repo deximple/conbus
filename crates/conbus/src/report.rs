@@ -1282,6 +1282,18 @@ pub fn doctor(paths: &Paths) -> io::Result<()> {
         conversations.len(),
         scan.defects.len()
     );
+    // Hooks in transit: the spool a daemon has not drained yet.
+    let waiting = std::fs::read_dir(paths.spool_dir())
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
+                .count()
+        })
+        .unwrap_or(0);
+    if waiting > 0 {
+        println!("spool     {waiting} waiting");
+    }
     // When the last record was written, because "the recorder is installed and
     // the daemon is up" says nothing about whether anything is arriving. The
     // two-hour outage this check exists for looked healthy on every other line.
@@ -1726,6 +1738,8 @@ mod tests {
             bus_id: "01996b1e-2c4a-7c31-9d0e-4f2a6b8c1d3e".parse().expect("id"),
             vendor_turn_id: None,
             vendor_agent_id: None,
+            hook_id: None,
+            spooled_at: None,
             source: Source {
                 harness: Harness::new(Harness::CLAUDE_CODE),
                 harness_version: None,
