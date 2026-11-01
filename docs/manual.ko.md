@@ -1,6 +1,6 @@
 # conbus 매뉴얼
 
-이 매뉴얼은 macOS와 Linux용 **conbus 1.0.0-rc.2**를 설명합니다. 짧게 훑으려면
+이 매뉴얼은 macOS와 Linux용 **conbus 1.0.0-rc.3**를 설명합니다. 짧게 훑으려면
 [README](../README.md)를, 릴리스 사이에 무엇이 바뀌었는지는
 [CHANGELOG](../CHANGELOG.md)를 보세요. English: [manual.md](manual.md)
 
