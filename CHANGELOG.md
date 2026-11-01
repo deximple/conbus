@@ -6,6 +6,8 @@ the entry says so when it does.
 
 ## [Unreleased]
 
+## [1.0.0-rc.2] — 2026-11-01
+
 ### Fixed
 
 - A start-up gap fill the time budget cut short is now remembered in

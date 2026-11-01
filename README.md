@@ -9,7 +9,7 @@ briefed on what recent sessions there were doing, and when a vendor stops a
 turn for quota — or when you say so — the next leg picks the conversation up.
 The vendor TUIs stay the window; conbus is the part underneath.
 
-**1.0.0-rc.1 · macOS · Linux · Apache-2.0.** Local only: no hosted service, no
+**1.0.0-rc.2 · macOS · Linux · Apache-2.0.** Local only: no hosted service, no
 telemetry, and conbus never reads or stores vendor auth tokens. One harness
 on one laptop does not need it.
 
