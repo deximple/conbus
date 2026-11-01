@@ -1190,7 +1190,55 @@ fn report_twins(summary: Twins) {
     }
 }
 
+/// `CONBUS_DOCTOR_TIMING` turns on per-section timings on stderr; stdout is
+/// untouched. `doctor` is the place operators ask "why is this slow" — the
+/// marks answer without a profiler.
+fn doctor_mark(section: &str, elapsed: std::time::Duration) {
+    if std::env::var_os("CONBUS_DOCTOR_TIMING").is_some() {
+        eprintln!("doctor    {section} {:.2}s", elapsed.as_secs_f64());
+    }
+}
+
 pub fn doctor(paths: &Paths) -> io::Result<()> {
+    // Both threads start before any output: the vendor probes and the log
+    // scan are pure reads that nothing below reorders, so they run while the
+    // early sections print rather than after them.
+    let scan_t = std::thread::spawn({
+        let log_dir = paths.log_dir();
+        let cache_dir = paths.cache_dir();
+        move || {
+            let started = std::time::Instant::now();
+            (
+                SegmentLog::scan_meta(log_dir, Some(&cache_dir)),
+                started.elapsed(),
+            )
+        }
+    });
+    let now_probe = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let probe_t = std::thread::spawn(move || {
+        let started = std::time::Instant::now();
+        let probe = |read: &dyn Fn() -> std::io::Result<crate::quota::Quota>| {
+            let started = std::time::Instant::now();
+            match read() {
+                Ok(quota) => crate::quota::describe(&quota, now_probe),
+                // A probe that ran its whole deadline out says so;
+                // one that failed fast names why.
+                Err(err) if started.elapsed() >= std::time::Duration::from_secs(2) => {
+                    let _ = err;
+                    "did not answer within 2s".to_string()
+                }
+                Err(err) => format!("unavailable — {err}"),
+            }
+        };
+        (
+            probe(&|| crate::quota::read_with(std::time::Duration::from_secs(2))),
+            probe(&|| crate::quota::read_agy_with(std::time::Duration::from_secs(2))),
+            started.elapsed(),
+        )
+    });
     println!("build     {}", crate::build_info::describe());
     println!(
         "root      {} ({:?})",
@@ -1290,7 +1338,14 @@ pub fn doctor(paths: &Paths) -> io::Result<()> {
         ),
     }
 
-    let scan = SegmentLog::scan_meta(paths.log_dir(), Some(&paths.cache_dir()))?;
+    let (scan, scan_elapsed) = scan_t.join().unwrap_or_else(|_| {
+        (
+            Err(io::Error::other("the scan worker panicked")),
+            std::time::Duration::ZERO,
+        )
+    });
+    let scan = scan?;
+    doctor_mark("scan_meta", scan_elapsed);
     let conversations: std::collections::HashSet<_> =
         scan.records.iter().map(|r| r.bus_id).collect();
     println!(
@@ -1330,66 +1385,60 @@ pub fn doctor(paths: &Paths) -> io::Result<()> {
     // than the sum of them. Output order is the println!s below, not the
     // order the threads finish in.
     let home = std::env::var("HOME").ok();
-    let now_probe = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    let (
-        replay,
-        meter,
-        twins_summary,
-        nameless_sessions,
-        warm,
-        claude,
-        route,
-        codex_quota,
-        agy_quota,
-    ) = std::thread::scope(|scope| {
-        let probe_t = scope.spawn(|| {
-            let probe = |read: &dyn Fn() -> std::io::Result<crate::quota::Quota>| {
+    let (replay, meter, twins_summary, nameless_sessions, warm, claude, route) =
+        std::thread::scope(|scope| {
+            let replay_t = scope.spawn(|| {
                 let started = std::time::Instant::now();
-                match read() {
-                    Ok(quota) => crate::quota::describe(&quota, now_probe),
-                    // A probe that ran its whole deadline out says so;
-                    // one that failed fast names why.
-                    Err(err) if started.elapsed() >= std::time::Duration::from_secs(2) => {
-                        let _ = err;
-                        "did not answer within 2s".to_string()
-                    }
-                    Err(err) => format!("unavailable — {err}"),
-                }
-            };
+                (
+                    conbus_core::continuation::replay(&scan.records, home.as_deref()),
+                    started.elapsed(),
+                )
+            });
+            let meter_t = scope.spawn(|| {
+                let started = std::time::Instant::now();
+                (
+                    conbus_core::meter::Meter::fold(&scan.records),
+                    started.elapsed(),
+                )
+            });
+            let twin_t = scope.spawn(|| {
+                let started = std::time::Instant::now();
+                (
+                    (twins(&scan.records), nameless(&scan.records)),
+                    started.elapsed(),
+                )
+            });
+            let warm_t = scope.spawn(|| {
+                let started = std::time::Instant::now();
+                (
+                    (
+                        crate::hop::live_warm_threads(&scan.records),
+                        crate::hop::live_claude_sessions(&scan.records),
+                        crate::hop::decide_from(paths, &scan.records, None),
+                    ),
+                    started.elapsed(),
+                )
+            });
+            let ((twins_summary, nameless_sessions), twins_elapsed) = twin_t.join().expect("twins");
+            let ((warm, claude, route), warm_elapsed) = warm_t.join().expect("warm");
+            doctor_mark("probe twins", twins_elapsed);
+            doctor_mark("probe warm+route", warm_elapsed);
+            let (replay, replay_elapsed) = replay_t.join().expect("replay");
+            let (meter, meter_elapsed) = meter_t.join().expect("meter");
+            doctor_mark("probe replay", replay_elapsed);
+            doctor_mark("probe meter", meter_elapsed);
             (
-                probe(&|| crate::quota::read_with(std::time::Duration::from_secs(2))),
-                probe(&|| crate::quota::read_agy_with(std::time::Duration::from_secs(2))),
+                replay,
+                meter,
+                twins_summary,
+                nameless_sessions,
+                warm,
+                claude,
+                route,
             )
         });
-        let replay_t =
-            scope.spawn(|| conbus_core::continuation::replay(&scan.records, home.as_deref()));
-        let meter_t = scope.spawn(|| conbus_core::meter::Meter::fold(&scan.records));
-        let twin_t = scope.spawn(|| (twins(&scan.records), nameless(&scan.records)));
-        let warm_t = scope.spawn(|| {
-            (
-                crate::hop::live_warm_threads(&scan.records),
-                crate::hop::live_claude_sessions(&scan.records),
-                crate::hop::decide_from(paths, &scan.records, None),
-            )
-        });
-        let (twins_summary, nameless_sessions) = twin_t.join().expect("twins");
-        let (warm, claude, route) = warm_t.join().expect("warm");
-        let (codex_quota, agy_quota) = probe_t.join().expect("probes");
-        (
-            replay_t.join().expect("replay"),
-            meter_t.join().expect("meter"),
-            twins_summary,
-            nameless_sessions,
-            warm,
-            claude,
-            route,
-            codex_quota,
-            agy_quota,
-        )
-    });
+    let (codex_quota, agy_quota, probe_elapsed) = probe_t.join().expect("probes");
+    doctor_mark("probe quota", probe_elapsed);
     report_twins(twins_summary);
     report_nameless(nameless_sessions);
     println!("briefing  {} conversation(s) judged", replay.total());
