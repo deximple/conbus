@@ -268,7 +268,9 @@ pub fn summary(paths: &Paths) -> Summary {
         let gloss = classify(reason);
         match families
             .iter_mut()
-            .find(|(g, t, _)| *g == gloss && t == reason)
+            // One row per family — the first-seen text speaks for it; only
+            // the unclassified `other` family still splits on exact text.
+            .find(|(g, t, _)| *g == gloss && (*g != "other" || t == reason))
         {
             Some((_, _, n)) => *n += 1,
             None => families.push((gloss, reason.to_string(), 1)),
@@ -492,6 +494,48 @@ mod tests {
         assert!(rendered.contains("adapter"), "{rendered}");
         // The transient one is still folded into its own count, not a reason.
         assert!(rendered.contains("1 transient connection"), "{rendered}");
+    }
+
+    #[test]
+    fn orphans_with_different_tails_read_as_one_story() {
+        let dir = home();
+        let paths = paths_at(dir.path());
+        append(
+            &paths,
+            &Dropped::new("no conversation for this session deadbeef"),
+        );
+        append(
+            &paths,
+            &Dropped::new("no conversation for this session cafebabe"),
+        );
+
+        let summary = summary(&paths);
+        assert_eq!(summary.reasons.len(), 1, "{:?}", summary.reasons);
+        assert_eq!(summary.reasons[0].1, 2);
+        assert!(describe(&summary).contains("2×"));
+    }
+
+    #[test]
+    fn adapter_gaps_with_different_events_read_as_one_story() {
+        let dir = home();
+        let paths = paths_at(dir.path());
+        append(&paths, &Dropped::new("no mapping for hook event \"A\""));
+        append(&paths, &Dropped::new("no mapping for hook event \"B\""));
+
+        let summary = summary(&paths);
+        assert_eq!(summary.reasons.len(), 1, "{:?}", summary.reasons);
+        assert_eq!(summary.reasons[0].1, 2);
+    }
+
+    #[test]
+    fn unclassified_reasons_stay_separate_rows() {
+        let dir = home();
+        let paths = paths_at(dir.path());
+        append(&paths, &Dropped::new("something odd happened here"));
+        append(&paths, &Dropped::new("something else odd happened"));
+
+        let summary = summary(&paths);
+        assert_eq!(summary.reasons.len(), 2, "{:?}", summary.reasons);
     }
 
     #[test]
