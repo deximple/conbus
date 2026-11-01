@@ -1199,12 +1199,17 @@ pub fn doctor(paths: &Paths) -> io::Result<()> {
     // which is the window this line exists for.
     match crate::build_info::daemon_build(paths) {
         crate::build_info::DaemonBuild::Running(stamp)
-            if stamp.build == crate::build_info::BUILD =>
+            if stamp.build == crate::build_info::BUILD && stamp.serving.is_some() =>
         {
             println!(
                 "daemon    build {} pid {} since {}",
                 stamp.build, stamp.pid, stamp.started
             );
+        }
+        crate::build_info::DaemonBuild::Running(stamp)
+            if stamp.build == crate::build_info::BUILD =>
+        {
+            println!("recorder  starting since {}", stamp.started);
         }
         crate::build_info::DaemonBuild::Running(stamp) => println!(
             "daemon    build {} pid {} since {} — DIFFERS from this binary ({}); restart the daemon",
@@ -2184,7 +2189,7 @@ mod tests {
         std::fs::create_dir_all(paths.root()).expect("root");
         assert!(describe_hardening(&paths).contains("no live daemon stamp"));
 
-        crate::build_info::stamp(&paths).expect("stamp");
+        crate::build_info::stamp(&paths, "conversation_only").expect("stamp");
         assert!(describe_hardening(&paths).contains("did not stamp a lock report"));
 
         crate::build_info::stamp_hardening(&paths, true, true, None).expect("locked");

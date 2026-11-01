@@ -1042,7 +1042,12 @@ pub fn prepare(paths: &Paths, retention: Retention) -> io::Result<()> {
         Ok(0) => {}
         Ok(n) => {
             note!("filled {n} gap record(s) from official transcripts");
-            scan = SegmentLog::scan_meta(paths.log_dir(), Some(&paths.cache_dir())).unwrap_or(scan);
+            // The written records are the log's newest n — read just the tail
+            // instead of scanning every segment a second time.
+            let (written, _) =
+                SegmentLog::tail(paths.log_dir(), n as usize, |_| true).unwrap_or_default();
+            scan.records
+                .extend(written.iter().map(conbus_core::segment::meta));
         }
         Err(err) => note!("gap fill skipped ({err})"),
     }
@@ -1140,10 +1145,11 @@ pub fn serve(paths: &Paths, retention: Retention) -> io::Result<()> {
             paths.root().display()
         );
     }
-    let listener = bind(&paths.socket())?;
-    // Named before restore. `doctor` and the recorder tests wait on the
-    // socket; a stamp that lands after a long scan looks like no daemon.
-    if let Err(err) = crate::build_info::stamp(paths) {
+    // The first stamp, before anything long: a daemon that takes a minute to
+    // prepare shows "starting" to a doctor, never a dead process — and a hook
+    // that arrives early meets a refused socket at once rather than waiting
+    // 500 ms on a daemon that cannot answer yet.
+    if let Err(err) = crate::build_info::stamp(paths, retention.name()) {
         note!("could not write the build stamp: {err}");
     }
     // The registry is derived state, so it is rebuilt from the segments rather
@@ -1157,6 +1163,17 @@ pub fn serve(paths: &Paths, retention: Retention) -> io::Result<()> {
         .with_arena(paths.root().to_path_buf())
         .watch_chat_exports(paths);
 
+    // Bind only now: a hook that arrives during prepare and restore found no
+    // socket (or a refused one) and went straight to its fallback, instead of
+    // blocking on a listener that was not answering. The test knob widens that
+    // window so the order is observable.
+    if let Ok(ms) = std::env::var("CONBUS_TEST_PAUSE_BEFORE_BIND_MS")
+        && let Ok(ms) = ms.parse::<u64>()
+    {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
+    let listener = bind(&paths.socket())?;
+
     // Restore grew the heap. Darwin's first `mlockall` is ENOSYS; lock the
     // pages that now hold the bindings and chapters, not the empty start heap.
     // The build stamp is already on disk; this only adds the lock result.
@@ -1168,6 +1185,10 @@ pub fn serve(paths: &Paths, retention: Retention) -> io::Result<()> {
         report.memory_lock_error.clone(),
     ) {
         note!("could not stamp hardening: {err}");
+    }
+    // Serving is the last thing the stamp learns: absent means still starting.
+    if let Err(err) = crate::build_info::stamp_serving(paths) {
+        note!("could not mark the stamp serving: {err}");
     }
 
     note!(

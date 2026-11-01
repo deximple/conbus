@@ -168,6 +168,18 @@ impl Retention {
         }
     }
 
+    /// The level's name on the daemon's build stamp — the spelling
+    /// `CONBUS_RETENTION` takes. A hook reads it to decide whether spooling
+    /// its dropped turn is consented to at all.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Retention::Full => "full",
+            Retention::ConversationOnly => "conversation_only",
+            Retention::EncryptedTools => "encrypted_tools",
+            Retention::Ephemeral => "ephemeral",
+        }
+    }
+
     /// The record as it should reach disk, or `None` if nothing should.
     pub fn redact(&self, record: &Record) -> Option<Record> {
         match self {
