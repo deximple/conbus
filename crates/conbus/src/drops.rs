@@ -202,8 +202,8 @@ pub struct Summary {
     pub capped: bool,
     pub last: Option<(String, String)>,
     /// Standing drops grouped to a reason family, most frequent first —
-    /// because "29 orphans" is a restart's footprint and "1 adapter gap" is a
-    /// vendor schema that moved, and a bare count cannot tell them apart.
+    /// because "29 orphans" is a prompt hook that did not fire and "1 adapter gap"
+    /// is a vendor schema that moved, and a bare count cannot tell them apart.
     pub reasons: Vec<(Reason, usize)>,
 }
 
@@ -224,11 +224,12 @@ fn classify(reason: &str) -> &'static str {
     if reason.starts_with("no conversation for this session")
         || reason.starts_with("spooled hook still has no conversation")
     {
-        // The binding dies with the daemon that minted it, and an event for a
-        // session whose prompt the recorder never saw cannot start one. A
-        // restart mid-turn looks exactly like this; Cursor's split hooks made
-        // 4,229 of them on 2026-09-08 before its tool-call proof existed.
-        "orphan — a session the recorder never bound (restart mid-turn, or a prompt that never arrived)"
+        // Bindings come back from the log, so a restart does not cause this.
+        // An event for a session whose prompt the recorder never saw cannot
+        // start a conversation: a tool event waits a day for that prompt and a
+        // turn's or session's end does not wait. Cursor's split hooks made 4,229
+        // of them on 2026-09-08 before its tool-call proof existed.
+        "orphan — a session no prompt has bound (its prompt hook never reached the recorder)"
     } else if reason.starts_with("no mapping for hook event") {
         // The vendor's schema moved ahead of this build's adapter.
         "adapter gap — the vendor published an event this build does not know"
@@ -512,7 +513,7 @@ mod tests {
         let summary = summary(&paths);
         let rendered = describe(&summary);
         // Every standing reason is named once, with its count, and a short
-        // meaning — the difference between "the bus restarted mid-turn" and
+        // meaning — the difference between "a prompt hook did not fire" and
         // "the vendor's schema moved" is the difference between noise and an
         // adapter that needs an update.
         assert!(rendered.contains("3×"), "{rendered}");
@@ -521,6 +522,21 @@ mod tests {
         assert!(rendered.contains("adapter"), "{rendered}");
         // The transient one is still folded into its own count, not a reason.
         assert!(rendered.contains("1 transient connection"), "{rendered}");
+    }
+
+    #[test]
+    fn an_orphan_is_not_put_down_to_a_restart() {
+        // Bindings come back from the log, so a restart stopped causing these.
+        // Telling a person it did sends them looking in the wrong place.
+        for reason in [
+            "no conversation for this session; the daemon has no binding for it",
+            "spooled hook still has no conversation (orphan)",
+        ] {
+            let family = classify(reason);
+            assert!(family.starts_with("orphan"), "{family}");
+            assert!(family.contains("prompt hook"), "{family}");
+            assert!(!family.contains("restart"), "{family}");
+        }
     }
 
     #[test]

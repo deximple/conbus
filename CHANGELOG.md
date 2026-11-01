@@ -15,6 +15,8 @@ the entry says so when it does.
   shutdown, so a restart with a full spool cannot fill the drop log. Spooled tool
   bodies are still elided, because sealing in a hook would mean reading the key
   there. A Keychain that does not answer is counted the same way.
+- `doctor` no longer puts an orphan down to a restart. Bindings come back from the
+  log, so it is a session whose prompt hook never reached the recorder.
 - A tool event that arrives before its session has a conversation now waits in the
   spool for up to a day for the prompt that binds it, up to 8 MiB, instead of being
   deleted at the next two-second tick. Whether it survived used to come down to
