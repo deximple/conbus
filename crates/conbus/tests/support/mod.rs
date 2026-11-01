@@ -30,3 +30,4 @@ pub fn write_executable(path: &Path, contents: &str) {
     let status = child.wait().expect("sh exit");
     assert!(status.success(), "could not write {}", path.display());
 }
+pub mod refserver;

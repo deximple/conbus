@@ -28,5 +28,6 @@ sha2 = "0.10"
 security-framework = "2.11"
 
 [dev-dependencies]
+ed25519-dalek = { version = "2.1", default-features = false, features = ["alloc", "zeroize"] }
 serde_json.workspace = true
 tempfile.workspace = true
