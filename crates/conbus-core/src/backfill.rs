@@ -1907,6 +1907,42 @@ mod codex_tests {
     }
 
     #[test]
+    fn a_turn_minted_in_the_same_millisecond_as_its_thread_is_its_own() {
+        // A thread's first turn can be minted in the millisecond the thread was.
+        let mut turn = turns().remove(0);
+        turn["id"] = serde_json::json!("01a06316-03dc-7fff-8000-000000000009");
+
+        let out = parse_codex_thread(&thread(), &[turn]);
+
+        assert_eq!(out.skipped.get("turn older than its thread"), None);
+        assert!(
+            out.entries
+                .iter()
+                .any(|e| matches!(e.event, Event::TurnStarted { .. }))
+        );
+    }
+
+    #[test]
+    fn only_a_uuid_v7_says_when_it_was_minted() {
+        // Read as a time, this v4 id's first bits are older than any thread.
+        let mut turn = turns().remove(0);
+        turn["id"] = serde_json::json!("00000000-0000-4000-8000-000000000001");
+
+        let out = parse_codex_thread(&thread(), &[turn.clone()]);
+
+        assert_eq!(out.skipped.get("turn older than its thread"), None);
+
+        // And a thread with such an id says nothing about the turns it lists.
+        let mut old_style = thread();
+        old_style["id"] = serde_json::json!("ffffffff-ffff-4fff-8fff-ffffffffffff");
+        turn["id"] = serde_json::json!("01a06316-3a98-7022-b592-f9e9ac2305b5");
+
+        let out = parse_codex_thread(&old_style, &[turn]);
+
+        assert_eq!(out.skipped.get("turn older than its thread"), None);
+    }
+
+    #[test]
     fn a_thread_whose_id_is_not_a_uuid_is_counted_not_recovered() {
         let mut odd = thread();
         odd["id"] = serde_json::json!("not-a-uuid");

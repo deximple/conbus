@@ -2810,3 +2810,186 @@ fn a_fifo_named_like_a_rollout_is_no_sign_of_a_thread_to_ask() {
     assert!(said.contains("1 not a regular file"), "{said}");
     assert_eq!(launches(), before, "brought up to ask about it");
 }
+
+#[test]
+fn a_range_a_read_error_deferred_is_filled_by_the_next_start() {
+    // A log unreadable at one start, a missed turn, hooks served after it, and the log
+    // readable again at the next.
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let daemon = start(home);
+    hook(home, &prompt(S, "p0", "before"));
+    stop(daemon);
+    transcript(
+        home,
+        S,
+        &[
+            user(S, "p0", "before"),
+            user(S, "p1", "only the transcript holds this"),
+            reply(S, "a1"),
+        ],
+    );
+    let older = an_older_segment_goes_unreadable(home);
+
+    stop(start(home));
+
+    let held = home.join("cache/gap-since").exists();
+    std::fs::set_permissions(&older, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    newer_records_arrive(home);
+    stop(start(home));
+    let all = log_lines(home);
+    assert!(held, "the unreadable start left no marker");
+    assert!(
+        all.iter().any(|record| record["vendor_turn_id"] == "p1"),
+        "lost:\n{}",
+        show(&all)
+    );
+    assert!(!home.join("cache/gap-since").exists(), "the marker clears");
+}
+
+#[test]
+fn no_time_left_for_the_codex_pass_keeps_its_range_for_the_next_start() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let (_stub, fake) = codex_stand_in(FAKE_APP_SERVER);
+    a_live_codex_thread(home);
+
+    timed_start(home, &fake, "0", &home.join("notes"));
+    assert!(
+        home.join("cache/gap-since-codex").exists(),
+        "nothing holds the range"
+    );
+    newer_records_arrive(home);
+    start_with_codex(home, &fake);
+
+    let all = log_lines(home);
+    assert!(
+        all.iter().any(|record| record["vendor_turn_id"] == "t1"),
+        "not asked at the next start:\n{}",
+        show(&all)
+    );
+}
+
+#[test]
+fn a_server_that_stalls_on_its_first_thread_is_left_alone_for_every_thread() {
+    // No thread answered, so nothing says the next one would. Without this each
+    // further thread costs a start its whole limit.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let (stub, fake) = codex_stand_in(
+        r#"
+here = os.path.dirname(os.path.abspath(sys.argv[0]))
+open(os.path.join(here, "launches"), "a").write("x\n")
+for line in sys.stdin:
+    msg = json.loads(line)
+    if msg.get("method") == "initialize":
+        print(json.dumps({"jsonrpc":"2.0","id":msg.get("id"),"result":{"userAgent":"fake"}}), flush=True)
+    elif msg.get("method") == "thread/turns/list":
+        time.sleep(600)
+"#,
+    );
+    let daemon = start(home);
+    codex_thread_live(home, THREAD_A, "a0", "before");
+    codex_thread_live(home, THREAD_B, "b0", "before");
+    stop(daemon);
+    rollout_of(home, THREAD_A, 0);
+    rollout_of(home, THREAD_B, 60);
+    let notes = home.join("notes");
+    timed_start(home, &fake, "1500", &notes);
+    let launches = || {
+        std::fs::read_to_string(stub.path().join("launches"))
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+    let before = launches();
+
+    timed_start(home, &fake, "1500", &notes);
+
+    assert_eq!(launches(), before, "brought up again within the hour");
+}
+
+#[test]
+fn two_exports_overlap_either_way_round_and_a_second_start_adds_nothing() {
+    const C: &str = "11111111-2222-4333-8444-555555555555";
+    let older = json!([chat(
+        C,
+        &[("m1", "human", "first"), ("m2", "assistant", "a1")]
+    )]);
+    let newer = json!([chat(
+        C,
+        &[
+            ("m1", "human", "first"),
+            ("m2", "assistant", "a1"),
+            ("m3", "human", "second"),
+            ("m4", "assistant", "a2")
+        ]
+    )]);
+    for (a, b) in [(&newer, &older), (&older, &newer)] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = dir.path();
+        std::fs::create_dir_all(home.join("chat-export/a")).expect("dir");
+        std::fs::create_dir_all(home.join("chat-export/b")).expect("dir");
+        std::fs::write(home.join("chat-export/a/conversations.json"), a.to_string()).expect("a");
+        std::fs::write(home.join("chat-export/b/conversations.json"), b.to_string()).expect("b");
+
+        stop(start(home));
+        stop(start(home));
+
+        let count = |text: &str| {
+            log_lines(home)
+                .iter()
+                .filter(|record| record["prompt"]["text"] == text)
+                .count()
+        };
+        assert_eq!(
+            (count("first"), count("second")),
+            (1, 1),
+            "\n{}",
+            show(&log_lines(home))
+        );
+    }
+}
+
+#[test]
+fn three_exports_in_one_pass_write_the_later_turn_once() {
+    // The second export appends to a conversation this pass has already seen, and the
+    // third must see that too.
+    const C: &str = "11111111-2222-4333-8444-555555555555";
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let older = json!([chat(
+        C,
+        &[("m1", "human", "first"), ("m2", "assistant", "a1")]
+    )]);
+    let newer = json!([chat(
+        C,
+        &[
+            ("m1", "human", "first"),
+            ("m2", "assistant", "a1"),
+            ("m3", "human", "second"),
+            ("m4", "assistant", "a2")
+        ]
+    )]);
+    for (name, body) in [("a", &older), ("b", &newer), ("c", &newer)] {
+        let folder = home.join("chat-export").join(name);
+        std::fs::create_dir_all(&folder).expect("dir");
+        std::fs::write(folder.join("conversations.json"), body.to_string()).expect("write");
+    }
+
+    stop(start(home));
+
+    let count = |text: &str| {
+        log_lines(home)
+            .iter()
+            .filter(|record| record["prompt"]["text"] == text)
+            .count()
+    };
+    assert_eq!(
+        (count("first"), count("second")),
+        (1, 1),
+        "\n{}",
+        show(&log_lines(home))
+    );
+}

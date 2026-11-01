@@ -582,6 +582,7 @@ fn append_gaps_at_start_in(
             .unwrap_or(std::time::Duration::ZERO)
             .min(std::time::Duration::from_secs(8));
         let fill = fill_live_codex_gaps(
+            &CodexSource::from_env(),
             held,
             Some(&mut *log),
             codex_since,
@@ -973,6 +974,26 @@ const NO_STATE: i64 = i64::MIN;
 /// The state of a thread the app-server stopped answering on. Never current.
 const FAILED: i64 = i64::MIN + 1;
 
+/// Where the Codex pass looks: which binary answers, and where its rollouts are.
+/// From the environment, except in a test, where setting that would not be sound.
+struct CodexSource {
+    binary: std::ffi::OsString,
+    home: Option<PathBuf>,
+}
+
+impl CodexSource {
+    fn from_env() -> Self {
+        CodexSource {
+            binary: crate::appserver::codex_binary(),
+            home: std::env::var_os("CODEX_HOME")
+                .map(PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex"))
+                }),
+        }
+    }
+}
+
 /// What the Codex pass found, whether or not it wrote any of it.
 #[derive(Default, Debug)]
 struct CodexFill {
@@ -997,6 +1018,7 @@ struct CodexFill {
 /// `timing.codex_deferred`, because the range it leaves behind is not covered by
 /// any later start unless something holds it.
 fn fill_live_codex_gaps(
+    source: &CodexSource,
     held: &[Record],
     mut log: Option<&mut SegmentLog>,
     since: Option<i64>,
@@ -1022,12 +1044,15 @@ fn fill_live_codex_gaps(
     // at all the ask falls back to `thread/list` as before.
     let walk = Instant::now();
     let mut unknown = 0;
-    let mut recent = codex_threads_touched_since(
-        &known.live_codex,
-        since,
-        &mut unknown,
-        &mut fill.not_regular,
-    );
+    let mut recent = source.home.as_deref().and_then(|home| {
+        codex_threads_touched_since_in(
+            home,
+            &known.live_codex,
+            since.unwrap_or(i64::MIN),
+            &mut unknown,
+            &mut fill.not_regular,
+        )
+    });
     timing.codex_walk_ms = elapsed_ms(walk);
     timing.codex_unknown_files = unknown;
     timing.codex_layout_unknown = recent.is_none() && unknown > 0;
@@ -1056,7 +1081,7 @@ fn fill_live_codex_gaps(
         return Ok(fill);
     }
     let start = Instant::now();
-    let mut server = match AppServer::start(server_limit) {
+    let mut server = match AppServer::start_with(&source.binary, server_limit) {
         Ok(server) => server,
         Err(err) => {
             if start.elapsed() >= server_limit {
@@ -1239,19 +1264,6 @@ fn threads_updated_since(
 /// directory could be walked, leaving the caller its `thread/list` fallback.
 /// With no `since` every thread with a rollout is asked, which is what a fill by
 /// hand wants.
-fn codex_threads_touched_since(
-    sessions: &HashSet<BusId>,
-    since: Option<i64>,
-    unknown: &mut u64,
-    not_regular_seen: &mut u64,
-) -> Option<Vec<(BusId, i64)>> {
-    let since = since.unwrap_or(i64::MIN);
-    let home = std::env::var_os("CODEX_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))?;
-    codex_threads_touched_since_in(&home, sessions, since, unknown, not_regular_seen)
-}
-
 fn codex_threads_touched_since_in(
     codex_home: &Path,
     sessions: &HashSet<BusId>,
@@ -1369,6 +1381,7 @@ pub fn fill_gaps(
         // Empty, because by hand everything is asked whatever a start has noted.
         let mut ran = ReadSoFar::default();
         let fill = fill_live_codex_gaps(
+            &CodexSource::from_env(),
             &held,
             log.as_mut(),
             None,
@@ -3262,6 +3275,194 @@ mod tests {
 
         assert_eq!(outcome.gap_records, 0);
         assert_eq!(outcome.unread.get(NOT_REGULAR), Some(&1));
+    }
+
+    #[test]
+    fn a_session_with_two_copies_is_read_from_the_most_recently_written() {
+        // Older by name as well, so the first by path would be the copy without it.
+        let machine = machine();
+        recorded_live(&machine, SESSION);
+        transcript(&machine, SESSION);
+        let moved = machine.transcripts.join("-Applications-conbus-moved");
+        fs::create_dir_all(&moved).expect("dir");
+        let original = machine
+            .transcripts
+            .join("-Applications-conbus")
+            .join(format!("{SESSION}.jsonl"));
+        let hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3_600);
+        fs::File::options()
+            .write(true)
+            .open(&original)
+            .expect("open")
+            .set_modified(hour_ago)
+            .expect("backdate");
+        let held_copy = fs::read_to_string(&original).expect("read");
+        transcript_two_turns(&machine, SESSION);
+        fs::rename(original.clone(), moved.join(format!("{SESSION}.jsonl")))
+            .expect("the newer copy");
+        fs::write(&original, held_copy).expect("the older copy");
+        fs::File::options()
+            .write(true)
+            .open(&original)
+            .expect("open")
+            .set_modified(hour_ago)
+            .expect("backdate");
+
+        let outcome = fill_gaps(&machine.paths, &machine.transcripts, true, false).expect("fill");
+
+        assert_eq!(outcome.gap_turns, 1, "the turn only the newer copy holds");
+        assert!(holds_prompt(&machine, "the turn the daemon missed"));
+    }
+
+    #[test]
+    fn a_spool_file_over_the_hooks_cap_is_not_on_its_way() {
+        // The drain will not read it, so it does not count as about to be written.
+        let machine = machine();
+        recorded_live(&machine, SESSION);
+        transcript_two_turns(&machine, SESSION);
+        in_the_spool(&machine, "big", SESSION, "P2", "the turn the daemon missed");
+        let path = machine.paths.spool_dir().join("big.json");
+        let mut text = fs::read_to_string(&path).expect("read");
+        text.push_str(&" ".repeat(1_048_576 + 1));
+        fs::write(&path, text).expect("pad");
+
+        let outcome = fill_gaps(&machine.paths, &machine.transcripts, true, false).expect("fill");
+
+        assert_eq!(outcome.gap_records, 2);
+    }
+
+    #[test]
+    fn a_budget_the_transcripts_used_up_holds_the_codex_range_too() {
+        // The Codex pass never ran, so nothing of its range has been read.
+        let machine = machine();
+        let home = tempfile::tempdir().expect("tempdir");
+        claude_transcript(home.path(), SESSION);
+        live_at(&machine, Timestamp::now(), SESSION);
+        let mut log =
+            SegmentLog::open(machine.paths.log_dir(), Retention::default()).expect("open");
+
+        let (_, timing) = append_gaps_at_start_in(
+            &machine.paths,
+            &held(&machine),
+            &mut log,
+            std::time::Duration::ZERO,
+            Some(home.path()),
+        )
+        .expect("fill");
+
+        assert!(timing.budget_exhausted);
+        assert!(timing.codex_deferred.is_some());
+        assert!(machine.paths.cache_dir().join("gap-since-codex").exists());
+    }
+
+    /// A live Codex thread with a rollout under `codex_home`, and what the pass needs
+    /// to ask about it through a stand-in that answers at once.
+    fn a_thread_a_stand_in_can_answer(
+        machine: &Machine,
+        codex_home: &Path,
+    ) -> (CodexSource, Vec<Record>) {
+        let thread = "01a19463-cbd4-7b50-b819-000000000abc";
+        logged(
+            machine,
+            vec![live_prompt(
+                thread,
+                Harness::CODEX,
+                BusId::mint(),
+                Some("t0"),
+                "seen",
+            )],
+        );
+        rollout(
+            &codex_home.join("sessions"),
+            &format!("rollout-2026-11-01T00-00-00-{thread}.jsonl"),
+            2_000_000_000,
+        );
+        let fake = codex_home.join("codex");
+        crate::test_support::write_executable(
+            &fake,
+            r#"#!/usr/bin/env python3
+import json, sys
+for line in sys.stdin:
+    msg = json.loads(line)
+    if msg.get("method") == "initialize":
+        print(json.dumps({"jsonrpc":"2.0","id":msg.get("id"),"result":{"userAgent":"fake"}}), flush=True)
+    elif msg.get("method") == "thread/turns/list":
+        print(json.dumps({"jsonrpc":"2.0","id":msg.get("id"),"result":{"data":[],"nextCursor":None}}), flush=True)
+"#,
+        );
+        let source = CodexSource {
+            binary: fake.into_os_string(),
+            home: Some(codex_home.to_path_buf()),
+        };
+        (source, held(machine))
+    }
+
+    #[test]
+    fn a_budget_that_runs_out_between_threads_defers_the_rest_unasked() {
+        // What the server's own limit does not catch: its limit can be the longer one.
+        let machine = machine();
+        let codex_home = tempfile::tempdir().expect("tempdir");
+        let (source, records) = a_thread_a_stand_in_can_answer(&machine, codex_home.path());
+        let mut elsewhere = Elsewhere::new(machine.paths.spool_dir(), &records);
+        let mut timing = GapTiming::default();
+
+        let fill = fill_live_codex_gaps(
+            &source,
+            &records,
+            None,
+            None,
+            &mut elsewhere,
+            StartFill {
+                timing: &mut timing,
+                deadline: Instant::now(),
+                read: &mut ReadSoFar::default(),
+            },
+            std::time::Duration::from_secs(60),
+        )
+        .expect("the pass");
+
+        assert_eq!(timing.list_turns_attempted, 0, "{fill:?}");
+        assert!(timing.budget_exhausted);
+        assert_eq!(
+            timing.codex_deferred.as_deref(),
+            Some("the start's budget ran out")
+        );
+    }
+
+    #[test]
+    fn no_time_left_for_the_server_defers_it_without_calling_it_stalled() {
+        // A server given no time has not stalled, so the next start asks it.
+        let machine = machine();
+        let codex_home = tempfile::tempdir().expect("tempdir");
+        let (source, records) = a_thread_a_stand_in_can_answer(&machine, codex_home.path());
+        let mut elsewhere = Elsewhere::new(machine.paths.spool_dir(), &records);
+        let mut timing = GapTiming::default();
+        let mut read = ReadSoFar::default();
+
+        fill_live_codex_gaps(
+            &source,
+            &records,
+            None,
+            None,
+            &mut elsewhere,
+            StartFill {
+                timing: &mut timing,
+                deadline: Instant::now(),
+                read: &mut read,
+            },
+            std::time::Duration::ZERO,
+        )
+        .expect("the pass");
+
+        assert!(timing.budget_exhausted);
+        assert_eq!(
+            timing.codex_deferred.as_deref(),
+            Some("no time left in the start's budget")
+        );
+        assert!(
+            !read.knows(STALLED),
+            "a stall note would leave it alone for an hour"
+        );
     }
 
     #[test]
