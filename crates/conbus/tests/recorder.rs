@@ -1816,14 +1816,20 @@ fn every_line_of_the_daemon_log_says_when_it_happened() {
     }
 
     // The other line the outage would have needed: a connection that says
-    // nothing, which the daemon drops after its silence bound.
+    // nothing, which the daemon drops after its silence bound. The note lands
+    // when the daemon gets around to it — on an emulated runner a fixed sleep
+    // can end before accept even sees the connection, so wait on the file.
     let quiet = std::os::unix::net::UnixStream::connect(&socket).expect("connect");
-    std::thread::sleep(Duration::from_millis(400));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let text = loop {
+        let text = std::fs::read_to_string(&log).unwrap_or_default();
+        if text.contains("sent no request") || Instant::now() >= deadline {
+            break text;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
     drop(quiet);
-    std::thread::sleep(Duration::from_millis(200));
     daemon.stop();
-
-    let text = std::fs::read_to_string(&log).expect("daemon.log");
     let lines: Vec<&str> = text.lines().filter(|line| !line.is_empty()).collect();
     assert!(lines.len() >= 2, "expected a banner and a drop: {text}");
     for line in &lines {

@@ -202,7 +202,7 @@ M1의 끝: `git cherry -v main devin/unlock`과 파일별 대조로 남은 차�
 | `log --tail 1` | 8.1 s | ≤ 0.2 s |
 | `usage --days 7` | 12.7 s | ≤ 2 s |
 | `doctor` | 22.4 s | ≤ 3 s |
-| 시작 → serving | 약 110 s | ≤ 5 s |
+| 시작 → serving(실제 재시작: 서빙 → 훅 기록 몇 개 → TERM → 재시작) | 약 110 s | ≤ 5 s |
 | 재시작 중 훅 유실 | 0.2.7에서 5 s 창에 5건, 지금 창은 110 s | 0 |
 | 레코더 RSS | 340 MB | ≤ 256 MB |
 
@@ -266,8 +266,8 @@ AGENTS.md의 "SQLite는 파생" 항목에 사이드카와 스풀을 추가해 �
 **M7.0 `devin/m7.0-scripts`** (0:30)
 
 - `scripts/shadow-replay.sh OLD NEW CLONE`: S1 비교를 재현 가능하게.
-- `scripts/canary.sh {preflight,status,verdict,start,restart,rollback}`: 7절대로. **진짜 `HOME`이고 `CONBUS_SKIP_LAUNCHCTL`이 없을 때만 실제로 교체한다.** 그 외에는 `CONBUS_CANARY_REHEARSAL=1`을 요구하고 launchctl을 건너뛴다. 금지 시간대는 `CONBUS_CANARY_BLACKOUT` 환경 변수로 받는다(값은 저장소에 넣지 않는다). 형식은 `HH:MM-HH:MM`(매일, 자정 넘김 허용), `[요일] HH:MM-HH:MM [Zone]`(`Mon-Fri 09:00-15:30 Asia/Seoul` 같은), `<epoch>-<epoch>` 셋 중 하나다. 어느 것으로도 파싱되지 않는 값은 금지 시간대로 간주해 닫힌다(안전 쪽 실패).
-- 임시 `HOME` + `CONBUS_SKIP_LAUNCHCTL=1`로 예행 연습한다.
+- `scripts/canary.sh {preflight,status,verdict,start,restart,rollback}`: 7절대로. **진짜 교체는 진짜 `HOME` + `CONBUS_SKIP_LAUNCHCTL` 없음 + `CONBUS_CANARY_REHEARSAL` 없음이 모두 맞을 때만** 일어난다. `CONBUS_CANARY_REHEARSAL=1`이 있으면 무조건 리허설인데, 그것도 진짜 `HOME`에서는 어떤 파일도 건드리기 전에 거부한다(리허설은 임시 `HOME`에서만). 금지 시간대는 `CONBUS_CANARY_BLACKOUT` 환경 변수로 받는다(값은 저장소에 넣지 않는다). 형식은 `HH:MM-HH:MM`(매일, 자정 넘김 허용), `[요일] HH:MM-HH:MM [Zone]`(`Mon-Fri 09:00-15:30 Asia/Seoul` 같은), `<epoch>-<epoch>` 셋 중 하나다. 어느 것으로도 파싱되지 않는 값은 금지 시간대로 간주해 닫힌다(안전 쪽 실패).
+- 임시 `HOME`에서 예행 연습한다. 리허설 스크립트의 가짜 바이너리는 `install --apply`에도 답하므로 실제 모드 분기까지 시험한다.
 
 **RC**
 
@@ -302,15 +302,17 @@ AGENTS.md의 "SQLite는 파생" 항목에 사이드카와 스풀을 추가해 �
 
 1. `preflight`: S1~S5 증거 존재, 서명본 sha 대조, `TeamIdentifier`, 롤백 복사본, plist 백업, 금지 시간대 확인. **새 바이너리로 라이브 루트에 사이드카를 미리 빌드한다**(`cache/`만 쓴다). 안 그러면 첫 시작이 수 분 걸려 아래 확인이 매번 실패한다.
 2. `mv -f conbus.new conbus && conbus install --apply` (kickstart 아님, HANDOFF 참고).
-3. 자동 확인: build = daemon build, `CONBUS_CANARY_SERVING_LIMIT`(기본 30초) 안에 새 pid가 serving, 훅 왕복(`hooks` 행이 전부 `runs`), 드롭 사유 증가 0. 하나라도 실패하면 **자동 롤백**. 시작→serving 5초 목표는 롤백 조건이 아니라 `verdict` 판정 항목이다(현재 측정치가 5초 위라 매번 되돌리는 셈이 된다).
+3. 자동 확인: build = daemon build, `CONBUS_CANARY_SERVING_LIMIT`(기본 30초) 안에 새 pid가 serving, 훅 왕복(`hooks` 행이 전부 `runs`), **이전에 없던 드롭 사유 0 — 단, 교체 창에 불가피하게 생기는 두 사유는 예외로 세어 `canary.json`의 `swap_window_drops`에 남긴다**. 하나라도 실패하면 **자동 롤백**. 시작→serving 5초 목표는 롤백 조건이 아니라 `verdict` 판정 항목이다(현재 측정치가 5초 위라 매번 되돌리는 셈이 된다).
 
-**계획된 재시작**: 1일 차와 6일 차에 `canary.sh restart`(`install --apply`를 돌리고 serving ms·새 드롭 수를 `~/.conbus/canary.json`에 기록 — `verdict`가 이 항목들을 계획된 것으로 제외한다).
+**첫 교체의 유실이 불가피한 이유**: `mv`와 레코더 정지 사이에 돈 새 훅(프로토콜 v6)은 옛 0.2.8 레코더(v5)에 거절당한다. 0.2.8의 `daemon.build`에는 보존 수준(`retention`)이 없어 훅이 스풀 동의를 얻지 못하고 드롭한다. `start`는 이 사유(`this daemon speaks protocol v<이전>; the hook speaks v<후보>`, `no daemon on … Connection refused`)를 실패가 아니라 `swap_window_drops`로 세고, `verdict`는 교체 후 60초 안의 것만 면제한다. 60초 뒤에도 같은 사유가 나오면 새 데몬이 거절하고 있다는 뜻이라 FAIL이다. 시작 복구의 gap fill이 일부를 되찾는다.
+
+**계획된 재시작**: 1일 차와 6일 차에 `canary.sh restart`(`install --apply`를 돌리고 serving ms·재시작 중 `drops.jsonl`에 추가된 줄 수를 `~/.conbus/canary.json`에 기록 — `verdict`가 이 항목들을 계획된 것으로 제외한다. 세션 없는 페이로드 거절은 유실이 아니라 따로 표시).
 
 **통과 조건** (`canary.sh verdict`가 교체 시각 이후 로그로 계산):
 
 1. 계획 외 레코더 재시작 0.
 2. 읽지 못한 줄 0.
-3. 계획된 재시작에서 유실 0, 새 드롭 사유 0.
+3. 계획된 재시작에서 유실 0(추가된 드롭 줄 수), 새 드롭 사유 0 — 교체 후 60초 안의 예상 사유(`swap_window_drops`)는 면제되고 개수가 표시된다.
 4. 7일 동안 활동이 있는 하네스(최근 실측 기준 `claude_code`, `codex`, `grok`, `cursor`) 전부 활동일마다 기록 있음. OpenCode는 S2로 대체.
 5. twins·`repeated` 증가가 기준선 이하.
 6. **닫힌 날마다** RC의 `usage --json` = 같은 로그를 읽은 0.2.8 (`tokens_*` 제외).
@@ -387,13 +389,13 @@ Copilot CLI 어댑터(설치·실 payload 필요), Gemini CLI 어댑터, 프롬�
 | M0 | 완료 | #70 #71 #72 | `main` 테스트 707 통과·0 실패·1 무시(1.94와 1.99.1 같음) | 1.99.1 clippy가 계획의 2건 외에 4건(`needless_late_init` 1, `collapsible_match` 3)을 더 잡아 M0.2에서 함께 고침. M0.5: private vulnerability reporting·Dependabot alerts·secret scanning·push protection 켬, `main` 보호(필수 `gate`, strict 끔, 리뷰 없음, force push·삭제 금지). M0.6: v0.2.9 서명·공증 후 교체, 내려받아 `TeamIdentifier=4UN6WC576K`·`Notarized Developer ID` 확인, `latest`는 v0.2.9. 랜딩의 "공증 안 됨"·"실제 한도를 만난 적 없음" 문구도 사실과 달라 함께 고침 |
 | M1 | 완료 | #76 #78 #79 #81 #82 | macOS 746 통과·0 실패·1 무시, Linux x86_64·aarch64 초록 | unlock의 기능 커밋 10개를 다섯 PR로 흡수. `git cherry`와 파일별 대조에서 남은 차이는 `site/`(M6)와 unlock 이후 `main`에 들어온 작업, 의도해 다르게 쓴 문서뿐. M1.2 의미 충돌(`sync.rs` 행 키)은 테스트로 고정. M1.3은 "정책 없음 = 바이트 동일", "못 읽는 정책 = 결정 없음 + doctor 경고"를 새 테스트로 고정. Linux CI가 잡은 결함 2건을 M1.4에서 함께 고침: macOS 전용 상수의 dead code, 스레드 테스트가 스텁을 쓰고 곧바로 실행할 때의 ETXTBSY(스텁을 자식 `sh`가 쓰게 함). `linux`·`linux-arm`을 `main` 필수 체크에 추가 |
 | M2 | 완료 | #84 #87 #92 #100 | Claude Code 2.1.316, Codex 0.166.0, OpenCode 2.2.3, Grok 1.0.71, cursor-agent 2026.10.19, agy 1.4.12 실세션 캡처. `real_payloads` 17/17 | OpenCode 2.x가 0.2.x 플러그인을 처음부터 거부하고 있었다(벤더 로그에만 남음). 2.x 플러그인으로 고침(#84). Grok은 세션 종료 뒤 `Stop`을 한 번 더 보내고 `StopCancelled`가 등록돼 있지 않았다(#87). cursor-agent `-p`에는 프롬프트·턴 종료 훅이 없다(지원 표에 기록). 정책 deny는 Claude Code와 Codex 실세션에서 지켜졌다. 세션 사용: Claude 3, Codex 3, OpenCode 3, Grok 2, Cursor 1. Cursor IDE는 이 Mac에 없어 미확인 |
-| M3 | 완료 | #73 #74 #83 #88 #91 #94 #95 #97 #99 #104 #105 | 캐시 첫 빌드 32.4 s·778 MB(로그 10.3 GB), 이후 `log --tail 1` 13 ms·`usage --days 7` 1.31 s, 캐시 유무 결과 행 단위 동일. 시작→서빙 11.0 s·RSS 445.5 MB. doctor 3.35 s(벤더 오프)·4.1 s(실제 PATH). 1,000-hook 스톰 무손실 | 목표 미달 2건을 측정으로 기록: 시작→서빙 11.0 s > 5 s(prepare의 메타 스캔이 5.3 s를 씀; 체크포인트는 설계만), doctor 3.35 s > 3 s(실제 PATH 병렬 프로브로 64.1→4.1 s). M3.4 RSS 개선·M3.6 drops 표시는 절단 순서표에 따라 제외. 스풀은 정확히 한 번을 약속하지 않고 중복 계산 의미를 지킨다 |
-| M4 | 완료 | #85 #86 #89 #93 #101 #102 | 종료 코드·키 집합 골든 테스트 초록. 업그레이드 왕복 테스트 초록(macOS) | 안정 계약은 `docs/stability.md`(#85). 알 수 없는 명령·플래그·빠진 값은 exit 2, `hook`은 면제(#101). `usage --json`·`--shareable`·`progress --json`·`log --json` 키 집합 고정(#93). 레코드 봉투·이벤트 종류·프로토콜·롤백 규칙은 `docs/log-format.md`와 매뉴얼에(#86). RFD 0001 accept, 0002·0003 draft 유지(#89). 0.2.x 업그레이드는 설치 멱등·plist 환경 보존·uninstall이 Conbus 소유만 회수함을 테스트로 고정(#102); Linux systemd 업그레이드 경로는 이번에 만들지 않았다 |
-| M5 | 완료 | #75 #80 #90 #96 #106 | sync reference 왕복 테스트 초록. M5.6 리뷰 CRITICAL·HIGH 0 | curl `-q` 첫 인자·TLS 고정·리다이렉트 거절·본문은 `--config -`와 stdin으로(#80). 추론 리스너 루프백 전용·읽기쓰기 타임아웃(#75). `-` 있는 태그는 prerelease, 안정 태그는 서명 전 draft(#90). reference 서버가 조각난 TCP 본문 결함 1건을 잡았고, TLS는 `CURL_CA_BUNDLE` 경로만 문서화(#106). M5.4 관리형 설치는 절단 순서표에 따라 제외 |
+| M3 | 완료 | #73 #74 #83 #88 #91 #94 #95 #97 #99 #104 #105 | 캐시 첫 빌드 32.4 s·778 MB(로그 10.3 GB), 이후 `log --tail 1` 13 ms·`usage --days 7` 1.31 s, 캐시 유무 결과 행 단위 동일. 시작→서빙 11.0 s·RSS 445.5 MB. doctor 3.35 s(벤더 오프)·4.1 s(실제 PATH). 1,000-hook 스톰 무손실 | 목표 미달 2건을 측정으로 기록: 시작→서빙 11.0 s > 5 s(prepare의 메타 스캔이 5.3 s를 씀; 체크포인트는 설계만), doctor 3.35 s > 3 s(실제 PATH 병렬 프로브로 64.1→4.1 s). 스풀은 정확히 한 번을 약속하지 않고 중복 계산 의미를 지킨다. **Lead 대기**: M3.4 RSS(조사 완료 — `relock_derived`가 fold churn이 키운 빈 allocator 페이지까지 mlock하는 것이 주원인 후보, 개선은 Lead), M3.6 drops 표시(구현·테스트 완료 #116, 리뷰 대기) |
+| M4 | 완료 | #85 #86 #89 #93 #101 #102 | 종료 코드·키 집합 골든 테스트 초록. 업그레이드 왕복 테스트 초록(macOS) | 안정 계약은 `docs/stability.md`(#85). 알 수 없는 명령·플래그·빠진 값은 exit 2, `hook`은 면제(#101). `usage --json`·`--shareable`·`progress --json`·`log --json` 키 집합 고정(#93). 레코드 봉투·이벤트 종류·프로토콜·롤백 규칙은 `docs/log-format.md`와 매뉴얼에(#86). RFD 0001 accept, 0002·0003 draft 유지(#89). 0.2.x 업그레이드는 설치 멱등·plist 환경 보존·uninstall이 Conbus 소유만 회수함을 테스트로 고정(#102). Linux systemd 왕복은 `#[cfg(target_os = "linux")]` 테스트로 추가(#115, 머지 대기 — Linux CI가 실행한다) |
+| M5 | 완료 | #75 #80 #90 #96 #106 | sync reference 왕복 테스트 초록. M5.6 리뷰 CRITICAL·HIGH 0 | curl `-q` 첫 인자·TLS 고정·리다이렉트 거절·본문은 `--config -`와 stdin으로(#80). 추론 리스너 루프백 전용·읽기쓰기 타임아웃(#75). `-` 있는 태그는 prerelease, 안정 태그는 서명 전 draft(#90). reference 서버가 조각난 TCP 본문 결함 1건을 잡았고, TLS는 `CURL_CA_BUNDLE` 경로만 문서화(#106). M5.4는 구현됨(#117, 리뷰 대기): doctor가 관리형 파일을 읽어 `allowManagedHooksOnly` 아래 사용자 훅이 발화하지 않음을 말하고, `install --managed`가 root 외 쓰기 가능 바이너리를 경고 |
 | M6 | 완료 | #98 #103 | `check-docs.sh` 초록(0.2.9, 명령 19개). site 테스트 6/6(vitest) | `check-docs.sh`가 첫 실행에서 실제 누락 4건을 잡았다(README·한국어 매뉴얼에 `policy`, 두 매뉴얼에 `sync`). 한국어 매뉴얼은 Linux 미지원이라고 적혀 있던 것을 고치고 정책·프로필·sync 절을 넣었다. 랜딩은 `site/` 하나로 합치고 `docs/www/`를 지웠다. site는 `site/**` 경로 필터 CI로만 돌고 배포하지 않았다 |
 | M7 | 완료 | #108 #109 | `v1.0.0-rc.1` 태그 게시, `pre=true`·`draft=false`, `latest`는 v0.2.9 유지. 릴리스 드라이런 3타깃 초록 | canary.sh·shadow-replay.sh·canary-rehearsal.sh(#108). RC PR #109: 버전 범프·Cargo.lock·CHANGELOG·매뉴얼 헤드라인 |
-| S1–S5 | 완료 | #110 | S1: 0.2.8↔RC 읽기 차이는 `tokens_*` 키·새 doctor 항목뿐, 캐시 유무 동일; RC가 969,129레코드 전수 읽고 0.2.8이 RC 기록을 역방향으로 읽음. S3 스톰 10/10 무손실. S4 Colima ARM64 왕복. S5 TLS 왕복 | S2 실세션 패리티(claude·codex 각 4==4; grok 프로젝트 훅 없음·cursor 미인증·opencode 비대화형 이벤트 없음 — 한계로 기록). S5가 refserver의 와이어 불일치 3건(`day_closed`, `accepted` 형상, 장치 id 형식)을 잡아 시험 하니스를 고쳤다(#110) |
-| Canary | 준비 완료 | #110 #113 | `canary.sh`를 §7 계약대로 재작성: start가 preflight를 먼저 돌리고, 교체 뒤 serving·build·훅 왕복·드롭 검사 실패 시 자동 롤백. `restart` 서브커맨드와 `canary.json` 창 기록 추가. verdict가 재시작 분류·패리티·RSS·시간 예산을 실제로 계산. 리허설이 CI gate에서 돈다 | 라이브 교체는 하지 않음. RC 바이너리는 Developer ID 서명·공증 완료 — 운영자가 `canary.sh start --from`으로 시작 (operator-todo.md에 절차) |
+| S1–S5 | 완료 | #110 | S1: 0.2.8↔RC 읽기 차이는 `tokens_*` 키·새 doctor 항목뿐, 캐시 유무 동일; RC가 969,129레코드 전수 읽고 0.2.8이 RC 기록을 역방향으로 읽음. S3 스톰 10/10 무손실 + 알 수 없는 스키마 스풀 유지(레코더 동작 중). S4 Colima ARM64 설치→유닛→훅→doctor→재시작→uninstall 전 단계 통과(첫 보고는 증거 누락으로 재실행). S5 TLS 왕복 | S2 실세션 패리티(claude·codex 각 4==4; grok 프로젝트 훅 없음·cursor 미인증·opencode 비대화형 이벤트 없음 — 한계로 기록). OpenCode 2.2.5 실세션은 별도 검증에서 `turn-started`·`turn-ended Complete` 기록 확인(성공 경로는 어댑터 수정 #114 필요). S5가 refserver의 와이어 불일치 3건(`day_closed`, `accepted` 형상, 장치 id 형식)을 잡아 시험 하니스를 고쳤다(#110). Linux 실벤더는 미검증 |
+| Canary | rc.2 뒤 시작 | #110 #113 | `canary.sh`를 §7 계약대로 재작성: start가 preflight를 먼저 돌리고, 교체 뒤 serving·build·훅 왕복·드롭 검사 실패 시 자동 롤백. `restart` 서브커맨드와 `canary.json` 창 기록 추가. verdict가 재시작 분류·패리티·RSS·시간 예산을 실제로 계산. 리허설이 CI gate에서 돈다 | 라이브 교체는 하지 않음. rc.1에서 발견된 결함(OpenCode `turn-ended` #114 등)이 있어 canary는 그 수정이 들어간 `rc.2`로 시작한다. rc.1 바이너리 자체는 Developer ID 서명·공증 완료 |
 | 1.0.0 | | | | |
 
 ### 변경 기록
@@ -407,3 +409,8 @@ Copilot CLI 어댑터(설치·실 payload 필요), Gemini CLI 어댑터, 프롬�
 | 2026-11-01 11:45 | 시작→서빙 목표 5 s를 11.0 s 측정 기록으로 대체, 체크포인트는 설계만 | prepare의 메타 스캔이 5.3 s를 써 남은 예산으로 목표 불가; 계획은 측정·설계 기록을 허용 |
 | 2026-11-01 11:45 | M3.4 RSS 개선·M3.6 drops 이유 표시 제외 | 절단 순서표의 선택 항목; 필수 항목이 먼저 |
 | 2026-11-01 11:50 | M5.4 관리형 설치(doctor 읽기·`install --managed` 경고) 제외 | 절단 순서표 #4; S5에 필요한 reference 서버(M5.2)가 먼저 |
+| 2026-11-01 13:xx | 잘렸던 항목 복구: M4.5 Linux systemd 왕복 테스트(#115), M3.6 drops 사유 표시(#116), M5.4 관리형(#117) — 머지·리뷰는 Lead | 앞선 세션이 예산을 남기고 절단한 항목들; SWE-2 세션이 되살림 |
+| 2026-11-01 13:xx | `usage_otlp` 닫힌 포트 테스트의 비결정성 수정 머지(#111); `src` 테스트 모듈의 동일 패턴은 별도 PR(#112, 열림) | main CI gate가 간헐 실패로 빨갰다 — connect가 "refused"가 아니라 "reset"을 받는 포트 경쟁 |
+| 2026-11-01 13:xx | `canary.sh`를 §7 계약으로 재작성 머지(#113): 자동 롤백·계획 재시작·창 고정 verdict·패리티·RSS·시간 예산·blackout 문법; 리허설을 macOS CI gate에 | 이전 구현은 안내 문구만 출력하고 보고서가 말한 검사를 하지 않았다 |
+| 2026-11-01 13:xx | OpenCode 2.x 어댑터: `session.execution.succeeded` → `turn-ended Complete` 전달 추가(#114, 열림) | 실세션 검증에서 `turn-started`만 남고 완료 턴은 drops(`no mapping`)로 버려짐을 확인 |
+| 2026-11-01 13:xx | S4 증거 재수집·S3 미지원 스키마 재검증·S6 `install --apply` 차이 측정(Codex 재신뢰 불필요 확인)·벤치 재측정·M3.4 RSS 조사·커버리지 측정 | 첫 보고의 S4 증거는 209바이트 fatal 한 줄이었고 여러 경로가 미검증이었다 |

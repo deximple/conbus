@@ -11,12 +11,14 @@
 # preflight, status and verdict are read-only (preflight also makes the
 # plist backup — a copy, never a change). start, restart and rollback swap
 # or reload the installed binary. Per the 1.0 plan, §7:
-#   - the swap is real only under the real HOME with CONBUS_SKIP_LAUNCHCTL
-#     unset; it then ends in `conbus install --apply` (bootout + bootstrap,
-#     never kickstart — the stamp-poll and doctor still run after it);
-#   - anything else is a rehearsal and needs CONBUS_CANARY_REHEARSAL=1
-#     (--live is a convenience alias): the file swap still runs, launchctl
-#     and `install --apply` are skipped and the script says so;
+#   - the swap is real only when ALL of these hold: HOME is the passwd
+#     home, CONBUS_SKIP_LAUNCHCTL is unset, CONBUS_CANARY_REHEARSAL is
+#     unset. It then ends in `conbus install --apply` (bootout +
+#     bootstrap, never kickstart — the stamp-poll and doctor still run).
+#   - a rehearsal needs CONBUS_CANARY_REHEARSAL=1 AND a throwaway HOME —
+#     under the passwd home the flag is refused before anything moves.
+#     The file swap still runs; launchctl and `install --apply` are
+#     skipped and the script says so.
 #   - a start during CONBUS_CANARY_BLACKOUT is refused. The spec is
 #     HH:MM-HH:MM (daily, wrap allowed), `[days] HH:MM-HH:MM [Zone]` like
 #     "Mon-Fri 09:00-15:30 Asia/Seoul", or <epoch>-<epoch>; a spec that
@@ -27,15 +29,22 @@
 #     CONBUS_CANARY_SERVING_LIMIT seconds (default 30): a new daemon pid
 #     serving, a doctor with no DIFFERS against the candidate build,
 #     every hooks line `runs`, and zero drop reasons that were not there
-#     before. Any failure rolls back automatically and exits 1. The
-#     5-second serving goal is a verdict criterion, not a rollback one —
-#     current measurements sit above it and would undo every cutover.
+#     before — except the two a normal swap window produces (a protocol
+#     refusal while the old daemon still answers, or no listener
+#     mid-restart), which are counted into canary.json as
+#     swap_window_drops instead. Any other failure rolls back
+#     automatically and exits 1. The 5-second serving goal is a verdict
+#     criterion, not a rollback one — current measurements sit above it
+#     and would undo every cutover.
 #   - state lives at <root>/canary.json: swap time, previous/candidate
-#     builds, candidate sha, and the planned restarts (each with its
-#     start->serving milliseconds and new-drop count).
+#     builds, candidate sha, swap-window drop count, and the planned
+#     restarts (each with its start->serving milliseconds and the number
+#     of drop lines added during it — not new-reason strings).
 #   - `restart` performs a planned restart (`install --apply`) and records
 #     its measurements. `verdict` bounds its window by the recorded swap
-#     time unless --since overrides it.
+#     time unless --since overrides it; its budgets come from
+#     CONBUS_CANARY_TAIL_MS / _USAGE_MS / _DOCTOR_MS / _SERVING_MS /
+#     _RSS_MB / _WINDOW_DAYS, defaulting to the plan's M3 targets.
 #
 # The install dir is detected exactly the way install.sh places it:
 # $HOME/.local/bin. Swaps write beside the target and rename — never a copy
@@ -63,17 +72,43 @@ drops_log=$root/drops.jsonl
 state_file=$root/canary.json
 
 serving_limit=${CONBUS_CANARY_SERVING_LIMIT:-30}
-rss_budget_mb=${CONBUS_CANARY_RSS_MB:-600}
+rss_budget_mb=${CONBUS_CANARY_RSS_MB:-256}
 window_days=${CONBUS_CANARY_WINDOW_DAYS:-7}
+# Verdict budgets — the plan's M3 targets, overridable per machine.
+tail_ms_budget=${CONBUS_CANARY_TAIL_MS:-200}
+usage_ms_budget=${CONBUS_CANARY_USAGE_MS:-2000}
+doctor_ms_budget=${CONBUS_CANARY_DOCTOR_MS:-3000}
+serving_ms_budget=${CONBUS_CANARY_SERVING_MS:-5000}
 
 is_uint() { case $1 in '' | *[!0-9]*) return 1 ;; *) return 0 ;; esac }
 
+# HOME resolves to this user's passwd home — independent of SKIP or
+# REHEARSAL, so a rehearsal under it can be refused outright. `cd` with
+# HOME unset fails in bash, but `cd ~` resolves the login entry via
+# getpwuid — no dscl/getent/getpwnam dependency.
+passwd_home() {
+    env -u HOME bash -c 'cd ~ && pwd -P' 2>/dev/null
+}
+
+is_passwd_home() {
+    local pw
+    pw=$(passwd_home) || return 1
+    [ -n "$pw" ] || return 1
+    [ "$(cd "$HOME" && pwd -P)" = "$(cd "$pw" && pwd -P)" ]
+}
+
 # The real environment: HOME is this user's passwd home and nothing asked
-# that launchctl be skipped. Anything else must declare itself a rehearsal.
+# that launchctl be skipped. CONBUS_CANARY_TEST_REAL_HOME is the
+# rehearsal's seam into the real code path: honoured only when it resolves
+# to the same throwaway HOME the script sees, which by construction is not
+# the passwd home. Naming the passwd home through it can never launder a
+# real swap.
 is_real_env() {
     [ -z "${CONBUS_SKIP_LAUNCHCTL:-}" ] || return 1
-    real_home=$(env -u HOME bash -c 'cd && pwd -P' 2>/dev/null) || return 1
-    [ "$(cd "$HOME" && pwd -P)" = "$real_home" ]
+    is_passwd_home && return 0
+    [ -n "${CONBUS_CANARY_TEST_REAL_HOME:-}" ] || return 1
+    this_home=$(cd "$HOME" && pwd -P)
+    [ "$(cd "$CONBUS_CANARY_TEST_REAL_HOME" 2>/dev/null && pwd -P)" = "$this_home" ]
 }
 
 # --- blackout ---------------------------------------------------------------
@@ -212,21 +247,28 @@ blackout_active() {
 
 # --- daemon ---------------------------------------------------------------
 
-# Decide real vs rehearsal for the swap subcommands. Echoes the mode;
-# refuses when neither applies.
+# Decide real vs rehearsal for the swap subcommands. Rehearsal is checked
+# first: CONBUS_CANARY_REHEARSAL under the passwd home is refused before
+# anything moves — a rehearsal that ran the real path would be a half
+# deploy. A real swap needs the real HOME, CONBUS_SKIP_LAUNCHCTL unset and
+# REHEARSAL unset all at once. Everything else is refused.
 swap_mode() {
     sub=$1
+    if [ -n "${CONBUS_CANARY_REHEARSAL:-}" ]; then
+        if is_passwd_home; then
+            refuse "$sub: CONBUS_CANARY_REHEARSAL is set under the real HOME —" \
+                "rehearsing must not touch the real install; refusing before anything moves"
+        fi
+        echo rehearsal
+        return
+    fi
     if is_real_env; then
         echo real
         return
     fi
-    if [ -n "${CONBUS_CANARY_REHEARSAL:-}" ] || [ "${live:-0}" = 1 ]; then
-        echo rehearsal
-        return
-    fi
-    refuse "$sub: not the real HOME or CONBUS_SKIP_LAUNCHCTL is set —" \
-        "rehearsing needs CONBUS_CANARY_REHEARSAL=1 (or --live); the file" \
-        "swap then runs but launchctl and install --apply are skipped"
+    refuse "$sub: the real swap needs the real HOME with" \
+        "CONBUS_SKIP_LAUNCHCTL unset; a rehearsal needs" \
+        "CONBUS_CANARY_REHEARSAL=1 under a throwaway HOME"
 }
 
 # After a swap: re-register hooks and reload the daemon. In the real path
@@ -308,11 +350,12 @@ state_restart_drop_total() {
         awk '{ t += $1 } END { print t + 0 }'
 }
 
-state_write() { # state_write <swapped> <prev> <cand> <sha> <restarts-json-array> [rolled_back]
+state_write() { # state_write <swapped> <prev> <cand> <sha> <restarts-json-array> [rolled_back] [swap_window_drops]
     mkdir -p "$root"
     tmp=$state_file.tmp
-    printf '{"swapped":"%s","prev_build":"%s","candidate_build":"%s","candidate_sha256":"%s","restarts":%s%s}\n' \
-        "$1" "$2" "$3" "$4" "$5" "${6:+,\"rolled_back\":\"$6\"}" >"$tmp"
+    printf '{"swapped":"%s","prev_build":"%s","candidate_build":"%s","candidate_sha256":"%s","restarts":%s%s%s}\n' \
+        "$1" "$2" "$3" "$4" "$5" "${6:+,\"rolled_back\":\"$6\"}" \
+        "${7:+,\"swap_window_drops\":$7}" >"$tmp"
     mv -f "$tmp" "$state_file"
 }
 
@@ -333,6 +376,15 @@ state_add_restart() { # state_add_restart <ts> <serving_ms|-> <new_drops>
         "$(state_get candidate_build)" "$(state_get candidate_sha256)" "$new"
 }
 
+# Spool files left after a rollback — the restored 0.2.x build does not
+# read a spool, so they sit until a newer daemon drains them. Reported,
+# never deleted here.
+say_spool() {
+    n=0
+    [ -d "$root/spool" ] && n=$(ls "$root/spool" 2>/dev/null | wc -l | tr -d ' ')
+    say "spool: $n file(s) — the old build does not drain them; they wait for the next daemon"
+}
+
 # The distinct drop reasons in drops.jsonl, one per line.
 drop_reasons() {
     [ -f "$drops_log" ] || return 0
@@ -348,6 +400,26 @@ new_drop_reasons() {
     rm -f "$tmp"
 }
 
+# The drop reasons a normal swap window legitimately produces. Between the
+# mv and the new daemon serving, a firing hook either reaches the old
+# daemon — which answers a protocol refusal it cannot spool past, since an
+# old build's stamp names no retention — or finds nobody listening at all.
+# Both vanish when the new daemon is up; the boot's gap fill recovers some.
+# A same-version "refusal" or any other reason is not a swap artifact.
+expected_swap_reason() {
+    case $1 in
+        "the daemon refused the record: this daemon speaks protocol v"*"; the hook speaks v"*)
+            rest=${1#*"this daemon speaks protocol v"}
+            old_v=${rest%%;*}
+            new_v=${rest##*"the hook speaks v"}
+            new_v=${new_v%%.*}
+            is_uint "$old_v" && is_uint "$new_v" && [ "$old_v" != "$new_v" ]
+            ;;
+        "no daemon on "*": Connection refused"*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 # YYYY-MM-DD -> the next YYYY-MM-DD, on macOS or GNU date.
 next_day() {
     if [ "$(uname -s)" = Darwin ]; then
@@ -357,13 +429,16 @@ next_day() {
     fi
 }
 
-# ISO-8601 UTC -> epoch, on macOS or GNU date. Empty on failure.
+# ISO-8601 UTC -> epoch, on macOS or GNU date. Empty on failure. The input
+# is always a UTC stamp, so it is parsed as UTC everywhere — an unadorned
+# `date -j -f` reads it in local time and shifts every window by the
+# zone offset.
 ts_epoch() {
     iso=${1%%.*}
     if [ "$(uname -s)" = Darwin ]; then
-        date -j -f "%Y-%m-%dT%H:%M:%S" "$iso" +%s 2>/dev/null || true
+        TZ=UTC date -j -f "%Y-%m-%dT%H:%M:%S" "$iso" +%s 2>/dev/null || true
     else
-        date -d "$iso" +%s 2>/dev/null || true
+        date -u -d "$iso" +%s 2>/dev/null || true
     fi
 }
 
@@ -465,7 +540,7 @@ do_preflight() {
     # the check degrades to the hash.
     if [ -n "$from" ]; then
         [ -f "$from" ] || die "no candidate at $from"
-        if [ "$(uname -s)" = Darwin ] && is_real_env; then
+        if [ "$(uname -s)" = Darwin ] && is_passwd_home; then
             if codesign --verify --strict "$from" 2>/dev/null; then
                 team=$(codesign -dv "$from" 2>&1 | sed -n 's/^TeamIdentifier=//p')
                 if [ -n "$team" ] && [ "$team" != "not set" ]; then
@@ -530,13 +605,12 @@ do_preflight() {
 
 sub=${1:-}
 [ $# -ge 1 ] && shift
-live=0
 from=""
 evidence=""
 since=""
 while [ $# -gt 0 ]; do
     case $1 in
-        --live) live=1 ;;
+        --live) refuse "--live is gone — a rehearsal is CONBUS_CANARY_REHEARSAL=1 under a throwaway HOME" ;;
         --from)
             [ $# -ge 2 ] || refuse "--from wants a path"
             from=$2
@@ -665,6 +739,9 @@ case $sub in
 
         # 3. New drop reasons since the swap (a known reason repeating is
         #    not new), plus every planned restart's recorded new_drops.
+        #    A swap-window reason — the old daemon's protocol refusal or a
+        #    dropped connection mid-restart — is exempt only inside 60
+        #    seconds after the swap; the same reason later is a fault.
         if [ -f "$drops_log" ]; then
             new_reasons=$(awk -v s="$since" '
                 {
@@ -678,13 +755,38 @@ case $sub in
             ' "$drops_log")
             drop_count=$(echo "$new_reasons" | head -1)
             new_reasons=$(echo "$new_reasons" | tail -n +2 | LC_ALL=C sort)
+            s_epoch=$(ts_epoch "$since")
+            swap_exempted=0
+            real_new=""
+            while IFS= read -r r; do
+                [ -z "$r" ] && continue
+                if expected_swap_reason "$r" && is_uint "${s_epoch:-}"; then
+                    late=0 n_here=0
+                    while IFS= read -r dl; do
+                        t=${dl#*'"ts":"'}; t=${t%%'"'*}
+                        [ "$t" \> "$since" ] || continue
+                        n_here=$((n_here + 1))
+                        e=$(ts_epoch "$t")
+                        if ! is_uint "${e:-}" || [ "$e" -gt $((s_epoch + 60)) ]; then
+                            late=1
+                        fi
+                    done <<< "$(grep -F "\"reason\":\"$r\"" "$drops_log" || true)"
+                    if [ "$late" = 1 ]; then
+                        real_new="$real_new ${r} (persisted >60s after the swap)"
+                    else
+                        swap_exempted=$((swap_exempted + n_here))
+                    fi
+                else
+                    real_new="$real_new $r"
+                fi
+            done <<< "$new_reasons"
             restart_drops=$(state_restart_drop_total)
-            if [ -z "$new_reasons" ] && [ "$restart_drops" -eq 0 ]; then
+            if [ -z "$real_new" ] && [ "$restart_drops" -eq 0 ]; then
                 line PASS drops \
-                    "0 new drop reason(s) ($drop_count drop(s), $restart_drops on planned restarts)"
-            elif [ -n "$new_reasons" ]; then
+                    "0 new drop reason(s) ($drop_count drop(s)${swap_exempted:+, $swap_exempted expected swap-window}, $restart_drops on planned restarts)"
+            elif [ -n "$real_new" ]; then
                 line FAIL drops \
-                    "new drop reason(s) since $since: $(echo "$new_reasons" | tr '\n' ' ')"
+                    "new drop reason(s) since $since:$real_new"
             else
                 line FAIL drops "$restart_drops drop(s) during planned restarts"
             fi
@@ -771,13 +873,13 @@ case $sub in
         if [ ! -x "$rollback_bin" ]; then
             line FAIL usage-parity "no $rollback_bin — the 0.2.8 side of the parity is missing"
         else
-            strip='s/"tokens_[a-z_]*":[0-9]*,\?//g; s/,\}/}/g; s/,]/]/g'
+            strip='s/"tokens_[a-z_]*":[0-9]*,?//g; s/,\}/}/g; s/,]/]/g'
             parity_bad=""
             d=$since_day
             guard=0
             while [ "$d" \< "$today_utc" ] && [ "$guard" -lt 370 ]; do
-                old=$("$rollback_bin" usage --json --day "$d" 2>/dev/null | sed "$strip" || true)
-                new=$("$bin" usage --json --day "$d" 2>/dev/null | sed "$strip" || true)
+                old=$("$rollback_bin" usage --json --day "$d" 2>/dev/null | sed -E "$strip" || true)
+                new=$("$bin" usage --json --day "$d" 2>/dev/null | sed -E "$strip" || true)
                 if [ "$old" != "$new" ]; then
                     parity_bad="$parity_bad $d"
                 fi
@@ -819,15 +921,15 @@ case $sub in
         t_usage=$(measure "$bin" usage --days 7)
         t_doctor=$(measure "$bin" doctor)
         tb_bad=""
-        [ "$t_tail" -gt 200 ] && tb_bad="$tb_bad tail"
-        [ "$t_usage" -gt 2000 ] && tb_bad="$tb_bad usage"
-        [ "$t_doctor" -gt 3000 ] && tb_bad="$tb_bad doctor"
+        [ "$t_tail" -gt "$tail_ms_budget" ] && tb_bad="$tb_bad tail(${t_tail}>${tail_ms_budget})"
+        [ "$t_usage" -gt "$usage_ms_budget" ] && tb_bad="$tb_bad usage(${t_usage}>${usage_ms_budget})"
+        [ "$t_doctor" -gt "$doctor_ms_budget" ] && tb_bad="$tb_bad doctor(${t_doctor}>${doctor_ms_budget})"
         if [ -z "$tb_bad" ]; then
             line PASS time-budget \
-                "log --tail 1 ${t_tail}ms≤200 usage --days 7 ${t_usage}ms≤2000 doctor ${t_doctor}ms≤3000"
+                "log --tail 1 ${t_tail}ms≤${tail_ms_budget} usage --days 7 ${t_usage}ms≤${usage_ms_budget} doctor ${t_doctor}ms≤${doctor_ms_budget}"
         else
             line FAIL time-budget \
-                "log --tail 1 ${t_tail}ms usage --days 7 ${t_usage}ms doctor ${t_doctor}ms — over on:$tb_bad"
+                "over budget on:$tb_bad"
         fi
 
         # 8. Serving ≤ 5 s on the newest recorded boot — the goal §7 moved
@@ -838,10 +940,10 @@ case $sub in
             e0=$(ts_epoch "$started") e1=$(ts_epoch "$serving")
             if is_uint "${e0:-}" && is_uint "${e1:-}"; then
                 serving_ms=$(( (e1 - e0) * 1000 ))
-                if [ "$serving_ms" -le 5000 ]; then
-                    line PASS serving-budget "start->serving ${serving_ms} ms ≤ 5000"
+                if [ "$serving_ms" -le "$serving_ms_budget" ]; then
+                    line PASS serving-budget "start->serving ${serving_ms} ms ≤ ${serving_ms_budget}"
                 else
-                    line FAIL serving-budget "start->serving ${serving_ms} ms > 5000"
+                    line FAIL serving-budget "start->serving ${serving_ms} ms > ${serving_ms_budget}"
                 fi
             else
                 line UNCHECKED serving-budget "stamp has no serving pair to measure"
@@ -903,18 +1005,16 @@ case $sub in
         if [ -f "$stamp" ]; then
             old_stamp_pid=$(sed -n 's/.*"pid":\([0-9]*\).*/\1/p' "$stamp")
         fi
-        before=$(mktemp)
-        drop_reasons >"$before"
+        before_lines=0
+        [ -f "$drops_log" ] && before_lines=$(wc -l <"$drops_log" | tr -d ' ')
         ts=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
         if [ "$mode" = rehearsal ]; then
             say "rehearsal: 'conbus install --apply' skipped (it would hit launchctl)"
-            state_add_restart "$ts" -1 "$(new_drop_reasons "$before" | wc -l | tr -d ' ')"
-            rm -f "$before"
+            state_add_restart "$ts" -1 0
             say "recorded a planned restart at $ts (rehearsal — no reload)"
             exit 0
         fi
         if ! "$bin" install --apply; then
-            rm -f "$before"
             die "conbus install --apply failed — restart not recorded; check 'canary.sh status'"
         fi
         serving_ms=-1
@@ -928,17 +1028,35 @@ case $sub in
         else
             say "restart: no new serving stamp inside ${serving_limit}s — check 'canary.sh status'"
         fi
-        new_count=$(new_drop_reasons "$before" | wc -l | tr -d ' ')
-        state_add_restart "$ts" "$serving_ms" "$new_count"
-        rm -f "$before"
-        say "recorded planned restart at $ts: serving ${serving_ms} ms, $new_count new drop reason(s)"
+        # new_drops is the number of drop lines the restart added — the
+        # plan's "유실 0", not a new-reason count. A sessionless refusal is
+        # the vendor's payload, not a lost record: excluded, shown aside.
+        new_drops=0 sessionless=0
+        if [ -f "$drops_log" ]; then
+            while IFS= read -r l; do
+                [ -z "$l" ] && continue
+                case $l in
+                    *'"reason":"the hook payload names no session'*)
+                        sessionless=$((sessionless + 1)) ;;
+                    *) new_drops=$((new_drops + 1)) ;;
+                esac
+            done <<< "$(tail -n "+$((before_lines + 1))" "$drops_log" 2>/dev/null || true)"
+        fi
+        state_add_restart "$ts" "$serving_ms" "$new_drops"
+        extra=""
+        [ "$sessionless" -gt 0 ] && extra=" ($sessionless sessionless refusal(s) not counted)"
+        say "recorded planned restart at $ts: serving ${serving_ms} ms, $new_drops drop(s)$extra"
         ;;
 
     start)
+        # The swap guard decides before any file check: a rehearsal under
+        # the real HOME refuses even where no conbus is installed at all —
+        # dying on a missing binary would be the wrong verdict for the
+        # condition the guard exists to catch.
+        mode=$(swap_mode start)
         [ -n "$from" ] || refuse "start wants --from <candidate-binary>"
         [ -x "$from" ] || die "candidate is not an executable: $from"
         [ -x "$bin" ] || die "no installed conbus at $bin — canary only covers an install.sh install"
-        mode=$(swap_mode start)
         if blackout_active; then
             if [ "$BLACKOUT_REASON" = unparseable ]; then
                 refuse "start: CONBUS_CANARY_BLACKOUT='${CONBUS_CANARY_BLACKOUT:-}' is unparseable — treated as active, not swapping"
@@ -965,6 +1083,8 @@ case $sub in
         fi
         before_drops=$(mktemp)
         drop_reasons >"$before_drops"
+        before_lines=0
+        [ -f "$drops_log" ] && before_lines=$(wc -l <"$drops_log" | tr -d ' ')
 
         # Stage the candidate beside the target first, then swap names.
         cp "$from" "$new_bin"
@@ -1002,11 +1122,22 @@ case $sub in
             fi
         fi
 
-        if [ -z "$fail_reason" ]; then
-            new_drops=$(new_drop_reasons "$before_drops")
-            if [ -n "$new_drops" ]; then
-                fail_reason="new drop reason(s) since the swap: $(echo "$new_drops" | tr '\n' ' ')"
-            fi
+        swap_window_drops=0
+        if [ -z "$fail_reason" ] && [ -f "$drops_log" ]; then
+            while IFS= read -r l; do
+                [ -z "$l" ] && continue
+                r=${l#*'"reason":"'}; r=${r%%'"'*}
+                if expected_swap_reason "$r"; then
+                    swap_window_drops=$((swap_window_drops + 1))
+                elif ! grep -qxF "$r" "$before_drops"; then
+                    fail_reason="new drop reason(s) since the swap: $r"
+                    break
+                fi
+            done <<< "$(tail -n "+$((before_lines + 1))" "$drops_log" 2>/dev/null || true)"
+        fi
+        if [ "$swap_window_drops" -gt 0 ]; then
+            say "start: $swap_window_drops swap-window drop(s) — the old daemon" \
+                "refused the new hook mid-restart; expected, counted, not rolled back"
         fi
         rm -f "$before_drops"
 
@@ -1019,7 +1150,13 @@ case $sub in
             state_write "$swapped_ts" "$prev_build" "$cand_build" "$cand_sha" '[]' \
                 "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
             say "rolled back $bin to $("$bin" --version 2>&1 || echo unknown)"
+            say_spool
             die "start failed: $fail_reason (rolled back automatically)"
+        fi
+
+        if [ "$swap_window_drops" -gt 0 ]; then
+            state_write "$swapped_ts" "$prev_build" "$cand_build" "$cand_sha" '[]' \
+                "" "$swap_window_drops"
         fi
 
         say "start: serving, matching build, hooks runs, no new drops — canary is live"
@@ -1040,6 +1177,7 @@ case $sub in
         if reregister_daemon "$mode"; then reload=1; fi
         if [ "$reload" = 1 ]; then wait_for_serving "$old_stamp_pid" || true; fi
         check_doctor "$mode"
+        say_spool
         ;;
 
     "" | -h | --help | help)

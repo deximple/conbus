@@ -47,6 +47,13 @@ pub fn normalize(json: &str) -> Result<Normalized, HookError> {
             author: None,
             prompt: Body::kept(payload.prompt.unwrap_or_default()),
         },
+        // `session.execution.succeeded` is the 2.x bus event for a turn that
+        // finished without an error; the plugin forwards it verbatim.
+        "session.execution.succeeded" => Event::TurnEnded {
+            state: TurnState::Complete,
+            assistant_message: None,
+            tokens: None,
+        },
         "session.error" => Event::TurnEnded {
             state: error_state(payload.error.as_ref()),
             assistant_message: None,
@@ -205,6 +212,28 @@ mod tests {
                     }
                 );
             }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_succeeded_execution_is_a_completed_turn() {
+        // The 2.x plugin forwards `session.execution.succeeded` verbatim; a
+        // turn that ends this way is complete, not an interruption.
+        let json = r#"{
+            "opencode_plugin": 1,
+            "hook_event_name": "session.execution.succeeded",
+            "session_id": "ses_1",
+            "cwd": "/repo"
+        }"#;
+        match normalize(&Harness::new(Harness::OPENCODE), json).expect("ok") {
+            Normalized::Event { observed, .. } => match &observed.event {
+                Event::TurnEnded {
+                    state: TurnState::Complete,
+                    ..
+                } => {}
+                other => panic!("{other:?}"),
+            },
             other => panic!("{other:?}"),
         }
     }
