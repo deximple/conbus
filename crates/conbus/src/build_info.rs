@@ -37,6 +37,14 @@ pub struct Stamp {
     pub build: String,
     pub pid: u32,
     pub started: String,
+    /// The retention level this daemon records under, named at first write so
+    /// a hook can ask whether spooling is consented to. Absent on older stamps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention: Option<String>,
+    /// Set only once the socket is bound and answered — a stamp without it is
+    /// a daemon still preparing, and no client should wait on its socket.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serving: Option<String>,
     /// Set after restore+relock. Absent on a first write or an older daemon.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub core_dumps_disabled: Option<bool>,
@@ -46,11 +54,19 @@ pub struct Stamp {
     pub memory_lock_error: Option<String>,
 }
 
-/// Write this process's build beside the socket. Written beside and renamed,
-/// so a `doctor` reading mid-write sees the old stamp or the new one, never
-/// half of either.
-pub fn stamp(paths: &Paths) -> io::Result<()> {
-    write_stamp(paths, None)
+/// Write this process's build beside the socket — the first stamp, before
+/// the socket exists, so a client sees a daemon preparing rather than a dead
+/// one. Written beside and renamed, so a `doctor` reading mid-write sees the
+/// old stamp or the new one, never half of either.
+pub fn stamp(paths: &Paths, retention: &str) -> io::Result<()> {
+    write_stamp(paths, None, Some(retention), false)
+}
+
+/// The second stamp: the socket is bound and answering. Anything before this
+/// is a starting daemon, which `doctor` and a spooling hook both tell apart
+/// from a serving one.
+pub fn stamp_serving(paths: &Paths) -> io::Result<()> {
+    write_stamp(paths, None, None, true)
 }
 
 /// Record what locking actually did, after restore grew the heap.
@@ -67,6 +83,8 @@ pub fn stamp_hardening(
             memory_locked,
             memory_lock_error,
         }),
+        None,
+        false,
     )
 }
 
@@ -76,7 +94,12 @@ struct HardenStamp {
     memory_lock_error: Option<String>,
 }
 
-fn write_stamp(paths: &Paths, harden: Option<HardenStamp>) -> io::Result<()> {
+fn write_stamp(
+    paths: &Paths,
+    harden: Option<HardenStamp>,
+    retention: Option<&str>,
+    serving: bool,
+) -> io::Result<()> {
     let previous = std::fs::read_to_string(stamp_file(paths))
         .ok()
         .and_then(|text| serde_json::from_str::<Stamp>(text.trim()).ok())
@@ -88,6 +111,14 @@ fn write_stamp(paths: &Paths, harden: Option<HardenStamp>) -> io::Result<()> {
             .as_ref()
             .map(|seen| seen.started.clone())
             .unwrap_or_else(|| Timestamp::now().to_string()),
+        retention: retention
+            .map(String::from)
+            .or_else(|| previous.as_ref().and_then(|s| s.retention.clone())),
+        serving: if serving {
+            Some(Timestamp::now().to_string())
+        } else {
+            previous.as_ref().and_then(|s| s.serving.clone())
+        },
         core_dumps_disabled: harden
             .as_ref()
             .map(|h| h.core_dumps_disabled)
@@ -156,7 +187,7 @@ mod tests {
         let paths = Paths::from_env(dir.path().to_str(), None, None).expect("paths");
         std::fs::create_dir_all(paths.root()).expect("root");
 
-        stamp(&paths).expect("stamp");
+        stamp(&paths, "conversation_only").expect("stamp");
 
         match daemon_build(&paths) {
             DaemonBuild::Running(found) => {
@@ -187,7 +218,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let paths = Paths::from_env(dir.path().to_str(), None, None).expect("paths");
         std::fs::create_dir_all(paths.root()).expect("root");
-        stamp(&paths).expect("stamp");
+        stamp(&paths, "conversation_only").expect("stamp");
         match daemon_build(&paths) {
             DaemonBuild::Running(found) => assert_eq!(found.memory_locked, None),
             other => panic!("{other:?}"),
