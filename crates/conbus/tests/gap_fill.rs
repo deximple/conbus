@@ -123,6 +123,14 @@ fn reply(session: &str, text: &str) -> String {
     .to_string()
 }
 
+/// What a running turn's transcript ends on: text, and the model not stopped.
+fn partial(session: &str, text: &str) -> String {
+    json!({"type": "assistant", "sessionId": session, "timestamp": T0, "version": "2.1.316",
+           "message": {"role": "assistant", "stop_reason": "tool_use",
+                       "content": [{"type": "text", "text": text}]}})
+    .to_string()
+}
+
 fn transcript(home: &Path, session: &str, lines: &[String]) {
     let dir = home.join(".claude/projects/-repo");
     std::fs::create_dir_all(&dir).expect("dir");
@@ -558,7 +566,7 @@ fn a_turn_still_running_at_a_restart_gets_no_ending_from_its_partial_text() {
         &[
             user(S, "p0", "before"),
             user(S, "p1", "still running"),
-            reply(S, "Let me look at that first."),
+            partial(S, "Let me look at that first."),
         ],
     );
 
@@ -716,4 +724,65 @@ fn the_codex_pass_does_not_write_a_spooled_turn_twice() {
         "\n{}",
         show(&turn)
     );
+}
+
+#[test]
+fn a_running_turn_no_hook_reported_is_filled_and_ended_by_its_own_stop() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let daemon = start(home);
+    hook(home, &prompt(S, "p0", "before"));
+    stop(daemon);
+    transcript(
+        home,
+        S,
+        &[
+            user(S, "p0", "before"),
+            user(S, "p1", "the hook for this one was lost"),
+            partial(S, "Let me look at that first."),
+        ],
+    );
+
+    let daemon = start(home);
+    let while_running = log_lines(home);
+    let endings = |records: &[Value]| -> Vec<Value> {
+        records
+            .iter()
+            .filter(|record| record["event"] == "turn_ended")
+            .cloned()
+            .collect()
+    };
+    assert!(
+        while_running
+            .iter()
+            .any(|record| record["vendor_turn_id"] == "p1"),
+        "the prompt is filled:\n{}",
+        show(&while_running)
+    );
+    assert!(
+        endings(&while_running).is_empty(),
+        "{}",
+        show(&while_running)
+    );
+
+    // The turn finishes with the recorder up.
+    hook(home, &ended(S, "p1", "the answer"));
+    transcript(
+        home,
+        S,
+        &[
+            user(S, "p0", "before"),
+            user(S, "p1", "the hook for this one was lost"),
+            partial(S, "Let me look at that first."),
+            reply(S, "the answer"),
+        ],
+    );
+    stop(daemon);
+    stop(start(home));
+
+    let all = log_lines(home);
+    let done = endings(&all);
+    assert_eq!(done.len(), 1, "{}", show(&all));
+    assert_eq!(done[0]["assistant_message"]["text"], "the answer");
+    assert!(done[0]["hook_id"].is_string(), "{}", show(&all));
 }

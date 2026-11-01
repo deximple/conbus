@@ -27,6 +27,9 @@ the entry says so when it does.
   the Codex pass. Gap fill leaves what the spool holds to the drain, so the hook's
   records are the ones written, and a turn still running at the restart does not
   get an ending from its partial text.
+- A recovered turn ends only when the transcript shows the model stopped. Before,
+  any reply counted, so a turn still running or cut off on a tool call was recorded
+  as `Complete` with partial text, and its real `Stop` wrote a second ending.
 
 ## [1.0.0-rc.3] — 2026-11-01
 
