@@ -225,6 +225,19 @@ fn a_vendor_that_could_not_be_told_is_neither_green_nor_a_sign_in() {
 }
 
 #[test]
+fn a_running_vendor_that_quotes_a_missing_file_is_not_called_uninstalled() {
+    // Only a program that could not be started is not installed. This one started,
+    // answered, and happens to quote the same errno.
+    let (_refused_dir, broken) =
+        codex_refusing_with("cannot read a file: No such file or directory (os error 2)");
+
+    let html = page_with(&[("CONBUS_CODEX_BIN", &broken)]);
+
+    assert_eq!(banner(&html), "neutral", "{html}");
+    assert!(html.contains("<tr><td>codex</td><td>SKIP"), "{html}");
+}
+
+#[test]
 fn a_sign_out_outranks_what_could_not_be_told() {
     let (_refused_dir, broken) = codex_refusing_with("the server is on fire");
     let (_gh_dir, gh_out) = fake_gh(1);

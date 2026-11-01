@@ -1,6 +1,6 @@
 //! `conbus auth --html [PATH]`: one self-contained page. The banner, the table,
 //! and a paste box whose script names a page entirely offline. No server, and a
-//! policy that lets it load nothing and reach nothing.
+//! policy that lets it load nothing and connect nowhere.
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};

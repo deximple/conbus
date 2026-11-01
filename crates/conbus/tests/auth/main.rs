@@ -1,6 +1,6 @@
 //! `conbus auth`: the vendor table with stand-ins, `--url` naming a page
 //! without ever echoing its query values, and `--html` writing one
-//! self-contained page that reaches no network.
+//! self-contained page that connects nowhere.
 
 use std::process::Command;
 
