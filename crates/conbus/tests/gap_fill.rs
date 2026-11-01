@@ -1206,7 +1206,7 @@ for line in sys.stdin:
     if m == "initialize":
         print(json.dumps({"jsonrpc":"2.0","id":i,"result":{"userAgent":"fake"}}), flush=True)
     elif m == "thread/turns/list":
-        time.sleep(0.5)
+        time.sleep(0.8)
         t = msg["params"]["threadId"]
         data = [{"id":"turn-of-"+t,"items":[{"type":"userMessage","content":[{"type":"text","text":"said in "+t}]},{"type":"agentMessage","text":"a"}],
                  "status":"completed","startedAt":1788368800,"completedAt":1788368801}]
@@ -1239,6 +1239,13 @@ fn threads_a_budget_cut_off_are_reached_by_later_starts() {
     let dir = tempfile::tempdir().expect("tempdir");
     let home = dir.path();
     let (_stub, fake) = stand_in(SLOW_APP_SERVER);
+    // Its first exec can take seconds on a loaded machine. Charged to a start, that
+    // would read as an app-server that stalled.
+    let warmed = Command::new(&fake)
+        .stdin(Stdio::null())
+        .status()
+        .expect("warm the stand-in");
+    assert!(warmed.success());
     live_threads_touched_in_order(home);
 
     let reached = |home: &Path, thread: &str| {
@@ -1251,7 +1258,9 @@ fn threads_a_budget_cut_off_are_reached_by_later_starts() {
             home,
             daemon_command(home)
                 .env("CONBUS_CODEX_BIN", &fake)
-                .env("CONBUS_GAP_BUDGET_MS", "2000")
+                // Five answers at most, with room for a slow first exec: a stand-in
+                // that answers nothing inside its limit counts as stalled.
+                .env("CONBUS_GAP_BUDGET_MS", "4000")
                 .spawn()
                 .expect("daemon"),
         );
@@ -1351,4 +1360,138 @@ for line in sys.stdin:
         .collect();
     assert_eq!(filled.len(), 1, "\n{}", show(&filled));
     assert_eq!(filled[0]["prompt"]["text"], "the fork's own prompt");
+}
+/// A stand-in that never answers `initialize`: the stall `AppServer` documents,
+/// from an MCP server it is trying to start.
+fn a_stalled_app_server() -> (tempfile::TempDir, PathBuf) {
+    stand_in("#!/bin/sh\nexec sleep 60\n")
+}
+
+/// One start, keeping what the daemon said in `daemon-notes` under the root.
+fn start_with_stalled_codex(home: &Path, codex: &Path) {
+    let notes = std::fs::File::options()
+        .create(true)
+        .append(true)
+        .open(home.join("daemon-notes"))
+        .expect("notes");
+    let daemon = wait_serving(
+        home,
+        daemon_command(home)
+            .env("CONBUS_CODEX_BIN", codex)
+            .env("CONBUS_GAP_BUDGET_MS", "1000")
+            .stderr(Stdio::from(notes))
+            .spawn()
+            .expect("daemon"),
+    );
+    stop(daemon);
+}
+
+/// How many starts asked the app-server, and how many left it alone. Read from
+/// what the daemon says rather than from the stand-in, whose first exec can
+/// outlast its limit on a loaded machine.
+fn asked_and_left_alone(home: &Path) -> (usize, usize) {
+    let notes = std::fs::read_to_string(home.join("daemon-notes")).unwrap_or_default();
+    let deferred: Vec<&str> = notes
+        .lines()
+        .filter(|line| line.contains("codex gap fill deferred ("))
+        .collect();
+    let left_alone = deferred
+        .iter()
+        .filter(|line| line.contains("it stalled at an earlier start"))
+        .count();
+    (deferred.len() - left_alone, left_alone)
+}
+
+#[test]
+fn a_stalled_app_server_costs_one_start_not_every_start() {
+    // Eight seconds in the real case, with the socket closed. Keeping the range
+    // must not mean paying that on every restart for as long as Codex is wedged.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let (_stub, fake) = a_stalled_app_server();
+    a_live_codex_thread(home);
+
+    start_with_stalled_codex(home, &fake);
+    start_with_stalled_codex(home, &fake);
+    start_with_stalled_codex(home, &fake);
+
+    assert_eq!(
+        asked_and_left_alone(home),
+        (1, 2),
+        "asked again within the hour"
+    );
+    assert!(
+        home.join("cache/gap-since-codex").exists(),
+        "and the range is still held"
+    );
+}
+
+#[test]
+fn a_stalled_app_server_is_asked_again_once_the_back_off_has_passed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let (_stub, fake) = a_stalled_app_server();
+    a_live_codex_thread(home);
+    start_with_stalled_codex(home, &fake);
+
+    // Two hours ago, as far as the record of it goes.
+    let read = home.join("cache/gap-read");
+    let held = std::fs::read_to_string(&read).expect("a record of the stall");
+    let epoch = conbus_core::clock::Timestamp::from_unix_seconds(0).expect("epoch");
+    let long_ago = conbus_core::clock::Timestamp::now().seconds_since(epoch) - 2 * 3600;
+    let rewound: Vec<String> = held
+        .lines()
+        .map(|line| match line.split_once('\t') {
+            Some((_, "codex app-server stalled")) => {
+                format!("{long_ago}\tcodex app-server stalled")
+            }
+            _ => line.to_string(),
+        })
+        .collect();
+    assert!(
+        rewound.iter().any(|line| line.ends_with("stalled")),
+        "the stall was noted: {held}"
+    );
+    std::fs::write(&read, rewound.join("\n") + "\n").expect("rewind");
+
+    start_with_stalled_codex(home, &fake);
+
+    assert_eq!(asked_and_left_alone(home), (2, 0));
+}
+
+#[test]
+fn an_app_server_that_is_only_missing_is_tried_every_start() {
+    // It costs nothing, and installing Codex should fill the range at the next one.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let (_stub, fake) = stand_in(FAKE_APP_SERVER);
+    a_live_codex_thread(home);
+    stop(start(home)); // the app-server cannot start
+
+    start_with_codex(home, &fake);
+
+    assert!(
+        log_lines(home)
+            .iter()
+            .any(|record| record["vendor_turn_id"] == "t1"),
+        "the next start did not try"
+    );
+}
+
+#[test]
+fn backfill_gaps_by_hand_asks_a_stalled_app_server_regardless() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let (_stub, fake) = a_stalled_app_server();
+    a_live_codex_thread(home);
+    start_with_stalled_codex(home, &fake);
+    let (_stub2, working) = stand_in(FAKE_APP_SERVER);
+
+    let (ok, said) = backfill_gaps(home, &working, true);
+
+    assert!(ok, "{said}");
+    assert!(
+        said.contains("1 thread(s), 1 turn(s), 2 record(s)"),
+        "{said}"
+    );
 }
