@@ -61,3 +61,14 @@ Stop a cycle when the picked defect is verified fixed. Do not mark the product f
   failed first through the real binary and `install`'s own registrations, with
   four event kinds doubled. Live check not yet run: no Grok pair in records
   written after `install --apply` and a daemon restart.
+- 2026-11-01 1.0 hardening — defects picked from live evidence and real vendor
+  runs rather than from memory. OpenCode 2.x had been refusing the plugin since
+  it moved to 2.0 (its own log said so on every start; nothing reached the log):
+  a 2.x plugin now loads. Grok 1.0.71 fires a `Stop` after `SessionEnd`, which
+  was recorded as a second turn end, and documents `StopCancelled`, which was
+  not registered. A recorder restart dropped the hooks that arrived while it
+  recovered: it now binds after recovery and hooks spool, and a 1,000-hook
+  storm across a restart loses nothing. `sync` let a `.curlrc` change its
+  transport, and `--inference-listen` bound any address. Reads stopped scanning
+  tool bodies (93% of the log): `log --tail 1` went from 8.8 s to 13 ms on a
+  10 GB log.

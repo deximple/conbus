@@ -58,7 +58,7 @@ The agents' own terminals and apps stay the window. conbus has no chat UI.
 
 ## 2. Before you install
 
-- **macOS** on Apple silicon or Intel, or **Linux** on x86_64. The recorder is
+- **macOS** on Apple silicon or Intel, or **Linux** on x86_64 or aarch64. The recorder is
   a launchd agent on a Mac and a systemd user unit on Linux; it does not run
   on Windows yet.
 - **At least one agent, already signed in** through its own binary: Claude Code
@@ -81,7 +81,8 @@ curl -fsSL https://raw.githubusercontent.com/deximple/conbus/main/install.sh | s
 The script:
 
 1. downloads the release asset for this OS — `conbus-macos-universal.tar.gz`
-   on a Mac, `conbus-linux-x86_64.tar.gz` on Linux — from the latest release
+   on a Mac, `conbus-linux-x86_64.tar.gz` or `conbus-linux-aarch64.tar.gz` on
+   Linux, chosen by `uname -m` — from the latest release
    (falling back to `gh release download` when the anonymous download is
    refused);
 2. checks it against its published SHA-256, and stops without installing
@@ -629,6 +630,16 @@ folder.
 this for you.
 
 ---
+
+### `conbus sync` (experimental)
+
+`conbus sync` is the client for an invited service that receives one row of
+counts per day — the same numbers `usage --shareable` prints, with no folder
+names. No service exists yet; [RFD 0002](rfd/0002-metadata-sync.md) and
+[RFD 0003](rfd/0003-security-design.md) are drafts. `conbus sync --join
+INVITE` only shows the invite; with `--apply` it stores a device key in the
+login Keychain. `conbus sync --off` deletes that key even when the service
+cannot be reached. The log itself never leaves the machine.
 
 ## 12. Upgrading
 
