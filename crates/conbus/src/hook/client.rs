@@ -344,10 +344,10 @@ pub fn run_in(
 
 /// The failures a later daemon can put right: nothing to connect to, a reply
 /// that never came or could not be read, a session whose binding died with
-/// the old daemon, a refusal that names the protocol — a newer hook can wait
-/// for a daemon that speaks it — or a log that would not take the record, such
-/// as a full disk. Any other refusal or a retention `Withheld` is a real
-/// decision, and the drop stands.
+/// the old daemon, a refusal that names the protocol or could not read the
+/// request — a newer hook can wait for a daemon that speaks it — or a log that
+/// would not take the record, such as a full disk. Any other refusal or a
+/// retention `Withheld` is a real decision, and the drop stands.
 fn spoolable(reason: &str) -> bool {
     reason.starts_with("no daemon on ")
         || reason.starts_with("could not bound the daemon call:")
@@ -356,7 +356,9 @@ fn spoolable(reason: &str) -> bool {
         || reason.starts_with("unreadable reply ")
         || reason.starts_with("no conversation for this session")
         || (reason.starts_with("the daemon refused the record:")
-            && (reason.contains("protocol v") || refused_by_the_log(reason)))
+            && (reason.contains("protocol v")
+                || reason.contains("unreadable request")
+                || refused_by_the_log(reason)))
 }
 
 /// The daemon read the request and the log would not take it. `lost` is what
@@ -825,6 +827,15 @@ mod tests {
         assert!(spoolable(
             "the daemon refused the record: 1 record(s) written, 1 held: \
              Permission denied (os error 13)"
+        ));
+    }
+
+    #[test]
+    fn a_request_the_daemon_could_not_parse_can_wait_for_one_that_can() {
+        // What every daemon before this change says to a kind it does not know.
+        assert!(spoolable(
+            "the daemon refused the record: unreadable request: \
+             unknown variant `message_displayed`"
         ));
     }
 

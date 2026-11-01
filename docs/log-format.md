@@ -73,5 +73,7 @@ so no caller can put a withheld body on disk.
 Hooks reach the recorder over a Unix socket (`conbus.sock`, mode `0600`) as one
 JSON request per line. `PROTOCOL_VERSION` (`crates/conbus/src/wire.rs`) moves
 whenever the request's shape does. A recorder refuses a hook that speaks a
-newer protocol and says so ("Restart the daemon"); a hook that speaks an older
-one is served.
+newer protocol and says so ("Restart the daemon"), and that includes a request
+at its own version with an event kind it does not know. The hook keeps what was
+refused in `spool/`, where it waits up to seven days for a recorder that can read
+it. A hook that speaks an older protocol is served.

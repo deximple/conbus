@@ -8,6 +8,11 @@ the entry says so when it does.
 
 ### Fixed
 
+- A newer hook's new event kind now waits in the spool for a daemon that can read
+  it, as `docs/log-format.md` always said. It used to be refused as unreadable and
+  dropped live, and deleted from the spool. It waits up to seven days and then goes
+  with a drop line, as does an entry from a newer protocol, which used to wait for
+  ever.
 - A log that refuses a write, as a full disk or a read-only segment does, no
   longer destroys the record. The daemon holds it in memory, up to 16 MiB, and the
   hook spools a copy if it can. The record lands once, in arrival order, when the

@@ -239,7 +239,8 @@ A log that refuses a write, as a full disk or a read-only segment does, does not
 lose the record either. The daemon holds it in memory, up to 16 MiB, and the hook
 spools a copy if there is room. It lands once, in arrival order, when the log
 takes writes again, and `drops.jsonl` then says how long and how many. A spooled
-entry the log keeps refusing is kept for seven days and then dropped with a line.
+entry the log keeps refusing is kept for seven days and then dropped with a line,
+and so is one written by a newer build that this daemon cannot read yet.
 With the daemon down and the disk really full there is nowhere to put a record,
 so it is lost, with no trace left on that disk.
 ```
