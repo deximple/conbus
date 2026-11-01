@@ -2380,3 +2380,57 @@ for line in sys.stdin:
         show(&all)
     );
 }
+
+#[test]
+fn a_fork_whose_first_prompt_hook_was_lost_does_not_record_the_parents_words() {
+    // The fork shape on real transcripts since 2026-08-31: the parent's lines under
+    // the fork's own id and one prompt id, that of the fork's first prompt. One id
+    // opens one turn, so the parent's first words would stand for it.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let daemon = start(home);
+    hook(home, &prompt(CHILD, "q", "the fork's second prompt"));
+    stop(daemon);
+    transcript(
+        home,
+        CHILD,
+        &[
+            from_before_the_file(sdk_user(CHILD, "p", "the parent's first prompt")),
+            from_before_the_file(reply(CHILD, "the parent's first reply")),
+            from_before_the_file(sdk_user(CHILD, "p", "the parent's second prompt")),
+            from_before_the_file(reply(CHILD, "the parent's second reply")),
+            sdk_user(CHILD, "p", "the fork's first prompt"),
+            reply(CHILD, "the fork's first reply"),
+            sdk_user(CHILD, "q", "the fork's second prompt"),
+            reply(CHILD, "the fork's second reply"),
+        ],
+    );
+
+    stop(start(home));
+
+    let all = log_lines(home);
+    let turn: Vec<&Value> = all
+        .iter()
+        .filter(|record| record["vendor_turn_id"] == "p")
+        .collect();
+    assert_eq!(turn.len(), 1, "\n{}", show(&all));
+    assert_eq!(
+        turn[0]["prompt"]["text"],
+        "the fork's first prompt",
+        "\n{}",
+        show(&all)
+    );
+    assert!(
+        all.iter()
+            .any(|record| record["assistant_message"]["text"] == "the fork's first reply"),
+        "\n{}",
+        show(&all)
+    );
+    assert!(
+        !all.iter().any(|record| record["prompt"]["text"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("the parent's"))),
+        "\n{}",
+        show(&all)
+    );
+}
