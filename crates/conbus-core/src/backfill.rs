@@ -102,9 +102,10 @@ struct Message {
 /// or cut off, which matters because an ending cannot be taken back.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ModelStop {
-    /// It stopped on its own account.
+    /// It finished what it had to say.
     Stopped,
-    /// It was still working when the file ended or the next prompt came.
+    /// It had not finished: it was on a tool call, or something cut it short.
+    /// Live, `max_tokens` reaches the recorder as `StopFailure`, not `Complete`.
     Working,
     /// The line does not say. Builds that wrote no `stop_reason`, or a line
     /// caught before the vendor knew.
@@ -114,7 +115,7 @@ enum ModelStop {
 impl ModelStop {
     fn of(stop_reason: Option<&str>) -> Self {
         match stop_reason {
-            Some("end_turn" | "max_tokens" | "refusal" | "stop_sequence") => ModelStop::Stopped,
+            Some("end_turn") => ModelStop::Stopped,
             Some(_) => ModelStop::Working,
             None => ModelStop::Unsaid,
         }
@@ -1464,14 +1465,29 @@ mod tests {
     }
 
     #[test]
-    fn a_last_turn_the_model_stopped_has_its_ending() {
-        for stop_reason in ["end_turn", "max_tokens", "refusal", "stop_sequence"] {
+    fn a_last_turn_the_model_finished_has_its_ending() {
+        let out = parse(&[
+            user("", "P1", "a prompt"),
+            said("the answer", serde_json::json!("end_turn")),
+        ]);
+
+        assert_eq!(endings(&out), vec!["the answer"]);
+    }
+
+    #[test]
+    fn a_turn_cut_short_is_not_recovered_as_complete() {
+        // `max_tokens` reaches the live path as `StopFailure`, which is not
+        // `Complete`, and the text is truncated. The others do not say it finished
+        // either, and a missing ending can be filled by a hook where a false one
+        // cannot be taken back.
+        for stop_reason in ["max_tokens", "refusal", "stop_sequence"] {
             let out = parse(&[
                 user("", "P1", "a prompt"),
-                said("the answer", serde_json::json!(stop_reason)),
+                said("the answer so far", serde_json::json!(stop_reason)),
+                user("", "P2", "another prompt"),
             ]);
 
-            assert_eq!(endings(&out), vec!["the answer"], "{stop_reason}");
+            assert_eq!(endings(&out), Vec::<String>::new(), "{stop_reason}");
         }
     }
 
