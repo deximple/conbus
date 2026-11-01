@@ -1387,12 +1387,17 @@ fn spawn_hop_apply(bus_id: BusId, to: Option<String>) {
                     .find_map(|line| line.strip_prefix("route"))
                     .map(str::trim)
                     .unwrap_or("no route line");
+                let steps = said
+                    .lines()
+                    .find_map(|line| line.strip_prefix("steps"))
+                    .map(str::trim)
+                    .unwrap_or("no steps line");
                 if out.status.success() {
-                    note!("automatic hop --apply for {bus_id} in {ms} ms: {route}");
+                    note!("automatic hop --apply for {bus_id} in {ms} ms: {route} ({steps})");
                 } else {
                     let err = String::from_utf8_lossy(&out.stderr);
                     note!(
-                        "automatic hop --apply for {bus_id} exited {} after {ms} ms ({route}): {}",
+                        "automatic hop --apply for {bus_id} exited {} after {ms} ms ({route}; {steps}): {}",
                         out.status,
                         err.trim()
                     );

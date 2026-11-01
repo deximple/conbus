@@ -385,6 +385,8 @@ fn apply_hop(
         reason,
         provenance,
     } = *chosen;
+    let started = std::time::Instant::now();
+    let mut steps = Vec::new();
     let focus = predecessor(records, from, current)?;
     let code_freshness = Some(crate::code::probe(focus.workspace.as_deref()).line());
     if matches!(lease_of(records, focus.bus_id), Lease::Held(_)) {
@@ -394,6 +396,7 @@ fn apply_hop(
     }
 
     let text = digest(records, focus.bus_id);
+    steps.push(("decide", started.elapsed().as_millis()));
     let kind = match hop {
         Hop::Displaced => "displaced",
         Hop::HandedOff => "handed_off",
@@ -406,16 +409,19 @@ fn apply_hop(
     // why. Recording first can only cost a `routed` line for a hop whose
     // destination then failed to open, which the log can say and a person
     // can read.
+    let lease_at = std::time::Instant::now();
     if !routed_to(records, focus.bus_id, to) {
         record_hop(paths, &focus, to, hop, reason, code_freshness, provenance)?;
         println!("recorded  routed {kind}");
     }
+    steps.push(("lease", lease_at.elapsed().as_millis()));
 
     // Destination first among the warms. Overflow to Codex was waiting on
     // `claude -p` (MCP spawn) before `codex://` could open. The other leg
     // still warms after the vendor window is up; a failure there is not a
     // failed hop. Each warm writes its own lease, checked, where it opens —
     // this used to write a second, unchecked copy from here as well.
+    let warm_at = std::time::Instant::now();
     let thread = match to.as_str() {
         Harness::CODEX => {
             let thread = take_codex_warm(paths, records, &focus, &text)?;
@@ -441,8 +447,24 @@ fn apply_hop(
             None
         }
     };
+    steps.push(("warm", warm_at.elapsed().as_millis()));
 
-    handoff(paths, &focus, to.as_str(), thread.as_deref())
+    let open_at = std::time::Instant::now();
+    let opened = handoff(paths, &focus, to.as_str(), thread.as_deref());
+    steps.push(("open", open_at.elapsed().as_millis()));
+    // The daemon's own line quotes this one — the 21-minute hop left no
+    // line at all once, so the log now says where the time went.
+    let total = started.elapsed().as_millis();
+    println!(
+        "steps     {}",
+        steps
+            .iter()
+            .map(|(name, ms)| format!("{name} {ms} ms"))
+            .chain([format!("total {total} ms")])
+            .collect::<Vec<_>>()
+            .join(" · ")
+    );
+    opened
 }
 
 fn take_codex_warm(
