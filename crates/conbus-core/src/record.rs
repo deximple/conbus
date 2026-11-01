@@ -311,8 +311,8 @@ mod tests {
         Record {
             vendor_turn_id: Some(VendorTurnId::new("ed06c859-f62e-418f-96f0-556d61fa97d5")),
             vendor_agent_id: Some(VendorAgentId::new("agent-7")),
-            hook_id: None,
-            spooled_at: None,
+            hook_id: Some("01a19463-cbd4-7b50-b819-1c9ecf85ef18".into()),
+            spooled_at: Some("2026-11-01T00:00:00.000Z".parse().expect("ts")),
             source: Source {
                 backfilled_from: Some(crate::backfill::CLAUDE_TRANSCRIPT.to_string()),
                 ..source()
