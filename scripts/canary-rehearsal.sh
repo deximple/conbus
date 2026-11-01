@@ -88,6 +88,24 @@ EOF
 
 # --- fixtures ---------------------------------------------------------------
 
+# codesign for the fakes on the real path, which are not signed. It writes a
+# line at a time like the real one, so a reader that leaves early costs it a
+# SIGPIPE.
+write_codesign() { # write_codesign <dir> <--verify exit> <flags>
+    mkdir -p "$1"
+    cat >"$1/codesign" <<EOF
+#!/bin/sh
+[ "\$1" = --verify ] && exit $2
+echo 'CodeDirectory v=20500 size=7701 flags=$3 hashes=230+7 location=embedded' >&2
+sleep 0.1
+echo 'TeamIdentifier=ABCDE12345' >&2
+EOF
+    chmod 755 "$1/codesign"
+}
+write_codesign "$tmp/signed" 0 '0x10000(runtime)'
+write_codesign "$tmp/no-runtime" 0 '0x0(none)'
+write_codesign "$tmp/unverified" 1 '0x10000(runtime)'
+
 # `agy models` as the real path asks it: with no login, and with one.
 printf '#!/bin/sh\nexit 1\n' >"$tmp/agy-no-login"
 printf '#!/bin/sh\nexit 0\n' >"$tmp/agy-signed-in"
@@ -138,6 +156,7 @@ run_real() {
         HOME="$home" CONBUS_CANARY_TEST_REAL_HOME="$home" \
         CONBUS_AGY_BIN="${real_path_agy:-$tmp/agy-no-login}" \
         CONBUS_CANARY_SERVING_LIMIT=${SERVING_LIMIT:-30} \
+        PATH="$tmp/${real_path_signing:-signed}:$PATH" \
         bash "$canary" "$@"
 }
 
@@ -213,6 +232,29 @@ expect 0 $? "preflight passes on a healthy fake install"
 run preflight --evidence "$tmp/evidence" >"$tmp/preflight.out"
 expect 0 $? "preflight passes with --evidence"
 expect_grep '^PASS evidence-s5' "$tmp/preflight.out" "s1–s5 markers found in --evidence dir"
+
+# The candidate's signature, which only the real path checks. A rehearsal that
+# skips it let a broken check reach the first real start.
+if [ "$(uname -s)" = Darwin ]; then
+    code=0
+    run_real preflight --from "$tmp/stage/conbus-good" --evidence "$tmp/evidence" \
+        >"$tmp/preflight-signed.out" 2>&1 || code=$?
+    expect 0 "$code" "preflight on the real path passes a signed candidate"
+    expect_grep '^PASS signature' "$tmp/preflight-signed.out" "the signature is checked"
+    expect_grep '^PASS hardened-runtime' "$tmp/preflight-signed.out" "a hardened runtime is found"
+
+    code=0
+    real_path_signing=no-runtime run_real preflight --from "$tmp/stage/conbus-good" \
+        --evidence "$tmp/evidence" >"$tmp/preflight-noruntime.out" 2>&1 || code=$?
+    expect 1 "$code" "preflight fails a candidate with no hardened runtime"
+    expect_grep '^FAIL hardened-runtime' "$tmp/preflight-noruntime.out" "the missing runtime is named"
+
+    code=0
+    real_path_signing=unverified run_real preflight --from "$tmp/stage/conbus-good" \
+        --evidence "$tmp/evidence" >"$tmp/preflight-unverified.out" 2>&1 || code=$?
+    expect 1 "$code" "preflight fails a candidate that does not verify"
+    expect_grep '^FAIL signature' "$tmp/preflight-unverified.out" "the bad signature is named"
+fi
 expect_file "$home/Library/LaunchAgents/sh.conbus.daemon.plist.bak" \
     "preflight backed the plist up beside itself"
 

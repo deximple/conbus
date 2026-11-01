@@ -687,7 +687,7 @@ do_preflight() {
     # the check degrades to the hash.
     if [ -n "$from" ]; then
         [ -f "$from" ] || die "no candidate at $from"
-        if [ "$(uname -s)" = Darwin ] && is_passwd_home; then
+        if [ "$(uname -s)" = Darwin ] && { is_passwd_home || is_real_env; }; then
             if codesign --verify --strict "$from" 2>/dev/null; then
                 team=$(codesign -dv "$from" 2>&1 | sed -n 's/^TeamIdentifier=//p')
                 if [ -n "$team" ] && [ "$team" != "not set" ]; then
@@ -701,8 +701,13 @@ do_preflight() {
             slices=$(lipo -archs "$from" 2>/dev/null || uname -m)
             runtime_fail=""
             for arch in $slices; do
-                codesign -dv --arch "$arch" "$from" 2>&1 | grep -q 'runtime' ||
-                    runtime_fail="$runtime_fail $arch"
+                # All of it first: `grep -q` leaves at the match, and the
+                # SIGPIPE codesign takes for that fails the pipe under pipefail.
+                signed=$(codesign -dv --arch "$arch" "$from" 2>&1 || true)
+                case $signed in
+                    *runtime*) ;;
+                    *) runtime_fail="$runtime_fail $arch" ;;
+                esac
             done
             if [ -z "$runtime_fail" ]; then
                 check 0 hardened-runtime "all slices ($slices)"
