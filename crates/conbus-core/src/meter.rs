@@ -146,6 +146,8 @@ mod tests {
             bus_id: "01996b1e-2c4a-7c31-9d0e-4f2a6b8c1d3e".parse().expect("id"),
             vendor_turn_id: None,
             vendor_agent_id: None,
+            hook_id: None,
+            spooled_at: None,
             source: Source {
                 harness: Harness::new(Harness::CLAUDE_CODE),
                 harness_version: None,

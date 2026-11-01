@@ -449,6 +449,9 @@ struct Tally {
     recorded_twice: u64,
     probe: u64,
     repeated: u64,
+    /// Hook ids already counted here — a spool re-delivery is the same event,
+    /// so the second one is a `repeated` count and nothing more.
+    seen_hook_ids: HashSet<String>,
     /// When each report that names a vendor thing was last counted.
     delivered: HashMap<(BusId, u64), Timestamp>,
     /// Each harness's last limit stop, for telling episodes apart.
@@ -489,6 +492,17 @@ impl Tally {
             workspace: workspace.clone(),
             attendance,
         };
+        if record
+            .hook_id
+            .as_ref()
+            .is_some_and(|h| !self.seen_hook_ids.insert(h.clone()))
+        {
+            self.records += 1;
+            self.repeated += 1;
+            self.rows.entry(key).or_default().1.repeated += 1;
+            self.harnesses.entry(harness).or_default().1.repeated += 1;
+            return;
+        }
         if self.is_twin(record) {
             self.repeated += 1;
             self.rows.entry(key).or_default().1.repeated += 1;
@@ -833,6 +847,8 @@ mod tests {
             bus_id: bus_id.parse().expect("id"),
             vendor_turn_id: None,
             vendor_agent_id: None,
+            hook_id: None,
+            spooled_at: None,
             source,
             event,
         }

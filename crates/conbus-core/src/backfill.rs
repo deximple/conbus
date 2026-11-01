@@ -185,6 +185,8 @@ pub fn parse_claude_transcript(text: &str, bus_id: BusId) -> Recovered {
                     source: source.clone(),
                     vendor_turn_id: line.prompt_id.clone().map(VendorTurnId::new),
                     vendor_agent_id: None,
+                    hook_id: None,
+                    spooled_at: None,
                     event: Event::TurnStarted {
                         author: line.prompt_source.clone().map(Author::new),
                         prompt: Body::kept(text),
@@ -248,6 +250,8 @@ fn prepend_session_candidate(out: &mut Recovered, bus_id: BusId, harness_version
             },
             vendor_turn_id: None,
             vendor_agent_id: None,
+            hook_id: None,
+            spooled_at: None,
             event: Event::SessionCandidate { trigger: None },
         },
     );
@@ -369,6 +373,8 @@ pub fn parse_codex_thread(thread: &serde_json::Value, turns: &[serde_json::Value
             source: source.clone(),
             vendor_turn_id: vendor_turn_id.clone(),
             vendor_agent_id: None,
+            hook_id: None,
+            spooled_at: None,
             event: Event::TurnStarted {
                 author: None,
                 prompt: Body::kept(prompt.join("\n")),
@@ -394,6 +400,8 @@ pub fn parse_codex_thread(thread: &serde_json::Value, turns: &[serde_json::Value
             source,
             vendor_turn_id: None,
             vendor_agent_id: None,
+            hook_id: None,
+            spooled_at: None,
             event: Event::SessionCandidate { trigger: None },
         },
     );
@@ -431,6 +439,8 @@ fn close_codex(out: &mut Recovered, bus_id: BusId, source: &Source, open: Option
         source: source.clone(),
         vendor_turn_id,
         vendor_agent_id: None,
+        hook_id: None,
+        spooled_at: None,
         event: Event::TurnEnded {
             state: TurnState::Complete,
             assistant_message: said,
@@ -465,6 +475,8 @@ fn close(out: &mut Recovered, bus_id: BusId, open: Option<OpenTurn>) {
         source,
         vendor_turn_id: None,
         vendor_agent_id: None,
+        hook_id: None,
+        spooled_at: None,
         event: Event::TurnEnded {
             state: TurnState::Complete,
             assistant_message: Some(Body::kept(text)),
@@ -578,6 +590,8 @@ fn parse_chat_conversation(conversation: &Value) -> Recovered {
                         .and_then(Value::as_str)
                         .map(VendorTurnId::new),
                     vendor_agent_id: None,
+                    hook_id: None,
+                    spooled_at: None,
                     event: Event::TurnStarted {
                         author: Some(Author::new("human")),
                         prompt: Body::kept(text.to_string()),
@@ -613,6 +627,8 @@ fn parse_chat_conversation(conversation: &Value) -> Recovered {
                 source: source(),
                 vendor_turn_id: None,
                 vendor_agent_id: None,
+                hook_id: None,
+                spooled_at: None,
                 event: Event::SessionCandidate { trigger: None },
             },
         );
