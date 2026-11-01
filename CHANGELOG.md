@@ -28,6 +28,10 @@ the entry says so when it does.
 - `conbus hook --inference-listen` refuses an address that is not loopback.
   The listener authenticates nothing, and it used to bind whatever address it
   was given.
+- `conbus sync` no longer lets a `.curlrc` change how it sends: curl runs with
+  `-q` first, HTTPS and TLS 1.2 or newer only, no redirects, and the body is
+  sent byte for byte as signed (`data-binary`). Before, a `.curlrc` line such
+  as `insecure` or `proxy` applied to every send.
 
 ## [0.2.9] — 2026-11-01
 

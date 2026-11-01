@@ -722,8 +722,14 @@ fn write_state(path: &Path, state: &State) -> io::Result<()> {
     Ok(())
 }
 
+/// `-q` has to be the very first argument: it is the only way to stop curl
+/// reading `~/.curlrc` (or `$CURL_HOME`/`$XDG_CONFIG_HOME`'s), and one line in
+/// that file — `insecure`, `location`, `proxy = …` — would undo the transport
+/// rules of RFD 0003 (D5). The rest pins them here instead: HTTPS only, TLS 1.2
+/// or newer, and no redirect is ever followed.
 fn curl_args() -> &'static [&'static str] {
     [
+        "-q",
         "--config",
         "-",
         "--silent",
@@ -732,13 +738,16 @@ fn curl_args() -> &'static [&'static str] {
         "30",
         "--proto",
         "=https",
+        "--tlsv1.2",
+        "--max-redirs",
+        "0",
     ]
     .as_slice()
 }
 
 fn curl_config(post: &Post) -> String {
     format!(
-        "url = {}\nrequest = \"POST\"\nheader = \"Content-Type: application/json\"\nheader = \"Conbus-Signature: {}\"\ndata = {}\n",
+        "url = {}\nrequest = \"POST\"\nheader = \"Content-Type: application/json\"\nheader = \"Conbus-Signature: {}\"\ndata-binary = {}\n",
         curl_quote(&post.url),
         post.signature_hex,
         curl_quote(&String::from_utf8_lossy(&post.body))
@@ -1336,6 +1345,90 @@ mod tests {
         assert_eq!(CURL, "/usr/bin/curl");
         assert!(config.contains("Conbus-Signature"));
         assert!(!config.contains("http://"));
+    }
+
+    #[test]
+    fn curl_ignores_every_curlrc_and_cannot_be_redirected_or_downgraded() {
+        // curl reads ~/.curlrc unless `-q` is its very first argument, and one
+        // line there (`insecure`, `location`, `proxy = …`) would undo RFD 0003
+        // D5. The body goes as `data-binary` because `data` treats a leading
+        // `@` as a file name: the bytes sent must be the bytes signed.
+        let args = curl_args();
+        assert_eq!(args[0], "-q", "{args:?}");
+        let joined = args.join(" ");
+        for wanted in ["--proto =https", "--tlsv1.2", "--max-redirs 0"] {
+            assert!(joined.contains(wanted), "missing {wanted}: {joined}");
+        }
+        for unwanted in ["-L", "--location", "-k", "--insecure", "--proxy"] {
+            assert!(!args.contains(&unwanted), "{unwanted} in {joined}");
+        }
+        let config = curl_config(&Post {
+            url: "https://sync.example/v1/batch".into(),
+            signature_hex: "00".into(),
+            body: b"@/etc/passwd".to_vec(),
+        });
+        assert!(
+            config.contains("\ndata-binary = \"@/etc/passwd\"\n"),
+            "{config}"
+        );
+        assert!(!config.contains("\ndata = "), "{config}");
+    }
+
+    #[test]
+    fn a_hostile_curlrc_is_never_read() {
+        // A real curl with our arguments, a home whose .curlrc routes everything
+        // through a "proxy" we listen on, and a URL that refuses connections.
+        // Read, the file would send curl to our listener; ignored, curl fails
+        // straight away on the refused port and nothing ever connects.
+        use std::net::TcpListener;
+        if !std::path::Path::new(CURL).exists() {
+            panic!("{CURL} is missing; this test needs the curl the transport runs");
+        }
+        let proxy = TcpListener::bind("127.0.0.1:0").expect("bind proxy");
+        proxy.set_nonblocking(true).expect("nonblocking");
+        let closed = TcpListener::bind("127.0.0.1:0").expect("bind closed");
+        let closed_port = closed.local_addr().expect("addr").port();
+        drop(closed);
+        let home = home();
+        let rc = format!(
+            "proxy = \"http://127.0.0.1:{}\"\ninsecure\nlocation\n",
+            proxy.local_addr().expect("proxy addr").port()
+        );
+        for dir in [home.path().to_path_buf(), home.path().join(".config")] {
+            fs::create_dir_all(&dir).expect("dir");
+            fs::write(dir.join(".curlrc"), &rc).expect("curlrc");
+        }
+        let mut child = Command::new(CURL)
+            .args(curl_args())
+            .env("HOME", home.path())
+            .env("CURL_HOME", home.path())
+            .env("XDG_CONFIG_HOME", home.path().join(".config"))
+            .env_remove("HTTPS_PROXY")
+            .env_remove("https_proxy")
+            .env_remove("ALL_PROXY")
+            .env_remove("all_proxy")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn curl");
+        let config = curl_config(&Post {
+            url: format!("https://127.0.0.1:{closed_port}/v1/batch"),
+            signature_hex: "00".into(),
+            body: b"{}".to_vec(),
+        });
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(config.as_bytes())
+            .expect("write config");
+        let status = child.wait().expect("curl exit");
+        assert!(!status.success(), "a refused port must fail");
+        assert!(
+            proxy.accept().is_err(),
+            "curl connected to the proxy named only in .curlrc"
+        );
     }
 
     #[test]
