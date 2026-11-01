@@ -6,6 +6,13 @@ the entry says so when it does.
 
 ## [Unreleased]
 
+### Fixed
+
+- A prompt drained from the spool no longer records a `briefed` or `continued`
+  line for a briefing nobody received, and a chat order that waited in the spool
+  is no longer carried out later with nobody told. The prompt itself is recorded;
+  a person who gave an order during a restart gives it again.
+
 ## [1.0.0-rc.3] — 2026-11-01
 
 ### Fixed
