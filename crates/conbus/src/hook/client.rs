@@ -203,13 +203,12 @@ pub fn briefing_reply(harness: &str, hook_event_name: &str, context: &str, messa
 /// Mirror one hook payload. Returns the line to print, or a diagnostic when the
 /// record did not land; the caller reports it, prints the silent reply, and
 /// still exits zero.
-pub fn run(harness: &str, stdin: &mut impl Read) -> Result<Reply, Dropped> {
-    run_in(Paths::resolve().ok().as_ref(), harness, stdin)
-}
-
-/// As [`run`], with the data root named rather than read from the
-/// environment: the Inference listener resolves it once, and a test hands
-/// over a root of its own instead of reaching the person's recorder.
+///
+/// The data root is named rather than read from the environment because the
+/// caller resolves it once anyway — the policy decision has to find the same
+/// `policy.json` before this ever runs — and because the Inference listener
+/// and tests hand over a root of their own instead of reaching the person's
+/// recorder.
 pub fn run_in(
     paths: Option<&Paths>,
     harness: &str,

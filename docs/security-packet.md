@@ -29,6 +29,7 @@ else `~/.conbus`.
 | `log/segment-*.jsonl` | prompts and replies; tool bodies only if `CONBUS_RETENTION` says so | directory `0700`, files `0600` |
 | `conbus.sock` | the recorder's socket | `0600` |
 | `facts.jsonl`, `links.jsonl`, `takeover.json`, `quota/`, `drops.jsonl`, `daemon.log`, `chat-export/` | derived state, and the recorder's own messages | inside the `0700` root |
+| `policy.json` | the person's own `PreToolUse` rules, if they wrote any — off otherwise | inside the `0700` root |
 
 - **Retention.** By default, prompts and replies are kept and tool inputs and
   outputs are not written, only their size. `CONBUS_RETENTION` changes that:
@@ -51,6 +52,13 @@ else `~/.conbus`.
 - **Name a directory of its own for `CONBUS_HOME`.** conbus makes it `0700`,
   whatever else is in it.
 - The recorder turns off core dumps, and locks its memory where macOS allows.
+- **The policy file is read, never written.** If `policy.json` exists, the
+  hook process checks each `PreToolUse` payload against its rules itself —
+  before and independently of the recorder — and answers `deny` or `ask` in
+  the vendor's own hook output. A file that does not parse decides nothing
+  (`doctor` says why), a missing file means policy is off, and there is no
+  `allow`: the file can tighten a call, never lift a vendor's prompt. No rule
+  comes from anywhere else — there is no server to push one.
 
 ## What leaves the Mac
 

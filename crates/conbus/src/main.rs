@@ -18,6 +18,7 @@ mod install;
 mod intent;
 mod landing;
 mod otlp;
+mod policy;
 mod progress;
 mod quota;
 mod report;
@@ -84,18 +85,27 @@ fn main() -> ExitCode {
             // empty context block.
             let mut payload = String::new();
             let _ = std::io::stdin().read_to_string(&mut payload);
-            let reply = match hook::client::run(&harness, &mut payload.as_bytes()) {
-                Ok(reply) => reply,
-                Err(err) => {
-                    // Durable, because the vendor swallows stderr; throttled,
-                    // because a stopped daemon would otherwise write one of
-                    // these per hook per turn straight into the transcript.
-                    if drops::record(&err) {
-                        eprintln!("conbus hook: record dropped: {err}");
+            let paths = Paths::resolve().ok();
+            // The local policy decides from the payload alone, before and
+            // independent of the daemon round trip: a down or slow recorder
+            // must not lift a deny, so the same decision is the reply
+            // whichever way the record lands.
+            let decision = policy::decide(paths.as_ref(), &harness, &payload);
+            let reply =
+                match hook::client::run_in(paths.as_ref(), &harness, &mut payload.as_bytes()) {
+                    Ok(reply) => decision.unwrap_or(reply),
+                    Err(err) => {
+                        // Durable, because the vendor swallows stderr; throttled,
+                        // because a stopped daemon would otherwise write one of
+                        // these per hook per turn straight into the transcript.
+                        if drops::record(&err) {
+                            eprintln!("conbus hook: record dropped: {err}");
+                        }
+                        decision.unwrap_or_else(|| {
+                            hook::client::failure_reply(&harness, &payload).to_string()
+                        })
                     }
-                    hook::client::failure_reply(&harness, &payload).to_string()
-                }
-            };
+                };
             // One JSON object and nothing else. The vendor's parser runs
             // `JSON.parse` on the whole of stdout, so a stray line anywhere
             // turns a reply into plain text — which on `UserPromptSubmit` is
@@ -144,6 +154,10 @@ fn main() -> ExitCode {
         Command::Doctor => run(report::doctor),
         Command::Status => run(report::status),
         Command::Quota => run(quota::run),
+        Command::Policy { test } => run(|paths| match test {
+            Some(test) => policy::test(paths, &test.harness, &test.tool, &test.input),
+            None => policy::check(paths),
+        }),
         Command::Hop {
             from,
             to,

@@ -54,6 +54,11 @@ pub enum Command {
     Status,
     /// Ask Codex's app-server how much of the account's quota is used.
     Quota,
+    /// The local PreToolUse policy: `check` prints the effective rules (or
+    /// why there are none), `test` runs them against one call.
+    Policy {
+        test: Option<PolicyTest>,
+    },
     /// Decide which harness should serve the next turn.
     Hop {
         from: Option<String>,
@@ -120,6 +125,15 @@ pub enum Command {
     Version,
     Help,
     Unknown(String),
+}
+
+/// `conbus policy test --harness H --tool T --input JSON`.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct PolicyTest {
+    pub harness: String,
+    pub tool: String,
+    /// The `tool_input` the payload would carry, as JSON.
+    pub input: String,
 }
 
 /// The harness assumed when nothing says otherwise. Stage 0 registers against
@@ -208,6 +222,13 @@ where
         "doctor" => Command::Doctor,
         "status" => Command::Status,
         "quota" => Command::Quota,
+        "policy" => Command::Policy {
+            test: (args.get(1).map(String::as_str) == Some("test")).then(|| PolicyTest {
+                harness: flag_value(&args, "--harness").unwrap_or_default(),
+                tool: flag_value(&args, "--tool").unwrap_or_default(),
+                input: flag_value(&args, "--input").unwrap_or_default(),
+            }),
+        },
         "hop" => Command::Hop {
             from: flag_value(&args, "--from"),
             to: flag_value(&args, "--to").or_else(|| positional_dest(&args)),
@@ -321,6 +342,10 @@ USAGE:
     conbus doctor                 report what is and is not wired up
     conbus status                 routing rules, quota, hop history, cost
     conbus quota                  Codex probe + Claude StatusLine cache + catalog
+    conbus policy check           the effective policy.json rules; a file that
+                                  cannot be a policy exits non-zero
+    conbus policy test --harness H --tool T --input JSON
+                                  what the rules would decide, or none
     conbus hop [HARNESS] [--from ID] [--to HARNESS] [--apply] [--demo]
                                   decide the next harness; a positional name
                                   is --to; --apply records it and opens the
