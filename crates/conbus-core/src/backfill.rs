@@ -13,7 +13,7 @@
 //! record is a weaker fact than a mirrored one and a reader that cannot tell
 //! them apart will over-trust the log.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -68,6 +68,14 @@ struct Line {
     prompt_source: Option<String>,
     #[serde(rename = "isSidechain", default)]
     is_sidechain: Option<bool>,
+    #[serde(rename = "isMeta", default)]
+    is_meta: Option<bool>,
+    #[serde(rename = "isCompactSummary", default)]
+    is_compact_summary: Option<bool>,
+    #[serde(rename = "isVisibleInTranscriptOnly", default)]
+    is_visible_in_transcript_only: Option<bool>,
+    #[serde(rename = "queueTranscriptOnly", default)]
+    queue_transcript_only: Option<bool>,
     #[serde(default)]
     cwd: Option<String>,
     #[serde(default)]
@@ -80,6 +88,91 @@ struct Line {
 struct Message {
     #[serde(default)]
     content: Option<serde_json::Value>,
+    #[serde(default)]
+    model: Option<String>,
+}
+
+/// The model the vendor names on an assistant line it wrote itself: an API
+/// error, a usage limit, "No response requested." Live, a failure reaches the
+/// recorder as `StopFailure`, not as a reply.
+const VENDOR_WROTE_THIS: &str = "<synthetic>";
+
+/// What a `user` line with text is, in the terms of the live path: whether the
+/// prompt hook would have fired for it.
+///
+/// The vendor's flags decide before the words do, because the words mislead.
+/// Against the live log, joined by `promptId` over 2,094 transcripts: 186
+/// prompts that open on `<system-reminder>` and 1,399 `<task-notification>`
+/// lines fired the hook with the same text, and 522 `isMeta` lines did too.
+/// What those meta lines have, and the 5 that did not fire have not, is a
+/// `promptSource`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum UserLine {
+    /// A prompt: a turn starts here.
+    Prompt,
+    /// Only a turn if the model goes on to answer it. A typed slash command
+    /// looks the same whether the model will run it or the vendor will answer
+    /// it locally, and an image with no words has nothing to go on at all.
+    Tentative,
+    /// The person stopped the turn in progress.
+    Interrupt,
+    /// A local command's output: the command before it never reached the model.
+    LocalOutput,
+    /// Written for the vendor's own use, and not a turn or the end of one.
+    Bookkeeping(&'static str),
+}
+
+fn read_user_line(line: &Line, text: &str) -> UserLine {
+    let set = |flag: Option<bool>| flag == Some(true);
+    if set(line.is_compact_summary) || set(line.is_visible_in_transcript_only) {
+        return UserLine::Bookkeeping("compaction summary");
+    }
+    if set(line.queue_transcript_only) {
+        return UserLine::Bookkeeping("transcript-only line");
+    }
+    if line.prompt_source.is_some() {
+        return UserLine::Prompt;
+    }
+    if set(line.is_meta) {
+        return UserLine::Bookkeeping("meta line");
+    }
+    let head = text.trim_start();
+    if head.is_empty() {
+        UserLine::Tentative
+    } else if head.starts_with("[Request interrupted") {
+        UserLine::Interrupt
+    } else if head.starts_with("<local-command-") {
+        UserLine::LocalOutput
+    } else if head.starts_with("<command-name>") || head.starts_with("<command-message>") {
+        UserLine::Tentative
+    } else {
+        UserLine::Prompt
+    }
+}
+
+/// Whether a message's content holds an image, for a prompt that has no words.
+fn holds_image(content: &serde_json::Value) -> bool {
+    content.as_array().is_some_and(|blocks| {
+        blocks
+            .iter()
+            .any(|block| block.get("type").and_then(|t| t.as_str()) == Some("image"))
+    })
+}
+
+/// Start the turn a prompt line opens, closing the one before it.
+fn open_turn(
+    out: &mut Recovered,
+    bus_id: BusId,
+    open: &mut Option<OpenTurn>,
+    opened: &mut HashSet<String>,
+    entry: Entry,
+) {
+    close(out, bus_id, open.take());
+    if let Some(id) = &entry.vendor_turn_id {
+        opened.insert(id.as_str().to_string());
+    }
+    out.entries.push(entry);
+    *open = Some(OpenTurn { last_reply: None });
 }
 
 /// A turn that has started and not yet been closed by the next prompt.
@@ -132,6 +225,12 @@ pub fn parse_claude_transcript(text: &str, session: &str, bus_id: BusId) -> Reco
         ..Recovered::default()
     };
     let mut open: Option<OpenTurn> = None;
+    // A prompt that is a turn only if the model answers it.
+    let mut tentative: Option<Entry> = None;
+    // The vendor numbers its turns: every line of one carries the same
+    // `promptId`, so a skill's body or a second block of one prompt starts
+    // nothing.
+    let mut opened: HashSet<String> = HashSet::new();
     let mut harness_version: Option<String> = None;
 
     for raw in text.lines() {
@@ -181,17 +280,45 @@ pub fn parse_claude_transcript(text: &str, session: &str, bus_id: BusId) -> Reco
 
         match kind {
             "user" => {
-                let Some(text) = line
-                    .message
-                    .as_ref()
-                    .and_then(|m| m.content.as_ref())
-                    .and_then(text_of)
-                else {
+                let content = line.message.as_ref().and_then(|m| m.content.as_ref());
+                let Some(text) = content.and_then(text_of).or_else(|| {
+                    // No words, and still somebody's prompt: the hook sees it
+                    // with an empty one.
+                    content.filter(|c| holds_image(c)).map(|_| String::new())
+                }) else {
                     out.skip("user line with no text");
                     continue;
                 };
-                close(&mut out, bus_id, open.take());
-                out.entries.push(Entry {
+                let kind = read_user_line(&line, &text);
+                match kind {
+                    UserLine::Bookkeeping(why) => {
+                        out.skip(why);
+                        continue;
+                    }
+                    // The vendor fires no `Stop` for an interrupt, so the
+                    // recorder writes no ending for it, and neither does this.
+                    UserLine::Interrupt => {
+                        open = None;
+                        tentative = None;
+                        out.skip("interrupt line");
+                        continue;
+                    }
+                    UserLine::LocalOutput => {
+                        tentative = None;
+                        out.skip("local command output");
+                        continue;
+                    }
+                    UserLine::Prompt | UserLine::Tentative => {}
+                }
+                if line
+                    .prompt_id
+                    .as_ref()
+                    .is_some_and(|id| opened.contains(id))
+                {
+                    out.skip("another line of an open turn");
+                    continue;
+                }
+                let entry = Entry {
                     bus_id,
                     observed_at: at,
                     source: source.clone(),
@@ -203,16 +330,24 @@ pub fn parse_claude_transcript(text: &str, session: &str, bus_id: BusId) -> Reco
                         author: line.prompt_source.clone().map(Author::new),
                         prompt: Body::kept(text),
                     },
-                });
-                open = Some(OpenTurn { last_reply: None });
+                };
+                if kind == UserLine::Tentative {
+                    tentative = Some(entry);
+                    continue;
+                }
+                tentative = None;
+                open_turn(&mut out, bus_id, &mut open, &mut opened, entry);
             }
             "assistant" => {
-                let Some(text) = line
-                    .message
-                    .as_ref()
-                    .and_then(|m| m.content.as_ref())
-                    .and_then(text_of)
-                else {
+                let message = line.message.as_ref();
+                if message.and_then(|m| m.model.as_deref()) == Some(VENDOR_WROTE_THIS) {
+                    out.skip("assistant line the vendor wrote");
+                    continue;
+                }
+                if let Some(entry) = tentative.take() {
+                    open_turn(&mut out, bus_id, &mut open, &mut opened, entry);
+                }
+                let Some(text) = message.and_then(|m| m.content.as_ref()).and_then(text_of) else {
                     out.skip("assistant line with no text");
                     continue;
                 };
@@ -939,6 +1074,294 @@ mod tests {
 
         assert!(out.entries.is_empty());
         assert_eq!(out.skipped.get("line of another session"), Some(&3));
+    }
+
+    /// The prompts a parse started, as their text.
+    fn prompts(out: &Recovered) -> Vec<String> {
+        out.entries
+            .iter()
+            .filter_map(|entry| match &entry.event {
+                Event::TurnStarted { prompt, .. } => match prompt {
+                    Body::Kept { text } => Some(text.clone()),
+                    other => panic!("{other:?}"),
+                },
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The endings a parse wrote, as their text.
+    fn endings(out: &Recovered) -> Vec<String> {
+        out.entries
+            .iter()
+            .filter_map(|entry| match &entry.event {
+                Event::TurnEnded {
+                    assistant_message: Some(Body::Kept { text }),
+                    ..
+                } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A `user` line: `extra` is the flags, in the shapes real transcripts use.
+    fn user(extra: &str, id: &str, text: &str) -> String {
+        format!(
+            r#"{{"type":"user","sessionId":"S1","timestamp":"2026-11-01T00:00:00.000Z","promptId":"{id}",{extra}"message":{{"role":"user","content":{}}}}}"#,
+            serde_json::json!(text)
+        )
+    }
+
+    fn assistant(text: &str) -> String {
+        format!(
+            r#"{{"type":"assistant","sessionId":"S1","timestamp":"2026-11-01T00:00:01.000Z","message":{{"role":"assistant","model":"m","stop_reason":"end_turn","content":[{{"type":"text","text":{}}}]}}}}"#,
+            serde_json::json!(text)
+        )
+    }
+
+    fn parse(lines: &[String]) -> Recovered {
+        parse_claude_transcript(&lines.join("\n"), "S1", BusId::mint())
+    }
+
+    #[test]
+    fn lines_the_vendor_marks_as_not_a_prompt_do_not_become_turns() {
+        let out = parse(&[
+            user("", "P1", "a real prompt"),
+            user(
+                r#""isMeta":true,"#,
+                "P2",
+                "Base directory for this skill: /x",
+            ),
+            user(
+                r#""isCompactSummary":true,"isVisibleInTranscriptOnly":true,"#,
+                "P3",
+                "This session is being continued from a previous conversation",
+            ),
+            user("", "P4", "[Request interrupted by user]"),
+            user(
+                r#""promptSource":"system","queueTranscriptOnly":true,"#,
+                "P5",
+                "<task-notification>not sent to the model</task-notification>",
+            ),
+        ]);
+
+        assert_eq!(prompts(&out), vec!["a real prompt"]);
+    }
+
+    #[test]
+    fn a_skill_body_does_not_end_the_turn_it_belongs_to() {
+        let out = parse(&[
+            user(r#""promptSource":"sdk","#, "P1", "use the skill"),
+            user(
+                r#""isMeta":true,"#,
+                "P1",
+                "Base directory for this skill: /x",
+            ),
+            assistant("the answer"),
+        ]);
+
+        assert_eq!(prompts(&out), vec!["use the skill"]);
+        assert_eq!(endings(&out), vec!["the answer"]);
+    }
+
+    #[test]
+    fn a_compaction_inside_a_turn_does_not_end_it() {
+        let out = parse(&[
+            user(r#""promptSource":"sdk","#, "P1", "a long job"),
+            user(
+                r#""isCompactSummary":true,"isVisibleInTranscriptOnly":true,"#,
+                "P1",
+                "This session is being continued from a previous conversation",
+            ),
+            assistant("done after the compaction"),
+        ]);
+
+        assert_eq!(prompts(&out), vec!["a long job"]);
+        assert_eq!(endings(&out), vec!["done after the compaction"]);
+    }
+
+    #[test]
+    fn a_local_command_is_not_a_turn() {
+        // `/model` and friends: the caveat, the command, its output. The model
+        // never hears of it.
+        let out = parse(&[
+            user(
+                r#""isMeta":true,"#,
+                "P1",
+                "<local-command-caveat>Caveat</local-command-caveat>",
+            ),
+            user("", "P1", "<command-name>/model</command-name>"),
+            user(
+                "",
+                "P1",
+                "<local-command-stdout>Set model</local-command-stdout>",
+            ),
+        ]);
+
+        assert!(out.entries.is_empty(), "{:?}", out.entries);
+    }
+
+    #[test]
+    fn a_local_command_with_no_output_is_not_a_turn_either() {
+        let out = parse(&[user("", "P1", "<command-name>/exit</command-name>")]);
+
+        assert!(out.entries.is_empty(), "{:?}", out.entries);
+    }
+
+    #[test]
+    fn a_prompt_behind_a_local_command_on_the_same_id_is_the_turn() {
+        let out = parse(&[
+            user(
+                r#""isMeta":true,"#,
+                "P1",
+                "<local-command-caveat>Caveat</local-command-caveat>",
+            ),
+            user("", "P1", "<command-name>/model</command-name>"),
+            user(
+                "",
+                "P1",
+                "<local-command-stdout>Set model</local-command-stdout>",
+            ),
+            user(r#""promptSource":"sdk","#, "P1", "the real prompt"),
+            assistant("the answer"),
+        ]);
+
+        assert_eq!(prompts(&out), vec!["the real prompt"]);
+        assert_eq!(endings(&out), vec!["the answer"]);
+    }
+
+    #[test]
+    fn a_slash_command_the_model_answers_is_a_turn() {
+        // Typed by a person, and the hook fires for it. It carries no
+        // `promptSource`, and only the model answering tells it from `/model`.
+        let out = parse(&[
+            user(
+                "",
+                "P1",
+                "<command-message>go</command-message>\n<command-name>/go</command-name>",
+            ),
+            user(r#""isMeta":true,"#, "P1", "the command's expanded body"),
+            assistant("went"),
+        ]);
+
+        assert_eq!(out.entries.len(), 3, "session, prompt, ending");
+        assert_eq!(
+            prompts(&out),
+            vec!["<command-message>go</command-message>\n<command-name>/go</command-name>"]
+        );
+        assert_eq!(endings(&out), vec!["went"]);
+    }
+
+    #[test]
+    fn a_turn_before_a_slash_command_keeps_its_own_ending() {
+        let out = parse(&[
+            user("", "P1", "first"),
+            assistant("first answer"),
+            user("", "P2", "<command-name>/go</command-name>"),
+            assistant("went"),
+        ]);
+
+        assert_eq!(prompts(&out).len(), 2);
+        assert_eq!(endings(&out), vec!["first answer", "went"]);
+    }
+
+    #[test]
+    fn a_prompt_of_nothing_but_an_image_is_a_turn_with_no_words() {
+        // The hook sees it with an empty prompt. The `[Image…]` marker after it
+        // is the vendor's note about the image, marked meta.
+        let image = r#"{"type":"user","sessionId":"S1","timestamp":"2026-11-01T00:00:00.000Z","promptId":"P1","promptSource":"sdk","message":{"role":"user","content":[{"type":"image","source":{"type":"base64","data":"AA=="}}]}}"#;
+        let out = parse(&[
+            image.to_string(),
+            user(r#""isMeta":true,"#, "P1", "[Image: source: /tmp/a.png]"),
+            assistant("a cat"),
+        ]);
+
+        assert_eq!(prompts(&out), vec![""]);
+        assert_eq!(endings(&out), vec!["a cat"]);
+    }
+
+    #[test]
+    fn a_meta_line_the_vendor_submitted_as_a_prompt_is_a_turn() {
+        // Measured against the live log: `isMeta` with a `promptSource` is a
+        // prompt the system or a peer sent. 522 of these fired the prompt hook,
+        // and 5 meta lines without one did not.
+        let out = parse(&[
+            user(
+                r#""isMeta":true,"promptSource":"system","#,
+                "P1",
+                "scheduled wake-up",
+            ),
+            assistant("woke"),
+        ]);
+
+        assert_eq!(prompts(&out), vec!["scheduled wake-up"]);
+        assert_eq!(endings(&out), vec!["woke"]);
+    }
+
+    #[test]
+    fn a_prompt_that_opens_on_a_system_reminder_is_still_a_prompt() {
+        // SDK front ends put context in front of what the person typed. The
+        // hook records the same text, so the tag says nothing about who wrote
+        // the rest.
+        let text = "<system-reminder>context</system-reminder>\nthe person's words";
+        let out = parse(&[
+            user(r#""promptSource":"sdk","#, "P1", text),
+            assistant("ok"),
+        ]);
+
+        assert_eq!(prompts(&out), vec![text]);
+    }
+
+    #[test]
+    fn words_a_person_typed_are_a_prompt_whatever_they_look_like() {
+        let out = parse(&[user(
+            r#""promptSource":"typed","#,
+            "P1",
+            "[Request interrupted by user] is what it printed, why?",
+        )]);
+
+        assert_eq!(out.entries.len(), 2, "{:?}", out.entries);
+    }
+
+    #[test]
+    fn a_turn_the_person_interrupted_has_no_ending_as_on_the_live_path() {
+        // The vendor fires no `Stop` for an interrupt, so the recorder writes
+        // no ending, and neither may a recovery.
+        let out = parse(&[
+            user("", "P1", "start something"),
+            assistant("working on it"),
+            user("", "P1", "[Request interrupted by user]"),
+            user("", "P2", "do this instead"),
+            assistant("done"),
+        ]);
+
+        assert_eq!(prompts(&out), vec!["start something", "do this instead"]);
+        assert_eq!(endings(&out), vec!["done"]);
+    }
+
+    #[test]
+    fn one_prompt_id_opens_one_turn() {
+        let out = parse(&[
+            user(r#""promptSource":"sdk","#, "P1", "the prompt"),
+            assistant("part one"),
+            user(r#""promptSource":"sdk","#, "P1", "more of the same turn"),
+            assistant("part two"),
+        ]);
+
+        assert_eq!(prompts(&out), vec!["the prompt"]);
+        assert_eq!(endings(&out), vec!["part two"]);
+    }
+
+    #[test]
+    fn the_vendors_own_message_is_not_the_models_reply() {
+        // An API error or a usage limit is written as an assistant line by the
+        // vendor itself. Live, `StopFailure` reports it; `Complete` would say
+        // the opposite.
+        let synthetic = r#"{"type":"assistant","sessionId":"S1","timestamp":"2026-11-01T00:00:01.000Z","isApiErrorMessage":true,"message":{"role":"assistant","model":"<synthetic>","stop_reason":"stop_sequence","content":[{"type":"text","text":"API Error: overloaded"}]}}"#;
+        let out = parse(&[user("", "P1", "a prompt"), synthetic.to_string()]);
+
+        assert_eq!(prompts(&out), vec!["a prompt"]);
+        assert_eq!(endings(&out), Vec::<String>::new());
     }
 
     #[test]

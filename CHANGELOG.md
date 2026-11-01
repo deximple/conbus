@@ -12,6 +12,12 @@ the entry says so when it does.
   transcript's session is its file name, and lines naming another session are
   counted as not read. Before this, a Claude Desktop continuation that changed
   near a restart could gain every turn of its parent under its own `bus_id`.
+- Gap fill and `backfill` no longer record vendor bookkeeping as turns: lines
+  marked `isMeta` without a `promptSource`, compaction summaries, interrupts,
+  local-command output and the vendor's own error messages. A skill's body or a
+  compaction no longer ends the turn it sits inside. A turn the person
+  interrupted now has no ending, as on the live path. Records already in the log
+  stay: the log is append-only.
 
 ## [1.0.0-rc.3] — 2026-11-01
 
