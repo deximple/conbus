@@ -291,6 +291,48 @@ case $sub in
             check 0 plist-backup "no service file present — nothing to back up"
         fi
 
+        # The candidate binary: Developer ID signature, hardened runtime on
+        # every slice, and a matching published hash when a .sha256 sidecar
+        # sits beside it (the release asset naming). macOS only — on Linux
+        # the check degrades to the hash.
+        if [ -n "$from" ]; then
+            [ -f "$from" ] || die "no candidate at $from"
+            if [ "$(uname -s)" = Darwin ]; then
+                if codesign --verify --strict "$from" 2>/dev/null; then
+                    team=$(codesign -dv "$from" 2>&1 | sed -n 's/^TeamIdentifier=//p')
+                    if [ -n "$team" ] && [ "$team" != "not set" ]; then
+                        check 0 signature "Developer ID team $team"
+                    else
+                        check 1 signature "verifies but names no team — not a Developer ID build"
+                    fi
+                else
+                    check 1 signature "codesign --verify --strict failed on $from"
+                fi
+                slices=$(lipo -archs "$from" 2>/dev/null || uname -m)
+                runtime_fail=""
+                for arch in $slices; do
+                    codesign -dv --arch "$arch" "$from" 2>&1 | grep -q 'runtime' ||
+                        runtime_fail="$runtime_fail $arch"
+                done
+                if [ -z "$runtime_fail" ]; then
+                    check 0 hardened-runtime "all slices ($slices)"
+                else
+                    check 1 hardened-runtime "missing on:$runtime_fail"
+                fi
+            fi
+            if [ -f "$from.sha256" ]; then
+                want=$(awk '{print $1}' "$from.sha256")
+                got=$(shasum -a 256 "$from" | awk '{print $1}')
+                if [ "$want" = "$got" ]; then
+                    check 0 artifact-hash "matches $from.sha256"
+                else
+                    check 1 artifact-hash "sha256 mismatch: want $want got $got"
+                fi
+            else
+                check 2 artifact-hash "no $from.sha256 beside the candidate"
+            fi
+        fi
+
         if blackout_active; then
             check 1 blackout "CONBUS_CANARY_BLACKOUT is active (${CONBUS_CANARY_BLACKOUT:-})"
         else
