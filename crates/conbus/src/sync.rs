@@ -18,7 +18,9 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
+#[cfg(target_os = "macos")]
 const KEYCHAIN_SERVICE: &str = "sh.conbus";
+#[cfg(target_os = "macos")]
 const KEYCHAIN_ACCOUNT: &str = "sync-device-key";
 const CURL: &str = "/usr/bin/curl";
 const SCHEMA: u64 = 1;
