@@ -18,6 +18,8 @@ envelope comes first, then the event's own fields at the same level:
 | `bus_id` | string (UUIDv7) | The conversation |
 | `vendor_turn_id` | string, optional | The vendor's turn correlator |
 | `vendor_agent_id` | string, optional | Set when a subagent wrote the record |
+| `hook_id` | string, optional | The id the hook minted, so a delivery retried through the spool is counted once |
+| `spooled_at` | string, optional | When the hook wrote it to the spool, while `ts` stays the write time |
 | `harness` | string | `claude_code`, `codex`, `cursor`, `grok`, `opencode`, `agy`, `claude_chat` |
 | `harness_version` | string, optional | When the vendor exposes it to its hooks |
 | `vendor_session_id` | string, optional | The vendor's session id |
