@@ -6,8 +6,10 @@
 // an id and an effect or setup function"). The payloads are the ones the 1.x
 // plugin sends, so the recorder reads both the same way. A person's prompt is
 // `session.inbox.enqueued` with a `user` item carrying the text they sent, and
-// it is sent once per inbox id. A failed execution is the error. 2.x publishes
-// no session-created event, so a conversation starts at its first prompt.
+// it is sent once per inbox id. A failed execution is the error; a finished
+// execution closes the turn. The bus also emits `session.created`, but a
+// conversation still starts at its first prompt because a created session may
+// never receive one.
 import { spawn } from "node:child_process";
 
 // How many inbox ids are remembered; the oldest is forgotten first, so a long
@@ -60,6 +62,13 @@ export default {
             cwd: where(event),
             message_id: data.inboxID,
             prompt: text,
+          });
+        } else if (event?.type === "session.execution.succeeded" && data.sessionID) {
+          void send({
+            opencode_plugin: 1,
+            hook_event_name: "session.execution.succeeded",
+            session_id: data.sessionID,
+            cwd: where(event),
           });
         } else if (event?.type === "session.execution.failed" && data.sessionID) {
           void send({
