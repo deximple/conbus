@@ -1037,10 +1037,11 @@ fn load_meta_segment(
         return Ok(loaded);
     }
     let (records, defects) = parse_segment(segment)?;
+    let records: Vec<Record> = records.iter().map(meta).collect();
     if closed && let Some(cache) = cache {
         write_sidecar(cache, segment, &records, &defects);
     }
-    Ok((records.into_iter().map(|r| meta(&r)).collect(), defects))
+    Ok((records, defects))
 }
 
 /// What `build_cache` reports.
@@ -1139,6 +1140,7 @@ impl SegmentLog {
                 continue;
             }
             let (records, defects) = parse_segment(segment)?;
+            let records: Vec<Record> = records.iter().map(meta).collect();
             write_sidecar(cache, segment, &records, &defects);
             report.built += 1;
         }
