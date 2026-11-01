@@ -525,7 +525,10 @@ is left alone for an hour so it holds up one start, not all of them. `conbus bac
 same gaps on demand without a deadline, for Claude Code and Codex, across all
 history; with `--apply` it too needs the recorder stopped, and once it has read every
 Codex thread the Codex range is done. Deleting `cache/` drops
-the remembered ranges — run `conbus backfill --gaps` after one.
+the remembered ranges — run `conbus backfill --gaps` after one. A fill takes a line
+stamped over a minute before its transcript was created for a copy from another
+conversation, as a fork's opening lines are, so a transcript copied or restored has
+only its newer lines read.
 
 **Claude.ai conversations** have no hooks in the desktop app. Export your data
 from Claude.ai (Settings → Privacy → Export data) and drop the zip (or

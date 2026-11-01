@@ -483,7 +483,9 @@ conbus install --apply     # 레코더를 다시 켭니다
 채우며, Claude Code와 Codex에 대해 전체 기록에 걸쳐 동작합니다. `--apply`를
 붙이면 이것 역시 레코더를 멈춰야 하고, Codex 스레드를 모두 읽고 나면 Codex 범위는
 끝납니다. `cache/`를 지우면 기억한 범위도
-사라지므로 그 뒤에는 `conbus backfill --gaps`를 실행하세요.
+사라지므로 그 뒤에는 `conbus backfill --gaps`를 실행하세요. 트랜스크립트가 만들어지기
+1분 넘게 전에 찍힌 줄은 포크의 앞부분처럼 다른 대화에서 복사된 것으로 보고 채우지
+않으므로, 복사하거나 복원한 트랜스크립트는 그 뒤에 쓰인 줄만 읽습니다.
 
 **Claude.ai 대화**는 데스크톱 앱에 훅이 없습니다. Claude.ai에서 데이터를
 내보내고(Settings → Privacy → Export data) 그 zip(또는 `conversations.json`)을

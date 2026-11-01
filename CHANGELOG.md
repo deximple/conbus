@@ -49,6 +49,34 @@ the entry says so when it does.
 - Gap fill and `backfill` no longer copy a parent Codex thread into its fork. A
   forked thread lists its parent's turns as its own, under the parent's turn ids.
   A turn older than its thread is now counted as not read.
+- A fork's copy of its parent's turn is no longer written under the fork when the
+  copied lines carry the fork's own id. A turn id another conversation holds, or has
+  waiting in the spool, is not missing here; transcripts are read oldest file first,
+  so a parent gets to a turn neither holds; and a line stamped well before its own
+  file was created is taken for a copy, in a fill only. Records already written stay.
+- Codex turns are now asked for oldest first. `thread/turns/list` lists newest first
+  unless asked, so a running turn could get an older turn's reply as a false ending,
+  and a filled batch ended on its oldest turn. Threads already recovered in the wrong
+  order stay as they are.
+- A missed turn a tool call ended gets its ending again, from the vendor's
+  `toolEndsTurn`. Turns that end on a tool call without that flag still get none.
+- One Codex thread slower than the app-server's limit costs one start, not every
+  start, even when another thread answers first. `conbus backfill --gaps --apply`
+  ends the wait once it has read the thread.
+- A deadline now ends an app-server read whatever the process tree does. The server
+  runs in its own process group and the whole group is killed, so a wrapper's child
+  can no longer hold a start for as long as it lives.
+- A refusal from the app-server keeps the Codex range unless the server says it has
+  no such method. A temporary refusal used to lose the range.
+- In the `thread/list` fallback a thread is read again at each start while a range is
+  held, so a new turn in it is no longer skipped as already read.
+- A transcript that could not be read keeps the fill's range.
+- `cache/` is `0700` from the first time gap fill makes it.
+- A chat export moved into the drop folder during a downtime is now read, whatever
+  its file time. `cache/chat-export-read` says what a start has read.
+- Gap fill reads only regular files. A FIFO named like a transcript or an export
+  blocked a start, or `conbus backfill`, for good. Anything else is skipped and
+  counted as not read, and a link is not followed.
 
 ## [1.0.0-rc.3] — 2026-11-01
 
