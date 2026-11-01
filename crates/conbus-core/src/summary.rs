@@ -62,6 +62,7 @@ mod tests {
                 last_activity: "2026-09-06T00:00:00.000Z".parse().expect("ts"),
                 last_turn: None,
                 turn_ended_at: None,
+                turn_started_at: None,
                 turns: 8,
                 backfilled: false,
                 live: true,

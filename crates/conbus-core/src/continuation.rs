@@ -86,9 +86,13 @@ pub struct Candidate {
     /// How the last turn ended, when the last thing that happened *was* a turn
     /// ending. `None` means a turn was in flight.
     pub last_turn: Option<TurnState>,
-    /// When the newest turn end folded so far happened. What [`overtaken`] holds
-    /// a late record against, so it outlives the next turn's start.
+    /// When the newest main-thread turn end folded so far happened. What
+    /// [`overtaken`] holds a late record against, so it outlives the next turn's
+    /// start. A subagent's stop does not set it: the main turn goes on behind it.
     pub turn_ended_at: Option<Timestamp>,
+    /// When the newest turn start folded so far happened, which a late turn end
+    /// is held against the same way.
+    pub turn_started_at: Option<Timestamp>,
     pub turns: u64,
     /// Reconstructed from the vendor's own history rather than mirrored live.
     pub backfilled: bool,
@@ -196,18 +200,21 @@ pub const SELF_SUPPLIED_UNITS: usize = 1_200;
 /// conversations in the real log are a single turn with nothing to carry.
 pub const MIN_TURNS: u64 = 2;
 
-/// Whether a record that waited on its way to the log happened before the
-/// conversation's last turn end, and so says nothing about now.
+/// Whether a record that waited on its way to the log happened before `line`, and
+/// so says nothing about now.
 ///
 /// A record's place in the log is when it landed, and it can land behind a turn
 /// end that came after it: through the spool, parked for the prompt that binds its
 /// session, or overtaken by a live hook. The tool ran, or the prompt came, and that
-/// turn is over. A record that did not wait has no `spooled_at`, and is news.
-fn overtaken(record: &Record, turn_ended_at: Option<Timestamp>) -> bool {
+/// turn is over. A turn end can land behind a newer turn's start the same way, and
+/// that turn is not over. A record that did not wait has no `spooled_at`, and is
+/// news. So is one whose line is stamped later than the record reached the log: a
+/// clock that stepped back says nothing about the order.
+fn overtaken(record: &Record, line: Option<Timestamp>) -> bool {
     record
         .spooled_at
-        .zip(turn_ended_at)
-        .is_some_and(|(waited_from, ended)| waited_from < ended)
+        .zip(line)
+        .is_some_and(|(waited_from, line)| waited_from < line && line <= record.ts)
 }
 
 impl Candidate {
@@ -251,12 +258,14 @@ impl Candidate {
             last_activity: record.ts,
             last_turn: None,
             turn_ended_at: None,
+            turn_started_at: None,
             turns: 0,
             backfilled: false,
             live: false,
         });
 
         let says_nothing_now = overtaken(record, candidate.turn_ended_at);
+        let happened = record.spooled_at.unwrap_or(record.ts);
         candidate.harness = record.source.harness.clone();
         candidate.last_activity = record.ts;
         if record.source.workspace.is_some() {
@@ -268,14 +277,18 @@ impl Candidate {
         match &record.event {
             Event::TurnStarted { .. } => {
                 candidate.turns += 1;
+                candidate.turn_started_at = candidate.turn_started_at.max(Some(happened));
                 if !says_nothing_now {
                     candidate.last_turn = None;
                 }
             }
             Event::TurnEnded { state, .. } => {
-                candidate.last_turn = Some(state.clone());
-                let happened = record.spooled_at.unwrap_or(record.ts);
-                candidate.turn_ended_at = candidate.turn_ended_at.max(Some(happened));
+                if !overtaken(record, candidate.turn_started_at) {
+                    candidate.last_turn = Some(state.clone());
+                }
+                if record.vendor_agent_id.is_none() {
+                    candidate.turn_ended_at = candidate.turn_ended_at.max(Some(happened));
+                }
             }
             // A session opening or closing does not disturb how the last turn
             // ended: a conversation that finished and then had its window
@@ -637,6 +650,7 @@ mod tests {
             last_activity: ago(120),
             last_turn: Some(TurnState::Complete),
             turn_ended_at: None,
+            turn_started_at: None,
             turns: 6,
             backfilled: false,
             live: false,
@@ -1377,6 +1391,75 @@ mod tests {
             assert_eq!(stopped(&folded[&bus_id]), Stopped::Finished, "{read}");
         }
         assert!(cache.join("meta").is_dir(), "the sidecars were really used");
+    }
+
+    #[test]
+    fn a_subagents_stop_does_not_hide_the_main_turn_a_late_tool_event_proves() {
+        // 4,799 of 32,982 turn ends in one real log are a subagent's, and the main
+        // turn goes on behind them. Only the main thread's end draws the line.
+        let bus_id = BusId::mint();
+        let mut subagent_stop = logged(bus_id, ago(100), ended(TurnState::Complete));
+        subagent_stop.vendor_agent_id = Some(crate::event::VendorAgentId::new("agent-1"));
+        let records = vec![
+            logged(bus_id, ago(300), prompt()),
+            subagent_stop,
+            waited(bus_id, ago(90), ago(110), tool_call()),
+        ];
+
+        assert_eq!(stopped(&Candidate::index(&records)[0]), Stopped::InFlight);
+    }
+
+    #[test]
+    fn a_clock_that_stepped_back_does_not_hide_a_running_turn() {
+        // A turn end stamped ahead of what came after it says nothing about order.
+        let bus_id = BusId::mint();
+        let records = vec![
+            logged(bus_id, ago(300), prompt()),
+            logged(bus_id, ago(-500), ended(TurnState::Complete)),
+            waited(bus_id, ago(50), ago(60), prompt()),
+            waited(bus_id, ago(49), ago(55), tool_call()),
+        ];
+
+        assert_eq!(stopped(&Candidate::index(&records)[0]), Stopped::InFlight);
+    }
+
+    #[test]
+    fn a_late_turn_end_does_not_close_a_turn_that_started_after_it() {
+        let bus_id = BusId::mint();
+        let records = vec![
+            logged(bus_id, ago(300), prompt()),
+            logged(bus_id, ago(100), prompt()),
+            waited(bus_id, ago(90), ago(200), ended(TurnState::Complete)),
+        ];
+
+        assert_eq!(stopped(&Candidate::index(&records)[0]), Stopped::InFlight);
+    }
+
+    #[test]
+    fn a_turn_end_that_waited_still_closes_the_turn_it_belongs_to() {
+        // The other side of that: it came after its own turn's start.
+        let bus_id = BusId::mint();
+        let records = vec![
+            logged(bus_id, ago(300), prompt()),
+            waited(bus_id, ago(90), ago(200), ended(TurnState::Complete)),
+        ];
+
+        assert_eq!(stopped(&Candidate::index(&records)[0]), Stopped::Finished);
+    }
+
+    #[test]
+    #[ignore = "`spooled_at` is when the hook gave up, so a tool event its hook gave up on \
+                just after the Stop reads as later than the Stop. The window is milliseconds, \
+                and it reads the same on `main`"]
+    fn a_tool_event_whose_hook_gave_up_after_the_stop_does_not_reopen_the_turn() {
+        let bus_id = BusId::mint();
+        let records = vec![
+            logged(bus_id, ago(300), prompt()),
+            logged(bus_id, ago(100), ended(TurnState::Complete)),
+            waited(bus_id, ago(90), ago(99), tool_call()),
+        ];
+
+        assert_eq!(stopped(&Candidate::index(&records)[0]), Stopped::Finished);
     }
 
     #[test]

@@ -26,7 +26,9 @@ the entry says so when it does.
   after it. A finished conversation was briefed to the next session as still
   mid-turn, and a quota stop stopped reading as one, once a late tool event landed
   behind the turn's end. The fold reads `spooled_at`, which the log already has, so
-  an old log needs no migration.
+  an old log needs no migration. Only a main-thread turn end counts, a record counts
+  as late only if it also reached the log after that end, and a late turn end does
+  not close a turn that started after it.
 - A newer hook's new event kind now waits in the spool for a daemon that can read
   it, as `docs/log-format.md` always said. It used to be refused as unreadable and
   dropped live, and deleted from the spool. It waits up to seven days and then goes
@@ -39,8 +41,12 @@ the entry says so when it does.
   line. A spooled entry goes with a drop line only once the file is seven days old
   and the log has refused for seven days without one write working. Only a hook's
   request is held: `conbus hop` and a lease are told the write failed, and it stays
-  failed, seat included. A short write no longer leaves a torn line. A spooled
-  Inference frame still answers `allow`.
+  failed. A short write no longer leaves a torn line. A spooled Inference frame
+  still answers `allow`. A record only in memory is lost if the recorder stops before
+  the log takes it, so `conbus doctor` says on its `writable` line when the log is
+  refusing and how many are at risk, by asking the daemon. A nearly full disk that
+  takes short records and refuses a long one leaves no drop line while nothing has
+  waited or been lost, and `daemon.log` hears about it at most every ten minutes.
 - A hook that connects to a daemon just as it closes now spools its record instead
   of dropping it. On macOS that failure shows up as `could not bound the daemon
   call`, which is a restart like any other.
