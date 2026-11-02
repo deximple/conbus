@@ -425,6 +425,10 @@ impl ReadSoFar {
         self.0.contains_key(source)
     }
 
+    fn state_of(&self, source: &str) -> Option<i64> {
+        self.0.get(source).copied()
+    }
+
     /// Whether this source has been read in exactly this state.
     fn is_current(&self, source: &str, state: i64) -> bool {
         self.0.get(source) == Some(&state)
@@ -804,6 +808,15 @@ fn ingest_chat_exports_filtered(
     Ok(filled)
 }
 
+/// Noted in a held range, with the time, when the app-server used up its limit
+/// without answering about a single thread.
+const STALLED: &str = "codex app-server stalled";
+
+/// How long after a stall a start leaves the app-server alone. A wedged one holds
+/// a start for its whole limit with the socket closed, and keeping the range must
+/// not mean paying that on every restart. By hand, `backfill --gaps` always asks.
+const STALL_BACK_OFF_SECS: i64 = 3600;
+
 /// The state of a thread with no rollout on disk to give it one.
 const NO_STATE: i64 = i64::MIN;
 
@@ -872,10 +885,26 @@ fn fill_live_codex_gaps(
         timing.codex_deferred = Some("no time left in the start's budget".to_string());
         return Ok(fill);
     }
+    let now = Timestamp::now();
+    let now_unix = Timestamp::from_unix_seconds(0).map_or(0, |epoch| now.seconds_since(epoch));
+    if read
+        .state_of(STALLED)
+        .is_some_and(|at| now_unix - at < STALL_BACK_OFF_SECS)
+    {
+        timing.codex_deferred = Some(
+            "it stalled at an earlier start, and is asked again after an hour or by \
+             `conbus backfill --gaps`"
+                .to_string(),
+        );
+        return Ok(fill);
+    }
     let start = Instant::now();
     let mut server = match AppServer::start(server_limit) {
         Ok(server) => server,
         Err(err) => {
+            if start.elapsed() >= server_limit {
+                read.note(STALLED, now_unix);
+            }
             timing.codex_deferred = Some(err.to_string());
             return Ok(fill);
         }
@@ -939,6 +968,9 @@ fn fill_live_codex_gaps(
                 // Nothing behind it will answer either. It goes behind the threads
                 // not yet asked next time, or it stops them being reached at all.
                 read.note(name, FAILED);
+                if timing.list_turns_threads == 0 && start.elapsed() >= server_limit {
+                    read.note(STALLED, now_unix);
+                }
                 timing.codex_deferred = Some(why);
                 break;
             }
