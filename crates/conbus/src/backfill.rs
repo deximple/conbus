@@ -12,8 +12,9 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use conbus_core::backfill::{
-    CLAUDE_CHAT_EXPORT, CLAUDE_TRANSCRIPT, CODEX_THREAD, Recovered, parse_claude_chat_export,
-    parse_claude_transcript, parse_claude_transcript_born, parse_codex_thread,
+    CLAUDE_CHAT_EXPORT, CLAUDE_TRANSCRIPT, CODEX_THREAD, Recovered, oldest_first,
+    parse_claude_chat_export, parse_claude_transcript, parse_claude_transcript_born,
+    parse_codex_thread,
 };
 
 use crate::appserver::AppServer;
@@ -2107,7 +2108,8 @@ fn recover_codex(
 /// The order has to be asked for: `sortDirection` "defaults to descending", in the
 /// schema of codex-cli 0.166.0. Read newest first, an older turn's reply lands on a
 /// newer prompt, a running turn gets an ending that is not its own, and a filled
-/// batch ends on its oldest turn.
+/// batch ends on its oldest turn. It is put in order here as well, for a server that
+/// does not do as it is asked.
 fn list_turns(server: &mut AppServer, thread_id: &str) -> io::Result<Vec<serde_json::Value>> {
     let mut turns = Vec::new();
     let mut cursor: Option<String> = None;
@@ -2121,6 +2123,7 @@ fn list_turns(server: &mut AppServer, thread_id: &str) -> io::Result<Vec<serde_j
         turns.extend(page["data"].as_array().into_iter().flatten().cloned());
         cursor = page["nextCursor"].as_str().map(str::to_string);
         if cursor.is_none() {
+            oldest_first(&mut turns);
             return Ok(turns);
         }
     }

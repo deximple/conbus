@@ -184,10 +184,11 @@ recovered this way are stamped `backfilled_from: codex_thread`.
 `codex-0.166.0-ThreadTurnsListParams.json` beside this file is what
 `codex app-server generate-json-schema` printed. Of `sortDirection` (`asc`,
 `desc`) it says "Optional turn pagination direction; defaults to descending."
-Nothing here has seen the order on real data: a probe on copied rollouts with a
-throwaway `CODEX_HOME`, no config and no network accepted both values and listed
-no turns. Of real threads recovered without asking, 77 were written newest first,
-7 oldest first and 4 mixed.
+A probe on copied rollouts with a throwaway `CODEX_HOME`, no config and no network
+accepted both values and listed no turns, so `asc` has not been seen working. The
+default has: 280 real threads recovered without asking hold 2,792 turns, and against
+the order those turns appear in their rollouts, 2,510 neighbours were written out of
+order, and 2 if read backwards.
 
 ## 0.166.0 — `codex exec` fires hooks
 

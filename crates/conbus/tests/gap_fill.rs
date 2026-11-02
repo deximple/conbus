@@ -2993,3 +2993,40 @@ fn three_exports_in_one_pass_write_the_later_turn_once() {
         show(&log_lines(home))
     );
 }
+
+#[test]
+fn a_server_that_ignores_the_direction_gives_a_running_turn_no_false_ending() {
+    // Newest first whatever it is asked, as a server older than the field would be.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let (_stub, fake) = codex_stand_in(
+        r#"
+def prompt(tid, words, status, started, reply=None):
+    items=[{"type":"userMessage","content":[{"type":"text","text":words}]}] if words else []
+    if reply: items.append({"type":"agentMessage","text":reply,"phase":"final_answer"})
+    return {"id":tid,"items":items,"status":status,"startedAt":started,"completedAt":started+1}
+for line in sys.stdin:
+    msg = json.loads(line)
+    m = msg.get("method"); i = msg.get("id")
+    if m == "initialize":
+        print(json.dumps({"jsonrpc":"2.0","id":i,"result":{"userAgent":"fake"}}), flush=True)
+    elif m == "thread/turns/list":
+        data=[prompt("t3","still running","inProgress",1788368900),
+              prompt("t2","","completed",1788368800,"an older reply"),
+              prompt("t1","older prompt","completed",1788368700,"older first reply")]
+        print(json.dumps({"jsonrpc":"2.0","id":i,"result":{"data":data,"nextCursor":None}}), flush=True)
+"#,
+    );
+    a_live_codex_thread(home);
+
+    start_with_codex(home, &fake);
+
+    let all = log_lines(home);
+    assert_eq!(turns_filled(&all), ["t1", "t3"], "\n{}", show(&all));
+    assert!(
+        !all.iter()
+            .any(|record| record["vendor_turn_id"] == "t3" && record["event"] == "turn_ended"),
+        "a running turn ended, with an older turn's words:\n{}",
+        show(&all)
+    );
+}
