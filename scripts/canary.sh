@@ -830,6 +830,7 @@ drop_table() { # drop_table <since> <end of the swap window> <file>...
                 return
             }
             lines++
+            if (starts(d_reason, "the log refused writes for a while") && d_ts > last_outage) last_outage = d_ts
             c = drop_class(d_reason, d_detail)
             if (c == "lost" && drop_swap_reason(d_reason) && !(d_ts > swap_end)) { swap++; return }
             if (c == "elided") {
@@ -852,7 +853,10 @@ drop_table() { # drop_table <since> <end of the swap window> <file>...
             # as one: the line says records were lost, so it fails either way.
             weight = 1
             if (c == "lost" && d_detail ~ /^[1-9][0-9]* record\(s\) lost$/) weight = d_detail + 0
-            if (c == "lost" && match(d_detail, /[1-9][0-9]* could not be kept/)) weight = substr(d_detail, RSTART, RLENGTH) + 0
+            if (c == "lost" && match(d_detail, /[1-9][0-9]* could not be kept/)) {
+                weight = substr(d_detail, RSTART, RLENGTH) + 0
+                not_kept += weight
+            }
             total[c] += weight
             n[c SUBSEP key]++
         }
@@ -867,8 +871,8 @@ drop_table() { # drop_table <since> <end of the swap window> <file>...
                 total[c] += n_other[key]
                 n[c SUBSEP key] = n_other[key]
             }
-            printf "lines %d\nswap %d\nbad %d\nlast %s\nfirst_rotated %s\nelided %d\nelided_bad %d\nbaseline %d\n",
-                lines, swap, bad, last, first_rotated, elided, elided_bad, baseline
+            printf "lines %d\nswap %d\nbad %d\nlast %s\nfirst_rotated %s\nelided %d\nelided_bad %d\nbaseline %d\nlast_outage %s\nnot_kept %d\n",
+                lines, swap, bad, last, first_rotated, elided, elided_bad, baseline, last_outage, not_kept
             for (c in total) printf "total_%s %d\n", c, total[c]
             for (entry in n) {
                 split(entry, part, SUBSEP)
@@ -1540,11 +1544,13 @@ verdict_log_files() {
 # spool entry and the drop line together, and daemon.log is the one trace left when
 # that write lands. A build that holds refused records (#155) says so at each end
 # instead, and its drop line covers an outage that ended; one that has not ended is
-# read here. Doctor's 10% warning stays a note: this Mac lives under it.
+# read here. Its daemon.log notes are throttled, so a recovery can have only the drop
+# line to say it: this reads after verdict_drops for that reason. Doctor's 10% warning
+# stays a note: this Mac lives under it.
 verdict_disk() {
     vd_rows=""
     if [ -r "$daemon_log" ]; then
-        vd_rows=$(awk -v s="$since" '
+        vd_rows=$(awk -v s="$since" -v recovered="$(row_value "$dt_rows" last_outage)" '
             $1 ~ /^[0-9]/ && $1 > s && /record\(s\) refused by the log/ {
                 lines++
                 if (first == "") { first = $0; sub(/^.*refused by the log: */, "", first) }
@@ -1552,23 +1558,32 @@ verdict_disk() {
             }
             $1 ~ /^[0-9]/ && $1 > s && /the log refused a write / {
                 refusing = $0
+                refusing_at = $1
                 sub(/^.*the log refused a write /, "", refusing)
             }
             $1 ~ /^[0-9]/ && $1 > s && /the log takes writes again/ { refusing = "" }
             $1 ~ /^[0-9]/ && $1 > s && match($0, /[1-9][0-9]* could not be kept/) { not_kept += substr($0, RSTART, RLENGTH) }
-            END { printf "lines %d\ntotal %d\nfirst %s\nrefusing %s\nnot_kept %d\n", lines, total, first, refusing, not_kept }' "$daemon_log")
+            END {
+                if (recovered > refusing_at) refusing = ""
+                printf "lines %d\ntotal %d\nfirst %s\nrefusing %s\nnot_kept %d\n", lines, total, first, refusing, not_kept
+            }' "$daemon_log")
     fi
     vd_lines=$(row_value "$vd_rows" lines)
     vd_total=$(row_value "$vd_rows" total)
     vd_first=$(row_value "$vd_rows" first | cut -c1-120)
     vd_refusing=$(row_value "$vd_rows" refusing | cut -c1-120)
     vd_not_kept=$(row_value "$vd_rows" not_kept)
+    # Whichever log said it. A throttled note leaves only the drop line.
+    vd_lost_outage=$(row_value "$dt_rows" not_kept)
+    if [ "${vd_lost_outage:-0}" -gt "${vd_not_kept:-0}" ]; then
+        vd_not_kept=$vd_lost_outage
+    fi
     vd_line=$(printf '%s\n' "$doctor_out" | sed -n 's/^disk  *//p' | sed -n '1p')
     vd_write_bad=$(log_cannot_take "$doctor_out")
     if [ "${vd_lines:-0}" -gt 0 ]; then
         line FAIL disk "$vd_total record(s) refused by the log since $since, $vd_lines time(s) in daemon.log: $vd_first"
     elif [ "${vd_not_kept:-0}" -gt 0 ]; then
-        line FAIL disk "$vd_not_kept record(s) could not be kept since $since, by daemon.log"
+        line FAIL disk "$vd_not_kept record(s) could not be kept since $since"
     elif [ -n "$vd_refusing" ]; then
         line FAIL disk "the log refused a write and daemon.log does not say it stopped: $vd_refusing"
     elif [ -n "$vd_write_bad" ]; then
@@ -2072,7 +2087,6 @@ case $sub in
         verdict_reboots
         verdict_unreadable
         verdict_log_files
-        verdict_disk
 
         # A read that failed and a log with no rows are different facts, and
         # neither is evidence of activity.
@@ -2114,6 +2128,7 @@ case $sub in
         #    usage rows taken above.
         verdict_drops
         verdict_log_outages
+        verdict_disk
 
         if [ -n "$window_problem" ]; then
             line UNCHECKED tool-bodies \

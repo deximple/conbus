@@ -2791,6 +2791,28 @@ install_persona slowonly
 code=0; run verdict >"$tmp/verdict-slowonly.out" 2>&1 || code=$?
 expect 4 "$code" "a slow vendor alone proves no hook runs"
 
+# Two outages minutes apart: the recovery note is throttled, and the drop line is the one that says it ended.
+verdict_fixture
+printf '%s conbus daemon: the log refused a write (No space left on device (os error 28)); keeping what it refuses until it stops\n' "$(iso_ago 7200)" >>"$home/.conbus/daemon.log"
+drop_line 7000 'the log refused writes for a while' '3 record(s) waited and landed, 0 could not be kept, since 2026-11-01T00:00:00.000Z: No space left on device (os error 28)'
+code=0; run verdict >"$tmp/verdict-recovered-drop.out" 2>&1 || code=$?
+expect 0 "$code" "a recovery in the drop log counts with no note in daemon.log"
+expect_grep '^PASS disk' "$tmp/verdict-recovered-drop.out" "disk passes"
+expect_grep '^PASS log-outages — 1 time(s)' "$tmp/verdict-recovered-drop.out" "and the outage is counted"
+# A drop line older than the note is an earlier outage, and says nothing about this one.
+verdict_fixture
+drop_line 7200 'the log refused writes for a while' '3 record(s) waited and landed, 0 could not be kept, since 2026-11-01T00:00:00.000Z: No space left on device (os error 28)'
+printf '%s conbus daemon: the log refused a write (No space left on device (os error 28)); keeping what it refuses until it stops\n' "$(iso_ago 3600)" >>"$home/.conbus/daemon.log"
+code=0; run verdict >"$tmp/verdict-recovered-older.out" 2>&1 || code=$?
+expect 1 "$code" "an older recovery does not end a later refusal"
+expect_grep '^FAIL disk — the log refused a write' "$tmp/verdict-recovered-older.out" "and disk says so"
+# An outage that lost records is no pass on the line about disks, whichever log said it.
+verdict_fixture
+drop_line 3600 'the log refused writes for a while and records may be lost' '3 record(s) waited and landed, 2 could not be kept, since 2026-11-01T00:00:00.000Z: No space left on device (os error 28)'
+code=0; run verdict >"$tmp/verdict-disk-lost.out" 2>&1 || code=$?
+expect 1 "$code" "an outage that lost records fails"
+expect_no_grep '^PASS disk' "$tmp/verdict-disk-lost.out" "and disk does not read as fine beside it"
+
 # A real build under this throwaway HOME would ask an agy that is not signed
 # in, and a build older than the sign-in check opens a browser tab doing it.
 expect_file "$tmp/agy-bin.seen" "the fakes saw doctor run"
