@@ -2959,6 +2959,15 @@ code=0; run verdict >"$tmp/verdict-orphans-archive.out" 2>&1 || code=$?
 rm -f "$home/.conbus/drops.capped-20261025.jsonl" "$home/.conbus/drops.capped-copy.jsonl"
 expect 0 "$code" "rotated and archived logs count toward the baseline"
 expect_grep 'median 15.0 a day over the 28 day(s) before the swap' "$tmp/verdict-orphans-archive.out" "each line once"
+# A drop log that only reaches back five days before the swap has five days of baseline, not 23 days of none.
+verdict_fixture
+: >"$home/.conbus/drops.jsonl"
+orphan_days "$home/.conbus/drops.jsonl" 15 8 12
+state_with drops_file "$(drops_identity)"
+orphan_lines "$home/.conbus/drops.jsonl" 150 3600
+code=0; run verdict >"$tmp/verdict-orphans-short.out" 2>&1 || code=$?
+expect 0 "$code" "days before the drop log begins are not days with none"
+expect_grep 'median 15.0 a day over the [45] day(s) before the swap' "$tmp/verdict-orphans-short.out" "and the days it covers are said"
 # A flood older than four weeks does not inflate it.
 verdict_fixture
 orphan_lines "$home/.conbus/drops.capped-20261025.jsonl" 5000 $((60 * DAY))
