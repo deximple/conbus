@@ -8,16 +8,21 @@ the entry says so when it does.
 
 ### Added
 
-- `conbus auth` (experimental): which vendor needs a sign-in (conbus itself never
-  does, and recording needs none), and what conbus runs with nobody at the
-  keyboard. `pbpaste | conbus auth --url -` names a page from its scheme and host
-  and, when it calls back to a port on this machine, walks every process listening
-  there up to the root. It says `yes` when a process named conbus is in that
-  ancestry, `no` when none is, with what such a walk cannot see, and `cannot tell`
-  otherwise, with what would tell. `--url URL` works too, and warns when the URL
-  has a query, because that is now in shell history. It reads no vendor config. It
-  prints no query value but a callback's port and, as the URL's claim, a `client`
-  name. `--html` writes the table and a paste box as one offline page.
+- `conbus auth` (experimental): for when a sign-in tab opens and you should not have
+  to guess whose it is. It asks Codex, agy and gh whether they are signed in, says
+  which vendors it did not ask, and lists what conbus runs with nobody at the
+  keyboard; conbus itself needs no login, and recording needs none.
+  `pbpaste | conbus auth --url -` names a page from its scheme and host and, when it
+  calls back to a port on this machine, walks every process listening there. It says
+  `yes` only when a conbus command is above what listens and the page belongs to a
+  vendor conbus starts itself, and `no` only when the chain goes up to an app or a
+  person's session with no conbus in it, with what such a walk cannot see. Otherwise
+  it says `cannot tell` and what would tell: a listener hanging straight from the root
+  or a service manager, an unknown page, and anything under `conbus run`, which is
+  your own agent, all read that way. `--url URL` works too, and warns when the URL has
+  a query, because that is now in shell history. It reads no vendor config. It prints
+  no query value but a callback's port and, as the URL's claim, a plain `client` name.
+  `--html` writes the table and a paste box as one offline page.
 
 ### Fixed
 
@@ -25,13 +30,18 @@ the entry says so when it does.
   a full `drops.jsonl` is rotated to `drops.1.jsonl` and a fresh file takes new
   drops. One generation is kept, so the rotation before last is gone. Summaries
   read both generations, say `at least` once a rotation has happened, and lose only
-  the line when a line is torn or holds a byte that is not UTF-8. New drop logs are
-  `0600`. `the hook payload names no session` now names the payload's field names
-  (never values), so the cause of a flood is visible.
+  the line when a line is torn or holds a byte that is not UTF-8. A drop after a torn
+  line starts on a fresh one, so the next reason is kept. New drop logs are `0600`.
+  `the hook payload names no session` now names the payload's field names (never
+  values), so the cause of a flood is visible.
 - `scripts/canary.sh` reads both generations and compares drop reasons by
-  timestamp instead of line offsets. On a capped log from a build that does not
-  rotate, its `drops` item says `UNCHECKED` instead of `PASS`. An `UNCHECKED` item
-  does not stop `verdict` passing as a whole, so read those lines.
+  timestamp instead of line offsets. A drop log at its cap that it cannot see past no
+  longer reads `PASS`: its `drops` item says `UNCHECKED`.
+- Release packages name no account in their tar headers. `scripts/sign-release.sh
+  --upload` refuses to publish a release an install would refuse: the wrong signing
+  team, a checksum naming another file, a package of another version, or an
+  `install.sh` that is not the script. After publishing it fetches what people get
+  and says loudly if that is wrong.
 - `doctor`, `status` and the quota read behind a hop's decision no longer run
   `agy`. They read what `conbus quota`, a command a person ran, cached. `doctor` and
   `status` show the reading with its age; past 90 minutes they say `last read 2h

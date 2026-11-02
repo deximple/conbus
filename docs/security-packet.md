@@ -95,14 +95,18 @@ Anything that leaves goes through a program the person already runs:
   of these tools uses its own login, which conbus never reads.
 - **`conbus auth`.** It answers "whose sign-in page is this", and sends nothing
   anywhere of its own. `conbus auth` and `--html` run `codex app-server` for its
-  limits read, `agy models` (never `-p`) and `gh auth status`. `--url` runs `lsof`
-  and `ps`, for a callback port on this machine only. It reads no vendor config and
-  no browser storage. The address it is given can hold a token: it stays in memory
-  for that one run, only its scheme, host, callback parameters and `client` are
-  decoded, and nothing of it is stored. No query value is printed but a callback's
-  port and, as the URL's claim, a `client` name that is short and printable. An
-  address on the command line is in shell history, so `conbus auth --url -` reads it
-  from stdin, and the command warns otherwise. `--html` writes a `0600` page with a
+  limits read, `agy models` (never `-p`) and `gh auth status --json hosts`, of which
+  only each account's state and whether it is active are read. `--url` runs `lsof` and
+  `ps`, for a callback port on this machine only: `ps` is asked for process names, and
+  for a conbus process also its subcommand, and that one word is all that is kept. It
+  reads no vendor config and no browser storage. The address it is given can hold a
+  token: it stays in memory for that one run, only its scheme, host, callback
+  parameters and `client` are decoded, other values are only searched undecoded for
+  an address on this machine, and nothing of it is stored. No query value is printed
+  but a callback's port and, as the URL's claim, a `client` name that is plain: ASCII
+  letters, digits, dots, dashes, underscores and single spaces, up to 64 characters.
+  An address on the command line is in shell history, so `conbus auth --url -` reads
+  it from stdin, and the command warns otherwise. `--html` writes a `0600` page with a
   policy that lets it load nothing and connect nowhere; vendor text in it is escaped.
 - **Listeners.** The first is the Unix socket above. The second,
   `conbus hook --inference-listen`, is off unless started. It takes Anthropic
