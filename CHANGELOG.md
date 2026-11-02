@@ -71,6 +71,9 @@ the entry says so when it does.
   record. A hop nobody followed up used to hold it for ever, and an unrelated prompt
   days later bound to the conversation for good. A hop followed up after a day gets
   a fresh id.
+- A hook that connects to a daemon just as it closes now spools its record instead
+  of dropping it. On macOS that failure shows up as `could not bound the daemon
+  call`, which is a restart like any other.
 
 ## [1.0.0-rc.3] — 2026-11-01
 

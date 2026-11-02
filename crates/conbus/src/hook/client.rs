@@ -336,6 +336,7 @@ pub fn run_in(
 /// `Withheld` is a real decision, and the drop stands.
 fn spoolable(reason: &str) -> bool {
     reason.starts_with("no daemon on ")
+        || reason.starts_with("could not bound the daemon call:")
         || reason.starts_with("could not send the record:")
         || reason.starts_with("no reply from the daemon:")
         || reason.starts_with("unreadable reply ")
@@ -773,6 +774,16 @@ mod tests {
         assert!(!brief.contains("hookSpecificOutput"), "{brief}");
         assert!(!brief.contains("additionalContext"), "{brief}");
         assert!(brief.contains("\"continue\":true"), "{brief}");
+    }
+
+    #[test]
+    fn a_connect_onto_a_closing_daemon_is_a_restart_and_spools() {
+        // Darwin refuses socket options on a socket whose peer has gone, so a
+        // hook that connects just as the daemon closes fails here, before it
+        // has sent a byte. Seven of these sit in a real drop log.
+        assert!(spoolable(
+            "could not bound the daemon call: Invalid argument (os error 22)"
+        ));
     }
 
     #[test]
