@@ -115,7 +115,7 @@ fn describe_record(record: &Record, now: Timestamp) -> String {
     let Some(last) = &record.last else {
         return match record.destinations.last() {
             Some(started) => format!(
-                "{ONE_COPY}; a run that did not finish left files in {}",
+                "{ONE_COPY}; a run that did not finish may have left files in {}",
                 started.path
             ),
             None => ONE_COPY.to_string(),

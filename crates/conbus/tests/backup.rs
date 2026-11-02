@@ -2464,10 +2464,29 @@ fn a_first_copy_to_a_new_folder_is_on_record_before_it_starts() {
         "{line}"
     );
     assert!(line.contains(folder.to_str().expect("utf-8")), "{line}");
-    assert!(line.contains("did not finish"), "{line}");
+    assert!(
+        line.contains("a run that did not finish may have left files"),
+        "a failed copy tidies up, so the folder may be empty: {line}"
+    );
 
     ok(&world.backup(&folder));
     assert!(world.doctor_line().contains("last ok"));
+}
+
+#[test]
+fn a_folder_that_could_not_be_made_is_not_said_to_hold_files() {
+    let world = World::with_log();
+    let parent = world.base.join("readonly");
+    fs::create_dir(&parent).expect("dir");
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o500)).expect("chmod");
+    let out = world.backup(&parent.join("x"));
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).expect("chmod");
+    assert!(!out.status.success());
+    let line = world.doctor_line();
+    assert!(!line.contains("left files"), "{line}");
+
+    let said = ok(&world.conbus(&["uninstall"]));
+    assert!(!said.contains(parent.to_str().expect("utf-8")), "{said}");
 }
 
 // ---- A disk that is not there ----

@@ -176,7 +176,8 @@ fn copy_to(paths: &Paths, to: &Path, home: Option<&Path>) -> io::Result<()> {
     destination::refuse_if_full(&folder, new_bytes, new_files, room_for, standing.clones)?;
 
     // On record before the first copy lands: however this run ends, something
-    // says where the plain text went.
+    // says where the plain text went. A folder that could not be made holds none.
+    layout.create(&folder)?;
     let name = folder.to_string_lossy().into_owned();
     let record = if record.knows(&name) {
         record
@@ -185,7 +186,6 @@ fn copy_to(paths: &Paths, to: &Path, home: Option<&Path>) -> io::Result<()> {
         write_record(paths, &record)?;
         record
     };
-    layout.create(&folder)?;
     if first_here {
         for note in FIRST_RUN_NOTES {
             println!("{note}");
