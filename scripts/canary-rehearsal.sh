@@ -2777,6 +2777,10 @@ spool_entry parked notified -235900
 code=0; run verdict >/dev/null 2>&1 || code=$?
 expect 0 "$code" "a parked entry just inside its day is still waiting"
 verdict_fixture
+spool_entry parked notified -240500
+code=0; run verdict >/dev/null 2>&1 || code=$?
+expect 0 "$code" "and just past it has the ten minutes a drain gets"
+verdict_fixture
 spool_entry parked notified -250000
 code=0; run verdict >"$tmp/verdict-parked-old.out" 2>&1 || code=$?
 expect 1 "$code" "one past its day is stuck"
