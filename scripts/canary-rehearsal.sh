@@ -313,6 +313,15 @@ expect_grep() { # expect_grep <pattern> <file> <what>
     echo "rehearsal: ok: $3"
 }
 
+expect_no_grep() { # expect_no_grep <pattern> <file> <what>
+    if grep -q "$1" "$2"; then
+        echo "rehearsal: FAIL: $3 — '$1' in $2:" >&2
+        cat "$2" >&2
+        exit 1
+    fi
+    echo "rehearsal: ok: $3"
+}
+
 write_stamp() { # write_stamp <build> <pid>
     printf '{"build":"%s","pid":%s,"started":"%s","serving":"%s","core_dumps_disabled":true,"memory_locked":true}\n' \
         "$1" "$2" "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)" "$(date -u +%Y-%m-%dT%H:%M:%S.002Z)" \
@@ -747,6 +756,26 @@ SERVING_LIMIT=5 run start --from "$tmp/stage/conbus-nohooks" >"$tmp/start-nohook
 expect 1 "$code" "no hook running at all rolls back"
 expect_grep 'no hook runs here' "$tmp/start-nohooks.out" "the reason says so"
 
+# A log that cannot take a record is not live, whatever else looks healthy.
+write_fake beef readonly "$tmp/stage/conbus-readonly"
+write_fake 01d old "$install_dir/conbus"
+rm -f "$rollback_bin" "$home/.conbus/canary.json"
+daemon_boot beef 4280
+code=0
+SERVING_LIMIT=5 run start --from "$tmp/stage/conbus-readonly" >"$tmp/start-readonly.out" 2>&1 || code=$?
+expect 1 "$code" "start does not call a log that cannot be appended to live"
+expect_grep 'the log cannot take a record: NOT APPENDABLE' "$tmp/start-readonly.out" "the reason is doctor's"
+expect_no_grep 'canary is live' "$tmp/start-readonly.out" "and nothing says live"
+expect "conbus 0.0.0-01d (01d)" "$("$install_dir/conbus" --version)" "the old build is back"
+write_fake beef refusing "$tmp/stage/conbus-refusing"
+write_fake 01d old "$install_dir/conbus"
+rm -f "$rollback_bin" "$home/.conbus/canary.json"
+daemon_boot beef 4281
+code=0
+SERVING_LIMIT=5 run start --from "$tmp/stage/conbus-refusing" >"$tmp/start-refusing.out" 2>&1 || code=$?
+expect 1 "$code" "nor one refusing writes"
+expect_grep 'the log cannot take a record: REFUSING' "$tmp/start-refusing.out" "and says so"
+
 # Codex's trust is a person's act, so it warns and does not undo a healthy swap.
 write_fake beef untrusted "$tmp/stage/conbus-untrusted"
 write_fake 01d old "$install_dir/conbus"
@@ -977,15 +1006,6 @@ install_persona() { # install_persona <persona>
     sed -E "s/\"candidate_sha256\":\"[^\"]*\"/\"candidate_sha256\":\"$(shasum -a 256 "$install_dir/conbus" | awk '{ print $1 }')\"/" \
         "$home/.conbus/canary.json" >"$home/.conbus/canary.json.new"
     mv -f "$home/.conbus/canary.json.new" "$home/.conbus/canary.json"
-}
-
-expect_no_grep() { # expect_no_grep <pattern> <file> <what>
-    if grep -q "$1" "$2"; then
-        echo "rehearsal: FAIL: $3 — '$1' in $2:" >&2
-        cat "$2" >&2
-        exit 1
-    fi
-    echo "rehearsal: ok: $3"
 }
 
 # Planned restarts are recorded; unplanned ones are counted by verdict.

@@ -27,7 +27,8 @@
 #   - start runs preflight first and refuses before swapping when it
 #     fails. After the swap it requires, inside
 #     CONBUS_CANARY_SERVING_LIMIT seconds (default 30): a new daemon pid
-#     serving, a doctor with no DIFFERS against the candidate build,
+#     serving, a doctor with no DIFFERS against the candidate build and a log
+#     that can take a record,
 #     every installed vendor's hooks line `runs` with no event missing, a daemon that answers on
 #     its socket, and zero drop reasons that were not there before — except
 #     the two a normal swap window produces (a protocol refusal while the old
@@ -2373,6 +2374,8 @@ case $sub in
                 fail_reason="the answering daemon is a different build than $cand_build"
             elif ! grep -q 'listening' <<<"$doctor_out"; then
                 fail_reason="the daemon is not answering after the swap"
+            elif [ -n "$(log_cannot_take "$doctor_out")" ]; then
+                fail_reason="the log cannot take a record: $(log_cannot_take "$doctor_out")"
             else
                 # A vendor this machine does not have has no hook to run, and
                 # trust is a person's act, told below rather than rolled back.
