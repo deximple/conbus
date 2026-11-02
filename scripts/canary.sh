@@ -792,6 +792,12 @@ drops_file_state() { # drops_file_state <1 when two rotations already explain it
     df_open="the drop log 'canary.sh start' saw is gone, moved aside or replaced, and no rotation explains it"
 }
 
+# The log's segments: an index each, oldest first. Nothing in conbus removes one.
+log_segments() {
+    [ -d "$root/log" ] || return 0
+    { ls "$root/log" 2>/dev/null || true; } | sed -n 's/^segment-\([0-9]*\)\.jsonl$/\1/p'
+}
+
 # The value of `<name> <value>` in rows an item built.
 row_value() { # row_value <rows> <name>
     printf '%s\n' "$1" | sed -n "s/^$2 //p"
@@ -846,6 +852,7 @@ drop_table() { # drop_table <since> <end of the swap window> <file>...
             # as one: the line says records were lost, so it fails either way.
             weight = 1
             if (c == "lost" && d_detail ~ /^[1-9][0-9]* record\(s\) lost$/) weight = d_detail + 0
+            if (c == "lost" && match(d_detail, /[1-9][0-9]* could not be kept/)) weight = substr(d_detail, RSTART, RLENGTH) + 0
             total[c] += weight
             n[c SUBSEP key]++
         }
@@ -1422,6 +1429,43 @@ verdict_unreadable() {
     fi
 }
 
+# A segment gone since the swap is records gone with no drop line and no start line,
+# and the usage rows of both builds agree without them. Doctor's count just reads
+# lower. So what was there at the swap has to still be there, and what came after
+# has to have no hole in it.
+verdict_log_files() {
+    vl_record=$(state_get log_files || true)
+    if [ -z "$vl_record" ]; then
+        line UNCHECKED log-files "canary.json has no record of the log's segments, so nothing says one has not gone since the swap"
+        return
+    fi
+    if [ -d "$root/log" ] && [ ! -r "$root/log" ]; then
+        line UNCHECKED log-files "$root/log cannot be read"
+        return
+    fi
+    IFS=: read -r vl_count vl_first vl_last <<<"$vl_record"
+    vl_rows=$(log_segments | awk -v last="${vl_last:-0}" -v had="$vl_count" '
+        { i = $1 + 0; if (had + 0 > 0 && i <= last + 0) old++; else { new++; if (i > high) high = i } }
+        END { printf "old %d\nnew %d\nhigh %d\n", old, new, high }')
+    vl_old=$(row_value "$vl_rows" old)
+    vl_new=$(row_value "$vl_rows" new)
+    vl_high=$(row_value "$vl_rows" high)
+    vl_after=$((10#${vl_last:-0}))
+    [ "$vl_count" -gt 0 ] || vl_after=-1
+    vl_faults=""
+    if [ "$vl_old" -lt "$vl_count" ]; then
+        vl_faults="$vl_faults; $((vl_count - vl_old)) of the $vl_count segment(s) there at the swap are gone"
+    fi
+    if [ "$vl_new" -gt 0 ] && [ "$vl_new" -ne $((vl_high - vl_after)) ]; then
+        vl_faults="$vl_faults; $((vl_high - vl_after - vl_new)) segment(s) written since the swap are gone"
+    fi
+    if [ -n "$vl_faults" ]; then
+        line FAIL log-files "${vl_faults#; }"
+    else
+        line PASS log-files "the $vl_count segment(s) there at the swap are all there, and $vl_new since with no gap"
+    fi
+}
+
 # Space, and anything else the log refused. A full disk can take the record, the
 # spool entry and the drop line together, and daemon.log is the one trace left when
 # that write lands. A build that holds refused records (#155) says so at each end
@@ -1441,16 +1485,20 @@ verdict_disk() {
                 sub(/^.*the log refused a write /, "", refusing)
             }
             $1 ~ /^[0-9]/ && $1 > s && /the log takes writes again/ { refusing = "" }
-            END { printf "lines %d\ntotal %d\nfirst %s\nrefusing %s\n", lines, total, first, refusing }' "$daemon_log")
+            $1 ~ /^[0-9]/ && $1 > s && match($0, /[1-9][0-9]* could not be kept/) { not_kept += substr($0, RSTART, RLENGTH) }
+            END { printf "lines %d\ntotal %d\nfirst %s\nrefusing %s\nnot_kept %d\n", lines, total, first, refusing, not_kept }' "$daemon_log")
     fi
     vd_lines=$(row_value "$vd_rows" lines)
     vd_total=$(row_value "$vd_rows" total)
     vd_first=$(row_value "$vd_rows" first | cut -c1-120)
     vd_refusing=$(row_value "$vd_rows" refusing | cut -c1-120)
+    vd_not_kept=$(row_value "$vd_rows" not_kept)
     vd_line=$(printf '%s\n' "$doctor_out" | sed -n 's/^disk  *//p' | sed -n '1p')
     vd_write_bad=$(log_cannot_take "$doctor_out")
     if [ "${vd_lines:-0}" -gt 0 ]; then
         line FAIL disk "$vd_total record(s) refused by the log since $since, $vd_lines time(s) in daemon.log: $vd_first"
+    elif [ "${vd_not_kept:-0}" -gt 0 ]; then
+        line FAIL disk "$vd_not_kept record(s) could not be kept since $since, by daemon.log"
     elif [ -n "$vd_refusing" ]; then
         line FAIL disk "the log refused a write and daemon.log does not say it stopped: $vd_refusing"
     elif [ -n "$vd_write_bad" ]; then
@@ -1952,6 +2000,7 @@ case $sub in
         verdict_recorder
         verdict_restarts
         verdict_unreadable
+        verdict_log_files
         verdict_disk
 
         # A read that failed and a log with no rows are different facts, and
@@ -2354,7 +2403,7 @@ case $sub in
         # Which file this window's drops land in, so the verdict can tell if it was
         # taken away. One that does not exist yet could vanish unseen, so it does now.
         (umask 077; : >>"$drops_log") 2>/dev/null || true
-        state_extra=",\"drops_file\":\"$(file_identity "$drops_log")\""
+        state_extra=",\"drops_file\":\"$(file_identity "$drops_log")\",\"log_files\":\"$(log_segments | awk 'NR == 1 { first = $1 } { last = $1; n++ } END { printf "%d:%s:%s", n, first, last }')\""
         # A rotation can rename drops.jsonl mid-swap, so "drops since now"
         # is a timestamp cut across both generations, not a line offset.
         before_ts=$(now_iso_ms)

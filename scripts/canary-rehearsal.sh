@@ -994,7 +994,10 @@ verdict_fixture() { # verdict_fixture [swapped-iso] [restarts-json]
     rm -f "$home/.conbus/drops.jsonl"
     printf '{"ts":"%s","reason":"socket closed early"}\n' \
         "$(iso_after "$fx_swapped" -$((5 * DAY)))" >"$home/.conbus/drops.jsonl"
-    printf '{"swapped":"%s","prev_build":"01d","candidate_build":"beef","candidate_sha256":"%s","restarts":%s,"drops_file":"%s"}\n' \
+    rm -rf "$home/.conbus/log"
+    mkdir -p "$home/.conbus/log"
+    touch "$home/.conbus/log/segment-00000000.jsonl" "$home/.conbus/log/segment-00000001.jsonl"
+    printf '{"swapped":"%s","prev_build":"01d","candidate_build":"beef","candidate_sha256":"%s","restarts":%s,"drops_file":"%s","log_files":"2:00000000:00000001"}\n' \
         "$fx_swapped" "$(shasum -a 256 "$install_dir/conbus" | awk '{ print $1 }')" "$fx_restarts" "$(drops_identity)" \
         >"$home/.conbus/canary.json"
     usage_rows "$(iso_after "$fx_swapped" -$((14 * DAY)))" claude_code codex >"$home/.usage-rows"
@@ -1026,7 +1029,7 @@ code=0
 run verdict >"$tmp/verdict.out" 2>&1 || code=$?
 if [ "$code" != 0 ]; then cat "$tmp/verdict.out" >&2; fi
 expect 0 "$code" "verdict exits 0 on a completed clean window"
-for name in build hooks recorder-serving restarts unreadable disk drops log-outages tool-bodies harness-activity twins-repeated \
+for name in build hooks recorder-serving restarts unreadable log-files disk drops log-outages tool-bodies harness-activity twins-repeated \
     usage-parity rss-budget time-budget serving-budget policy sync operator-feel; do
     grep -qE "^(PASS|FAIL|UNCHECKED) $name " "$tmp/verdict.out"
     expect 0 $? "verdict prints a $name line"
@@ -1288,7 +1291,7 @@ drop_line 3600 'the log refused writes for a while and records may be lost' '3 r
 code=0
 run verdict >"$tmp/verdict-held-lost.out" 2>&1 || code=$?
 expect 1 "$code" "an outage that could not keep its records fails"
-expect_grep '^FAIL drops — 1 lost record' "$tmp/verdict-held-lost.out" "as a lost record"
+expect_grep '^FAIL drops — 2 lost record' "$tmp/verdict-held-lost.out" "as the records it says it lost"
 expect_grep '^PASS log-outages — 0 time(s)' "$tmp/verdict-held-lost.out" "and is no outage that lost nothing"
 # Inside the swap window it is no less lost, and known words do not excuse it.
 verdict_fixture "$(iso_ago 120)"
@@ -2541,6 +2544,59 @@ expect_grep 'verdict: PASS.*1-day window' "$tmp/verdict-window-short.out" "a PAS
 verdict_fixture
 code=0; run verdict >"$tmp/verdict-window-7.out" 2>&1 || code=$?
 expect_no_grep '7-day window' "$tmp/verdict-window-7.out" "the plan's own window needs no remark"
+
+# Records the log could not keep, said only in daemon.log.
+verdict_fixture
+printf '%s conbus daemon: the log refused a write (No space left on device (os error 28)); keeping what it refuses until it stops\n%s conbus daemon: the log takes writes again; 3 record(s) waited and landed, 2 could not be kept, since 2026-11-01T00:00:00.000Z: No space left on device (os error 28)\n' "$(iso_ago 7200)" "$(iso_ago 7000)" >>"$home/.conbus/daemon.log"
+code=0; run verdict >"$tmp/verdict-notkept.out" 2>&1 || code=$?
+expect 1 "$code" "could not be kept, in daemon.log alone, still fails (P8)"
+expect_grep '^FAIL disk — 2 record(s) could not be kept' "$tmp/verdict-notkept.out" "with its count"
+verdict_fixture
+printf '%s conbus daemon: the log takes writes again; 3 record(s) waited and landed, 0 could not be kept, since 2026-11-01T00:00:00.000Z: No space left on device (os error 28)\n' "$(iso_ago 7000)" >>"$home/.conbus/daemon.log"
+code=0; run verdict >"$tmp/verdict-allkept.out" 2>&1 || code=$?
+expect 0 "$code" "0 could not be kept is no such thing"
+verdict_fixture
+printf '%s conbus daemon: the log takes writes again; 3 record(s) waited and landed, 10 could not be kept, since 2026-11-01T00:00:00.000Z: x\n' "$(iso_ago $((30 * DAY)))" >>"$home/.conbus/daemon.log"
+code=0; run verdict >"$tmp/verdict-notkept-before.out" 2>&1 || code=$?
+expect 0 "$code" "before the swap it says nothing about the window"
+# The real count on a `may be lost` line, not one for the line.
+verdict_fixture
+drop_line 3600 'the log refused writes for a while and records may be lost' '3 record(s) waited and landed, 4 could not be kept, since 2026-11-01T00:00:00.000Z: No space left on device (os error 28)'
+code=0; run verdict >"$tmp/verdict-maybelost.out" 2>&1 || code=$?
+expect 1 "$code" "records may be lost fails"
+expect_grep '^FAIL drops — 4 lost record' "$tmp/verdict-maybelost.out" "with what the line says it lost"
+# A segment removed since the swap, with nothing else to show for it.
+verdict_fixture
+code=0; run verdict >"$tmp/verdict-segments.out" 2>&1 || code=$?
+expect 0 "$code" "every segment there at the swap is still there"
+expect_grep '^PASS log-files' "$tmp/verdict-segments.out" "and has its own line"
+touch "$home/.conbus/log/segment-00000002.jsonl" "$home/.conbus/log/segment-00000003.jsonl"
+code=0; run verdict >"$tmp/verdict-segments-new.out" 2>&1 || code=$?
+expect 0 "$code" "new segments since are the log growing"
+rm -f "$home/.conbus/log/segment-00000000.jsonl"
+code=0; run verdict >"$tmp/verdict-segment-gone.out" 2>&1 || code=$?
+expect 1 "$code" "a closed segment removed since the swap cannot pass"
+expect_grep '^FAIL log-files.*1 of the 2 segment(s) there at the swap' "$tmp/verdict-segment-gone.out" "it says how many"
+verdict_fixture
+touch "$home/.conbus/log/segment-00000002.jsonl" "$home/.conbus/log/segment-00000003.jsonl"
+rm -f "$home/.conbus/log/segment-00000002.jsonl"
+code=0; run verdict >"$tmp/verdict-segment-hole.out" 2>&1 || code=$?
+expect 1 "$code" "nor one written since then"
+expect_grep '^FAIL log-files.*written since' "$tmp/verdict-segment-hole.out" "and says that"
+verdict_fixture
+sed -E 's/,"log_files":"[^"]*"//' "$home/.conbus/canary.json" >"$home/.conbus/canary.json.new"
+mv -f "$home/.conbus/canary.json.new" "$home/.conbus/canary.json"
+code=0; run verdict >"$tmp/verdict-segment-norecord.out" 2>&1 || code=$?
+expect 4 "$code" "a window that recorded none cannot pass"
+expect_grep '^UNCHECKED log-files' "$tmp/verdict-segment-norecord.out" "and says so"
+write_fake 01d old "$install_dir/conbus"
+rm -f "$rollback_bin" "$home/.conbus/canary.json"
+rm -f "$home/.conbus/log/"segment-*
+touch "$home/.conbus/log/segment-00000005.jsonl" "$home/.conbus/log/segment-00000006.jsonl"
+daemon_boot beef 4290
+code=0; run start --from "$tmp/stage/conbus-good" >/dev/null 2>&1 || code=$?
+expect 0 "$code" "start with segments"
+expect_grep '"log_files":"2:00000005:00000006"' "$home/.conbus/canary.json" "records them"
 
 # A real build under this throwaway HOME would ask an agy that is not signed
 # in, and a build older than the sign-in check opens a browser tab doing it.
