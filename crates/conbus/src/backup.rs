@@ -332,7 +332,7 @@ enum Step {
 fn plan(segments: &[PathBuf], rows: &Rows, log: &Path) -> io::Result<Plan> {
     let closed = segments.split_last().map_or(&[][..], |(_, closed)| closed);
     if let Some(open) = segments.last() {
-        refuse_if_not_its_copy(open, rows)?;
+        refuse_if_not_its_copy(open, rows, log)?;
     }
     let held = held_sizes(log)?;
     let mut copy = Vec::new();
@@ -370,14 +370,14 @@ fn plan(segments: &[PathBuf], rows: &Rows, log: &Path) -> io::Result<Plan> {
 /// that copy and perhaps more: a restored segment growing. Anything else is a new
 /// log under an old name, and counting it from the old row's length would call its
 /// records already safe. At most one segment to hash, and only when it has a row.
-fn refuse_if_not_its_copy(open: &Path, rows: &Rows) -> io::Result<()> {
+fn refuse_if_not_its_copy(open: &Path, rows: &Rows, log: &Path) -> io::Result<()> {
     let name = file_name(open);
     let Some(row) = rows.get(&name) else {
         return Ok(());
     };
     let size = fs::metadata(open).map_err(named(open))?.len();
     if size < row.size || digest_start(open, row.size)?.sha256 != row.sha256 {
-        return Err(differs(&name, size, row.size));
+        return Err(differs_from_row(size, row, log));
     }
     Ok(())
 }
@@ -428,8 +428,24 @@ fn step(
     if vouched {
         Ok(Step::Copy)
     } else {
-        Err(differs(name, size, row.size))
+        Err(differs_from_row(size, row, log))
     }
+}
+
+/// The log has not got what the manifest vouches for. What can be done depends on
+/// whether the copy still is that, which only a refusal has reason to read: restoring
+/// a copy that is not would be refused in turn, for ever.
+fn differs_from_row(in_log: u64, row: &Row, log: &Path) -> io::Error {
+    let Some(problem) = row_problem(log, row) else {
+        return differs(&row.name, in_log, row.size);
+    };
+    refuse(format!(
+        "{} in the log ({in_log} bytes) differs from what the manifest vouches for ({} bytes), \
+         and this backup cannot put it right: {problem}. Nothing was copied and the backup is \
+         untouched. Keep this folder, which may hold all that is left of those records, and \
+         back up to another folder",
+        row.name, row.size
+    ))
 }
 
 fn differs(name: &str, in_log: u64, in_backup: u64) -> io::Error {

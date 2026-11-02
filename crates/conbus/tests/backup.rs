@@ -2949,6 +2949,71 @@ fn a_damaged_copy_can_still_be_restored_the_way_the_manual_says() {
 }
 
 #[test]
+fn a_damaged_copy_with_the_log_lost_is_told_what_works() {
+    // Restoring that copy again could only be refused again, so the refusal must not
+    // send anyone round that loop. The first case is a closed segment; the others are
+    // the newest, which is the open one again after the restore. A flipped byte is
+    // the size it should be, which only reading it can tell.
+    for (newest, cut) in [(false, true), (true, true), (true, false)] {
+        let world = World::with_log();
+        let (closed, _) = split_open(&world);
+        let name = if newest {
+            closed.last()
+        } else {
+            closed.first()
+        }
+        .expect("a segment");
+        let folder = world.base.join("dest");
+        ok(&world.backup(&folder));
+        let copy = backup_log(&folder).join(name);
+        let mut bytes = fs::read(&copy).expect("read");
+        if cut {
+            bytes.truncate(bytes.len() / 2);
+        } else {
+            bytes[7] ^= 0x01;
+        }
+        fs::write(&copy, &bytes).expect("damage");
+        fs::remove_dir_all(world.log()).expect("the log is lost");
+
+        let restored = run_block(&world, &folder, &block_without_verify(), &[]);
+
+        assert!(!restored.started_the_recorder(), "{:?}", restored.calls);
+        let said = stderr(&restored.out);
+        assert!(said.contains(name), "{said}");
+        assert!(said.contains("another folder"), "{said}");
+        assert!(!said.contains("delete that file from the log"), "{said}");
+
+        // What it names, and it works.
+        let other = world.base.join("other");
+        ok(&world.backup(&other));
+        ok(&world.verify(&other));
+    }
+}
+
+#[test]
+fn a_copy_gone_with_the_log_changed_is_told_what_works() {
+    let world = World::with_log();
+    let (closed, _) = split_open(&world);
+    let folder = world.base.join("dest");
+    ok(&world.backup(&folder));
+    fs::remove_file(backup_log(&folder).join(&closed[0])).expect("rm");
+    let source = world.log().join(&closed[0]);
+    let mut bytes = fs::read(&source).expect("read");
+    bytes[7] ^= 0x01;
+    fs::write(&source, &bytes).expect("same length, other bytes");
+
+    let out = world.backup(&folder);
+
+    refused(&out, "differs");
+    refused(&out, "another folder");
+    assert!(
+        !stderr(&out).contains("delete that file from the log"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[test]
 fn a_wrong_segment_kept_by_cp_n_stops_the_restore_and_the_refusal_says_what_works() {
     // A recorder started a new log before the restore. `cp -n` keeps its short
     // segment-00000000 over the real one, so the block's last check has to catch

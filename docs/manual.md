@@ -832,15 +832,18 @@ If the block stops, the recorder stays stopped until you start it, and
   which copies it again. If the log has lost it too, that copy is all there is. A
   damaged line only reads as unreadable and the rest of the segment survives, so you
   can still restore it: paste the block without its `--verify` line, and if its last
-  check then refuses, run `conbus install --apply` yourself. A file `--verify` says
-  nothing vouches for is restored too if you do that, and as the newest segment the
-  recorder would write to it, so move it out of the backup first unless you know it
-  is yours.
+  check then refuses, run `conbus install --apply` yourself. That folder then goes on
+  refusing that segment, so keep it and send later backups to another folder. A file
+  `--verify` says nothing vouches for is restored too if you do that, and as the newest
+  segment the recorder would write to it, so move it out of the backup first unless you
+  know it is yours.
 - **The `socket` line says `listening`.** A recorder is still running. Stop it and
   paste the block again.
-- **The last check refused.** It names the segment. If the log's copy is damaged,
-  delete that file from the log and paste the block again. If a recorder has started a
-  new log there, see "Not over a new log" below.
+- **The last check refused.** It names the segment. If it says `cannot put it right`,
+  the backup's copy is damaged too and pasting again cannot help: run `conbus install
+  --apply` yourself, keep this folder, and send later backups to another one. Otherwise,
+  if the log's copy is damaged, delete that file from the log and paste the block again.
+  If a recorder has started a new log there, see "Not over a new log" below.
 
 And afterwards:
 
