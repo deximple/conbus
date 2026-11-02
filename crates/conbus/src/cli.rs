@@ -493,12 +493,14 @@ USAGE:
                                   --chat-export reads official Claude.ai conversations.json (or zip)
     conbus doctor                 report what is and is not wired up
     conbus auth [--url URL] [--html [PATH]] [--open]  (experimental)
-                                  whether any vendor needs a sign-in (conbus
-                                  itself never does); --url names whose page a
-                                  URL is and what listens on its callback port,
-                                  and --url - reads the URL from stdin, which
-                                  keeps a token out of shell history; --html
-                                  writes one self-contained page, --open opens it
+                                  asks codex, agy and gh whether they are signed in
+                                  (conbus itself needs no login), and says which it
+                                  did not ask; --url says whose page a URL is and
+                                  whether conbus is above what it calls back to, or
+                                  that it cannot tell; --url - reads the URL from
+                                  stdin, which keeps a token out of shell history;
+                                  --html writes one self-contained page, and --open
+                                  with it opens that page
     conbus status                 routing rules, quota, hop history, cost
     conbus quota                  Codex probe + Claude StatusLine cache + catalog
     conbus policy check           (experimental) the effective policy.json rules;

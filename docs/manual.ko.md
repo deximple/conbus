@@ -681,23 +681,29 @@ conbus uninstall --apply  # 지우기
 `wl-paste | conbus auth --url -` 또는
 `xclip -o -selection clipboard | conbus auth --url -`). 표준 입력으로 넘기면 주소에
 든 토큰이 셸 기록에도, 이 명령을 실행한 에이전트의 기록에도 남지 않습니다.
+파이프로 넘길 때는 한 줄이어야 합니다. 주소에는 줄바꿈이 없기 때문입니다.
 `conbus auth --url "<URL>"`도 동작하지만, 쿼리가 있는 URL이면 경고합니다. 아무것도
-저장하지 않으며, 쿼리 값은 콜백 포트와 `client` 이름만 출력합니다. `client` 이름은
-URL의 주장으로만 보여 줍니다.
+저장하지 않으며, 쿼리 값은 콜백 포트와 평범한 `client` 이름만 출력합니다. `client`
+이름은 URL의 주장으로만 보여 줍니다.
 
 페이지는 스킴과 호스트로만 판별하고, 그 밖은 `unknown page`입니다. 페이지가 이
 컴퓨터의 포트로 콜백하면 그 포트에서 듣는 프로세스를 모두 루트까지 거슬러 올라갑니다.
 그 결과는 다음과 같습니다.
 
-- `conbus yes` — 그 계보에 conbus라는 이름의 프로세스가 있습니다.
-- `conbus no` — 없습니다. 계보에 대한 말일 뿐이며, 다음 줄이 이 추적으로 볼 수 없는
-  것을 알려 줍니다. 자기를 시작한 프로세스보다 오래 살아남았으면서 자기 프로세스
-  그룹을 이끄는 서버와 hop이 연 앱은 모두 루트에 바로 매달립니다. conbus의 모든 읽기는
-  `codex app-server`를 시작하고, `conbus status`가 hop 목록을 보여 줍니다.
-- `conbus cannot tell` — 듣는 프로세스가 없거나, 포트가 없거나, 콜백이 다른
-  호스트에 있거나, 추적이 도중에 끊겼거나, 듣는 프로세스가 자기를 시작한 프로세스보다
-  오래 살아남은 것이 드러난 경우입니다(루트 바로 아래에 있으면서 자기 프로세스 그룹을
-  이끌지 않음). 무엇이 있으면 알 수 있는지 함께 알려 줍니다.
+- `conbus yes` — 듣는 프로세스 위에 conbus 명령이 있고, 페이지가 conbus가 직접 시작하는
+  벤더의 것입니다. Codex와 그 MCP 서버가 여는 브리지, agy, Claude가 여기에 해당합니다.
+  주소에는 어떤 포트든 적을 수 있으므로 `unknown page`는 이 답을 받지 못합니다.
+- `conbus no` — 계보가 앱이나 사람의 세션까지 올라가고 그 안에 conbus가 없습니다.
+  계보에 대한 말일 뿐이며, 다음 줄이 이 추적으로 볼 수 없는 것을 알려 줍니다. hop이 연
+  앱은 다른 앱처럼 launchd에 바로 매달립니다. conbus의 모든 읽기는 `codex app-server`를
+  시작하고, `conbus status`가 hop 목록을 보여 줍니다.
+- `conbus cannot tell` — 그 밖의 모든 경우이며, 무엇이 있으면 알 수 있는지 함께 알려
+  줍니다. 듣는 프로세스가 루트나 서비스 관리자(`launchd`, `init`, `systemd --user`)에
+  바로 매달려 있거나, 계보의 꼭대기가 앱도 세션도 아니면 이 답입니다. 서비스와, 시작한
+  프로세스가 끝난 뒤 남은 서버는 여기서 똑같이 보이기 때문입니다. 듣는 프로세스나 포트가
+  없을 때, 콜백이 다른 호스트나 사용자 지정 스킴을 쓰거나 conbus가 읽지 못하는 형태일
+  때, 추적이 도중에 끊겼을 때도 마찬가지입니다. `conbus run` 아래의 프로세스도 이
+  답입니다. 그것은 conbus가 아니라 당신의 에이전트이기 때문입니다.
 
 `conbus auth`는 벤더 설정을 읽지 않습니다. Playwright 브리지 페이지에
 `Invalid token provided`가 보이면 그 클라이언트가 받은 토큰이, 탭이 열린 Chrome
@@ -705,10 +711,13 @@ URL의 주장으로만 보여 줍니다.
 클라이언트의 `PLAYWRIGHT_MCP_EXTENSION_TOKEN`에 복사하세요.
 `PLAYWRIGHT_MCP_PROFILE_DIR_NAME`으로 프로필을 고정할 수 있습니다.
 
-`conbus auth`만 실행하면 지금 어느 벤더에 로그인이 필요한지와, 아무도 없을 때
-conbus가 무엇을 실행하는지를 보여 줍니다. 기록에는 로그인이 필요 없습니다.
-`conbus auth --html`은 같은 내용을 오프라인 한 장으로 쓰고, `--open`을 더해야만
-그 페이지를 엽니다.
+`conbus auth`만 실행하면 Codex, agy, gh에 로그인 여부를 묻고, 묻지 않은 벤더는
+`not checked`로 표시합니다. 즉 그 벤더들에 로그인이 필요 없다는 뜻이 아닙니다. hop에는
+Codex와 gh가 필요합니다. agy는 자기 쿼터 줄에만 쓰이므로, 쓰는 경우에만 로그인하세요.
+아무도 없을 때 conbus가 무엇을 실행하는지도 보여 줍니다. 기록에는 로그인이 필요
+없습니다. `conbus auth --html`은 같은 내용을 오프라인 한 장으로 쓰고, 그 배너는 어느
+벤더에 물었고 어느 벤더에 묻지 않았는지 알려 줍니다. `--html --open`이어야 그 페이지를
+엽니다. `--url`은 이 두 옵션과 함께 쓸 수 없습니다.
 
 **`nameless  <bus id> — N records…`** — 0.1.0 이전 빌드가 세션을 밝히지 않은
 이벤트를 공용 대화 하나 아래 묶었습니다. 0.1.0부터는 그런 이벤트를 거부합니다.
@@ -809,7 +818,7 @@ hop도 대화를 내 계정 하나에서 다른 계정으로 옮기지 않습니
 | `conbus install --managed` | Claude Code 관리 설정에 넣을 훅 블록(stdout의 JSON)과 넣을 곳을 출력. 아무것도 쓰지 않음([Managed Macs](fleet.md)) |
 | `conbus uninstall [--apply]` | 모두 다시 빼기. 로그는 남김 |
 | `conbus doctor` | 무엇이 연결됐고 무엇이 안 됐는지 |
-| `conbus auth [--url URL] [--html [PATH]] [--open]` | 어느 벤더가 로그인을 필요로 하는지(conbus 자체는 절대 아님). `--url`은 URL이 누구 페이지인지와 콜백 포트에서 무엇이 듣는지를 알려 주고, `--url -`는 URL을 표준 입력에서 읽음. `--html`은 같은 내용을 오프라인 한 장으로 씀(실험적) |
+| `conbus auth [--url URL] [--html [PATH]] [--open]` | Codex, agy, gh에 로그인 여부를 묻고(conbus 자체는 로그인이 필요 없음) 묻지 않은 벤더를 알려 줌. `--url`은 URL이 누구 페이지인지와 콜백 대상 위에 conbus가 있는지, 또는 알 수 없음을 알려 주고, `--url -`는 URL을 표준 입력에서 읽음. `--html`은 오프라인 한 장을 쓰고, `--open`을 함께 주면 그 페이지를 엶(실험적) |
 | `conbus status` | 라우팅 규칙, 쿼터, hop 기록, 비용 |
 | `conbus quota` | 각 레그에 남은 양 |
 | `conbus log [--json] [--bus-id ID] [--since TS] [--tail N] [--grep TEXT] [--reveal]` | 로그 읽기 |

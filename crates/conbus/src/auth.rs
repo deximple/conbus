@@ -3,10 +3,10 @@
 //! Operators have guessed at conbus every time a vendor's sign-in page opened.
 //! One was ours (an unattended `agy -p` probe); another was Codex.app's
 //! Playwright MCP bridge. This command says whether conbus needs a login at all
-//! (never), what each vendor's state is, and, given the address that opened,
-//! whose page it is and whether conbus is above the process it calls back to. An
-//! answer with nothing behind it is worse than none, so it says `cannot tell`
-//! whenever it did not check.
+//! (never), what the vendors it can ask say, and, given the address that opened,
+//! whose page it is and whether conbus is above the process it calls back to. A
+//! person must be able to trust the answer rather than guess, so where conbus
+//! cannot know, it says `cannot tell`.
 //!
 //! It blocks nothing and fixes nothing: it reads state and points at the
 //! vendor's own sign-in flow. Exit 0 regardless of vendor state — recording

@@ -194,7 +194,7 @@ and `rm -rf ~/.conbus` removes it if you want it gone.
 | `conbus install [--apply]` | Register the hooks with every vendor found; reports unless told to write |
 | `conbus uninstall [--apply]` | Take them all back out; the log is kept |
 | `conbus doctor` | Install and daemon health |
-| `conbus auth` | Which vendor needs a sign-in (conbus itself never does); `conbus auth --url -` reads a URL from stdin and names whose page opened (experimental) |
+| `conbus auth` | Asks Codex, agy and gh whether they are signed in (conbus itself needs no login); `conbus auth --url -` reads a URL from stdin and says whose page it is, or that it cannot tell (experimental) |
 | `conbus status` | Routing rules, quota, hop history, cost |
 | `conbus quota` | What each leg has left |
 | `conbus log [FILTERS]` | Read the conversation log back |

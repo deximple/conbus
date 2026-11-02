@@ -21,7 +21,7 @@ These are legal or structural, not preferences.
 ## Decided, do not redesign
 
 - Vendor TUIs stay the window. We do not build a chat UI.
-- One binary, argv dispatch: `conbus daemon|hook|log|install|backfill|doctor|quota|hop|go|status|run|arena|summary|verdict|sync|usage|progress|policy|--version`. Cargo workspace internally. `hop --apply` opens or syncs a bus-owned warm on both legs (`warm:` Codex, `warm-claude:` Claude). Cursor landing is official `cursor -n <workspace>`. A chat line that *is* an order (`이제 커서로 작업할거야`) is `--to` after the hook reply. It never injects into a thread the user opened. `conbus summary` is the only model-backed digest, and it never uses the protected leg.
+- One binary, argv dispatch: `conbus daemon|hook|log|install|backfill|doctor|auth|quota|hop|go|status|run|arena|summary|verdict|sync|usage|progress|policy|--version`. Cargo workspace internally. `hop --apply` opens or syncs a bus-owned warm on both legs (`warm:` Codex, `warm-claude:` Claude). Cursor landing is official `cursor -n <workspace>`. A chat line that *is* an order (`이제 커서로 작업할거야`) is `--to` after the hook reply. It never injects into a thread the user opened. `conbus summary` is the only model-backed digest, and it never uses the protected leg.
 - JSONL segments are the source of truth. SQLite is a disposable derived index, always rebuildable from segments. The `cache/` sidecars are derived the same way — delete them and nothing is lost. The `spool/` holds hooks in transit across a restart — drained by the next daemon, deleted after ingest, never synced.
 - Data in `~/.conbus/`, respecting `$XDG_STATE_HOME`.
 - Derived state lives in the daemon's private memory, not a file-backed mmap ring.
