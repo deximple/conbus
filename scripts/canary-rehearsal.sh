@@ -1607,6 +1607,51 @@ run verdict >"$tmp/verdict-outageday.out" 2>&1 || code=$?
 expect 1 "$code" "a day only gap fill has is a fail"
 expect_grep "^FAIL harness-activity.*the recorder saw nothing on them: *$outage" "$tmp/verdict-outageday.out" "the day is named"
 
+# A harness whose hook dies mid-window writes no drop line, so the rows are all there is. It was used on most days
+# before the swap and has gone quiet for the end of the window: not used, or not recorded?
+verdict_fixture
+for gone in 11 12 13; do keep_rows_except "\"day\":\"$(day_ago "$gone")\",\"harness\":\"codex\""; done
+for d in 0 1 2 3 4 5; do keep_rows_except "\"day\":\"$(day_ago $d)\",\"harness\":\"codex\""; done
+code=0; run verdict >"$tmp/verdict-diedmid.out" 2>&1 || code=$?
+expect 4 "$code" "a harness silent for its last days is a question (P5)"
+expect_grep "codex recorded on .* of the 14 days before the swap and not on its last 5 closed day(s)" "$tmp/verdict-diedmid.out" "it says what it saw"
+expect_grep 'answer with --idle codex' "$tmp/verdict-diedmid.out" "and the answer to give"
+code=0; run verdict --idle codex >"$tmp/verdict-diedmid-idle.out" 2>&1 || code=$?
+expect 0 "$code" "the operator can answer it"
+expect_grep "idle: codex" "$tmp/verdict-diedmid-idle.out" "and the pass says it rests on that"
+# The same, with gap fill on those days: its transcripts prove it was used.
+verdict_fixture
+for gone in 11 12 13; do keep_rows_except "\"day\":\"$(day_ago "$gone")\",\"harness\":\"codex\""; done
+for d in 0 1 2 3 4 5; do sed -E "/\"day\":\"$(day_ago $d)\",\"harness\":\"codex\"/s/\"tool_calls\":40,\"tool_denials\":0,\"repeated\":0,\"recovered\":0/\"tool_calls\":0,\"tool_denials\":0,\"repeated\":0,\"recovered\":9/" "$home/.usage-rows" >"$home/.usage-rows.new"; mv -f "$home/.usage-rows.new" "$home/.usage-rows"; done
+code=0; run verdict >"$tmp/verdict-diedmid-gap.out" 2>&1 || code=$?
+expect 1 "$code" "a harness only gap fill has on its last days fails (P5b)"
+expect_grep '^FAIL harness-activity.*codex: gap fill has 5 of its last 5 closed day(s), and the recorder saw none of them' "$tmp/verdict-diedmid-gap.out" "it is named"
+code=0; run verdict --idle codex >/dev/null 2>&1 || code=$?
+expect 1 "$code" "and no answer clears it"
+# Not every harness: one used on under half the days before the swap may stop.
+verdict_fixture
+for gone in 9 11 12 13 14 15 16 17 18 19 20; do keep_rows_except "\"day\":\"$(day_ago "$gone")\",\"harness\":\"codex\""; done
+for d in 0 1 2 3 4 5; do keep_rows_except "\"day\":\"$(day_ago $d)\",\"harness\":\"codex\""; done
+code=0; run verdict >"$tmp/verdict-rare.out" 2>&1 || code=$?
+expect 0 "$code" "a harness used on under half the days before the swap may stop"
+# Quiet for two days is not three.
+verdict_fixture
+for gone in 11 12 13; do keep_rows_except "\"day\":\"$(day_ago "$gone")\",\"harness\":\"codex\""; done
+for d in 0 1 2; do keep_rows_except "\"day\":\"$(day_ago $d)\",\"harness\":\"codex\""; done
+code=0; run verdict >"$tmp/verdict-twodays.out" 2>&1 || code=$?
+expect 0 "$code" "two quiet days are not three"
+verdict_fixture
+for gone in 11 12 13; do keep_rows_except "\"day\":\"$(day_ago "$gone")\",\"harness\":\"codex\""; done
+for d in 0 1 2 3; do keep_rows_except "\"day\":\"$(day_ago $d)\",\"harness\":\"codex\""; done
+code=0; run verdict >"$tmp/verdict-threedays.out" 2>&1 || code=$?
+expect 4 "$code" "three are"
+# A row today means it came back. Today is not over, so no row today says nothing.
+verdict_fixture
+for gone in 11 12 13; do keep_rows_except "\"day\":\"$(day_ago "$gone")\",\"harness\":\"codex\""; done
+for d in 1 2 3 4 5; do keep_rows_except "\"day\":\"$(day_ago $d)\",\"harness\":\"codex\""; done
+code=0; run verdict >"$tmp/verdict-backtoday.out" 2>&1 || code=$?
+expect 0 "$code" "a harness with a row today came back"
+
 # A harness that only ever arrives by export or gap fill is not a dead hook.
 verdict_fixture
 usage_row "$(day_ago 2)" claude_chat 3 0 9 >>"$home/.usage-rows"

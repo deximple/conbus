@@ -932,7 +932,7 @@ verdict_activity() {
     va_rows=$({
         printf '%s\n' "$usage_json" | sed 's/^/B /'
         printf '%s\n' "$window_json" | sed 's/^/W /'
-    } | LC_ALL=C awk -v closed="$va_closed" -v lb="$va_lookback" -v sd="$since_day" '
+    } | LC_ALL=C awk -v closed="$va_closed" -v lb="$va_lookback" -v sd="$since_day" -v today="$today_utc" '
         function num(key,    re) {
             re = "\"" key "\":[0-9]+"
             if (!match($0, re)) return 0
@@ -963,6 +963,7 @@ verdict_activity() {
             any_row = 1
             day_seen[d] = 1
             harness_seen[h] = 1
+            row_day[h, d] = 1
             recovered[h] += num("recovered")
             turns[h] += num("turns")
             tools[h] += num("tool_calls")
@@ -987,11 +988,28 @@ verdict_activity() {
                         if ((days[i] in day_seen) && !((h, days[i]) in live_day)) missed = missed "," days[i]
                     if (missed != "") streak = streak " " h ":" substr(missed, 2)
                 }
+                # A hook that dies writes no drop line, and one missed day takes a
+                # harness out of the rule above. So: its last closed days, newest
+                # first, that it has no live row on. A day nobody has a row on is
+                # the empty-day question, and a live row today means it came back.
+                quiet = 0; filled = 0
+                if (!((h, today) in live_day)) {
+                    for (i = n; i >= 1; i--) {
+                        if (!(days[i] in day_seen)) continue
+                        if ((h, days[i]) in live_day) break
+                        quiet++
+                        if ((h, days[i]) in row_day) filled++
+                    }
+                }
+                if (before_days[h] >= 7 && quiet >= 3 && live_days[h] > 0) {
+                    if (filled > 0) faded_fill = faded_fill " " h ":" filled ":" quiet
+                    else if (before_days[h] < 14) faded = faded " " h ":" before_days[h] ":" quiet
+                }
                 printf "table %s: the recorder saw it on %d of %d day(s) (%d turn(s), %d tool call(s)); gap fill recovered %d record(s)\n",
                     h, live_days[h], n + 1, turns[h], tools[h], recovered[h]
             }
-            printf "any %d\nempty%s\nrecovered_days%s\nsilent%s\nonly_recovered%s\nstreak%s\n",
-                any_row, empty, recovered_days, silent, only_recovered, streak
+            printf "any %d\nempty%s\nrecovered_days%s\nsilent%s\nonly_recovered%s\nstreak%s\nfaded%s\nfaded_fill%s\n",
+                any_row, empty, recovered_days, silent, only_recovered, streak, faded, faded_fill
         }')
 
     if [ "$(row_value "$va_rows" any)" != 1 ]; then
@@ -999,9 +1017,13 @@ verdict_activity() {
             "no record since $since — nothing recorded to judge, and no answer from a person changes that"
         return
     fi
-    va_faults="" va_open="" va_answered=""
+    va_faults="" va_open="" va_answered="" va_asked=""
     for pair in $(row_value "$va_rows" only_recovered); do
         va_faults="$va_faults; ${pair%%:*}: used since the swap, but only gap fill has it (${pair#*:} record(s)) — the recorder saw none of it"
+    done
+    for trio in $(row_value "$va_rows" faded_fill); do
+        va_rest=${trio#*:}
+        va_faults="$va_faults; ${trio%%:*}: gap fill has ${va_rest%%:*} of its last ${va_rest#*:} closed day(s), and the recorder saw none of them"
     done
     va_list=$(row_value "$va_rows" recovered_days)
     if [ -n "$va_list" ]; then
@@ -1013,6 +1035,7 @@ verdict_activity() {
             operator_answers="$operator_answers $1"
         else
             va_open="$va_open; $2"
+            va_asked="$va_asked,$1"
         fi
     }
     for va_item in $(row_value "$va_rows" empty); do
@@ -1024,12 +1047,16 @@ verdict_activity() {
     for pair in $(row_value "$va_rows" streak); do
         va_ask "${pair%%:*}" "${pair%%:*} recorded on all 14 days before the swap and not on ${pair#*:} — not used, or not recorded?"
     done
+    for trio in $(row_value "$va_rows" faded); do
+        va_rest=${trio#*:}
+        va_ask "${trio%%:*}" "${trio%%:*} recorded on ${va_rest%%:*} of the 14 days before the swap and not on its last ${va_rest#*:} closed day(s) — not used, or not recorded?"
+    done
 
     va_answer=${va_answered:+; on the operator\'s word, idle:$va_answered}
     if [ -n "$va_faults" ]; then
         line FAIL harness-activity "${va_faults#; }${va_open}${va_answer}"
     elif [ -n "$va_open" ]; then
-        line UNCHECKED harness-activity "${va_open#; } — answer with --idle <harness|day>, by name${va_answer}"
+        line UNCHECKED harness-activity "${va_open#; } — if so, answer with --idle ${va_asked#,}${va_answer}"
     else
         line PASS harness-activity "every closed day has records and every harness active before the swap has some since${va_answer}"
     fi
