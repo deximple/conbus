@@ -430,7 +430,7 @@ conbus quota
 | 레그 | 숫자의 출처 |
 | --- | --- |
 | Codex | Codex 자신의 app-server(`account/rateLimits/read`). Codex.app을 포함한 계정 전체 |
-| agy | `agy -p /usage`. `agy models`로 로그인을 확인한 뒤에만 실행 |
+| agy | `agy -p /usage`. `conbus quota`만 실행하고, `agy models`로 로그인을 확인한 뒤에만. `doctor`와 `status`는 캐시된 판독값을 보여 줌 |
 | Claude Code | Claude Code가 StatusLine 명령에 넘겨주는 `rate_limits` |
 | Cursor, grok, opencode | 아직 없음. 이들의 훅에는 남은 쿼터 필드가 없습니다 |
 
@@ -440,12 +440,20 @@ StatusLine을 실행하지 않으므로 판독값이 며칠 묵을 수 있습니
 StatusLine이 마지막으로 언제 돌았는지 알려 줍니다. conbus는 다른 방법으로 그
 숫자를 얻으려고 Claude의 자격 증명을 읽지 않습니다.
 
-**agy는 로그인돼 있을 때만 읽습니다.** 로그인하지 않은 `agy -p`는 브라우저 탭을
-열고, 시간 제한으로는 이를 막지 못합니다. 그래서 conbus는 먼저 `agy models`를
-실행합니다. 로그인이 없다고 나오면 `quota`, `doctor`, `status`가
-`AUTH_REQUIRED`라고 알리고, 다른 이유로 실패하거나 시간이 다 되면 `SKIP`이라고
-알립니다. 어느 쪽이든 `agy -p`는 실행되지 않고 판독값도 없으며, hop은 판독값 없이
-진행합니다. 로그인하려면 터미널에서 `agy`를 실행하세요.
+**agy는 `conbus quota`가 읽고, 로그인돼 있을 때만 읽습니다.** 로그인하지 않은
+`agy -p`는 브라우저 탭을 열고, 시간 제한으로는 이를 막지 못합니다. 그래서 `doctor`,
+`status`, hop이 판단할 때의 쿼터 읽기는 `agy`를 실행하지 않습니다. `conbus quota`는
+사람이 친 명령입니다. 먼저 `agy models`를 실행하고, 로그인이 확인될 때만
+`agy -p /usage`를 물은 뒤 판독값을 캐시합니다. 로그인이 없으면 `AUTH_REQUIRED`라고
+하고, `agy models`가 다른 이유로 실패하거나 시간이 다 되면 `SKIP`이라고 합니다.
+`conbus auth`도 묻지만 `agy models`만 실행하고 `-p`는 실행하지 않습니다.
+
+`doctor`와 `status`는 캐시된 판독값을 지난 시간과 함께 보여 줍니다. 90분이 지나면
+숫자를 보여 주지 않고 `last read 2h ago, so the numbers are not counted`라고 하며,
+판독값이 없으면 `no reading yet; conbus quota reads it`이라고 합니다. hop은 캐시로
+판단하고, 판독값이 없어도 진행합니다. 사람이 지시한 `agy`로의 hop과 `conbus run`은
+`agy` 자체를 대화형 세션으로 시작하며, 로그인이 없는 `agy`는 그때 로그인을 요구합니다.
+로그인하려면 터미널에서 `agy`를 실행하세요.
 
 ---
 
