@@ -45,6 +45,10 @@
 #     time unless --since overrides it; its budgets come from
 #     CONBUS_CANARY_TAIL_MS / _USAGE_MS / _DOCTOR_MS / _SERVING_MS /
 #     _RSS_MB / _WINDOW_DAYS, defaulting to the plan's M3 targets.
+#   - `verdict` exits 0 on a completed pass, 1 when an item fails, 2 when it
+#     refuses its arguments, 3 while the 7-day window is still open, and 4
+#     when the window is over but an item other than operator-feel could not
+#     be judged. Exit 4 is neither a fail nor a pass; it names what is open.
 #   - preflight fails on doctor's `disk` warning unless
 #     CONBUS_CANARY_DISK_WARN_OK=1 downgrades it to WARN.
 #   - every rollback — the automatic one after a failed start and the
@@ -127,8 +131,9 @@ run_doctor() {
     "$bin" doctor >"$df" 2>&1 &
     dpid=$!
     n=0
-    while kill -0 "$dpid" 2>/dev/null && [ $n -lt $((doctor_limit_s * 2)) ]; do
-        sleep 0.5
+    # A short tick: time-budget times this call, and a long one reads as doctor.
+    while kill -0 "$dpid" 2>/dev/null && [ $n -lt $((doctor_limit_s * 10)) ]; do
+        sleep 0.1
         n=$((n + 1))
     done
     if kill -0 "$dpid" 2>/dev/null; then
@@ -146,9 +151,13 @@ run_doctor() {
         rm -f "$df"
         return 142
     fi
-    wait "$dpid" 2>/dev/null || true
+    # The doctor's own status goes back to the caller: one that could not read
+    # the log exits non-zero after printing most of its lines.
+    doctor_status=0
+    wait "$dpid" 2>/dev/null || doctor_status=$?
     cat "$df"
     rm -f "$df"
+    return "$doctor_status"
 }
 
 # HOME resolves to this user's passwd home — independent of SKIP or
@@ -545,7 +554,10 @@ say_spool() {
 # drops.1, and reading drops.jsonl alone would miss it.
 drop_reasons() {
     for f in "$drops_rotated" "$drops_log"; do
-        [ -f "$f" ] && sed -n 's/.*"reason":"\([^"]*\)".*/\1/p' "$f"
+        # `continue`, not `&&`: a missing last file would end the loop non-zero
+        # and take the whole script down under pipefail, without a word.
+        [ -f "$f" ] || continue
+        sed -n 's/.*"reason":"\([^"]*\)".*/\1/p' "$f"
     done | LC_ALL=C sort -u
 }
 
@@ -886,26 +898,63 @@ case $sub in
         # The §7 pass criteria a machine can score, against the log since
         # the recorded swap. The default boundary is the swap time in
         # canary.json — restarts of the recorder itself do not move it, so
-        # an unplanned one is still counted. Exits 1 on a fail, 3 while the
-        # 7-day window is still open, 0 on a completed pass.
+        # an unplanned one is still counted.
+        #
+        # Exits 0 on a completed pass, 1 on a fail, 2 on arguments it refuses,
+        # 3 while the 7-day window is still open, 4 when the window is over and
+        # an item other than operator-feel could not be judged. Every read that
+        # can fail is taken with its status in hand, because `x=$(a | b)` under
+        # `set -e` ends the script on the spot and prints no summary at all.
         fails=0
+        unchecked=""
         line() { # line <PASS|FAIL|UNCHECKED> <name> <detail>
             printf '%s %s — %s\n' "$1" "$2" "$3"
-            if [ "$1" = FAIL ]; then fails=$((fails + 1)); fi
+            case $1 in
+                FAIL) fails=$((fails + 1)) ;;
+                UNCHECKED)
+                    # The one question no tool can answer may stay open for a
+                    # pass. Anything else left open means nothing was proved.
+                    if [ "$2" != operator-feel ]; then
+                        unchecked="$unchecked$2 — $3"$'\n'
+                    fi
+                    ;;
+            esac
         }
 
+        # Every comparison below is on this text, so anything else is refused
+        # rather than compared: `yesterday` sorts after every timestamp.
+        case $since in
+            '') ;;
+            [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) since="$since"T00:00:00.000Z ;;
+            [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z)
+                since=${since%Z}.000Z
+                ;;
+            [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z) ;;
+            *) refuse "--since '$since' is not YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS[.mmm]Z" ;;
+        esac
+        if [ -n "$since" ] && ! is_uint "$(ts_epoch "$since")"; then
+            refuse "--since '$since' is not a date"
+        fi
+        if [ -f "$state_file" ] && [ ! -r "$state_file" ]; then
+            line UNCHECKED window "$state_file cannot be read — nothing says when the swap was"
+            say "verdict: UNCHECKED — no swap time to judge a window from; not a pass"
+            exit 4
+        fi
+        recorded_swap=$(state_get swapped || true)
+        if [ -n "$recorded_swap" ] && ! is_uint "$(ts_epoch "$recorded_swap")"; then
+            line UNCHECKED window "$state_file says the swap was '$recorded_swap', which is not a time"
+            say "verdict: UNCHECKED — no swap time to judge a window from; not a pass"
+            exit 4
+        fi
         if [ -z "$since" ]; then
-            since=$(state_get swapped || true)
+            since=$recorded_swap
         fi
         if [ -z "$since" ] && [ -f "$stamp" ]; then
-            since=$(sed -n 's/.*"started":"\([^"]*\)".*/\1/p' "$stamp")
+            since=$(sed -n 's/.*"started":"\([^"]*\)".*/\1/p' "$stamp" 2>/dev/null || true)
             say "note: no canary.json — bounding by the daemon's own start $since"
         fi
         [ -n "$since" ] ||
             die "no --since, no canary.json, no daemon.build stamp — nothing to bound the window with"
-        case $since in
-            [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) since="$since"T00:00:00.000Z ;;
-        esac
         since_day=${since:0:10}
         say "window: since $since"
 
@@ -915,25 +964,25 @@ case $sub in
         #    minus the swap's own boot and each planned restart — each of
         #    those is one `install --apply`, one boot.
         starts=0
-        if [ -f "$daemon_log" ]; then
+        if [ -r "$daemon_log" ]; then
             starts=$(awk -v s="$since" '
                 $1 > s && /conbus daemon: .*: socket .* log / { n++ }
                 END { print n + 0 }
             ' "$daemon_log")
         else
-            line UNCHECKED restarts "no $daemon_log"
+            line UNCHECKED restarts "no readable $daemon_log"
         fi
         planned=$(state_restart_count)
         unplanned=$((starts - 1 - planned))
         [ "$unplanned" -lt 0 ] && unplanned=0
-        if [ -f "$daemon_log" ] && [ "$starts" -eq 0 ]; then
+        if [ -r "$daemon_log" ] && [ "$starts" -eq 0 ]; then
             # The swap itself boots once: a log that names no start since
             # the swap was rotated or truncated underneath it — counting
             # unplanned restarts against a window the log cannot see is
             # checking nothing.
             line UNCHECKED restarts \
                 "$daemon_log names no start since $since — the log does not reach back to the swap"
-        elif [ -f "$daemon_log" ]; then
+        elif [ -r "$daemon_log" ]; then
             if [ "$unplanned" -eq 0 ]; then
                 line PASS restarts \
                     "0 unplanned daemon start(s) since $since ($starts seen: 1 swap + $planned planned)"
@@ -946,12 +995,13 @@ case $sub in
         # 2. Unreadable log lines: the newest start line's report, else the
         #    doctor's log line.
         unreadable=""
-        if [ -f "$daemon_log" ]; then
+        if [ -r "$daemon_log" ]; then
             unreadable=$(sed -n 's/.*(\([0-9][0-9]*\) record(s), \([0-9][0-9]*\) unreadable).*/\2/p' \
                 "$daemon_log" | tail -1)
         fi
         if [ -z "$unreadable" ]; then
-            unreadable=$(run_doctor 2>/dev/null |
+            count_out=$(run_doctor 2>/dev/null || true)
+            unreadable=$(echo "$count_out" |
                 sed -n 's/^log.* \([0-9][0-9]*\) unreadable line(s)/\1/p' | tail -1)
         fi
         case ${unreadable:-x} in
@@ -968,7 +1018,9 @@ case $sub in
         #    A log at the cap on a build that does not rotate recorded
         #    nothing after it filled: drops is UNCHECKED, never a pass —
         #    the live file sat blind like that for seven days in October.
-        if drops_blind; then
+        if [ -f "$drops_log" ] && [ ! -r "$drops_log" ]; then
+            line UNCHECKED drops "$drops_log cannot be read"
+        elif drops_blind; then
             line UNCHECKED drops \
                 "$drops_log hit the cap and stopped recording — drops after that point are not observable"
         elif [ -f "$drops_log" ]; then
@@ -1036,9 +1088,22 @@ case $sub in
         #    harness) with records. A harness that misses a day some other
         #    harness recorded on cannot be told idle from lost — UNCHECKED
         #    with the gap named.
-        usage_json=$("$bin" usage --json --since 1970-01-01 2>/dev/null || true)
-        if [ -z "$usage_json" ]; then
-            line UNCHECKED harness-activity "usage --json gave no rows"
+        # A read that failed and a log with no rows are different facts, and
+        # neither is evidence of activity.
+        usage_err=$(mktemp "${TMPDIR:-/tmp}/canary-usage.XXXXXX")
+        usage_rc=0
+        usage_json=$("$bin" usage --json --since 1970-01-01 2>"$usage_err") || usage_rc=$?
+        usage_problem=""
+        if [ "$usage_rc" -ne 0 ]; then
+            usage_problem="usage --json failed (exit $usage_rc): $(sed -n '1p' "$usage_err" | cut -c1-160)"
+        elif [ -z "$usage_json" ]; then
+            usage_problem="usage --json gave no rows"
+        elif [ -s "$usage_err" ]; then
+            say "note: usage --json reported: $(sed -n '1p' "$usage_err" | cut -c1-160)"
+        fi
+        rm -f "$usage_err"
+        if [ -n "$usage_problem" ]; then
+            line UNCHECKED harness-activity "$usage_problem"
         else
             activity=$(echo "$usage_json" | awk -v s="$since_day" '
                 {
@@ -1066,7 +1131,12 @@ case $sub in
             gaps=$(echo "$activity" | sed -n 's/^gaps: //p')
             silent=$(echo "$activity" | sed -n 's/^silent: //p')
             nwdays=$(echo "$activity" | sed -n 's/^days://p')
-            if [ -z "$gaps" ]; then
+            if [ "${nwdays:-0}" -eq 0 ]; then
+                # No day in the window has a row: "every harness on all 0 days"
+                # would be true of a recorder that never wrote a line.
+                line UNCHECKED harness-activity \
+                    "usage --json has no rows since $since_day — nothing recorded to judge${silent:+; silent:$silent}"
+            elif [ -z "$gaps" ]; then
                 line PASS harness-activity \
                     "every active harness recorded on all $nwdays active day(s)${silent:+; silent:$silent}"
             else
@@ -1076,7 +1146,7 @@ case $sub in
         fi
 
         # 5. twins and `repeated` growth vs the pre-swap baseline, same rows.
-        if [ -n "$usage_json" ]; then
+        if [ -z "$usage_problem" ]; then
             rep_result=$(echo "$usage_json" | awk -v s="$since_day" '
                 {
                     day = ""
@@ -1101,7 +1171,7 @@ case $sub in
                     "repeated/day $2 since vs $3 before ($4 vs $5 total)"
             fi
         else
-            line UNCHECKED twins-repeated "usage --json gave no rows"
+            line UNCHECKED twins-repeated "$usage_problem"
         fi
 
         # 6. usage-parity: every closed UTC day in the window, the rollback
@@ -1113,28 +1183,45 @@ case $sub in
         else
             strip='s/"tokens_[a-z_]*":[0-9]*,?//g; s/,\}/}/g; s/,]/]/g'
             parity_bad=""
+            parity_unread=""
+            parity_empty=""
             parity_seen=0
             d=$since_day
             guard=0
             while [ "$d" \< "$today_utc" ] && [ "$guard" -lt 370 ]; do
-                old=$("$rollback_bin" usage --json --day "$d" 2>/dev/null | sed -E "$strip" || true)
-                new=$("$bin" usage --json --day "$d" 2>/dev/null | sed -E "$strip" || true)
-                if [ "$old" != "$new" ]; then
-                    parity_bad="$parity_bad $d"
+                old_rc=0 new_rc=0
+                old=$("$rollback_bin" usage --json --day "$d" 2>/dev/null) || old_rc=$?
+                new=$("$bin" usage --json --day "$d" 2>/dev/null) || new_rc=$?
+                if [ "$old_rc" -ne 0 ] || [ "$new_rc" -ne 0 ]; then
+                    # A side that failed compared nothing, whichever way the
+                    # text happens to come out.
+                    parity_unread="$parity_unread $d"
+                else
+                    old=$(echo "$old" | sed -E "$strip")
+                    new=$(echo "$new" | sed -E "$strip")
+                    if [ "$old" != "$new" ]; then
+                        parity_bad="$parity_bad $d"
+                    elif [ -z "$old" ]; then
+                        parity_empty="$parity_empty $d"
+                    else
+                        parity_seen=$((parity_seen + 1))
+                    fi
                 fi
-                [ -n "$old$new" ] && parity_seen=$((parity_seen + 1))
-                d=$(next_day "$d")
+                d=$(next_day "$d") || break
                 guard=$((guard + 1))
             done
-            if [ "$parity_seen" -eq 0 ]; then
+            if [ -n "$parity_bad" ]; then
+                line FAIL usage-parity "usage differs on:$parity_bad"
+            elif [ -n "$parity_unread" ]; then
+                line UNCHECKED usage-parity "a side could not read:$parity_unread"
+            elif [ "$parity_seen" -eq 0 ]; then
                 # Two binaries that both answer nothing "agree" on every
                 # day: a parity of emptiness proves nothing.
                 line UNCHECKED usage-parity \
                     "no closed day produced rows on either side — nothing was compared"
-            elif [ -z "$parity_bad" ]; then
-                line PASS usage-parity "closed days agree (tokens_* stripped)"
             else
-                line FAIL usage-parity "usage differs on:$parity_bad"
+                line PASS usage-parity \
+                    "$parity_seen closed day(s) with rows agree (tokens_* stripped)${parity_empty:+; empty on both sides, so not compared:$parity_empty}"
             fi
         fi
 
@@ -1142,8 +1229,11 @@ case $sub in
         #    three re-measured reads against the plan's targets.
         rss_kb=""
         if [ -f "$stamp" ]; then
-            pid=$(sed -n 's/.*"pid":\([0-9]*\).*/\1/p' "$stamp")
-            [ -n "$pid" ] && rss_kb=$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ')
+            pid=$(sed -n 's/.*"pid":\([0-9]*\).*/\1/p' "$stamp" 2>/dev/null || true)
+            # `ps` exits 1 for a dead pid, which is the case this item is for.
+            if [ -n "$pid" ]; then
+                rss_kb=$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ' || true)
+            fi
         fi
         if is_uint "${rss_kb:-}"; then
             rss_mb=$((rss_kb / 1024))
@@ -1156,35 +1246,61 @@ case $sub in
             line FAIL rss-budget "no running recorder pid — the daemon itself is not up"
         fi
 
-        measure() { # measure <cmd...> — echoes wall-clock milliseconds
+        measure() { # measure <cmd...> — echoes "<wall-clock ms> <exit status>"
             start_ms=$(perl -MTime::HiRes=time -e 'printf "%d", time()*1000')
-            "$@" >/dev/null 2>&1 || true
+            measured_rc=0
+            "$@" >/dev/null 2>&1 || measured_rc=$?
             end_ms=$(perl -MTime::HiRes=time -e 'printf "%d", time()*1000')
-            echo $((end_ms - start_ms))
+            echo "$((end_ms - start_ms)) $measured_rc"
         }
-        t_tail=$(measure "$bin" log --tail 1)
-        t_usage=$(measure "$bin" usage --days 7)
-        # Doctor probes vendors and the disk: under a load spike one read
-        # outlives the budget and a healthy canary read FAIL. Judge it by
-        # the median of three — a wedge still trips it, a spike does not.
-        t_doctor=$(for _ in 1 2 3; do measure run_doctor; done | sort -n | sed -n '2p')
+        # One slow read under load is the machine, not the build, and a doctor
+        # re-read starts its vendor probes again. So a read that makes its budget
+        # is read once; one that does not gets two more, and the median judges.
+        # A wedge still trips it, a spike does not.
+        judge_read() { # judge_read <budget ms> <cmd...> — echoes "<ms> <exit status>"
+            judge_budget=$1
+            shift
+            read -r judge_ms judge_rc <<<"$(measure "$@")"
+            if [ "$judge_rc" -eq 0 ] && [ "$judge_ms" -gt "$judge_budget" ]; then
+                judge_again=$(for _ in 1 2; do measure "$@"; done)
+                judge_ms=$(printf '%s\n%s\n' "$judge_ms" "$judge_again" | awk '{ print $1 }' | sort -n | sed -n '2p')
+                judge_rc=$(printf '%s\n' "$judge_again" | awk '$2 != 0 { rc = $2 } END { print rc + 0 }')
+            fi
+            echo "$judge_ms $judge_rc"
+        }
+        read -r t_tail rc_tail <<<"$(judge_read "$tail_ms_budget" "$bin" log --tail 1)"
+        read -r t_usage rc_usage <<<"$(judge_read "$usage_ms_budget" "$bin" usage --days 7)"
+        read -r t_doctor rc_doctor <<<"$(judge_read "$doctor_ms_budget" run_doctor)"
+        tb_failed=""
+        [ "$rc_tail" -eq 0 ] || tb_failed="$tb_failed log --tail(exit $rc_tail)"
+        [ "$rc_usage" -eq 0 ] || tb_failed="$tb_failed usage(exit $rc_usage)"
+        # 142 is run_doctor's cap: a doctor that never answered is over budget,
+        # which the times below already say. Any other status failed fast.
+        case $rc_doctor in
+            0 | 142) ;;
+            *) tb_failed="$tb_failed doctor(exit $rc_doctor)" ;;
+        esac
         tb_bad=""
         [ "$t_tail" -gt "$tail_ms_budget" ] && tb_bad="$tb_bad tail(${t_tail}>${tail_ms_budget})"
         [ "$t_usage" -gt "$usage_ms_budget" ] && tb_bad="$tb_bad usage(${t_usage}>${usage_ms_budget})"
         [ "$t_doctor" -gt "$doctor_ms_budget" ] && tb_bad="$tb_bad doctor(${t_doctor}>${doctor_ms_budget})"
-        if [ -z "$tb_bad" ]; then
+        if [ -n "$tb_failed" ]; then
+            # A read that fails fast beats any budget and proves none of them.
+            line UNCHECKED time-budget "a failing read cannot be timed:$tb_failed"
+        elif [ -z "$tb_bad" ]; then
             line PASS time-budget \
                 "log --tail 1 ${t_tail}ms≤${tail_ms_budget} usage --days 7 ${t_usage}ms≤${usage_ms_budget} doctor ${t_doctor}ms≤${doctor_ms_budget}"
         else
+            load_now=$(LC_ALL=C uptime | sed -E 's/.*load averages?: *//' || true)
             line FAIL time-budget \
-                "over budget on:$tb_bad"
+                "over budget on:$tb_bad (median of 3; load $load_now — re-run when the machine is quiet to tell the build from the load)"
         fi
 
         # 8. Serving ≤ 5 s on the newest recorded boot — the goal §7 moved
         #    here from the rollback checks.
         if [ -f "$stamp" ]; then
-            started=$(sed -n 's/.*"started":"\([^"]*\)".*/\1/p' "$stamp")
-            serving=$(sed -n 's/.*"serving":"\([^"]*\)".*/\1/p' "$stamp")
+            started=$(sed -n 's/.*"started":"\([^"]*\)".*/\1/p' "$stamp" 2>/dev/null || true)
+            serving=$(sed -n 's/.*"serving":"\([^"]*\)".*/\1/p' "$stamp" 2>/dev/null || true)
             e0=$(ts_epoch "$started") e1=$(ts_epoch "$serving")
             if is_uint "${e0:-}" && is_uint "${e1:-}"; then
                 serving_ms=$(( (e1 - e0) * 1000 ))
@@ -1207,8 +1323,8 @@ case $sub in
             line PASS policy "no policy.json — 0 decisions possible"
         elif ! "$bin" policy check >/dev/null 2>&1; then
             line FAIL policy "policy.json cannot be a policy — it decides nothing"
-        elif [ -z "$usage_json" ]; then
-            line UNCHECKED policy "policy.json present but usage --json gave no rows"
+        elif [ -n "$usage_problem" ]; then
+            line UNCHECKED policy "policy.json present but $usage_problem"
         else
             denials=$(echo "$usage_json" | awk -v s="$since_day" '
                 match($0, /"day":"[^"]*"/) { day = substr($0, RSTART + 7, RLENGTH - 8) }
@@ -1233,19 +1349,35 @@ case $sub in
 
         line UNCHECKED operator-feel "only the operator can answer this one"
 
-        # The window is open for CONBUS_CANARY_WINDOW_DAYS (default 7).
-        # A fail inside it still exits 1 — 3 only means "not done yet".
-        swapped_epoch=$(ts_epoch "$since")
-        if [ "$fails" -gt 0 ]; then
-            say "verdict: FAIL ($fails failing item(s))"
-            exit 1
-        elif is_uint "${swapped_epoch:-}" &&
-            [ "$swapped_epoch" -gt 0 ] &&
-            [ $((($(date +%s) - swapped_epoch) / 86400)) -lt "$window_days" ]; then
-            say "verdict: window incomplete ($(( ($(date +%s) - swapped_epoch) / 86400 ))/${window_days} days) — not a pass yet"
-            exit 3
+        # The window is open for CONBUS_CANARY_WINDOW_DAYS (default 7), counted
+        # from the recorded swap. --since moves what the items read, never the
+        # clock: an older date cannot complete a window that is still running,
+        # and a look at part of a window is not that window's verdict.
+        if [ -n "$recorded_swap" ] && [ "$since" != "$recorded_swap" ]; then
+            line UNCHECKED window \
+                "--since $since is not the recorded swap $recorded_swap — a look at part of the window, not its verdict"
+        elif [ -z "$recorded_swap" ]; then
+            line UNCHECKED window \
+                "no recorded swap — nothing says $since is where a $window_days-day window began"
         fi
-        say "verdict: PASS"
+        window_epoch=$(ts_epoch "${recorded_swap:-$since}")
+        unchecked_names=$(printf '%s' "$unchecked" | sed 's/ — .*//' | tr '\n' ' ')
+        # A fail inside the window still exits 1 — 3 only means "not done yet".
+        if [ "$fails" -gt 0 ]; then
+            say "verdict: FAIL ($fails failing item(s))${unchecked_names:+; also not judged: $unchecked_names}"
+            exit 1
+        elif ! is_uint "${window_epoch:-}"; then
+            say "verdict: UNCHECKED — '${recorded_swap:-$since}' cannot be read as a time; not a pass"
+            exit 4
+        elif [ $((($(date +%s) - window_epoch) / 86400)) -lt "$window_days" ]; then
+            say "verdict: window incomplete ($(( ($(date +%s) - window_epoch) / 86400 ))/${window_days} days) — not a pass yet${unchecked_names:+; also not judged so far: $unchecked_names}"
+            exit 3
+        elif [ -n "$unchecked" ]; then
+            say "verdict: UNCHECKED — not a pass; these could not be judged:"
+            printf '%s' "$unchecked" | sed 's/^/canary:   /'
+            exit 4
+        fi
+        say "verdict: PASS — every item judged; operator-feel is still yours to answer"
         exit 0
         ;;
 
