@@ -47,7 +47,24 @@ use cli::Command;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match cli::parse(&args, std::env::var("CONBUS_HARNESS").ok()) {
+    let command = cli::parse(&args, std::env::var("CONBUS_HARNESS").ok());
+    // `backfill --apply` and its kin write the log themselves, so they hold the
+    // recorder's claim until they are done, or refuse before writing anything.
+    let _claim = match &command {
+        Command::Backfill { apply: true, .. } => match Paths::resolve() {
+            Ok(paths) => match daemon::claim_for_a_fill(&paths) {
+                Ok(claim) => claim,
+                Err(err) => {
+                    eprintln!("conbus: {err}");
+                    return ExitCode::FAILURE;
+                }
+            },
+            // `run` says this one.
+            Err(_) => None,
+        },
+        _ => None,
+    };
+    match command {
         // A hook must never fail the turn it is attached to, so every failure
         // below leaves on stderr and exits zero.
         Command::Hook {

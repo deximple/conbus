@@ -1023,27 +1023,11 @@ const PREPARE_GAVE_UP: i32 = 75;
 /// must not stop recording, so failing to lock is said and walked past: `bind`
 /// still refuses a second listener, as it did before there was a lock.
 fn claim_recorder(paths: &Paths) -> io::Result<Option<fs::File>> {
-    let file = paths.root().join("daemon.lock");
-    let lock = fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .mode(0o600)
-        .open(&file)
-        .map_err(|err| note!("could not open {} ({err}); not locking", file.display()))
-        .ok();
+    let lock = open_the_claim(paths);
     let deadline = std::time::Instant::now() + CLAIM_WAIT;
     let mut said = false;
     loop {
-        let locked = match lock.as_ref().map(fs::File::try_lock) {
-            None | Some(Ok(())) => true,
-            Some(Err(fs::TryLockError::WouldBlock)) => false,
-            Some(Err(fs::TryLockError::Error(err))) => {
-                note!("could not lock {} ({err}); going on", file.display());
-                true
-            }
-        };
-        if locked && !someone_is_serving(&paths.socket()) {
+        if holds_the_claim(paths, lock.as_ref()) {
             return Ok(lock);
         }
         if std::time::Instant::now() >= deadline {
@@ -1066,6 +1050,56 @@ fn claim_recorder(paths: &Paths) -> io::Result<Option<fs::File>> {
         }
         std::thread::sleep(CLAIM_POLL);
     }
+}
+
+fn open_the_claim(paths: &Paths) -> Option<fs::File> {
+    let file = paths.root().join("daemon.lock");
+    fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .open(&file)
+        .map_err(|err| note!("could not open {} ({err}); not locking", file.display()))
+        .ok()
+}
+
+/// One look: whether this process now holds the claim, and nobody of an older build
+/// is serving the socket either.
+fn holds_the_claim(paths: &Paths, lock: Option<&fs::File>) -> bool {
+    let locked = match lock.map(fs::File::try_lock) {
+        None | Some(Ok(())) => true,
+        Some(Err(fs::TryLockError::WouldBlock)) => false,
+        Some(Err(fs::TryLockError::Error(err))) => {
+            note!(
+                "could not lock {}/daemon.lock ({err}); going on",
+                paths.root().display()
+            );
+            true
+        }
+    };
+    locked && !someone_is_serving(&paths.socket())
+}
+
+/// The claim for `backfill --apply` and its kin, which write the log themselves.
+/// Held until the fill is done, so a daemon starting meanwhile waits for it as it
+/// waits for any holder. Refused at once if anyone holds it: a recorder, or a
+/// start-up repair that has no socket yet, writing beside a fill writes every turn
+/// it fills twice and reuses `seq`, for good.
+pub fn claim_for_a_fill(paths: &Paths) -> io::Result<Option<fs::File>> {
+    let _ = paths.keep_private();
+    let lock = open_the_claim(paths);
+    if holds_the_claim(paths, lock.as_ref()) {
+        return Ok(lock);
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AddrInUse,
+        format!(
+            "a recorder or its start-up repair is using the log in {}; stop the recorder first, \
+             then run this again. Nothing was written",
+            paths.root().display()
+        ),
+    ))
 }
 
 /// `conbus daemon --prepare`. A daemon's own child is handed the claim, so it

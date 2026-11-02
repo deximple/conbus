@@ -502,7 +502,8 @@ This reads Claude Code's transcripts (`~/.claude/projects`) and Codex's threads
 (through Codex's own app-server), and files each session as a conversation
 marked as recovered. A session the recorder already saw live is not duplicated.
 
-`--apply` refuses while the recorder is running, because both would write to
+`--apply` refuses while the recorder or its start-up repair holds the log, and holds
+it itself until done, because both would write to
 the same file. Stop it, backfill, start it again:
 
 ```bash

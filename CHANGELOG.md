@@ -15,7 +15,10 @@ the entry says so when it does.
   already there to go, and otherwise exits having written nothing. A start-up repair
   that outlives its daemon holds that lock until it ends, so the next daemon waits
   for it rather than writing beside it. A repair that never returns gives up after
-  two minutes, and the daemon serves without it.
+  two minutes, and the daemon serves without it. `backfill --apply`, `--gaps
+  --apply` and `--chat-export --apply` take the same lock before writing and hold it
+  until they are done, or refuse at once if a recorder or its start-up repair holds
+  it: a fill beside a start used to write every turn it filled twice.
 
 ## [1.0.0-rc.3] — 2026-11-01
 

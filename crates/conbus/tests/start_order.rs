@@ -186,13 +186,25 @@ fn records(home: &std::path::Path) -> Vec<serde_json::Value> {
         .collect()
 }
 
+/// Now, as a transcript line stamps it. Gap fill sets aside a line stamped well
+/// before its file was made, so a fixed date makes a fixture no fill would take.
+fn now_stamp() -> String {
+    let out = Command::new("/bin/date")
+        .args(["-u", "+%Y-%m-%dT%H:%M:%S.000Z"])
+        .output()
+        .expect("date")
+        .stdout;
+    String::from_utf8(out).expect("utf8").trim().to_string()
+}
+
 /// A transcript holding a turn the log does not: what a start fills a gap from.
 fn transcript_with_a_gap(home: &std::path::Path) {
     let dir = home.join(".claude/projects/-repo");
     std::fs::create_dir_all(&dir).expect("dir");
+    let ts = now_stamp();
     let line = |id: &str, text: &str| {
         serde_json::json!({
-            "type": "user", "sessionId": SESSION, "timestamp": "2026-11-01T00:00:00.000Z",
+            "type": "user", "sessionId": SESSION, "timestamp": ts,
             "version": "2.1.316", "cwd": "/repo", "entrypoint": "cli", "promptId": id,
             "message": {"role": "user", "content": text}
         })
@@ -551,4 +563,109 @@ fn a_repair_that_finishes_is_not_touched_by_its_watchdog() {
     let said = std::io::read_to_string(stderr).expect("stderr");
     assert!(said.contains("ran in a separate process"), "{said}");
     assert!(!said.contains("gave up"), "{said}");
+}
+
+#[test]
+fn a_fill_by_hand_does_not_write_beside_a_start_up_repair_that_holds_the_root() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let first = Daemon(daemon_in(home.path()).spawn().expect("first"));
+    wait_serving(home.path(), first.0.id());
+    hook(home.path(), &prompt("p0", "first"));
+    drop(first);
+    let starting = Daemon(
+        daemon_in(home.path())
+            .env("CONBUS_TEST_PAUSE_IN_PREPARE_MS", "5000")
+            .spawn()
+            .expect("daemon"),
+    );
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while stamped_pid(home.path()) != Some(u64::from(starting.0.id())) {
+        assert!(Instant::now() < deadline, "never stamped");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    for args in [
+        &["backfill", "--gaps", "--apply"][..],
+        &["backfill", "--apply"][..],
+    ] {
+        let status = Command::new(bin())
+            .args(args)
+            .env("CONBUS_HOME", home.path())
+            .env("HOME", home.path())
+            .env("CONBUS_SKIP_LAUNCHCTL", "1")
+            .env("CONBUS_CODEX_BIN", "/nonexistent/codex")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("backfill");
+        assert!(
+            !status.success(),
+            "{args:?} ran while a start-up repair holds the root, and both write"
+        );
+    }
+    drop(starting);
+}
+
+#[test]
+fn the_gap_fixture_is_a_gap_a_start_would_fill() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let first = Daemon(daemon_in(home.path()).spawn().expect("daemon"));
+    wait_serving(home.path(), first.0.id());
+    hook(home.path(), &prompt("p0", "first"));
+    drop(first);
+    transcript_with_a_gap(home.path());
+    let second = Daemon(daemon_in(home.path()).spawn().expect("daemon"));
+    wait_serving(home.path(), second.0.id());
+    drop(second);
+    assert!(
+        records(home.path())
+            .iter()
+            .any(|r| r["vendor_turn_id"] == "gap"),
+        "the fixture's gap line is older than its file, so no fill takes it"
+    );
+}
+
+#[test]
+fn every_fill_by_hand_says_why_it_will_not_write_beside_the_recorder() {
+    // The plain words a person needs, from each of the three, and nothing written.
+    let home = tempfile::tempdir().expect("tempdir");
+    let live = Daemon(daemon_in(home.path()).spawn().expect("daemon"));
+    wait_serving(home.path(), live.0.id());
+    hook(home.path(), &prompt("p0", "first"));
+    transcript_with_a_gap(home.path());
+    let export_file = home.path().join("conversations.json");
+    let export = export_file.to_str().expect("utf8");
+    let before = records(home.path()).len();
+
+    let mut said = Vec::new();
+    for args in [
+        &["backfill", "--gaps", "--apply"][..],
+        &["backfill", "--apply"][..],
+        &["backfill", "--chat-export", export, "--apply"][..],
+    ] {
+        let out = Command::new(bin())
+            .args(args)
+            .env("CONBUS_HOME", home.path())
+            .env("HOME", home.path())
+            .env("CONBUS_SKIP_LAUNCHCTL", "1")
+            .env("CONBUS_CODEX_BIN", "/nonexistent/codex")
+            .stdout(Stdio::null())
+            .output()
+            .expect("backfill");
+        said.push((
+            format!("{args:?}"),
+            out.status.success(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        ));
+    }
+    let wrote = records(home.path()).len() - before;
+    drop(live);
+
+    for (args, succeeded, stderr) in said {
+        assert!(!succeeded, "{args}");
+        assert!(
+            stderr.contains("stop the recorder first"),
+            "{args}: {stderr}"
+        );
+    }
+    assert_eq!(wrote, 0);
 }
