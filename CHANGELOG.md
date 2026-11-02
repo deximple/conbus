@@ -6,6 +6,12 @@ the entry says so when it does.
 
 ## [Unreleased]
 
+### Fixed
+
+- Release packages now carry `THIRD_PARTY_NOTICES.txt`, the license text of every
+  crate built into the binary. They went out without it, though BSD-3-Clause asks
+  for it in a binary distribution and MIT for a copy of its notice.
+
 ## [1.0.0-rc.3] — 2026-11-01
 
 ### Fixed

@@ -944,8 +944,14 @@ esac
 expect root/root "$(owners_of "$pack/dist/${built[0]}")" "package.sh names no account in its tar headers"
 expect "conbus
 LICENSE
+THIRD_PARTY_NOTICES.txt
 README.md
-CHANGELOG.md" "$(tar -tzf "$pack/dist/${built[0]}")" "package.sh packs the same four members"
+CHANGELOG.md" "$(tar -tzf "$pack/dist/${built[0]}")" "package.sh packs the same five members"
+tar -xOzf "$pack/dist/${built[0]}" THIRD_PARTY_NOTICES.txt >"$tmp/notices.txt"
+grep -q '^curve25519-dalek .* BSD-3-Clause$' "$tmp/notices.txt" ||
+    fail "the package does not carry the notice of a crate built into the binary"
+grep -q 'isis agora lovecruft' "$tmp/notices.txt" ||
+    fail "the package names a crate and leaves out its copyright line"
 
 # A binary without the stamp could not be checked at release time, so it stops here.
 case $(uname -s) in

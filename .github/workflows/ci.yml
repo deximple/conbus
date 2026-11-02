@@ -64,6 +64,9 @@ jobs:
       - name: test
         run: cargo test --workspace --locked --no-fail-fast
 
+      - name: every shipped crate has its license text
+        run: sh scripts/third-party-notices.sh >/dev/null
+
       - name: canary rehearsal
         run: bash scripts/canary-rehearsal.sh
 
