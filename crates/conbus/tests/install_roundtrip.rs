@@ -387,3 +387,45 @@ fn uninstall_profile_takes_back_only_the_profile() {
         "the default profile keeps its registration"
     );
 }
+
+#[test]
+fn a_home_with_a_space_in_it_registers_hooks_that_run() {
+    // Installed the way a person would, and the registered command run the way a
+    // vendor runs it: through a shell, with the payload on stdin.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path().join("first last");
+    std::fs::create_dir_all(home.join(".claude")).expect("mkdir");
+    write(&home.join(".claude/settings.json"), &json!({}));
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_conbus"));
+
+    conbus(&binary, &home, &["install", "--apply"]);
+
+    let settings = read(&home.join(".claude/settings.json"));
+    let command = settings["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
+        .as_str()
+        .expect("a registered command")
+        .to_string();
+    let mut hook = Command::new("/bin/sh")
+        .args(["-c", &command])
+        .env("HOME", &home)
+        .env("CONBUS_SKIP_LAUNCHCTL", "1")
+        .env_remove("CONBUS_HOME")
+        .env_remove("XDG_STATE_HOME")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("sh");
+    std::io::Write::write_all(
+        hook.stdin.as_mut().expect("stdin"),
+        br#"{"session_id":"s","hook_event_name":"UserPromptSubmit","prompt":"x","prompt_id":"T"}"#,
+    )
+    .expect("payload");
+    let out = hook.wait_with_output().expect("wait");
+
+    assert!(out.status.success(), "{command}: {out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("\"continue\":true"),
+        "the hook did not run: {command}: {out:?}"
+    );
+}

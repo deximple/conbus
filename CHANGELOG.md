@@ -6,6 +6,12 @@ the entry says so when it does.
 
 ## [Unreleased]
 
+### Fixed
+
+- `install` now quotes the binary's path in the hooks it registers when the path
+  needs it. With a space in the home folder, every hook failed to start, so nothing
+  was recorded. `conbus doctor` reported it, and nothing else did.
+
 ## [1.0.0-rc.3] — 2026-11-01
 
 ### Fixed
