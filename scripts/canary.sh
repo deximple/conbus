@@ -28,14 +28,21 @@
 #     fails. After the swap it requires, inside
 #     CONBUS_CANARY_SERVING_LIMIT seconds (default 30): a new daemon pid
 #     serving, a doctor with no DIFFERS against the candidate build,
-#     every hooks line `runs`, and zero drop reasons that were not there
-#     before — except the two a normal swap window produces (a protocol
-#     refusal while the old daemon still answers, or no listener
-#     mid-restart), which are counted into canary.json as
-#     swap_window_drops instead. Any other failure rolls back
-#     automatically and exits 1. The 5-second serving goal is a verdict
-#     criterion, not a rollback one — current measurements sit above it
-#     and would undo every cutover.
+#     every installed vendor's hooks line `runs` with no event missing, a daemon that answers on
+#     its socket, and zero drop reasons that were not there before — except
+#     the two a normal swap window produces (a protocol refusal while the old
+#     daemon still answers, or no listener mid-restart), which are counted
+#     into canary.json as swap_window_drops instead, and lines that lost no
+#     record. Any other failure rolls back automatically and exits 1. The
+#     5-second serving goal is a verdict criterion, not a rollback one —
+#     current measurements sit above it and would undo every cutover.
+#   - `hooks ... runs` is not a round trip: doctor starts the command with a
+#     marker that returns before the socket, and for Cursor and OpenCode only
+#     reads the registration. So preflight --from sends the candidate's own hook
+#     through its own daemon into a throwaway log, and after the swap the live
+#     daemon must answer on its socket. Neither writes to the real log. What no
+#     check here can prove is that a vendor fires its hook; the verdict's
+#     harness-activity judges that from the records that arrive.
 #   - state lives at <root>/canary.json: swap time, previous/candidate
 #     builds, candidate sha, swap-window drop count, and the planned
 #     restarts (each with its start->serving milliseconds and the number
@@ -1328,6 +1335,68 @@ ts_epoch() {
     fi
 }
 
+# Does a record land through this binary? Its own hook, its own daemon, a log in a
+# throwaway root. No vendor can be found on this PATH, the empty root gives gap fill
+# nothing to read, and an unset retention never asks the Keychain. It proves the
+# binary's own path on this machine, not that a vendor calls it.
+candidate_round_trip() { # candidate_round_trip <binary>; says what happened, 0 if a record landed
+    rt_home=$(mktemp -d /tmp/canary-roundtrip.XXXXXX) || {
+        echo "could not make a throwaway root"
+        return 1
+    }
+    # Split on purpose, and no function around it: env execs the daemon, so `$!`
+    # is the daemon. Behind a function it would be a subshell, and the kill below
+    # would leave the daemon running on a root that is about to be removed.
+    rt_env="env -i HOME=$rt_home PATH=/usr/bin:/bin TMPDIR=/tmp CONBUS_SKIP_LAUNCHCTL=1 CONBUS_AGY_BIN=/usr/bin/false CONBUS_CODEX_BIN=/usr/bin/false"
+    $rt_env "$1" daemon >"$rt_home/daemon.out" 2>&1 &
+    rt_pid=$!
+    rt_said=""
+    rt_n=0
+    while ! grep -q '"serving"' "$rt_home/.conbus/daemon.build" 2>/dev/null; do
+        rt_n=$((rt_n + 1))
+        if ! kill -0 "$rt_pid" 2>/dev/null; then
+            rt_said="its daemon exited before serving an empty root"
+            break
+        fi
+        if [ "$rt_n" -gt $((serving_limit * 10)) ]; then
+            rt_said="its daemon did not serve an empty root inside ${serving_limit}s"
+            break
+        fi
+        sleep 0.1
+    done
+    if [ -z "$rt_said" ]; then
+        printf '{"session_id":"canary-round-trip","hook_event_name":"UserPromptSubmit","cwd":"%s","prompt":"canary round trip","prompt_id":"p1"}' "$rt_home" |
+            $rt_env "$1" hook --harness claude_code >/dev/null 2>&1 || rt_said="its hook exited non-zero"
+    fi
+    if [ -z "$rt_said" ]; then
+        rt_records=$($rt_env "$1" log --json 2>/dev/null | wc -l | tr -d ' ' || true)
+        if [ "${rt_records:-0}" -gt 0 ]; then
+            rt_said="ok"
+        else
+            rt_said="its hook answered, and no record reached the log"
+        fi
+    fi
+    kill "$rt_pid" 2>/dev/null || true
+    rt_n=0
+    while kill -0 "$rt_pid" 2>/dev/null && [ "$rt_n" -lt 50 ]; do
+        sleep 0.1
+        rt_n=$((rt_n + 1))
+    done
+    if kill -0 "$rt_pid" 2>/dev/null; then
+        # Removing a root under a live daemon helps nobody; say where it is.
+        rt_said="$rt_said; its daemon outlived SIGTERM, $rt_home left in place"
+    else
+        wait "$rt_pid" 2>/dev/null || true
+        rm -rf "$rt_home"
+    fi
+    if [ "$rt_said" = ok ]; then
+        echo "a record reached a throwaway log through this binary's own hook and daemon"
+        return 0
+    fi
+    echo "$rt_said"
+    return 1
+}
+
 # --- subcommands ------------------------------------------------------------
 
 do_preflight() {
@@ -1511,6 +1580,11 @@ do_preflight() {
             check 0 cache "$index_out"
         else
             check 1 cache "candidate log index failed: $index_out"
+        fi
+        if rt_out=$(candidate_round_trip "$from"); then
+            check 0 round-trip "$rt_out"
+        else
+            check 1 round-trip "$rt_out"
         fi
     else
         check 2 cache "no --from — the live cache is not prebuilt"
@@ -2131,9 +2205,15 @@ case $sub in
             elif ! grep -q 'listening' <<<"$doctor_out"; then
                 fail_reason="the daemon is not answering after the swap"
             else
-                bad_hooks=$(awk '/^hooks / && !/ runs /' <<<"$doctor_out" | sed -n '1p')
+                # A vendor this machine does not have has no hook to run, and
+                # trust is a person's act, told below rather than rolled back.
+                bad_hooks=$(hook_problems "$doctor_out" | awk '!/^ +(NOT TRUSTED|MODIFIED)/' | sed -n '1p')
                 if [ -n "$bad_hooks" ]; then
                     fail_reason="a hook is not 'runs': ${bad_hooks#hooks     }"
+                elif ! grep -q '^hooks .* runs ' <<<"$doctor_out"; then
+                    fail_reason="no hook runs here"
+                elif ! probe_recorder; then
+                    fail_reason="the daemon did not answer a request on its socket"
                 fi
             fi
         fi
@@ -2185,7 +2265,13 @@ case $sub in
                 "" "$swap_window_drops"
         fi
 
-        say "start: serving, matching build, hooks runs, no new drops — canary is live"
+        # Trust is a person's act inside Codex, so it cannot undo a swap. verdict
+        # fails it if it is still so a week later.
+        if grep -qE '^ +(NOT TRUSTED|MODIFIED)' <<<"$doctor_out"; then
+            say "start: Codex will not spawn some hooks until you approve them inside Codex; run 'conbus doctor' to see which"
+        fi
+        say "start: serving, matching build, hooks registered and starting, daemon answering, no new drops — canary is live"
+        say "start: not proved here: that a vendor fires its hooks. preflight sent the candidate's own hook through its own daemon into a throwaway log; harness-activity in 'canary.sh verdict' judges the real records"
         ;;
 
     rollback)
