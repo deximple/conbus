@@ -1212,7 +1212,7 @@ expect_grep '1× tool_use: spooled hook' "$tmp/verdict-orphan.out" "by event"
 expect_no_grep '01a0630' "$tmp/verdict-orphan.out" "without a session id"
 
 # A payload that names no session is the vendor's, per the plan: shown, and it
-# stops a pass only as a flood. Same for a payload the hook could not parse.
+# stops a pass only as a flood. Same for an empty payload.
 verdict_fixture
 drop_line 3600 'the hook payload names no session; an empty id would merge unrelated sessions into one conversation' 'preToolUse as cursor (fields: cwd,tool_name)'
 drop_line 3600 'EOF while parsing a value at line 1 column 0'
@@ -1291,6 +1291,35 @@ drop_line 3600 'the recorder stopped with records it could not land' '0 record(s
 code=0
 run verdict >"$tmp/verdict-stopped-zero.out" 2>&1 || code=$?
 expect 1 "$code" "a count of zero does not clear the line"
+
+# A vendor renaming or retyping a field reaches the hook as a parse error with a line and a column. These are what a
+# real hook writes for it, and the prompts are gone. Only an empty payload is what a hook run by hand says.
+verdict_fixture; drop_line 3600 'missing field `session_id` at line 1 column 66'
+code=0; run verdict >"$tmp/verdict-renamed-field.out" 2>&1 || code=$?
+expect 1 "$code" "a payload missing a field is the vendor moving, not noise (P1)"
+expect_grep '^FAIL drops — 1 adapter gap' "$tmp/verdict-renamed-field.out" "and is counted as an adapter gap"
+expect_grep 'missing field `session_id`$' "$tmp/verdict-renamed-field.out" "named without its column, so a hundred lines are one row"
+verdict_fixture; drop_line 3600 'invalid type: map, expected a string at line 1 column 14'
+code=0; run verdict >"$tmp/verdict-retyped-field.out" 2>&1 || code=$?
+expect 1 "$code" "a retyped field is the vendor moving, not noise (P1b)"
+verdict_fixture; drop_line 3600 'invalid type: string \"x\", expected a map at line 1 column 14'
+code=0; run verdict >"$tmp/verdict-retyped-quoted.out" 2>&1 || code=$?
+expect 1 "$code" "one with a quoted value too"
+expect_grep 'invalid type: string' "$tmp/verdict-retyped-quoted.out" "named whole, not cut at its quote"
+verdict_fixture; drop_line 3600 'EOF while parsing a value at line 1 column 0'
+code=0; run verdict >"$tmp/verdict-eof.out" 2>&1 || code=$?
+expect 0 "$code" "an empty payload stays shown only"
+# An invalid byte used to read as the empty payload above, with the prompt gone.
+verdict_fixture; drop_line 3600 'the hook payload could not be read' 'stream did not contain valid UTF-8'
+code=0; run verdict >"$tmp/verdict-unread-payload.out" 2>&1 || code=$?
+expect 1 "$code" "a payload that could not be read is a lost record"
+expect_grep '^FAIL drops — 1 lost record' "$tmp/verdict-unread-payload.out" "and counted as one"
+# Seen before the swap is no excuse, and a parse error at the swap is a new reason to start.
+verdict_fixture
+drop_line $((8 * DAY)) 'missing field `session_id` at line 1 column 66'
+drop_line 3600 'missing field `session_id` at line 1 column 66'
+code=0; run verdict >"$tmp/verdict-renamed-known.out" 2>&1 || code=$?
+expect 1 "$code" "a gap seen before the swap still fails"
 
 # The same words, seen before and covered by no rule, need a person.
 verdict_fixture

@@ -583,7 +583,9 @@ say_spool() {
 #               conversation to go in, and `the recorder stopped with records it
 #               could not land` (#158), whose detail says how many.
 #   gap         the adapter has no mapping for an event (`no mapping`, `no
-#               adapter`): the vendor moved. Fails at any count, named by event.
+#               adapter`), or a payload that does not parse as what it expects
+#               (`missing field ... at line N column M`): the vendor moved, and the
+#               prompt is gone. Fails at any count, named by event or by shape.
 #   ghost       the end of a session or a turn, or a notification, for a session
 #               with no binding. It carries no content of its own: 693 of the 729
 #               orphan lines in the three weeks before the swap, 8 of them within two
@@ -591,8 +593,10 @@ say_spool() {
 #               729 never reached the log.
 #   sessionless the payload named no session. The plan counts this as the vendor's,
 #               not a lost record.
-#   payload     the hook could not parse what it was given; it cannot say whether
-#               that was a record. 64 lines in eight weeks.
+#   payload     `EOF while parsing`: the hook was given nothing, which is what one
+#               run by hand says. 64 lines in eight weeks, and nothing else in the
+#               real history ends in a line and a column. Since the hook names a
+#               stdin it could not read, an invalid byte no longer reads as this.
 #   held        `the log refused writes for a while` (#155): an outage's one line,
 #               written once a write worked, when every record waited and landed.
 #               Delayed, not lost, and counted on its own line because a person
@@ -631,9 +635,11 @@ function drop_class(r, d) {
         starts(r, "no reply from the daemon:") || starts(r, "unreadable reply ") ||
         starts(r, "could not bound the daemon call:") || starts(r, "the daemon refused the record:") ||
         starts(r, "spooled hook refused") || starts(r, "spool entry ") ||
-        starts(r, "no home directory to resolve") || starts(r, "the socket path "))
+        starts(r, "no home directory to resolve") || starts(r, "the socket path ") ||
+        starts(r, "the hook payload could not be read"))
         return "lost"
-    if (starts(r, "could not read the hook payload") || r ~ / at line [0-9]+ column [0-9]+$/) return "payload"
+    if (starts(r, "EOF while parsing")) return "payload"
+    if (r ~ / at line [0-9]+ column [0-9]+$/) return "gap"
     return "other"
 }
 # The two reasons a normal swap window produces. Between the mv and the new
@@ -648,6 +654,11 @@ function drop_swap_reason(r,    old_v, new_v) {
     return old_v != new_v
 }
 function drop_gap_name(r,    rest, event, as) {
+    if (!starts(r, "no mapping") && !starts(r, "no adapter")) {
+        rest = r
+        sub(/ at line [0-9]+ column [0-9]+$/, "", rest)
+        return rest
+    }
     rest = r
     sub(/^[^"]*"/, "", rest)
     event = rest
