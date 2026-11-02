@@ -2469,6 +2469,15 @@ expect 4 "$code" "an OS boot time that cannot be read leaves it open"
 expect_grep '^UNCHECKED reboots' "$tmp/verdict-reboot-unread.out" "and says so"
 boot_at_none
 
+# A start line from before a boot is not that boot's, even inside the minute `last reboot` rounds to.
+verdict_fixture
+boot_at "$(iso_after "$fx_swapped" 10)"
+printf '%s conbus daemon: beef: socket /x/sock log /x/log (10 record(s), 0 unreadable)\n' "$(iso_after "$fx_swapped" 30)" >>"$home/.conbus/daemon.log"
+code=0; run verdict >"$tmp/verdict-reboot-soon.out" 2>&1 || code=$?
+expect 0 "$code" "a reboot right after the swap has its own start line"
+expect_grep '^PASS reboots — 1 reboot(s) in the window' "$tmp/verdict-reboot-soon.out" "and it is counted"
+boot_at_none
+
 # Trimming daemon.log must not read as zero restarts. Only a planned restart's
 # line left: the swap's own boot is gone, so nothing can be said before that line.
 planned_at=$(iso_ago $((2 * DAY)))

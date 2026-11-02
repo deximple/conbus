@@ -1504,7 +1504,9 @@ verdict_restarts() {
             b = split(boots, boot, " ")
             for (j = 1; j <= b; j++) {
                 for (i = 1; i <= n; i++) {
-                    if (st[i] < boot[j] - 60) continue
+                    # Up to a minute early, for what the reboot list rounds off. A start already
+                    # claimed that is earlier than the boot did not come from this boot.
+                    if (st[i] < boot[j] - 60 || ((i in used) && st[i] < boot[j])) continue
                     if (st[i] <= boot[j] + boot_grace && !(i in used)) { used[i] = 1; rebooted++ }
                     break
                 }
