@@ -121,9 +121,9 @@ write_fake() {
         nohooks) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "log       5 record(s), 1 conversation(s), 0 unreadable line(s)"; echo "hooks     cursor       not installed here"' ;;
         rotating) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "disk      log 1.0 MB — 1.0 GB free of 2.0 GB (50.0%)"; echo "log       5 record(s), 1 conversation(s), 0 unreadable line(s)"; echo "hooks     claude_code  runs — x"' ;;
         elided) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "hooks     claude_code  runs — x"'
-            install_body='touch "$HOME/.install-called"; now=$(perl -MTime::HiRes=gettimeofday -MPOSIX=strftime -e "(\$s,\$u)=gettimeofday; printf \"%s.%03dZ\", strftime(\"%Y-%m-%dT%H:%M:%S\", gmtime(\$s)), int(\$u/1000)"); printf "{\"detail\":\"7 tool event(s)\",\"reason\":\"tool bodies elided, not sealed\",\"ts\":\"%s\"}\n{\"reason\":\"the log refused writes for a while\",\"ts\":\"%s\"}\n" "$now" "$now" >> "$HOME/.conbus/drops.jsonl"' ;;
+            install_body='touch "$HOME/.install-called"; now=$(perl -MTime::HiRes=gettimeofday -MPOSIX=strftime -e "(\$s,\$u)=gettimeofday; printf \"%s.%03dZ\", strftime(\"%Y-%m-%dT%H:%M:%S\", gmtime(\$s)), int(\$u/1000)"); printf "{\"ts\":\"%s\",\"reason\":\"tool bodies elided, not sealed\",\"detail\":\"7 tool event(s)\"}\n{\"ts\":\"%s\",\"reason\":\"the log refused writes for a while\",\"detail\":\"7 record(s) waited and landed, 0 could not be kept, since 2026-11-01T00:00:00.000Z: No space left on device (os error 28)\"}\n" "$now" "$now" >> "$HOME/.conbus/drops.jsonl"' ;;
         lostlines) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "hooks     claude_code  runs — x"'
-            install_body='touch "$HOME/.install-called"; now=$(perl -MTime::HiRes=gettimeofday -MPOSIX=strftime -e "(\$s,\$u)=gettimeofday; printf \"%s.%03dZ\", strftime(\"%Y-%m-%dT%H:%M:%S\", gmtime(\$s)), int(\$u/1000)"); printf "{\"detail\":\"2 record(s) lost\",\"reason\":\"the recorder stopped with records it could not land\",\"ts\":\"%s\"}\n{\"reason\":\"the log refused writes for a while and records may be lost\",\"ts\":\"%s\"}\n" "$now" "$now" >> "$HOME/.conbus/drops.jsonl"' ;;
+            install_body='touch "$HOME/.install-called"; now=$(perl -MTime::HiRes=gettimeofday -MPOSIX=strftime -e "(\$s,\$u)=gettimeofday; printf \"%s.%03dZ\", strftime(\"%Y-%m-%dT%H:%M:%S\", gmtime(\$s)), int(\$u/1000)"); printf "{\"ts\":\"%s\",\"reason\":\"the recorder stopped with records it could not land\",\"detail\":\"2 record(s) lost\"}\n{\"ts\":\"%s\",\"reason\":\"the log refused writes for a while and records may be lost\",\"detail\":\"3 record(s) waited and landed, 1 could not be kept, since 2026-11-01T00:00:00.000Z: No space left on device (os error 28)\"}\n" "$now" "$now" >> "$HOME/.conbus/drops.jsonl"' ;;
         knowndrop) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "hooks     claude_code  runs — x"'
             install_body='touch "$HOME/.install-called"; printf "{\"ts\":\"%s\",\"reason\":\"socket closed early\"}\n" "$(perl -MTime::HiRes=gettimeofday -MPOSIX=strftime -e "(\$s,\$u)=gettimeofday; printf \"%s.%03dZ\", strftime(\"%Y-%m-%dT%H:%M:%S\", gmtime(\$s)), int(\$u/1000)")" >> "$HOME/.conbus/drops.jsonl"' ;;
         notokens) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "hooks     claude_code  runs — x"' ;;
@@ -1127,11 +1127,13 @@ rm -f "$home/.conbus/drops.1.jsonl"
 
 # --- what a drop line means ---------------------------------------------------
 
+# The real writer's field order: ts, reason, detail. Reversed, a torn line never tore
+# where a real one does, and a test of it proved nothing about the real file.
 drop_line() { # drop_line <seconds ago> <reason, JSON-escaped> [detail]
     if [ -n "${3:-}" ]; then
-        printf '{"detail":"%s","reason":"%s","ts":"%s"}\n' "$3" "$2" "$(iso_ago "$1")"
+        printf '{"ts":"%s","reason":"%s","detail":"%s"}\n' "$(iso_ago "$1")" "$2" "$3"
     else
-        printf '{"reason":"%s","ts":"%s"}\n' "$2" "$(iso_ago "$1")"
+        printf '{"ts":"%s","reason":"%s"}\n' "$(iso_ago "$1")" "$2"
     fi >>"$home/.conbus/drops.jsonl"
 }
 
@@ -1190,7 +1192,7 @@ expect 1 "$code" "an event already unmapped before the swap still lost its recor
 # swap back or failed a week. A tool event in one is real content, and fails.
 verdict_fixture
 for ghost in 'SessionEnd for session 01a06300' 'sessionEnd for session 01a06301' 'Stop for session 01a06302'; do
-    drop_line 3600 'no conversation for this session; the daemon has no binding for it (a restart mid-turn looks exactly like this)' "$ghost"
+    drop_line 3600 'no conversation for this session; the daemon has no binding for it (no prompt from this session has reached it)' "$ghost"
 done
 drop_line 3600 'spooled hook still has no conversation (orphan)' 'session_ended for session 01a06303'
 code=0
@@ -1234,22 +1236,22 @@ expect 2 "$code" "a limit that is not a number is refused"
 # A full disk that the daemon outlasted (#155). Every record waited and landed, so
 # that line is no loss. The same outage with records it could not keep is one.
 verdict_fixture
-drop_line 3600 'the log refused writes for a while' '3 record(s) waited in memory and landed, 0 could not be kept there, since 2026-11-01T00:00:00.000Z: No space left on device (os error 28)'
+drop_line 3600 'the log refused writes for a while' '3 record(s) waited and landed, 0 could not be kept, since 2026-11-01T00:00:00.000Z: No space left on device (os error 28)'
 code=0
 run verdict >"$tmp/verdict-held.out" 2>&1 || code=$?
 expect 0 "$code" "an outage in which every record landed is not a loss"
 expect_grep '^PASS drops — 0 lost records (1 line(s) since' "$tmp/verdict-held.out" "drops passes: it is not a drop"
 expect_no_grep 'not seen before\|no rule covers need' "$tmp/verdict-held.out" "and not a new reason"
 expect_grep '^PASS log-outages — 1 time(s) the log refused writes' "$tmp/verdict-held.out" "the outage has its own line"
-expect_grep '^  1× 3 record(s) waited in memory and landed' "$tmp/verdict-held.out" "with what it said"
-drop_line 1800 'the log refused writes for a while' '1 record(s) waited in memory and landed, 0 could not be kept there, since 2026-11-01T01:00:00.000Z: No space left on device (os error 28)'
+expect_grep '^  1× 3 record(s) waited and landed' "$tmp/verdict-held.out" "with what it said"
+drop_line 1800 'the log refused writes for a while' '1 record(s) waited and landed, 0 could not be kept, since 2026-11-01T01:00:00.000Z: No space left on device (os error 28)'
 code=0
 run verdict >"$tmp/verdict-held-two.out" 2>&1 || code=$?
 expect 0 "$code" "two outages are still no loss"
 expect_grep '^PASS log-outages — 2 time(s)' "$tmp/verdict-held-two.out" "they are counted"
 expect_grep '^PASS log-outages — 0 time(s)' "$tmp/verdict.out" "and a window with none says so"
 verdict_fixture
-drop_line 3600 'the log refused writes for a while and records may be lost' '3 record(s) waited in memory and landed, 2 could not be kept there, since 2026-11-01T00:00:00.000Z: No space left on device (os error 28)'
+drop_line 3600 'the log refused writes for a while and records may be lost' '3 record(s) waited and landed, 2 could not be kept, since 2026-11-01T00:00:00.000Z: No space left on device (os error 28)'
 code=0
 run verdict >"$tmp/verdict-held-lost.out" 2>&1 || code=$?
 expect 1 "$code" "an outage that could not keep its records fails"
@@ -1258,7 +1260,7 @@ expect_grep '^PASS log-outages — 0 time(s)' "$tmp/verdict-held-lost.out" "and 
 # Inside the swap window it is no less lost, and known words do not excuse it.
 verdict_fixture "$(iso_ago 120)"
 drop_line $((3 * DAY)) 'the log refused writes for a while and records may be lost' 'seen before the swap'
-drop_line 100 'the log refused writes for a while and records may be lost' '3 record(s) waited in memory and landed, 2 could not be kept there, since 2026-11-01T00:00:00.000Z: No space left on device (os error 28)'
+drop_line 100 'the log refused writes for a while and records may be lost' '3 record(s) waited and landed, 2 could not be kept, since 2026-11-01T00:00:00.000Z: No space left on device (os error 28)'
 code=0
 run verdict >"$tmp/verdict-held-lost-swap.out" 2>&1 || code=$?
 expect 1 "$code" "records may be lost has no exemption, not even in the swap window"
@@ -1302,13 +1304,13 @@ expect_grep '^UNCHECKED drops.*no rule covers' "$tmp/verdict-known.out" "and say
 # A line that cannot be read is not a line without a problem, and one bad byte
 # must not cost the read of the line it sits on.
 verdict_fixture
-printf '{"reason":"no daem\n' >>"$home/.conbus/drops.jsonl"
+printf '{"ts":"%s","reason":"no daem' "$(iso_ago 3600)" >>"$home/.conbus/drops.jsonl"
 code=0
 run verdict >"$tmp/verdict-torn.out" 2>&1 || code=$?
 expect 4 "$code" "a torn drop line is not a pass"
 expect_grep '^UNCHECKED drops.*no readable time or reason' "$tmp/verdict-torn.out" "the torn line is counted"
 verdict_fixture
-printf '{"reason":"no daemon on /x/\377/sock: Connection refused (os error 61)","ts":"%s"}\n' "$(iso_ago 3600)" \
+printf '{"ts":"%s","reason":"no daemon on /x/\377/sock: Connection refused (os error 61)"}\n' "$(iso_ago 3600)" \
     >>"$home/.conbus/drops.jsonl"
 code=0
 LC_ALL=en_US.UTF-8 run verdict >"$tmp/verdict-badbyte.out" 2>&1 || code=$?
@@ -1321,7 +1323,7 @@ expect_grep 'verdict: FAIL' "$tmp/verdict-badbyte.out" "and the verdict reaches 
 fill_to_cap() { # fill_to_cap <ts> — plain perl: `yes | head` dies on SIGPIPE under pipefail
     perl -e '
         my ($file, $ts) = @ARGV;
-        my $line = "{\"reason\":\"the hook payload names no session; an empty id would merge unrelated sessions into one conversation\",\"ts\":\"$ts\"}\n";
+        my $line = "{\"ts\":\"$ts\",\"reason\":\"the hook payload names no session; an empty id would merge unrelated sessions into one conversation\"}\n";
         my $n = int((4 * 1024 * 1024 - (-s $file)) / length($line)) + 1;
         open(my $fh, ">>", $file) or die; print $fh $line x $n; close $fh;' "$home/.conbus/drops.jsonl" "$1"
 }
@@ -1365,7 +1367,7 @@ expect_grep '^PASS drops-cap' "$tmp/preflight-rotating.out" "preflight lets a ro
 # Just rotated, no live file yet: the new reason is only in drops.1.
 verdict_fixture
 mv "$home/.conbus/drops.jsonl" "$home/.conbus/drops.1.jsonl"
-printf '{"reason":"a fault in the old generation","ts":"%s"}\n' "$(iso_ago 3600)" >>"$home/.conbus/drops.1.jsonl"
+printf '{"ts":"%s","reason":"a fault in the old generation"}\n' "$(iso_ago 3600)" >>"$home/.conbus/drops.1.jsonl"
 code=0
 run verdict >"$tmp/verdict-rotated-only.out" 2>&1 || code=$?
 expect 1 "$code" "a new reason only in drops.1 fails with no live file"
@@ -1382,7 +1384,7 @@ expect 0 "$code" "one rotation loses nothing"
 # Two rotations threw the baseline and part of the window away. Known kinds are
 # still known, which ends the false FAIL, and the hole in the evidence is named.
 verdict_fixture
-printf '{"reason":"the hook payload names no session; an empty id would merge unrelated sessions into one conversation","ts":"%s"}\n' \
+printf '{"ts":"%s","reason":"the hook payload names no session; an empty id would merge unrelated sessions into one conversation"}\n' \
     "$(iso_ago $((3 * DAY)))" >"$home/.conbus/drops.1.jsonl"
 rm -f "$home/.conbus/drops.jsonl"
 drop_line 3600 'the hook payload names no session; an empty id would merge unrelated sessions into one conversation'
@@ -1392,7 +1394,7 @@ expect 4 "$code" "two rotations leave a hole, not a pass and not a fail"
 expect_grep '^UNCHECKED drops.*anything dropped before it was rotated away' "$tmp/verdict-two-rotations.out" "the hole is named"
 expect_no_grep '^FAIL drops' "$tmp/verdict-two-rotations.out" "a known kind does not read as new"
 expect_grep '^PASS log-outages — at least 0 time(s)' "$tmp/verdict-two-rotations.out" "and a count over a hole says it is a floor"
-printf '{"reason":"a reason no rule covers","ts":"%s"}\n' "$(iso_ago $((3 * DAY)))" >"$home/.conbus/drops.1.jsonl"
+printf '{"ts":"%s","reason":"a reason no rule covers"}\n' "$(iso_ago $((3 * DAY)))" >"$home/.conbus/drops.1.jsonl"
 code=0
 run verdict >"$tmp/verdict-two-rotations-other.out" 2>&1 || code=$?
 expect 4 "$code" "with the baseline gone, an unknown reason is a question"
@@ -1436,7 +1438,7 @@ expect_grep '^FAIL tool-bodies — 2 tool event' "$tmp/verdict-elided-over.out" 
 # Both generations count, and a count that cannot be read cannot pass.
 verdict_fixture
 cat "$home/.conbus/drops.jsonl" >"$home/.conbus/drops.1.jsonl"
-printf '{"detail":"4 tool event(s)","reason":"tool bodies elided, not sealed","ts":"%s"}\n' "$(iso_ago 3600)" >>"$home/.conbus/drops.1.jsonl"
+printf '{"ts":"%s","reason":"tool bodies elided, not sealed","detail":"4 tool event(s)"}\n' "$(iso_ago 3600)" >>"$home/.conbus/drops.1.jsonl"
 elided_line 2
 code=0
 run verdict >"$tmp/verdict-elided-both.out" 2>&1 || code=$?
@@ -1625,7 +1627,7 @@ combined_fixture() {
         usage_row "$(iso_after "$fx_swapped" -$((3 * DAY)) | cut -c1-10)" "$silent_harness" >>"$home/.usage-rows"
     done
     drop_line $((9 * DAY)) "$1"
-    perl -e 'my ($r, $t) = @ARGV; print "{\"reason\":\"$r\",\"ts\":\"$t\"}\n" x 6000' "$1" "$(iso_ago 3600)" >>"$home/.conbus/drops.jsonl"
+    perl -e 'my ($r, $t) = @ARGV; print "{\"ts\":\"$t\",\"reason\":\"$r\"}\n" x 6000' "$1" "$(iso_ago 3600)" >>"$home/.conbus/drops.jsonl"
 }
 combined_fixture 'no daemon on /x/sock: Connection refused (os error 61)'
 code=0
@@ -1985,16 +1987,21 @@ expect 1 "$code" "no socket fails"
 expect_grep '^FAIL recorder-serving.*nothing answers' "$tmp/verdict-nosock.out" "and says so"
 
 # A spooled record old enough that a serving daemon should have drained it.
+spool_entry() { # spool_entry <name> <event kind> [touch -A offset]; a real entry but for its session
+    mkdir -p "$home/.conbus/spool"
+    printf '{"pv":6,"harness":"claude_code","vendor_session_id":"s","workspace":"/tmp/w","hid":"01a19a1e-0cce-75c2-aad8-43ea57dadd25","spooled":"2026-11-02T02:37:03.055Z","event":{"event":"%s"}}' "$2" \
+        >"$home/.conbus/spool/$1.json"
+    if [ -n "${3:-}" ]; then touch -A "$3" "$home/.conbus/spool/$1.json"; fi
+}
 verdict_fixture
-mkdir -p "$home/.conbus/spool"
+spool_entry old-entry turn_started
 touch -t 202001010000 "$home/.conbus/spool/old-entry.json"
 code=0
 run verdict >"$tmp/verdict-spool.out" 2>&1 || code=$?
 expect 1 "$code" "a record stuck in the spool fails"
 expect_grep '^FAIL recorder-serving.*1 spooled record' "$tmp/verdict-spool.out" "it is counted"
 verdict_fixture
-mkdir -p "$home/.conbus/spool"
-touch "$home/.conbus/spool/in-transit.json"
+spool_entry in-transit turn_started
 code=0
 run verdict >"$tmp/verdict-spool-fresh.out" 2>&1 || code=$?
 expect 0 "$code" "a record just spooled is in transit, not stuck"
@@ -2139,11 +2146,13 @@ code=0
 run verdict >"$tmp/verdict-refusing.out" 2>&1 || code=$?
 expect 1 "$code" "a log still refusing writes fails"
 expect_grep '^FAIL disk — the log refused a write.*No space left' "$tmp/verdict-refusing.out" "with the error"
-printf '%s conbus daemon: the log takes writes again; 3 record(s) waited in memory and landed, 0 could not be kept there\n' \
+printf '%s conbus daemon: the log takes writes again; 3 record(s) waited and landed, 0 could not be kept, since 2026-11-01T00:00:00.000Z: No space left on device (os error 28)\n' \
     "$(iso_ago $((2 * DAY - 60)))" >>"$home/.conbus/daemon.log"
+drop_line $((2 * DAY - 60)) 'the log refused writes for a while' '3 record(s) waited and landed, 0 could not be kept, since 2026-11-01T00:00:00.000Z: No space left on device (os error 28)'
 code=0
 run verdict >"$tmp/verdict-refused-over.out" 2>&1 || code=$?
 expect 0 "$code" "an outage the log came back from is left to its drop line"
+expect_grep '^PASS log-outages — 1 time(s)' "$tmp/verdict-refused-over.out" "and the drop line is what counts it"
 verdict_fixture
 install_persona lowdisk
 code=0
