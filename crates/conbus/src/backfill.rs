@@ -175,7 +175,7 @@ pub fn run_chat_export(paths: &Paths, export: &str, apply: bool) -> io::Result<(
     let mut log = apply
         .then(|| SegmentLog::open(paths.log_dir(), Retention::default()))
         .transpose()?;
-    let outcome = ingest_chat_text(&held, &text, log.as_mut())?;
+    let outcome = ingest_chat_text(&held, &mut Vec::new(), &text, log.as_mut())?;
 
     println!("export    {}", path.display());
     println!(
@@ -212,12 +212,14 @@ pub fn run_chat_export(paths: &Paths, export: &str, apply: bool) -> io::Result<(
 
 /// Official Chat export: first sighting is a new conversation; a later
 /// export of the same uuid appends only the turns the log does not hold.
+/// `written` is what this pass has already appended, which `held` cannot know of.
 fn ingest_chat_text(
     held: &[Record],
+    written: &mut Vec<Record>,
     text: &str,
     mut log: Option<&mut SegmentLog>,
 ) -> io::Result<Outcome> {
-    let known = known_from(held.iter());
+    let known = known_from(held.iter().chain(written.iter()));
     let mut outcome = Outcome::default();
     for recovered in parse_claude_chat_export(text) {
         for (reason, count) in &recovered.skipped {
@@ -235,6 +237,7 @@ fn ingest_chat_text(
             let sid = session.to_string();
             let mine: Vec<&Record> = held
                 .iter()
+                .chain(written.iter())
                 .filter(|record| {
                     record.bus_id == session
                         || record.source.vendor_session_id.as_deref() == Some(sid.as_str())
@@ -260,7 +263,7 @@ fn ingest_chat_text(
             outcome.gap_records += missing.len() as u64;
             if let Some(log) = log.as_mut() {
                 for entry in missing {
-                    log.append(entry)?;
+                    written.extend(log.append(entry)?);
                 }
             }
             continue;
@@ -277,7 +280,7 @@ fn ingest_chat_text(
         outcome.records += recovered.entries.len() as u64;
         if let Some(log) = log.as_mut() {
             for entry in recovered.entries {
-                log.append(entry)?;
+                written.extend(log.append(entry)?);
             }
         }
     }
@@ -792,6 +795,7 @@ fn ingest_chat_exports_filtered(
         return Ok(0);
     }
     let mut filled = 0u64;
+    let mut written = Vec::new();
     let mut entries: Vec<PathBuf> = fs::read_dir(dir)?
         .filter_map(|entry| entry.ok().map(|e| e.path()))
         .filter(|path| !official_only || is_official_privacy_export(path))
@@ -802,7 +806,7 @@ fn ingest_chat_exports_filtered(
         let Ok(text) = read_chat_export(&path) else {
             continue;
         };
-        let outcome = ingest_chat_text(held, &text, Some(log))?;
+        let outcome = ingest_chat_text(held, &mut written, &text, Some(log))?;
         filled += outcome.records + outcome.gap_records;
     }
     Ok(filled)
@@ -2586,7 +2590,8 @@ mod tests {
         let mut log =
             SegmentLog::open(machine.paths.log_dir(), Retention::default()).expect("open");
 
-        let outcome = ingest_chat_text(&records, export, Some(&mut log)).expect("ingest");
+        let outcome =
+            ingest_chat_text(&records, &mut Vec::new(), export, Some(&mut log)).expect("ingest");
 
         assert_eq!(outcome.gap_turns, 1, "the second saying only");
         assert_eq!(outcome.gap_records, 2);
@@ -2743,13 +2748,15 @@ mod tests {
         }"#;
         let mut log =
             SegmentLog::open(machine.paths.log_dir(), Retention::default()).expect("open");
-        let first_out = ingest_chat_text(&[], first, Some(&mut log)).expect("first");
+        let first_out =
+            ingest_chat_text(&[], &mut Vec::new(), first, Some(&mut log)).expect("first");
         assert_eq!(first_out.sessions, 1);
         assert!(first_out.gap_records == 0);
         let held = SegmentLog::scan(machine.paths.log_dir())
             .expect("scan")
             .records;
-        let later_out = ingest_chat_text(&held, later, Some(&mut log)).expect("later");
+        let later_out =
+            ingest_chat_text(&held, &mut Vec::new(), later, Some(&mut log)).expect("later");
         assert_eq!(later_out.sessions, 0);
         assert_eq!(later_out.already_backfilled, 0);
         assert_eq!(later_out.gap_sessions, 1);
@@ -2768,6 +2775,50 @@ mod tests {
             all.iter()
                 .all(|r| r.source.harness.as_str() == Harness::CLAUDE_CHAT)
         );
+    }
+
+    #[test]
+    fn two_exports_in_one_pass_write_a_conversation_once() {
+        // Two exports dropped while the recorder was down, the later one holding
+        // one more turn. Neither saw what the other wrote.
+        let machine = machine();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let message = |id: &str, sender: &str, text: &str| {
+            serde_json::json!({"uuid": id, "sender": sender, "text": text,
+                               "created_at": "2026-09-06T12:00:00.000Z"})
+        };
+        let export = |messages: Vec<serde_json::Value>| {
+            serde_json::json!([{
+                "uuid": "00000000-1111-2222-3333-444444444444",
+                "chat_messages": messages
+            }])
+            .to_string()
+        };
+        let first = vec![
+            message("m1", "human", "first"),
+            message("m2", "assistant", "ok"),
+        ];
+        let mut later = first.clone();
+        later.push(message("m3", "human", "next turn"));
+        later.push(message("m4", "assistant", "still ok"));
+        fs::write(dir.path().join("a.json"), export(first)).expect("a");
+        fs::write(dir.path().join("b.json"), export(later)).expect("b");
+        let mut log =
+            SegmentLog::open(machine.paths.log_dir(), Retention::default()).expect("open");
+
+        ingest_chat_exports(dir.path(), &[], &mut log).expect("ingest");
+
+        let all = held(&machine);
+        let said = |words: &str| {
+            all.iter()
+                .filter(|record| {
+                    matches!(&record.event, Event::TurnStarted { prompt, .. }
+                        if prompt_text(prompt).as_deref() == Some(words))
+                })
+                .count()
+        };
+        assert_eq!(said("first"), 1, "{all:?}");
+        assert_eq!(said("next turn"), 1, "{all:?}");
     }
 
     #[test]
