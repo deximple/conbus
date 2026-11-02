@@ -586,13 +586,27 @@ subprocess.Popen([sys.executable, "-c", server, here], stdin=subprocess.DEVNULL,
 
 #[test]
 fn a_real_server_left_behind_by_a_read_is_not_a_no() {
+    left_behind_is_not_a_no(CODEX_LEAVING_A_SERVER);
+}
+
+#[test]
+fn a_real_server_in_its_own_group_left_behind_by_a_read_is_not_a_no() {
+    // How Codex really starts an MCP server, and the shape the first orphan check
+    // missed: it leads its own group, like any service.
+    left_behind_is_not_a_no(&CODEX_LEAVING_A_SERVER.replace(
+        "stdin=subprocess.DEVNULL,",
+        "start_new_session=True, stdin=subprocess.DEVNULL,",
+    ));
+}
+
+fn left_behind_is_not_a_no(stand_in: &str) {
     if !have_lsof_and_ps() {
         return;
     }
     let root = tempfile::tempdir().expect("tempdir");
     let codex_dir = tempfile::tempdir().expect("tempdir");
     let codex = codex_dir.path().join("codex");
-    support::write_executable(&codex, CODEX_LEAVING_A_SERVER);
+    support::write_executable(&codex, stand_in);
     let quota = conbus(root.path())
         .arg("quota")
         .env("CONBUS_CODEX_BIN", &codex)
