@@ -746,9 +746,12 @@ It names the page from its scheme and host, and anything else is `unknown page`.
 When the page calls back to a port on this machine, it walks every process
 listening there up to the root. Then:
 
-- `conbus yes` — a conbus command is above what listens, and the page belongs to a
-  vendor conbus starts itself: Codex and the bridge its MCP servers open, agy, or
-  Claude. An address can name any port, so an unknown page never earns this.
+- `conbus yes` — this conbus is above what listens: the recorder, or a process that
+  runs the installed binary or the one answering, because anything can be called
+  conbus. And the page's own program sits between them: `codex` for an OpenAI page
+  and for the bridge its MCP servers open, `agy` for a Google one, `claude` for
+  Claude's. An address can name any port, so an unknown page never earns this, and
+  neither does a port under conbus that belongs to another of its vendors.
 - `conbus no` — the chain goes up to an app or a person's session, with no conbus in
   it. That covers the ancestry and no more, and the line after it says what a walk
   cannot see: an app a hop opened hangs from launchd like any other. Every conbus

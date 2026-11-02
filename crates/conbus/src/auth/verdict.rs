@@ -2,10 +2,15 @@
 //!
 //! `no` needs positive evidence: a listener on a port of this machine, walked up
 //! to something that vouches for itself, with no conbus on the way. `yes` needs a
-//! conbus command above that listener and a page of a vendor conbus runs, because
-//! an address can name any port. Anything less is `cannot tell`, and says what would
-//! tell. Even a `no` covers the ancestry and nothing more, so it carries what a walk
-//! cannot see.
+//! command of this conbus above that listener, because anything can be called
+//! conbus, and the page's own program between them, because an address can name
+//! any port and a port under conbus can be another vendor's. Anything less is
+//! `cannot tell`, and says what would tell. Even a `no` covers the ancestry and
+//! nothing more, so it carries what a walk cannot see.
+
+use std::path::{Path, PathBuf};
+
+use conbus_core::paths::Paths;
 
 use super::ancestry::{self, ConbusProcess, Holders, Listener, Stopped};
 use super::url::Callback;
@@ -42,12 +47,56 @@ fn look(callback: &Callback) -> Looked {
     }
 }
 
-/// The `process` lines and the verdict for a page's callbacks. `conbus_runs_it`:
-/// the page belongs to a vendor conbus starts as its own child.
-pub(super) fn describe(callbacks: &[Callback], conbus_runs_it: bool) -> Vec<String> {
+/// What tells this conbus from anything else called conbus: the recorder, by the
+/// pid in its stamp while that pid lives, and the installed binary and this one, by
+/// the file they run, links resolved.
+pub(super) struct ThisConbus {
+    recorder: Option<u32>,
+    binaries: Vec<PathBuf>,
+}
+
+impl ThisConbus {
+    pub(super) fn here(paths: &Paths) -> Self {
+        let recorder = match crate::build_info::daemon_build(paths) {
+            crate::build_info::DaemonBuild::Running(stamp) => Some(stamp.pid),
+            _ => None,
+        };
+        let installed =
+            std::env::var_os("HOME").map(|home| crate::install::installed_binary(Path::new(&home)));
+        let binaries = installed
+            .into_iter()
+            .chain(std::env::current_exe().ok())
+            .map(|binary| resolved(&binary))
+            .collect();
+        ThisConbus { recorder, binaries }
+    }
+
+    /// Whether `process` is this conbus; `None` when its binary could not be seen.
+    fn knows(&self, process: &ConbusProcess) -> Option<bool> {
+        if self.recorder == Some(process.pid) {
+            return Some(true);
+        }
+        let binary = resolved(process.binary.as_ref()?);
+        Some(self.binaries.contains(&binary))
+    }
+}
+
+fn resolved(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// What a page asks of a chain for a `yes`.
+pub(super) struct Wanted<'a> {
+    /// The programs conbus starts that open this page; none for a page that is not ours.
+    pub programs: &'static [&'static str],
+    pub this: &'a ThisConbus,
+}
+
+/// The `process` lines and the verdict for a page's callbacks.
+pub(super) fn describe(callbacks: &[Callback], wanted: &Wanted) -> Vec<String> {
     let looked: Vec<Looked> = callbacks.iter().map(look).collect();
     let mut lines = process_lines(&looked);
-    lines.extend(verdict_lines(&looked, conbus_runs_it));
+    lines.extend(verdict_lines(&looked, wanted));
     lines
 }
 
@@ -100,10 +149,10 @@ fn process_line(looked: &Looked) -> Vec<String> {
     }
 }
 
-fn verdict_lines(looked: &[Looked], conbus_runs_it: bool) -> Vec<String> {
+fn verdict_lines(looked: &[Looked], wanted: &Wanted) -> Vec<String> {
     let found: Vec<Above> = looked
         .iter()
-        .flat_map(|looked| conbus_above(looked, conbus_runs_it))
+        .flat_map(|looked| conbus_above(looked, wanted))
         .collect();
     if let Some(yes) = found.iter().find_map(Above::yes) {
         return vec![yes];
@@ -130,8 +179,8 @@ struct Above {
 }
 
 enum AboveKind {
-    /// The conbus command it names, over a page of a vendor conbus runs.
-    Command(String),
+    /// The command of this conbus it names, with the page's own program between.
+    Command { command: String, program: String },
     /// `conbus run`: the agent under it is the person's own.
     TheirAgent,
     /// The listener is conbus: `conbus hook --inference-listen` on a known port.
@@ -140,19 +189,28 @@ enum AboveKind {
     CommandUnread,
     /// conbus runs nothing that asks for this page.
     PageNotOurs,
+    /// `lsof` would not say which binary the process called conbus runs.
+    BinaryUnseen,
+    /// Called conbus, and neither the recorder nor the installed binary nor this one.
+    NotThisConbus,
+    /// This conbus, with none of the page's programs between it and the listener.
+    ProgramMissing {
+        command: String,
+        programs: &'static [&'static str],
+    },
 }
 
-fn conbus_above(looked: &Looked, conbus_runs_it: bool) -> Vec<Above> {
+fn conbus_above(looked: &Looked, wanted: &Wanted) -> Vec<Above> {
     let Looked::Port(port, Holders::Listeners(listeners)) = looked else {
         return Vec::new();
     };
     listeners
         .iter()
-        .filter_map(|listener| above(*port, listener, conbus_runs_it))
+        .filter_map(|listener| above(*port, listener, wanted))
         .collect()
 }
 
-fn above(port: u16, listener: &Listener, conbus_runs_it: bool) -> Option<Above> {
+fn above(port: u16, listener: &Listener, wanted: &Wanted) -> Option<Above> {
     let nearest = listener.conbus.first()?;
     let run = |process: &&ConbusProcess| process.command.as_deref() == Some("run");
     let unread = |process: &&ConbusProcess| process.command.is_none();
@@ -162,30 +220,52 @@ fn above(port: u16, listener: &Listener, conbus_runs_it: bool) -> Option<Above> 
         (process.pid, AboveKind::TheirAgent)
     } else if let Some(process) = listener.conbus.iter().find(unread) {
         (process.pid, AboveKind::CommandUnread)
-    } else if !conbus_runs_it {
+    } else if wanted.programs.is_empty() {
         (nearest.pid, AboveKind::PageNotOurs)
     } else {
-        let command = nearest.command.clone().unwrap_or_default();
-        (nearest.pid, AboveKind::Command(command))
+        (nearest.pid, ours(listener, nearest, wanted))
     };
     Some(Above { port, pid, kind })
 }
 
+/// A command of a conbus over a page conbus runs: `yes` only when it is this conbus,
+/// and the page's own program sits between it and the listener, or is the listener.
+fn ours(listener: &Listener, nearest: &ConbusProcess, wanted: &Wanted) -> AboveKind {
+    let command = nearest.command.clone().unwrap_or_default();
+    match wanted.this.knows(nearest) {
+        None => AboveKind::BinaryUnseen,
+        Some(false) => AboveKind::NotThisConbus,
+        Some(true) => match listener.chain[..nearest.depth]
+            .iter()
+            .find(|name| wanted.programs.contains(&name.as_str()))
+        {
+            Some(program) => AboveKind::Command {
+                command,
+                program: program.clone(),
+            },
+            None => AboveKind::ProgramMissing {
+                command,
+                programs: wanted.programs,
+            },
+        },
+    }
+}
+
 impl Above {
     fn yes(&self) -> Option<String> {
-        let AboveKind::Command(command) = &self.kind else {
+        let AboveKind::Command { command, program } = &self.kind else {
             return None;
         };
         Some(format!(
-            "conbus    yes: `conbus {command}` (pid {}) is above what listens on port {}, and it runs the vendor this page belongs to",
+            "conbus    yes: `conbus {command}` (pid {}), this conbus, is above what listens on port {}, and `{program}` between them is the program this page belongs to",
             self.pid, self.port
         ))
     }
 
     fn why_not_yes(&self) -> Option<String> {
         let (port, pid) = (self.port, self.pid);
-        match self.kind {
-            AboveKind::Command(_) => None,
+        match &self.kind {
+            AboveKind::Command { .. } => None,
             AboveKind::TheirAgent => Some(format!(
                 "what listens on port {port} runs under `conbus run` (pid {pid}), so it is your own agent, not conbus, and conbus does not know what it asked for"
             )),
@@ -198,6 +278,19 @@ impl Above {
             AboveKind::PageNotOurs => Some(format!(
                 "a conbus process (pid {pid}) is above what listens on port {port}, but conbus runs nothing that asks for this page. An address can name any port, so the port alone says nothing about who opened it; {HOPS}"
             )),
+            AboveKind::BinaryUnseen => Some(format!(
+                "a process called conbus (pid {pid}) is above what listens on port {port}, and `lsof` would not say which binary it runs, so it cannot be told from anything else called conbus. Looking again while the page still waits would tell"
+            )),
+            AboveKind::NotThisConbus => Some(format!(
+                "a process called conbus (pid {pid}) is above what listens on port {port}, but it is not this conbus: it is not the recorder, and it runs neither the installed binary nor this one. Anything can be called conbus; {HOPS}"
+            )),
+            AboveKind::ProgramMissing { command, programs } => {
+                let programs: Vec<String> = programs.iter().map(|p| format!("`{p}`")).collect();
+                Some(format!(
+                    "`conbus {command}` (pid {pid}) is above what listens on port {port}, but nothing between them is {}, the program this page belongs to. A port under conbus can be another vendor's, and an address can name any port; {HOPS}",
+                    programs.join(" or ")
+                ))
+            }
         }
     }
 }

@@ -12,11 +12,12 @@ pub(super) struct Page {
     pub host: &'static str,
     /// For a domain the vendor owns whole: its subdomains count too.
     pub subdomains: bool,
-    /// conbus starts this vendor's program as its own child, so a sign-in it asks
-    /// for can call back to a process under conbus: `codex app-server` and the
-    /// bridge its MCP servers open, `agy`, `claude -p`. Not `gh`, which conbus asks
-    /// for lookups only, and not Cursor or Grok, which a hop opens but does not parent.
-    pub conbus_runs_it: bool,
+    /// The programs conbus starts as its own children that open this page, so a
+    /// sign-in can call back to a process under one of them: `codex` (`codex
+    /// app-server`, and the bridge its MCP servers open), `agy`, `claude` (`claude
+    /// -p`). None for `gh`, which conbus asks for lookups only, nor for Cursor or
+    /// Grok, which a hop opens but does not parent.
+    pub programs: &'static [&'static str],
     pub label: &'static str,
 }
 
@@ -36,70 +37,70 @@ pub(super) const PAGES: &[Page] = &[
         scheme: BRIDGE_SCHEME,
         host: "mmlmfjhmonkocbjadbfplnigmagldckm",
         subdomains: false,
-        conbus_runs_it: true,
+        programs: &["codex"],
         label: "Playwright MCP Bridge connect page (a Chrome extension)",
     },
     Page {
         scheme: "https",
         host: "accounts.google.com",
         subdomains: false,
-        conbus_runs_it: true,
+        programs: &["agy"],
         label: "Google sign-in (agy and other Google-backed tools)",
     },
     Page {
         scheme: "https",
         host: "auth.openai.com",
         subdomains: false,
-        conbus_runs_it: true,
+        programs: &["codex"],
         label: "OpenAI sign-in (Codex)",
     },
     Page {
         scheme: "https",
         host: "claude.ai",
         subdomains: true,
-        conbus_runs_it: true,
+        programs: &["claude"],
         label: "a claude.ai page (Claude Code signs in here)",
     },
     Page {
         scheme: "https",
         host: "claude.com",
         subdomains: true,
-        conbus_runs_it: true,
+        programs: &["claude"],
         label: "a claude.com page (Claude Code signs in here)",
     },
     Page {
         scheme: "https",
         host: "antigravity.google",
         subdomains: true,
-        conbus_runs_it: true,
+        programs: &["agy"],
         label: "an antigravity.google page (agy signs in here)",
     },
     Page {
         scheme: "https",
         host: "console.anthropic.com",
         subdomains: false,
-        conbus_runs_it: true,
+        programs: &["claude"],
         label: "Anthropic Console (Claude Code signs in here)",
     },
     Page {
         scheme: "https",
         host: "cursor.com",
         subdomains: true,
-        conbus_runs_it: false,
+        programs: &[],
         label: "a cursor.com page (Cursor signs in here)",
     },
     Page {
         scheme: "https",
         host: "x.ai",
         subdomains: true,
-        conbus_runs_it: false,
+        programs: &[],
         label: "an x.ai page (Grok signs in here)",
     },
     Page {
         scheme: "https",
         host: "github.com",
         subdomains: false,
-        conbus_runs_it: false,
+        programs: &[],
         label: "a github.com page (gh signs in here)",
     },
 ];

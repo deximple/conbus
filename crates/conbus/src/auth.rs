@@ -371,7 +371,7 @@ fn warn_about_history(url: &str) {
 }
 
 /// `conbus auth --url <URL>`: whose page, who asked, whether conbus did.
-fn describe_url(url: &str) -> String {
+fn describe_url(paths: &Paths, url: &str) -> String {
     let mut out = String::new();
     let address = Address::parse(url.trim());
     let page = address.as_ref().and_then(Address::page);
@@ -388,8 +388,12 @@ fn describe_url(url: &str) -> String {
     }
 
     let callbacks = address.as_ref().map(Address::callbacks).unwrap_or_default();
-    let conbus_runs_it = page.is_some_and(|page| page.conbus_runs_it);
-    for line in verdict::describe(&callbacks, conbus_runs_it) {
+    let this = verdict::ThisConbus::here(paths);
+    let wanted = verdict::Wanted {
+        programs: page.map_or(&[], |page| page.programs),
+        this: &this,
+    };
+    for line in verdict::describe(&callbacks, &wanted) {
         out.push_str(&line);
         out.push('\n');
     }
@@ -428,10 +432,10 @@ fn open_page(path: &std::path::Path) {
 pub fn run(paths: &Paths, url: Option<&str>, html: Option<String>, open: bool) -> io::Result<()> {
     if let Some(url) = url {
         let answer = if url == "-" {
-            describe_url(&url_from_stdin()?)
+            describe_url(paths, &url_from_stdin()?)
         } else {
             warn_about_history(url);
-            describe_url(url)
+            describe_url(paths, url)
         };
         print!("{answer}");
         return Ok(());

@@ -23,7 +23,18 @@ impl ProcessTable {
         processes: &[(u32, u32, &str)],
         groups: &[(u32, u32)],
     ) -> Self {
-        Self::build(listeners, processes, groups, &[])
+        Self::build(listeners, processes, groups, &[], &[])
+    }
+
+    /// As [`ProcessTable::new`], with the binary each pid in `binaries` runs, as
+    /// `lsof` says it, or `None` where `lsof` says nothing. Any other pid runs this
+    /// test's own conbus, so it is this conbus.
+    fn with_binaries(
+        listeners: &[u32],
+        processes: &[(u32, u32, &str)],
+        binaries: &[(u32, Option<&str>)],
+    ) -> Self {
+        Self::build(listeners, processes, &[], &[], binaries)
     }
 
     /// As [`ProcessTable::new`], with the command line of each pid in `commands`
@@ -33,7 +44,7 @@ impl ProcessTable {
         processes: &[(u32, u32, &str)],
         commands: &[(u32, &str)],
     ) -> Self {
-        Self::build(listeners, processes, &[], commands)
+        Self::build(listeners, processes, &[], commands, &[])
     }
 
     fn build(
@@ -41,16 +52,30 @@ impl ProcessTable {
         processes: &[(u32, u32, &str)],
         groups: &[(u32, u32)],
         commands: &[(u32, &str)],
+        binaries: &[(u32, Option<&str>)],
     ) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         let lsof_calls = dir.path().join("lsof.calls");
         let pids: String = listeners.iter().map(|pid| format!("{pid}\n")).collect();
         let found = if listeners.is_empty() { 1 } else { 0 };
+        let this_conbus = std::fs::canonicalize(env!("CARGO_BIN_EXE_conbus")).expect("conbus");
+        let binary_arms: String = binaries
+            .iter()
+            .map(|(pid, binary)| match binary {
+                Some(path) => format!("  {pid}) printf 'p%s\\nftxt\\nn%s\\n' $pid '{path}' ;;\n"),
+                None => format!("  {pid}) exit 1 ;;\n"),
+            })
+            .collect();
         support::write_executable(
             &dir.path().join("lsof"),
             &format!(
-                "#!/bin/sh\n[ \"$1\" = --warm ] && exit 0\nprintf '%s\\n' \"$*\" >>'{}'\nprintf '%s' '{pids}'\nexit {found}\n",
-                lsof_calls.display()
+                "#!/bin/sh\n[ \"$1\" = --warm ] && exit 0\nprintf '%s\\n' \"$*\" >>'{}'\n\
+                 case \" $* \" in\n*' -d txt '*)\n\
+                 while [ $# -gt 0 ]; do [ \"$1\" = -p ] && pid=$2; shift; done\n\
+                 case $pid in\n{binary_arms}  *) printf 'p%s\\nftxt\\nn%s\\n' $pid '{}' ;;\nesac\nexit 0 ;;\nesac\n\
+                 printf '%s' '{pids}'\nexit {found}\n",
+                lsof_calls.display(),
+                this_conbus.display()
             ),
         );
         let arms: String = processes
@@ -87,12 +112,17 @@ impl ProcessTable {
     /// `conbus auth --url` with these stand-ins first on PATH.
     fn ask(&self, url: &str) -> String {
         let root = tempfile::tempdir().expect("tempdir");
+        self.ask_in(root.path(), url)
+    }
+
+    /// As [`ProcessTable::ask`], with `root` as conbus's home and state folder.
+    fn ask_in(&self, root: &std::path::Path, url: &str) -> String {
         let path = format!(
             "{}:{}",
             self.dir.path().display(),
             std::env::var("PATH").unwrap_or_default()
         );
-        let output = conbus(root.path())
+        let output = conbus(root)
             .args(["auth", "--url", url])
             .env("PATH", path)
             .output()
@@ -178,7 +208,8 @@ fn no_says_what_a_walk_cannot_see() {
 #[test]
 fn conbus_far_above_the_listener_is_still_yes() {
     // The walk used to stop at eight levels, without a word, and say `no`.
-    let names: Vec<String> = (0..11).map(|level| format!("level{level}")).collect();
+    let mut names: Vec<String> = (0..11).map(|level| format!("level{level}")).collect();
+    names[5] = "codex".to_string();
     let mut tree: Vec<(u32, u32, &str)> = names
         .iter()
         .enumerate()
@@ -209,7 +240,8 @@ fn every_listener_on_the_port_is_walked() {
         &[4242, 777],
         &[
             (4242, 1, "/opt/node/bin/node"),
-            (777, 776, "python3"),
+            (777, 778, "python3"),
+            (778, 776, "codex"),
             (776, 1, "conbus"),
             (1, 0, "/sbin/launchd"),
         ],
@@ -223,7 +255,7 @@ fn every_listener_on_the_port_is_walked() {
     );
     assert!(stdout.contains("pid 4242: node > launchd"), "{stdout}");
     assert!(
-        stdout.contains("pid 777: python3 > conbus > launchd"),
+        stdout.contains("pid 777: python3 > codex > conbus > launchd"),
         "{stdout}"
     );
 }
@@ -243,7 +275,8 @@ fn only_the_name_of_the_binary_makes_a_process_conbus() {
         let table = ProcessTable::new(
             &[50],
             &[
-                (50, 55, "node"),
+                (50, 52, "node"),
+                (52, 55, "codex"),
                 (55, 60, name),
                 (60, 1, "/Applications/Some.app/Contents/MacOS/Some"),
                 (1, 0, "/sbin/launchd"),
@@ -443,7 +476,8 @@ fn conbus_above_a_listener_outranks_a_broken_group() {
         &[50, 60],
         &[
             (50, 1, "python3"),
-            (60, 61, "node"),
+            (60, 62, "node"),
+            (62, 61, "codex"),
             (61, 1, "conbus"),
             (1, 0, "/sbin/launchd"),
         ],
@@ -478,7 +512,12 @@ fn a_port_with_several_callbacks_needs_all_of_them_clear_for_no() {
 fn conbus_above_one_callback_is_yes_whatever_another_says() {
     let table = ProcessTable::new(
         &[50],
-        &[(50, 40, "node"), (40, 1, "conbus"), (1, 0, "launchd")],
+        &[
+            (50, 45, "node"),
+            (45, 40, "agy"),
+            (40, 1, "conbus"),
+            (1, 0, "launchd"),
+        ],
     );
     let local = "http%3A%2F%2F127.0.0.1%3A55407%2F";
     let remote = "https%3A%2F%2Fanother.example%3A1%2F";
@@ -519,18 +558,34 @@ while time.time() < deadline and not os.path.exists(os.path.join(here, "stop")):
     time.sleep(0.05)
 "#;
 
+/// A real `codex` in `dir`, named as `ps` names the vendor's own: a link to bash
+/// called codex. Run as `codex app-server` from `dir`, bash reads `app-server`
+/// there, which starts the listener and waits on it, so the listener hangs from
+/// codex. The listener writes `port` and stops on `stop`.
+fn real_codex_in(dir: &std::path::Path) -> std::path::PathBuf {
+    let codex = dir.join("codex");
+    std::os::unix::fs::symlink("/bin/bash", &codex).expect("link bash");
+    std::fs::write(dir.join("app-server"), "python3 listen.py &\nwait\n").expect("app-server");
+    std::fs::write(dir.join("listen.py"), LISTENING_CODEX).expect("listener");
+    codex
+}
+
+fn have_bash() -> bool {
+    std::path::Path::new("/bin/bash").exists()
+}
+
 #[test]
 fn a_real_listener_under_a_real_conbus_is_yes() {
-    if !have_lsof_and_ps() {
+    if !have_lsof_and_ps() || !have_bash() {
         return;
     }
     let root = tempfile::tempdir().expect("tempdir");
     let codex_dir = tempfile::tempdir().expect("tempdir");
-    let codex = codex_dir.path().join("codex");
-    support::write_executable(&codex, LISTENING_CODEX);
+    let codex = real_codex_in(codex_dir.path());
     let port_file = codex_dir.path().join("port");
     let mut quota = conbus(root.path())
         .arg("quota")
+        .current_dir(codex_dir.path())
         .env("CONBUS_CODEX_BIN", &codex)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -560,7 +615,63 @@ fn a_real_listener_under_a_real_conbus_is_yes() {
         verdict_of(&stdout).starts_with("conbus    yes:"),
         "{stdout}"
     );
-    assert!(stdout.contains(" > conbus > "), "{stdout}");
+    assert!(stdout.contains(" > codex > conbus > "), "{stdout}");
+}
+
+#[test]
+fn a_real_listener_under_something_only_named_conbus_is_not_a_yes() {
+    // The review's shape with real processes: a binary called conbus, run as
+    // `conbus quota`, with the page's own program and a listener under it.
+    if !have_lsof_and_ps() || !have_bash() {
+        return;
+    }
+    let root = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::tempdir().expect("tempdir");
+    real_codex_in(dir.path());
+    let named_conbus = dir.path().join("conbus");
+    std::os::unix::fs::symlink("/bin/bash", &named_conbus).expect("link bash");
+    std::fs::write(
+        dir.path().join("quota"),
+        "\"$PWD/codex\" app-server &\nwait\n",
+    )
+    .expect("quota");
+    let mut named_conbus = Command::new(&named_conbus)
+        .arg("quota")
+        .current_dir(dir.path())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("run it");
+    let port_file = dir.path().join("port");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let port = loop {
+        if let Ok(text) = std::fs::read_to_string(&port_file) {
+            break text.trim().parse::<u16>().expect("port");
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the stand-in never listened"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+
+    let output = conbus(root.path())
+        .args([
+            "auth",
+            "--url",
+            &page_calling_back("https://auth.openai.com/oauth/authorize", port),
+        ])
+        .output()
+        .expect("run auth --url");
+    std::fs::write(dir.path().join("stop"), "").expect("stop");
+    named_conbus.wait().expect("it ends with its listener");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains(" > codex > conbus > "), "{stdout}");
+    let said = verdict_of(&stdout);
+    assert!(said.starts_with("conbus    cannot tell:"), "{stdout}");
+    assert!(said.contains("not this conbus"), "{stdout}");
 }
 
 /// A stand-in `codex app-server` that starts a server of its own and exits, leaving
@@ -874,26 +985,195 @@ const UNDER_A_CONBUS_READ: &[(u32, u32, &str)] = &[
     (1, 0, "/sbin/launchd"),
 ];
 
+/// As [`UNDER_A_CONBUS_READ`], with `program` where Codex is.
+fn under_a_conbus_read(program: &str) -> Vec<(u32, u32, &str)> {
+    UNDER_A_CONBUS_READ
+        .iter()
+        .map(|&(pid, ppid, name)| (pid, ppid, if pid == 40 { program } else { name }))
+        .collect()
+}
+
 /// A page with its callback on `port`.
 fn page_calling_back(page: &str, port: u16) -> String {
     format!("{page}?redirect_uri=http%3A%2F%2F127.0.0.1%3A{port}%2F")
 }
 
+/// Each page conbus can earn a `yes` for, and the program of its own that conbus
+/// starts: the bridge is opened by Codex's MCP servers.
+const PAGES_AND_PROGRAMS: &[(&str, &str)] = &[
+    ("https://accounts.google.com/o/oauth2/auth", "agy"),
+    ("https://antigravity.google/auth-success", "agy"),
+    ("https://auth.openai.com/oauth/authorize", "codex"),
+    ("https://console.anthropic.com/", "claude"),
+    ("https://claude.ai/login", "claude"),
+    ("https://platform.claude.com/oauth/authorize", "claude"),
+    ("https://claude.com/cai/oauth/authorize", "claude"),
+    (
+        "chrome-extension://mmlmfjhmonkocbjadbfplnigmagldckm/connect.html",
+        "codex",
+    ),
+];
+
 #[test]
 fn a_vendor_conbus_runs_under_a_conbus_command_is_yes_and_names_the_command() {
-    for page in [
-        "https://accounts.google.com/o/oauth2/auth",
-        "https://auth.openai.com/oauth/authorize",
-        "https://console.anthropic.com/",
-        "https://claude.ai/login",
-        "chrome-extension://mmlmfjhmonkocbjadbfplnigmagldckm/connect.html",
-    ] {
-        let table = ProcessTable::new(&[50], UNDER_A_CONBUS_READ);
+    for (page, program) in PAGES_AND_PROGRAMS {
+        let table = ProcessTable::new(&[50], &under_a_conbus_read(program));
         let stdout = table.ask(&page_calling_back(page, 55407));
         let said = verdict_of(&stdout);
         assert!(said.starts_with("conbus    yes:"), "{page}: {stdout}");
         assert!(said.contains("`conbus quota`"), "{page}: {stdout}");
+        assert!(said.contains(&format!("`{program}`")), "{page}: {stdout}");
     }
+}
+
+#[test]
+fn a_port_under_conbus_is_not_a_yes_for_a_page_its_program_does_not_open() {
+    // No attacker needed: a Claude or Google page naming the port of an MCP server
+    // that conbus's Codex started read `yes`.
+    for (page, program) in PAGES_AND_PROGRAMS {
+        for other in ["codex", "agy", "claude", "python3"] {
+            if other == *program {
+                continue;
+            }
+            let table = ProcessTable::new(&[50], &under_a_conbus_read(other));
+            let stdout = table.ask(&page_calling_back(page, 55407));
+            let said = verdict_of(&stdout);
+            assert!(
+                said.starts_with("conbus    cannot tell:"),
+                "{page} over {other}: {stdout}"
+            );
+            assert!(
+                said.contains(&format!("nothing between them is `{program}`")),
+                "{page} over {other}: {stdout}"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_page_s_program_may_be_what_listens() {
+    let table = ProcessTable::new(
+        &[40],
+        &[
+            (40, 30, "claude"),
+            (30, 1, "conbus"),
+            (1, 0, "/sbin/launchd"),
+        ],
+    );
+    let stdout = table.ask(&page_calling_back("https://claude.ai/login", 55407));
+    assert!(
+        verdict_of(&stdout).starts_with("conbus    yes:"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn the_page_s_program_above_conbus_does_not_count() {
+    // A hook's conbus runs under Claude Code, so `claude` is often above it. A Claude
+    // page naming the port of an MCP server its Codex started is still not ours.
+    let table = ProcessTable::new(
+        &[50],
+        &[
+            (50, 40, "node"),
+            (40, 30, "codex"),
+            (30, 20, "conbus"),
+            (20, 1, "claude"),
+            (1, 0, "/sbin/launchd"),
+        ],
+    );
+    let stdout = table.ask(&page_calling_back("https://claude.ai/login", 55407));
+    let said = verdict_of(&stdout);
+    assert!(said.starts_with("conbus    cannot tell:"), "{stdout}");
+    assert!(
+        said.contains("nothing between them is `claude`"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn a_process_only_named_conbus_is_not_a_yes() {
+    // What the review built: a small binary called conbus, run as `conbus quota`
+    // above a listener, earned a `yes` for a Google page naming its port.
+    let table = ProcessTable::with_binaries(
+        &[50],
+        &under_a_conbus_read("agy"),
+        &[(30, Some("/tmp/elsewhere/conbus"))],
+    );
+    let stdout = table.ask(&page_calling_back(
+        "https://accounts.google.com/o/oauth2/auth",
+        55407,
+    ));
+    let said = verdict_of(&stdout);
+    assert!(said.starts_with("conbus    cannot tell:"), "{stdout}");
+    assert!(said.contains("not this conbus"), "{stdout}");
+    assert!(
+        !stdout.contains("/tmp/elsewhere"),
+        "a binary's path is compared, never printed: {stdout}"
+    );
+}
+
+#[test]
+fn a_conbus_whose_binary_cannot_be_seen_is_not_a_yes() {
+    let table = ProcessTable::with_binaries(&[50], &under_a_conbus_read("codex"), &[(30, None)]);
+    let stdout = table.ask(&page_calling_back(
+        "https://auth.openai.com/oauth/authorize",
+        55407,
+    ));
+    let said = verdict_of(&stdout);
+    assert!(said.starts_with("conbus    cannot tell:"), "{stdout}");
+    assert!(said.contains("which binary"), "{stdout}");
+}
+
+#[test]
+fn the_recorder_is_this_conbus_whatever_binary_it_runs() {
+    // The recorder is known by the pid in its stamp, which must be alive: this test's.
+    let me = std::process::id();
+    let tree = [
+        (50, 40, "node"),
+        (40, me, "codex"),
+        (me, 1, "conbus"),
+        (1, 0, "/sbin/launchd"),
+    ];
+    let table = ProcessTable::with_binaries(&[50], &tree, &[(me, Some("/tmp/elsewhere/conbus"))]);
+    let url = page_calling_back("https://auth.openai.com/oauth/authorize", 55407);
+    let root = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        root.path().join("daemon.build"),
+        format!(r#"{{"build":"x","pid":{me},"started":"2026-11-02T00:00:00.000Z"}}"#),
+    )
+    .expect("stamp");
+
+    let stdout = table.ask_in(root.path(), &url);
+    assert!(
+        verdict_of(&stdout).starts_with("conbus    yes:"),
+        "{stdout}"
+    );
+
+    // Without its stamp the same process is only something named conbus.
+    let stdout = table.ask(&url);
+    assert!(verdict_of(&stdout).contains("not this conbus"), "{stdout}");
+}
+
+#[test]
+fn the_installed_binary_is_this_conbus() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let installed = root.path().join(".local/bin/conbus");
+    std::fs::create_dir_all(installed.parent().expect("parent")).expect("mkdir");
+    std::fs::write(&installed, "").expect("installed");
+    let installed = std::fs::canonicalize(&installed).expect("canonical");
+    let table = ProcessTable::with_binaries(
+        &[50],
+        &under_a_conbus_read("codex"),
+        &[(30, Some(installed.to_str().expect("utf-8")))],
+    );
+    let stdout = table.ask_in(
+        root.path(),
+        &page_calling_back("https://auth.openai.com/oauth/authorize", 55407),
+    );
+    assert!(
+        verdict_of(&stdout).starts_with("conbus    yes:"),
+        "{stdout}"
+    );
 }
 
 #[test]
@@ -1131,12 +1411,12 @@ fn what_a_real_sign_in_carries_beside_its_callback_does_not_stop_a_no() {
 
 #[test]
 fn the_real_claude_pages_can_earn_a_yes() {
-    for page in [
-        "https://platform.claude.com/oauth/authorize",
-        "https://claude.com/cai/oauth/authorize",
-        "https://antigravity.google/auth-success",
+    for (page, program) in [
+        ("https://platform.claude.com/oauth/authorize", "claude"),
+        ("https://claude.com/cai/oauth/authorize", "claude"),
+        ("https://antigravity.google/auth-success", "agy"),
     ] {
-        let table = ProcessTable::new(&[50], UNDER_A_CONBUS_READ);
+        let table = ProcessTable::new(&[50], &under_a_conbus_read(program));
         let stdout = table.ask(&page_calling_back(page, 55407));
         assert!(
             verdict_of(&stdout).starts_with("conbus    yes:"),

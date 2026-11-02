@@ -2,10 +2,15 @@
 //!
 //! Names only. A process's arguments can hold anything, so they are never asked
 //! for, and a directory is dropped from a name because it can hold a person's
-//! home. The one exception is a conbus process's own subcommand: `conbus run` and
-//! `conbus quota` mean different things here, and that word is all that is kept.
+//! home. The exceptions are a conbus process's own: its subcommand, because `conbus
+//! run` and `conbus quota` mean different things here, and that word is all that is
+//! kept; and the file it runs, because anything can be called conbus. That path is
+//! compared and never printed.
 
 use std::collections::HashSet;
+use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
+use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
@@ -27,7 +32,11 @@ pub(super) struct Listener {
 /// A process named conbus, and which command it is, if `ps` would say.
 pub(super) struct ConbusProcess {
     pub pid: u32,
+    /// Where it stands in the chain: 0 is the listener.
+    pub depth: usize,
     pub command: Option<String>,
+    /// The file it runs, if `lsof` would say.
+    pub binary: Option<PathBuf>,
 }
 
 /// Why a walk cannot say that nothing above a listener is conbus.
@@ -161,10 +170,13 @@ fn walk(pid: u32) -> Listener {
     };
     let conbus = steps
         .iter()
-        .filter(|(_, process)| is_conbus(&process.name))
-        .map(|(pid, _)| ConbusProcess {
+        .enumerate()
+        .filter(|(_, (_, process))| is_conbus(&process.name))
+        .map(|(depth, (pid, _))| ConbusProcess {
             pid: *pid,
+            depth,
             command: conbus_command(*pid),
+            binary: binary_of(*pid),
         })
         .collect();
     Listener {
@@ -201,6 +213,20 @@ fn conbus_command(pid: u32) -> Option<String> {
     ps.args(["-o", "args=", "-p", &pid.to_string()]);
     let output = crate::code::output_within(ps, ASK_WITHIN).ok()?;
     command_word(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// The file `pid` runs, as `lsof` names its program text: the kernel's own path,
+/// links resolved, which no name or argument changes.
+fn binary_of(pid: u32) -> Option<PathBuf> {
+    let mut lsof = Command::new("lsof");
+    lsof.args(["-a", "-p", &pid.to_string(), "-d", "txt", "-Fn"]);
+    let output = crate::code::output_within(lsof, ASK_WITHIN).ok()?;
+    output
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .find_map(|line| line.strip_prefix(b"n"))
+        .filter(|path| !path.is_empty())
+        .map(|path| PathBuf::from(OsStr::from_bytes(path)))
 }
 
 /// `/path to/conbus run claude_code` gives `run`. A word that is not a plain
