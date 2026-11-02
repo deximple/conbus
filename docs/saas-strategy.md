@@ -121,6 +121,9 @@ deployment — or a suite agrees to take the feed — the pipe goes first. Eithe
 way the recorder and the counts are the same, and the OpenTelemetry export is
 worth a local spike regardless: it needs no host.
 
+*Note, 2026-11-03.* V1 will not run (O7, under Gates), so no gate asks this
+question yet. Where it is asked is the operator's call.
+
 ## The product
 
 | Tier | What | Price |
@@ -183,9 +186,16 @@ signals a stranger produces without a call. The money gate is V2 as before,
 and the host gate is unchanged. The original table is kept underneath for the
 record.
 
+**Decided 2026-11-03 (O7).** The operator accepted the ladder as the live gate, so
+V0–V1 below are past. Two things about E1 changed. Its release is the `v1.0.0`
+stable tag, not a release candidate. Its date moved from 2026-11-04 to one week
+after `v1.0.0` is published and the landing page is live, whichever comes later, and
+the two posts go with it, after 1.0. Where the host gate below names V1, the ladder
+stands in its place.
+
 | Gate | Evidence | Pass | Kill |
 | --- | --- | --- | --- |
-| **E1 — exposure** (by 2026-11-04) | The repository public; a release with Linux and macOS binaries; the landing page live; at least two posts in places agent operators read | All four exist | — (a to-do, not a test) |
+| **E1 — exposure** (one week after `v1.0.0` is published and the landing page is live, whichever is later; was 2026-11-04) | The repository public; the `v1.0.0` release, not a release candidate, with Linux and macOS binaries; the landing page live; at least two posts in places agent operators read | All four exist | — (a to-do, not a test) |
 | **E2 — interest** (30 days after E1) | Waitlist signups, each with self-reported team size and the agent vendors the team pays for; release downloads from GitHub's own counts | ≥30 signups, of which ≥10 fit the buyer profile (10–200 developers, two or more supported vendors) | <10 signups after two separate posts: change the message or the profile before anything else |
 | **E3 — problem** (by 2026-12-22) | From the waitlist: a pasted `conbus usage --shareable` week, or the five-question form with a dated incident in the last 30 days, its cost and the workaround | ≥5 fitting signups show an account stop in an unattended run, a failing tool or a permission wait they say cost them something; ≥3 ask for a pilot | ≤2 |
 | **V2 — money** (by 2027-01-31) | A prepaid pilot of at least $250, or a signed order form | ≥1 | 0: fall back to Choice 1 |
@@ -196,7 +206,8 @@ record.
 - At most a third of E2 and E3 from the operator's own network, as before.
 - E1's first item is done: the repository is public.
 
-The original gates, superseded:
+The original gates, superseded on 2026-10-14 and past since O7 was decided on
+2026-11-03, kept for the record:
 
 | Gate | Pass | Kill |
 | --- | --- | --- |
@@ -251,6 +262,10 @@ budget, and the slip rule protects the gates: **fewer than 6 interviews by
 | | Release 0.2.0; notarization path; managed-settings package; security packet; gap-filled turns counted as `recovered`; probe traffic excluded; one end per Cursor turn and quota only from structured fields; Linux build (the first thing cut by the slip rule); `conbus verdict` closes 2026-09-28 and is recorded | agent |
 | to 2026-12-02 | If V1 passed: pilots. Regardless: a local OpenTelemetry export spike (the pipe); RFD 0003 — authentication, rotation, revocation, replay protection, TLS, residency, encryption at rest, backups, deletion with a receipt — before any sync code | both |
 | to 2026-12-22 | V2 → screen, pipe, or neither. On go, the operator decides hosting, billing, terms and privacy policy, and the host is started in a later turn, per `HANDOFF.md` | operator decides |
+
+*Note, 2026-11-03.* The twelve interviews and V1 in this table will not run: O7
+made the ladder under Gates the live gate, and E1 now waits for `v1.0.0` and the
+landing page.
 
 ## Risks
 

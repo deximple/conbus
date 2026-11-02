@@ -90,6 +90,13 @@ market were opened:
 - **Enterprise content capture** is allowed as a self-hosted, opt-in tier in
   the documents only. Nothing is built for it until a buyer asks.
 
+**Decided, 2026-11-03 (O7).** The operator chose the ladder: E1–E3 in
+`docs/saas-strategy.md` is the live gate, and the V0–V1 table there is kept as the
+record, with V0's pass. E1's release is the `v1.0.0` stable tag, not a release
+candidate, and E1 is due one week after `v1.0.0` is published and the landing page
+is live, whichever is later, instead of 2026-11-04. The two posts go with it, after
+1.0. The problem interviews named above will not run.
+
 ## Fall back
 
 - To **Choice 1** if a gate fails, if the value gate has not passed by
