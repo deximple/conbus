@@ -555,7 +555,41 @@ code=0
 run_sign "$devid" v9.9.9 --upload >"$tmp/t13b.out" 2>&1 || code=$?
 expect 1 "$code" "a failed submit dies"
 expect_grep 'could not submit' "$tmp/t13b.out" "the failed submit is named"
+expect_grep 'xcrun notarytool log abc-1 --keychain-profile' "$tmp/t13b.out" "its log command is shown"
 expect_untouched true "a failed submit"
+
+# Apple says Invalid and notarytool exits non-zero, as it does with --wait: the
+# operator reads Apple's own answer and the command for its log, and no guess
+# about the keychain profile, since Apple did get the code.
+scenario 9.9.9 v9.9.9 true
+echo never >"$tmp/spctl.mode"
+printf '{"status":"Invalid","id":"deadbeef-2","message":"Processing complete"}\n' >"$tmp/notary.out"
+touch "$tmp/fail-submit"
+code=0
+run_sign "$devid" v9.9.9 --upload >"$tmp/t13c.out" 2>&1 || code=$?
+expect 1 "$code" "an Invalid that exits non-zero dies"
+expect_grep '"status":"Invalid"' "$tmp/t13c.out" "notarytool's own answer is shown"
+expect_grep 'xcrun notarytool log deadbeef-2 --keychain-profile' "$tmp/t13c.out" "the command for Apple's log is shown"
+expect_nogrep 'profile stored' "$tmp/t13c.out" "a submission Apple answered is not blamed on the profile"
+expect_untouched true "an Invalid that exits non-zero"
+
+# notarytool fails before Apple gives an id: its own words come first, and only
+# then the guess about the profile.
+scenario 9.9.9 v9.9.9 true
+echo never >"$tmp/spctl.mode"
+printf '{"message":"HTTP status code: 401. Unable to authenticate."}\n' >"$tmp/notary.out"
+touch "$tmp/fail-submit"
+code=0
+run_sign "$devid" v9.9.9 --upload >"$tmp/t13d.out" 2>&1 || code=$?
+expect 1 "$code" "a submit with no id dies"
+expect_grep 'Unable to authenticate' "$tmp/t13d.out" "notarytool's own words are shown"
+expect_grep 'profile stored' "$tmp/t13d.out" "with no id, the profile is the guess"
+said=$(grep -n 'Unable to authenticate' "$tmp/t13d.out" | head -1 | cut -d: -f1)
+guess=$(grep -n 'profile stored' "$tmp/t13d.out" | head -1 | cut -d: -f1)
+[ "${said:-0}" -gt 0 ] && [ "$said" -lt "${guess:-0}" ] ||
+    fail "notarytool's words come before the guess about the profile"
+echo "rehearsal: ok: notarytool's words come before the guess about the profile"
+expect_untouched true "a submit with no id"
 
 # Gatekeeper agrees, the notarized requirement does not.
 scenario 9.9.9 v9.9.9 true

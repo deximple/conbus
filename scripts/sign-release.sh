@@ -248,18 +248,35 @@ notarized() {
   spctl --assess --type open --context context:primary-signature --verbose "$1" 2>&1 |
     grep -q 'source=Notarized Developer ID'
 }
+# notarytool's own answer, then the command for Apple's log of that submission,
+# so the operator reads what Apple said before any guess of ours. Sets `id`.
+notary_answer() {
+  cat "$work/notary.json" >&2
+  id=$(sed -n 's/.*"id" *: *"\([^"]*\)".*/\1/p' "$work/notary.json" | head -1)
+  if [ -n "$id" ]; then
+    echo "sign-release.sh: Apple's log of submission $id: xcrun notarytool log $id --keychain-profile $profile" >&2
+  fi
+}
 if ! $rehearsal; then
   if notarized "$bin"; then
     echo "sign-release.sh: Apple has already notarized this code; not submitting again"
   else
     ditto -c -k --keepParent "$bin" "$work/conbus.zip"
-    xcrun notarytool submit "$work/conbus.zip" --keychain-profile "$profile" \
-      --wait --output-format json > "$work/notary.json" ||
-      die "notarytool could not submit; is the $profile profile stored?"
+    # With --wait, notarytool exits non-zero on Apple's `Invalid` too, so a failure
+    # here is not yet a reason to doubt the profile.
+    if ! xcrun notarytool submit "$work/conbus.zip" --keychain-profile "$profile" \
+      --wait --output-format json > "$work/notary.json"; then
+      notary_answer
+      if [ -n "$id" ]; then
+        die "notarytool could not submit $tag: it failed on submission $id, which Apple has; its answer and log are above"
+      fi
+      die "notarytool could not submit $tag and gave no submission id; is the $profile profile stored?"
+    fi
     grep -q '"status" *: *"Accepted"' "$work/notary.json" || {
-      cat "$work/notary.json" >&2
-      id=$(sed -n 's/.*"id" *: *"\([^"]*\)".*/\1/p' "$work/notary.json" | head -1)
-      [ -n "$id" ] && xcrun notarytool log "$id" --keychain-profile "$profile" >&2
+      notary_answer
+      if [ -n "$id" ]; then
+        xcrun notarytool log "$id" --keychain-profile "$profile" >&2
+      fi
       die "Apple did not accept $tag for notarization"
     }
   fi
