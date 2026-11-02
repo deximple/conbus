@@ -43,6 +43,9 @@ the entry says so when it does.
 - `log --tail N --bus-id ID` now follows aliases, as a full read does. It used to
   match the id alone, so a split conversation showed part of itself. Naming a
   conversation now costs one pass over the cache; a plain `--tail` is unchanged.
+- `docs/stability.md` said `spool/` and `cache/` can be deleted without losing a
+  record. A spool file can be the only copy of its record, and `cache/gap-since`
+  holds a range still to fill; only `cache/meta/` is safe to delete.
 
 ## [1.0.0-rc.3] — 2026-11-01
 

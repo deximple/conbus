@@ -40,6 +40,22 @@ marks each one `(experimental)`.
   field means, or changing an exit code is breaking, and happens in 2.0 only.
 - An experimental surface that graduates moves into the stable table in the
   release that starts promising it.
-- `cache/` and `spool/` under the data root are not part of the promise. Both
-  are derived or in transit, can be deleted at any time without losing a
-  record, and their format can change in any release.
+- `cache/` and `spool/` under the data root are not part of the promise, and
+  their format can change in any release. They are not equally safe to delete:
+  - `cache/meta/` is derived from the log. Deleting it loses nothing; the next
+    read rebuilds it.
+  - `cache/gap-since`, `cache/gap-since-codex` and `cache/gap-read` are not
+    derived. They hold the gap-fill ranges a start could not finish, for
+    transcripts and for Codex threads, and how far each got. Deleting them means
+    those ranges are not resumed at the next start. `conbus backfill --gaps` fills
+    the same gaps by hand, except from a transcript moved by `cp`, `rsync -a` or
+    across volumes, which also needs `--include-older-lines` and has its risk
+    named in the manual. No record already written is lost.
+  - `cache/gap-held` says why a range is held, for `conbus doctor`. Deleting it
+    loses only that reason, until the next start finds it again.
+  - `cache/chat-export-read` says which chat exports a start has read. Deleting
+    it means each is read once more at the next start, outside that start's time
+    budget. That writes nothing, and took 0.2 s for 1,000 conversations against a
+    log of a million records.
+  - `spool/` holds hooks in transit, and a file there can be the only copy of
+    its record. Deleting one loses that record.

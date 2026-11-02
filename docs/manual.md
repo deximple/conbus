@@ -225,8 +225,8 @@ conbus log index                    # build the derived read cache under ~/.conb
 ```
 
 Reads that never print a tool body run against a derived cache of digested
-records under `~/.conbus/cache/`; it is rebuilt automatically on the first
-read and `conbus log index` builds it explicitly. Deleting `cache/` loses
+records under `~/.conbus/cache/meta/`; it is rebuilt automatically on the first
+read and `conbus log index` builds it explicitly. Deleting `cache/meta/` loses
 nothing. `CONBUS_NO_CACHE=1` reads the segments directly, as 0.2.x did.
 
 When a hook cannot reach the daemon — a restart, a crashed recorder — it
