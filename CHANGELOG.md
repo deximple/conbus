@@ -117,6 +117,11 @@ the entry says so when it does.
 - A hook that connects to a daemon just as it closes now spools its record instead
   of dropping it. On macOS that failure shows up as `could not bound the daemon
   call`, which is a restart like any other.
+- A log deleted or moved while the recorder runs no longer swallows what comes
+  after it. The recorder kept writing to the file it held open, so each record
+  reported success and nothing could ever read it, even after a restart. It now
+  checks that the file is still at its name before each write, and starts again
+  at that name if not.
 
 ## [1.0.0-rc.3] — 2026-11-01
 
