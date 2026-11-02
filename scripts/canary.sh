@@ -532,37 +532,24 @@ state_restart_drop_total() {
         awk '{ t += $1 } END { print t + 0 }'
 }
 
+# state_extra is what `start` measured before the swap, kept as it is on each write.
+state_extra=""
 state_write() { # state_write <swapped> <prev> <cand> <sha> <restarts-json-array> [rolled_back] [swap_window_drops]
     mkdir -p "$root"
     tmp=$state_file.tmp
-    printf '{"swapped":"%s","prev_build":"%s","candidate_build":"%s","candidate_sha256":"%s","restarts":%s%s%s}\n' \
+    printf '{"swapped":"%s","prev_build":"%s","candidate_build":"%s","candidate_sha256":"%s","restarts":%s%s%s%s}\n' \
         "$1" "$2" "$3" "$4" "$5" "${6:+,\"rolled_back\":\"$6\"}" \
-        "${7:+,\"swap_window_drops\":$7}" >"$tmp"
+        "${7:+,\"swap_window_drops\":$7}" "$state_extra" >"$tmp"
     mv -f "$tmp" "$state_file"
 }
 
-state_restarts_json() { # echoes the restarts array as stored, [] when absent
-    [ -f "$state_file" ] || { echo '[]'; return; }
-    sed -n 's/.*"restarts":\(\[.*\]\).*/\1/p' "$state_file" | sed -n '1p'
-}
-
-state_swap_window_drops() {
-    sed -n 's/.*"swap_window_drops":\([0-9]*\).*/\1/p' "$state_file"
-}
-
 state_add_restart() { # state_add_restart <ts> <serving_ms|-> <new_drops>
-    restarts=$(state_restarts_json)
-    entry=$(printf '{"ts":"%s","serving_ms":%s,"new_drops":%s}' "$1" "${2:--1}" "${3:-0}")
-    if [ "$restarts" = '[]' ]; then
-        new="[$entry]"
-    else
-        new="${restarts%\]},$entry]"
-    fi
-    # All of it: dropping rolled_back here would turn a rolled-back window back
-    # into a live one the moment anyone restarted.
-    state_write "$(state_get swapped)" "$(state_get prev_build)" \
-        "$(state_get candidate_build)" "$(state_get candidate_sha256)" "$new" \
-        "$(state_get rolled_back)" "$(state_swap_window_drops)"
+    # The array and nothing else. Dropping rolled_back here would turn a rolled-back
+    # window back into a live one the moment anyone restarted.
+    CANARY_RESTART=$(printf '{"ts":"%s","serving_ms":%s,"new_drops":%s}' "$1" "${2:--1}" "${3:-0}") \
+        perl -pe 's/"restarts":\[\]/"restarts":[$ENV{CANARY_RESTART}]/ or s/"restarts":\[(.*)\]/"restarts":[$1,$ENV{CANARY_RESTART}]/' \
+        "$state_file" >"$state_file.tmp"
+    mv -f "$state_file.tmp" "$state_file"
 }
 
 # Spool files left after a rollback — the restored 0.2.x build does not
@@ -724,6 +711,59 @@ new_drop_reasons() {
     rm -f "$tmp"
 }
 
+# `<device>:<inode>:<size>:<sha256 of those bytes>`, empty when there is no such file.
+# The drop log only ever grows, so the bytes it held then are still its first bytes
+# now, whatever it has become. Size alone cannot see a file rewritten in place.
+file_identity() { # file_identity <file>
+    [ -f "$1" ] || return 0
+    if [ "$(uname -s)" = Darwin ]; then
+        fi_stat=$(stat -f '%d:%i:%z' "$1" 2>/dev/null || true)
+    else
+        fi_stat=$(stat -c '%d:%i:%s' "$1" 2>/dev/null || true)
+    fi
+    [ -n "$fi_stat" ] || return 0
+    printf '%s:%s\n' "$fi_stat" "$(file_prefix_sha "$1" "${fi_stat##*:}")"
+}
+
+file_prefix_sha() { # file_prefix_sha <file> <bytes>
+    { head -c "$2" "$1" 2>/dev/null || true; } | shasum -a 256 | awk '{ print $1 }'
+}
+
+# Is the drop log the file `start` saw? The real rotation renames it, inode kept, so
+# it is one of the two names. Sets df_fault for a file the recorder cannot write and
+# df_open for evidence that was taken away.
+drops_file_state() { # drops_file_state <1 when two rotations already explain it>
+    df_fault="" df_open=""
+    if [ -e "$drops_log" ] && { [ ! -f "$drops_log" ] || [ ! -w "$drops_log" ]; }; then
+        df_fault="the recorder cannot write $drops_log, so no later drop can land there"
+    elif [ ! -e "$drops_log" ] && [ ! -w "$root" ]; then
+        df_fault="the recorder cannot create $drops_log, so no later drop can land there"
+    fi
+    df_recorded=$(state_get drops_file || true)
+    if [ -z "$df_recorded" ]; then
+        df_open="canary.json has no record of the drop log, so nothing says this is the file 'canary.sh start' saw"
+        return 0
+    fi
+    [ "$1" != 1 ] || return 0
+    IFS=: read -r df_dev df_ino df_size df_sha <<<"$df_recorded"
+    for df_file in "$drops_log" "$drops_rotated"; do
+        df_now=$(file_identity "$df_file")
+        case $df_now in
+            "$df_dev:$df_ino:"*) ;;
+            *) continue ;;
+        esac
+        df_rest=${df_now#"$df_dev:$df_ino:"}
+        df_now_size=${df_rest%%:*}
+        if [ "$df_now_size" -lt "$df_size" ]; then
+            df_open="$df_file is $df_now_size byte(s), smaller than the $df_size it was at the swap: part of what it held is gone"
+        elif [ "$(file_prefix_sha "$df_file" "$df_size")" != "$df_sha" ]; then
+            df_open="the first $df_size byte(s) of $df_file are not what they were at the swap: it was rewritten"
+        fi
+        return 0
+    done
+    df_open="the drop log 'canary.sh start' saw is gone, moved aside or replaced, and no rotation explains it"
+}
+
 # The value of `<name> <value>` in rows an item built.
 row_value() { # row_value <rows> <name>
     printf '%s\n' "$1" | sed -n "s/^$2 //p"
@@ -848,6 +888,8 @@ verdict_drops() {
         held_floor="at least "
         open="$open; the oldest drop line left is at $first_rotated, after the swap: anything dropped before it was rotated away"
     fi
+    drops_file_state "$discarded"
+    [ -z "$df_open" ] || open="$open; $df_open"
     if [ "${n_known:-0}" -gt 0 ]; then
         open="$open; ${n_known} line(s) with a known reason no rule covers need a person to say what they mean"
     fi
@@ -866,6 +908,7 @@ verdict_drops() {
     fi
 
     faults=""
+    [ -z "$df_fault" ] || faults="$faults, $df_fault"
     [ "${n_lost:-0}" -eq 0 ] || faults="$faults, ${n_lost} lost record(s)"
     [ "${n_gap:-0}" -eq 0 ] || faults="$faults, ${n_gap} adapter gap(s)"
     [ "$n_unseen" -eq 0 ] || faults="$faults, $n_unseen line(s) with a reason not seen before the swap"
@@ -2242,6 +2285,10 @@ case $sub in
         fi
         before_drops=$(mktemp)
         drop_reasons >"$before_drops"
+        # Which file this window's drops land in, so the verdict can tell if it was
+        # taken away. One that does not exist yet could vanish unseen, so it does now.
+        (umask 077; : >>"$drops_log") 2>/dev/null || true
+        state_extra=",\"drops_file\":\"$(file_identity "$drops_log")\""
         # A rotation can rename drops.jsonl mid-swap, so "drops since now"
         # is a timestamp cut across both generations, not a line offset.
         before_ts=$(now_iso_ms)

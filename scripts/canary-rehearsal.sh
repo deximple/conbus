@@ -927,6 +927,16 @@ rm -f "$rollback_bin"
 
 # --- restart + verdict -------------------------------------------------------
 
+# What `start` records about the drop log, measured the same way.
+drops_identity() {
+    if [ "$(uname -s)" = Darwin ]; then
+        di_stat=$(stat -f '%d:%i:%z' "$home/.conbus/drops.jsonl")
+    else
+        di_stat=$(stat -c '%d:%i:%s' "$home/.conbus/drops.jsonl")
+    fi
+    printf '%s:%s' "$di_stat" "$(shasum -a 256 "$home/.conbus/drops.jsonl" | awk '{ print $1 }')"
+}
+
 # A complete, healthy window: everything verdict reads, dated around <swapped>
 # (default 7 days and an hour ago, so the window is over). A scenario then
 # breaks the one thing it is about.
@@ -946,15 +956,16 @@ verdict_fixture() { # verdict_fixture [swapped-iso] [restarts-json]
     rm -rf "$home/.conbus/spool"
     write_fake beef live "$install_dir/conbus"
     write_fake 01d notokens "$rollback_bin"
-    printf '{"swapped":"%s","prev_build":"01d","candidate_build":"beef","candidate_sha256":"%s","restarts":%s}\n' \
-        "$fx_swapped" "$(shasum -a 256 "$install_dir/conbus" | awk '{ print $1 }')" "$fx_restarts" \
-        >"$home/.conbus/canary.json"
     printf '%s conbus daemon: beef: socket /x/sock log /x/log (10 record(s), 0 unreadable)\n' \
         "$(iso_after "$fx_swapped" 4)" >"$home/.conbus/daemon.log"
     printf '{"build":"beef","pid":%s,"started":"%s","serving":"%s","core_dumps_disabled":true,"memory_locked":true}\n' \
         "$recorder_pid" "$(iso_after "$fx_swapped" 1)" "$(iso_after "$fx_swapped" 4)" >"$home/.conbus/daemon.build"
+    rm -f "$home/.conbus/drops.jsonl"
     printf '{"ts":"%s","reason":"socket closed early"}\n' \
         "$(iso_after "$fx_swapped" -$((5 * DAY)))" >"$home/.conbus/drops.jsonl"
+    printf '{"swapped":"%s","prev_build":"01d","candidate_build":"beef","candidate_sha256":"%s","restarts":%s,"drops_file":"%s"}\n' \
+        "$fx_swapped" "$(shasum -a 256 "$install_dir/conbus" | awk '{ print $1 }')" "$fx_restarts" "$(drops_identity)" \
+        >"$home/.conbus/canary.json"
     usage_rows "$(iso_after "$fx_swapped" -$((14 * DAY)))" claude_code codex >"$home/.usage-rows"
 }
 
@@ -1409,6 +1420,78 @@ drop_line 3600 'spooled hook still has no conversation (orphan)' 'session_ended 
 code=0
 run verdict >"$tmp/verdict-one-rotation.out" 2>&1 || code=$?
 expect 0 "$code" "one rotation loses nothing"
+
+# The drop log taken away. A lost-record line sits in the window, then the file goes: removed, reseeded, emptied or
+# replaced. Reading what is left finds nothing wrong, so `start` records which file it was and what it held.
+verdict_fixture; drop_line 3600 'no daemon on /x/sock: Connection refused (os error 61)'
+rm -f "$home/.conbus/drops.jsonl"
+code=0; run verdict >"$tmp/verdict-dropsgone.out" 2>&1 || code=$?
+expect 4 "$code" "a drop log removed after the swap leaves drops open (P4)"
+expect_grep '^UNCHECKED drops.*is gone' "$tmp/verdict-dropsgone.out" "and says so"
+verdict_fixture; drop_line 3600 'no daemon on /x/sock: Connection refused (os error 61)'
+printf '{"ts":"2026-09-01T00:00:00.000Z","reason":"no daemon on /x/sock: Connection refused (os error 61)"}\n' >"$home/.conbus/drops.jsonl"
+code=0; run verdict >"$tmp/verdict-dropsreseeded.out" 2>&1 || code=$?
+expect 4 "$code" "a drop log reseeded after the swap leaves drops open (P4b)"
+expect_grep '^UNCHECKED drops.*rewritten' "$tmp/verdict-dropsreseeded.out" "and says so"
+verdict_fixture; drop_line 3600 'no daemon on /x/sock: Connection refused (os error 61)'
+: >"$home/.conbus/drops.jsonl"
+code=0; run verdict >"$tmp/verdict-dropsemptied.out" 2>&1 || code=$?
+expect 4 "$code" "a drop log emptied after the swap leaves drops open"
+expect_grep '^UNCHECKED drops.*smaller' "$tmp/verdict-dropsemptied.out" "and says so"
+verdict_fixture
+cat "$home/.conbus/drops.jsonl" >"$home/.conbus/drops.copy"
+mv "$home/.conbus/drops.jsonl" "$home/.conbus/drops.aside"
+mv "$home/.conbus/drops.copy" "$home/.conbus/drops.jsonl"
+code=0; run verdict >"$tmp/verdict-dropsother.out" 2>&1 || code=$?
+expect 4 "$code" "another file in its place, same bytes, leaves drops open"
+rm -f "$home/.conbus/drops.aside"
+# A file the recorder cannot write will hold no drop at all from now on.
+if [ "$(id -u)" != 0 ]; then
+    verdict_fixture
+    chmod 444 "$home/.conbus/drops.jsonl"
+    code=0; run verdict >"$tmp/verdict-dropsro.out" 2>&1 || code=$?
+    chmod 600 "$home/.conbus/drops.jsonl"
+    expect 1 "$code" "a drop log the recorder cannot write fails"
+    expect_grep '^FAIL drops.*cannot write' "$tmp/verdict-dropsro.out" "and says so"
+fi
+verdict_fixture
+rm -f "$home/.conbus/drops.jsonl"
+mkdir "$home/.conbus/drops.jsonl"
+code=0; run verdict >"$tmp/verdict-dropsdir.out" 2>&1 || code=$?
+rmdir "$home/.conbus/drops.jsonl"
+expect 1 "$code" "a directory in its place fails"
+# A window start did not record: nothing says this is the file.
+verdict_fixture
+sed -E 's/,"drops_file":"[^"]*"//' "$home/.conbus/canary.json" >"$home/.conbus/canary.json.new"
+mv -f "$home/.conbus/canary.json.new" "$home/.conbus/canary.json"
+code=0; run verdict >"$tmp/verdict-dropsnorecord.out" 2>&1 || code=$?
+expect 4 "$code" "a window that recorded no drop log cannot pass drops"
+expect_grep '^UNCHECKED drops.*no record of the drop log' "$tmp/verdict-dropsnorecord.out" "and says why"
+# The real rotation renames the file, inode kept, and a line grew it first. That is no fault.
+verdict_fixture
+drop_line 3600 'EOF while parsing a value at line 1 column 0'
+mv "$home/.conbus/drops.jsonl" "$home/.conbus/drops.1.jsonl"
+drop_line 1800 'EOF while parsing a value at line 1 column 0'
+code=0; run verdict >"$tmp/verdict-dropsrotated.out" 2>&1 || code=$?
+expect 0 "$code" "a real rotation is not flagged"
+verdict_fixture
+mv "$home/.conbus/drops.jsonl" "$home/.conbus/drops.1.jsonl"
+code=0; run verdict >"$tmp/verdict-dropsrotated-nolive.out" 2>&1 || code=$?
+expect 0 "$code" "nor one with no new line yet"
+# start records it, and creates the file when there is none, so a removal later can be seen.
+write_fake 01d old "$install_dir/conbus"
+rm -f "$rollback_bin" "$home/.conbus/canary.json" "$home/.conbus/drops.jsonl" "$home/.conbus/drops.1.jsonl"
+daemon_boot beef 4270
+code=0; run start --from "$tmp/stage/conbus-good" >"$tmp/start-dropsfile.out" 2>&1 || code=$?
+expect 0 "$code" "start with no drop log"
+expect_grep '"drops_file":"[0-9]*:[0-9]*:0:' "$home/.conbus/canary.json" "records one it made, empty"
+expect_file "$home/.conbus/drops.jsonl" "and it exists"
+# restart keeps it.
+code=0; run restart >/dev/null 2>&1 || code=$?
+expect_grep '"drops_file":"' "$home/.conbus/canary.json" "and restart keeps it"
+expect_grep '"restarts":\[{' "$home/.conbus/canary.json" "beside the restart it adds"
+code=0; run restart >/dev/null 2>&1 || code=$?
+expect 2 "$(grep -o '"serving_ms"' "$home/.conbus/canary.json" | wc -l | tr -d ' ')" "and a second one is appended"
 
 # Two rotations threw the baseline and part of the window away. Known kinds are
 # still known, which ends the false FAIL, and the hole in the evidence is named.
