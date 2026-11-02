@@ -119,6 +119,56 @@ been run under the hardened runtime this way — recorder, hook, `doctor`,
 entitlement lets a landed hop open Terminal through `osascript`. That path
 has not been exercised under the hardened runtime.
 
+## Reading the canary's verdict
+
+`scripts/canary.sh verdict` judges the window since `canary.sh start`, and its exit
+code is the answer:
+
+| Exit | Meaning |
+|---|---|
+| 0 | Pass. Every item was judged. `operator-feel` is still yours to answer. |
+| 1 | An item failed. |
+| 2 | It refused its arguments, or a number in the environment or in `canary.json`. |
+| 3 | The window is still open. A fail inside the window still exits 1. |
+| 4 | The window is over and an item other than `operator-feel` could not be judged. It names what is open. This is neither a fail nor a pass. |
+
+`--idle <harness|day>[,...]` is your answer to the one question a log cannot settle:
+"was this harness or day idle, or not recorded?". The question names what to pass, and
+a PASS prints the answer. Nothing else can be answered this way.
+
+`start` keeps what the verdict needs to judge the window in `canary.json`, including
+the budgets it ran under: `CONBUS_CANARY_RSS_MB`, `CONBUS_CANARY_DOCTOR_MS`,
+`CONBUS_CANARY_SERVING_LIMIT` and `CONBUS_CANARY_DISK_WARN_OK`. The verdict prints each
+one with where it came from, and the environment still wins. A window started by an
+older script has none of this recorded, and exits 4 on `drops` and `log-files`.
+
+Where a rollback goes: `start` copies the binary installed at that moment to
+`conbus.rollback`, replacing any copy left from an earlier window. A rollback, the
+automatic one after a failed `start` or `canary.sh rollback`, returns to that build, the
+one that ran before the swap. `usage-parity` compares against a separate copy,
+`conbus.parity`: the binary named with `--parity <binary>`, or by default the build
+being replaced. It is copied first, so `--parity ~/.local/bin/conbus.rollback` compares
+against an older copy before `start` replaces it. `preflight` and `start` print both
+builds by version and hash.
+
+What the verdict cannot see, so a PASS does not rule it out:
+
+- A drop log truncated back to its size at the swap. It is the same file with the same
+  first bytes, and the lines written since are simply gone.
+- A crash loop at login that ends in a running recorder within 30 minutes. A start that
+  never wrote its start line is not counted, and the first start after a boot is the
+  boot's own.
+- An `--idle` answer given in advance. It covers a later question about that harness or
+  day, and the PASS line names it.
+
+One case cannot pass and has nothing to answer: an empty drop log at the swap followed
+by one rotation reads as evidence rotated away, and gives exit 4.
+
+`start` exits 1 when it rolled back, or when it found no candidate or install to swap.
+It exits 2 when it refused before anything moved.
+`start` and `rollback` exit 3 when the rollback could not be verified, and say which
+check it was. `restart` exits 1 when the daemon never served.
+
 ## Operator decisions
 
 These are not engineering steps and no agent takes them on its own.

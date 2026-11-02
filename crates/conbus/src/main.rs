@@ -141,28 +141,35 @@ fn main() -> ExitCode {
             // explicit "carry on" costs nothing and cannot be mistaken for an
             // empty context block.
             let mut payload = String::new();
-            let _ = std::io::stdin().read_to_string(&mut payload);
+            let unread = std::io::stdin().read_to_string(&mut payload).err();
             let paths = Paths::resolve().ok();
             // The local policy decides from the payload alone, before and
             // independent of the daemon round trip: a down or slow recorder
             // must not lift a deny, so the same decision is the reply
             // whichever way the record lands.
             let decision = policy::decide(paths.as_ref(), &harness, &payload);
-            let reply =
-                match hook::client::run_in(paths.as_ref(), &harness, &mut payload.as_bytes()) {
-                    Ok(reply) => decision.unwrap_or(reply),
-                    Err(err) => {
-                        // Durable, because the vendor swallows stderr; throttled,
-                        // because a stopped daemon would otherwise write one of
-                        // these per hook per turn straight into the transcript.
-                        if drops::record(&err) {
-                            eprintln!("conbus hook: record dropped: {err}");
-                        }
-                        decision.unwrap_or_else(|| {
-                            hook::client::failure_reply(&harness, &payload).to_string()
-                        })
+            // A stdin that could not be read is said as that. Left to the parser,
+            // an invalid byte reads as an empty payload, which is what a hook run
+            // by hand looks like, and a prompt is gone with nothing to tell them
+            // apart.
+            let outcome = match unread {
+                Some(err) => hook::client::payload_unread(&harness, &err),
+                None => hook::client::run_in(paths.as_ref(), &harness, &mut payload.as_bytes()),
+            };
+            let reply = match outcome {
+                Ok(reply) => decision.unwrap_or(reply),
+                Err(err) => {
+                    // Durable, because the vendor swallows stderr; throttled,
+                    // because a stopped daemon would otherwise write one of
+                    // these per hook per turn straight into the transcript.
+                    if drops::record(&err) {
+                        eprintln!("conbus hook: record dropped: {err}");
                     }
-                };
+                    decision.unwrap_or_else(|| {
+                        hook::client::failure_reply(&harness, &payload).to_string()
+                    })
+                }
+            };
             // One JSON object and nothing else. The vendor's parser runs
             // `JSON.parse` on the whole of stdout, so a stray line anywhere
             // turns a reply into plain text — which on `UserPromptSubmit` is
