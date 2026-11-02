@@ -223,9 +223,12 @@ pub fn run(apply: bool, profile: Option<&str>) -> io::Result<()> {
     changed |= daemon_service(&service, apply)?;
     changed |= binary_file(&binary, apply)?;
 
-    let root = std::env::var_os("CONBUS_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".conbus"));
+    // Found as every other command finds it, `$XDG_STATE_HOME/conbus` included.
+    let resolved = conbus_core::paths::Paths::resolve();
+    let root = resolved
+        .as_ref()
+        .map(|paths| paths.root().to_path_buf())
+        .unwrap_or_else(|_| home.join(".conbus"));
     // Hooks in transit are removed, not kept — nothing is draining them now.
     let spool = root.join("spool");
     if spool.is_dir() {
@@ -255,8 +258,8 @@ pub fn run(apply: bool, profile: Option<&str>) -> io::Result<()> {
     }
     // Not under the root, so nothing above names them, and the record that does
     // goes with the root. Read here, while there is a binary to read it.
-    if let Ok(paths) = conbus_core::paths::Paths::resolve() {
-        match crate::backup::left_behind(&paths) {
+    if let Ok(paths) = &resolved {
+        match crate::backup::left_behind(paths) {
             Ok(copies) => {
                 for copy in copies {
                     println!(

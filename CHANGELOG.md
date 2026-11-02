@@ -215,6 +215,9 @@ the entry says so when it does.
 - Gap fill reads only regular files. A FIFO named like a transcript or an export
   blocked a start, or `conbus backfill`, for good. Anything else is skipped and
   counted as not read, and a link is not followed.
+- `conbus uninstall` now finds the log under `$XDG_STATE_HOME/conbus` when that is
+  set, as every other command does. It named no log there, and left the spool it
+  says it removes.
 ### Added
 
 - `conbus auth` (experimental): for when a sign-in tab opens and you should not have
