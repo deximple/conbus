@@ -90,6 +90,36 @@ struct Message {
     content: Option<serde_json::Value>,
     #[serde(default)]
     model: Option<String>,
+    #[serde(default)]
+    stop_reason: Option<String>,
+}
+
+/// What the model's last line said about whether it had stopped.
+///
+/// Measured on real transcripts: the model's lines carry `stop_reason` on all
+/// but 89 of 242,992, and every line of a tool call says `tool_use`. It is the
+/// only thing in a transcript that tells a finished turn from one still running
+/// or cut off, which matters because an ending cannot be taken back.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ModelStop {
+    /// It finished what it had to say.
+    Stopped,
+    /// It had not finished: it was on a tool call, or something cut it short.
+    /// Live, `max_tokens` reaches the recorder as `StopFailure`, not `Complete`.
+    Working,
+    /// The line does not say. Builds that wrote no `stop_reason`, or a line
+    /// caught before the vendor knew.
+    Unsaid,
+}
+
+impl ModelStop {
+    fn of(stop_reason: Option<&str>) -> Self {
+        match stop_reason {
+            Some("end_turn") => ModelStop::Stopped,
+            Some(_) => ModelStop::Working,
+            None => ModelStop::Unsaid,
+        }
+    }
 }
 
 /// The model the vendor names on an assistant line it wrote itself: an API
@@ -167,12 +197,15 @@ fn open_turn(
     opened: &mut HashSet<String>,
     entry: Entry,
 ) {
-    close(out, bus_id, open.take());
+    close(out, bus_id, open.take(), ClosedBy::NextPrompt);
     if let Some(id) = &entry.vendor_turn_id {
         opened.insert(id.as_str().to_string());
     }
     out.entries.push(entry);
-    *open = Some(OpenTurn { last_reply: None });
+    *open = Some(OpenTurn {
+        last_reply: None,
+        stop: ModelStop::Unsaid,
+    });
 }
 
 /// A turn that has started and not yet been closed by the next prompt.
@@ -183,6 +216,18 @@ struct OpenTurn {
     /// vendor upgrade mid-conversation is ordinary, and the ending belongs to
     /// the build that wrote it, not to the one that read the prompt.
     last_reply: Option<(Option<Timestamp>, String, Source)>,
+    /// What the turn's last line said about the model. A Chat export holds
+    /// finished messages only, so its turns are always stopped.
+    stop: ModelStop,
+}
+
+/// What closed a turn, which is what an unsaid stop is read against.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ClosedBy {
+    /// The next prompt: the turn is over, however it went.
+    NextPrompt,
+    /// The end of the file: the turn may still be running.
+    EndOfFile,
 }
 
 /// The text a message carries, ignoring everything that is not text.
@@ -347,6 +392,9 @@ pub fn parse_claude_transcript(text: &str, session: &str, bus_id: BusId) -> Reco
                 if let Some(entry) = tentative.take() {
                     open_turn(&mut out, bus_id, &mut open, &mut opened, entry);
                 }
+                if let Some(turn) = open.as_mut() {
+                    turn.stop = ModelStop::of(message.and_then(|m| m.stop_reason.as_deref()));
+                }
                 let Some(text) = message.and_then(|m| m.content.as_ref()).and_then(text_of) else {
                     out.skip("assistant line with no text");
                     continue;
@@ -359,7 +407,7 @@ pub fn parse_claude_transcript(text: &str, session: &str, bus_id: BusId) -> Reco
             other => out.skip(other),
         }
     }
-    close(&mut out, bus_id, open.take());
+    close(&mut out, bus_id, open.take(), ClosedBy::EndOfFile);
     prepend_session_candidate(&mut out, bus_id, harness_version);
     out
 }
@@ -607,15 +655,30 @@ fn unix_seconds(value: Option<&serde_json::Value>) -> Option<Timestamp> {
     Timestamp::from_unix_seconds(seconds)
 }
 
-/// End a turn with the last reply it received. A prompt that was never answered
-/// simply has no ending in the transcript, which is the truth about it.
-fn close(out: &mut Recovered, bus_id: BusId, open: Option<OpenTurn>) {
+/// End a turn with the last reply it received, if the turn is known to be over.
+///
+/// A prompt that was never answered simply has no ending in the transcript,
+/// which is the truth about it. Neither has a turn the model had not stopped when
+/// the source ran out or the next prompt came: its last text is partial, and
+/// `Complete` would say otherwise for good. A turn still running gets its ending
+/// from `Stop`.
+fn close(out: &mut Recovered, bus_id: BusId, open: Option<OpenTurn>, closed_by: ClosedBy) {
     let Some(OpenTurn {
         last_reply: Some((at, text, source)),
+        stop,
     }) = open
     else {
         return;
     };
+    let over = match stop {
+        ModelStop::Stopped => true,
+        ModelStop::Working => false,
+        ModelStop::Unsaid => closed_by == ClosedBy::NextPrompt,
+    };
+    if !over {
+        out.skip("reply of a turn not known to have ended");
+        return;
+    }
     out.entries.push(Entry {
         bus_id,
         observed_at: at,
@@ -727,7 +790,7 @@ fn parse_chat_conversation(conversation: &Value) -> Recovered {
                     out.skip("human message with no text");
                     continue;
                 };
-                close(&mut out, bus_id, open.take());
+                close(&mut out, bus_id, open.take(), ClosedBy::NextPrompt);
                 out.entries.push(Entry {
                     bus_id,
                     observed_at: at,
@@ -744,7 +807,10 @@ fn parse_chat_conversation(conversation: &Value) -> Recovered {
                         prompt: Body::kept(text.to_string()),
                     },
                 });
-                open = Some(OpenTurn { last_reply: None });
+                open = Some(OpenTurn {
+                    last_reply: None,
+                    stop: ModelStop::Stopped,
+                });
             }
             "assistant" => {
                 let Some(text) = text else {
@@ -763,7 +829,7 @@ fn parse_chat_conversation(conversation: &Value) -> Recovered {
             }),
         }
     }
-    close(&mut out, bus_id, open.take());
+    close(&mut out, bus_id, open.take(), ClosedBy::EndOfFile);
     if !out.entries.is_empty() {
         let observed_at = out.entries[0].observed_at;
         out.entries.insert(
@@ -798,7 +864,7 @@ mod tests {
 {"type":"assistant","sessionId":"S1","timestamp":"2026-07-28T15:36:56.388Z","version":"2.1.229","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Read","input":{}}]}}
 {"type":"assistant","sessionId":"S1","timestamp":"2026-07-28T15:37:00.000Z","version":"2.1.229","message":{"role":"assistant","content":[{"type":"text","text":"the answer"}]}}
 {"type":"user","sessionId":"S1","timestamp":"2026-07-28T15:38:00.000Z","version":"2.1.229","promptId":"P2","promptSource":"sdk","message":{"role":"user","content":[{"type":"text","text":"second question"}]}}
-{"type":"assistant","sessionId":"S1","timestamp":"2026-07-28T15:38:10.000Z","version":"2.1.247","message":{"role":"assistant","content":[{"type":"text","text":"and the second answer"}]}}
+{"type":"assistant","sessionId":"S1","timestamp":"2026-07-28T15:38:10.000Z","version":"2.1.247","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"and the second answer"}]}}
 "#;
 
     fn parsed() -> Recovered {
@@ -1362,6 +1428,121 @@ mod tests {
 
         assert_eq!(prompts(&out), vec!["a prompt"]);
         assert_eq!(endings(&out), Vec::<String>::new());
+    }
+
+    /// An assistant line that says why the model stopped, if it does.
+    fn said(text: &str, stop_reason: serde_json::Value) -> String {
+        serde_json::json!({
+            "type": "assistant", "sessionId": "S1", "timestamp": "2026-11-01T00:00:01.000Z",
+            "message": {"role": "assistant", "model": "m", "stop_reason": stop_reason,
+                        "content": [{"type": "text", "text": text}]}
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn a_last_turn_the_model_has_not_stopped_has_no_ending() {
+        // Read while it runs, the text so far is not how the turn ended: 321 of
+        // 1,954 real last turns stop on a tool call. `Stop` writes the ending
+        // when there is one.
+        for stop_reason in [
+            serde_json::json!("tool_use"),
+            serde_json::Value::Null,
+            serde_json::json!("pause_turn"),
+        ] {
+            let out = parse(&[
+                user("", "P1", "a prompt"),
+                said("let me look at that first", stop_reason.clone()),
+            ]);
+
+            assert_eq!(prompts(&out).len(), 1);
+            assert_eq!(endings(&out), Vec::<String>::new(), "{stop_reason}");
+            assert_eq!(
+                out.skipped.get("reply of a turn not known to have ended"),
+                Some(&1)
+            );
+        }
+    }
+
+    #[test]
+    fn a_last_turn_the_model_finished_has_its_ending() {
+        let out = parse(&[
+            user("", "P1", "a prompt"),
+            said("the answer", serde_json::json!("end_turn")),
+        ]);
+
+        assert_eq!(endings(&out), vec!["the answer"]);
+    }
+
+    #[test]
+    fn a_turn_cut_short_is_not_recovered_as_complete() {
+        // `max_tokens` reaches the live path as `StopFailure`, which is not
+        // `Complete`, and the text is truncated. The others do not say it finished
+        // either, and a missing ending can be filled by a hook where a false one
+        // cannot be taken back.
+        for stop_reason in ["max_tokens", "refusal", "stop_sequence"] {
+            let out = parse(&[
+                user("", "P1", "a prompt"),
+                said("the answer so far", serde_json::json!(stop_reason)),
+                user("", "P2", "another prompt"),
+            ]);
+
+            assert_eq!(endings(&out), Vec::<String>::new(), "{stop_reason}");
+        }
+    }
+
+    #[test]
+    fn the_last_line_of_a_turn_says_whether_it_stopped() {
+        // A tool call after the text keeps the turn running, and the model's
+        // next stop ends it even when that line has no text of its own.
+        let tool_call = r#"{"type":"assistant","sessionId":"S1","timestamp":"2026-11-01T00:00:02.000Z","message":{"role":"assistant","model":"m","stop_reason":"tool_use","content":[{"type":"tool_use","id":"t1","name":"Read","input":{}}]}}"#;
+        let stopped_without_text = r#"{"type":"assistant","sessionId":"S1","timestamp":"2026-11-01T00:00:03.000Z","message":{"role":"assistant","model":"m","stop_reason":"end_turn","content":[{"type":"thinking","thinking":"done"}]}}"#;
+
+        let running = parse(&[
+            user("", "P1", "a prompt"),
+            said("the answer", serde_json::json!("end_turn")),
+            tool_call.to_string(),
+        ]);
+        assert_eq!(endings(&running), Vec::<String>::new());
+
+        let finished = parse(&[
+            user("", "P1", "a prompt"),
+            said("the answer", serde_json::json!("tool_use")),
+            stopped_without_text.to_string(),
+        ]);
+        assert_eq!(endings(&finished), vec!["the answer"]);
+    }
+
+    #[test]
+    fn a_turn_cut_off_on_a_tool_call_gets_no_ending_from_the_next_prompt() {
+        let out = parse(&[
+            user("", "P1", "a prompt"),
+            said("working on it", serde_json::json!("tool_use")),
+            user("", "P2", "another prompt"),
+            said("the answer", serde_json::json!("end_turn")),
+        ]);
+
+        assert_eq!(prompts(&out).len(), 2);
+        assert_eq!(endings(&out), vec!["the answer"]);
+    }
+
+    #[test]
+    fn a_transcript_that_never_says_why_is_ended_only_by_the_next_prompt() {
+        // Lines from a build that wrote no `stop_reason`: the next prompt shows
+        // the turn is over, and nothing shows how the last one went.
+        let reply = |text: &str| {
+            format!(
+                r#"{{"type":"assistant","sessionId":"S1","timestamp":"2026-11-01T00:00:01.000Z","message":{{"role":"assistant","content":[{{"type":"text","text":"{text}"}}]}}}}"#
+            )
+        };
+        let out = parse(&[
+            user("", "P1", "first"),
+            reply("first answer"),
+            user("", "P2", "second"),
+            reply("second answer"),
+        ]);
+
+        assert_eq!(endings(&out), vec!["first answer"]);
     }
 
     #[test]
