@@ -2,14 +2,15 @@
 # Rehearse sign-release.sh end-to-end on a fake toolchain. gh, codesign, spctl,
 # xcrun, ditto and sleep come first in PATH, so the real control flow runs with
 # no keychain, no Apple and no network. Nothing here can publish: gh is a fake
-# that keeps a release in a directory.
+# that keeps a release in a directory, and curl a fake that serves it.
 #
 # The fake gh keeps state: whether the release is a draft, the bytes of each
 # asset, what they were at the moment of publishing, and the order of everything
 # that happened. So a check here asks what the release ended up as, not whether a
 # command line went by. It behaves as gh 2.101 does where the script leans on it:
-# an upload over an existing asset fails without --clobber, and a download fails
-# only when no pattern matches.
+# an upload over an existing asset fails without --clobber, --clobber deletes the
+# asset first, so a failed upload leaves it gone, and a download fails only when no
+# pattern matches. A real draft has never been through any of this.
 #
 #   scripts/sign-release-rehearsal.sh
 set -euo pipefail
@@ -72,6 +73,17 @@ echo "gh $*" >>"$SR_TMP/gh.calls"
 release=$SR_TMP/release
 [ "$1" = release ] || { echo "fake gh: only releases are rehearsed: $*" >&2; exit 2; }
 sub=$2
+# With no tag, `gh release view` asks about the latest release.
+if [ "$sub" = view ] && [ "$*" = "release view --json tagName --jq .tagName" ]; then
+    if [ -f "$SR_TMP/latest-is-another" ]; then
+        echo v0.0.1
+    elif [ -f "$release/latest" ]; then
+        cat "$release/tag"
+    else
+        echo v0.0.1
+    fi
+    exit 0
+fi
 tag=$3
 shift 3
 [ "$tag" = "$(cat "$release/tag")" ] || { echo "release not found" >&2; exit 1; }
@@ -110,7 +122,12 @@ case $sub in
                 *) files="$files $arg" ;;
             esac
         done
-        [ ! -f "$SR_TMP/fail-upload" ] || { echo "upload failed" >&2; exit 1; }
+        # gh deletes what it replaces before it uploads, so a failure leaves it gone.
+        if [ -f "$SR_TMP/fail-upload" ]; then
+            [ -z "$clobber" ] || for file in $files; do rm -f "$release/assets/$(basename "$file")"; done
+            echo "upload failed" >&2
+            exit 1
+        fi
         for file in $files; do
             name=$(basename "$file")
             if [ -f "$release/assets/$name" ] && [ -z "$clobber" ]; then
@@ -182,7 +199,7 @@ if [ -n "$dv" ]; then
         if [ -f "$SR_TMP/team-notset" ]; then
             echo 'TeamIdentifier=not set' >&2
         else
-            echo 'TeamIdentifier=ABCDE12345' >&2
+            echo "TeamIdentifier=$(cat "$SR_TMP/team")" >&2
         fi
     fi
     exit 0
@@ -241,6 +258,52 @@ for last; do :; done
 : > "$last"
 EOF
 
+# An anonymous download: only a published latest release is served, as GitHub does.
+cat >"$tools/curl" <<'EOF'
+#!/bin/sh
+echo "curl $*" >>"$SR_TMP/curl.calls"
+echo curl >>"$SR_TMP/order.log"
+release=$SR_TMP/release
+url=
+out=
+while [ $# -gt 0 ]; do
+    case $1 in
+        -o) out=$2; shift 2 ;;
+        -*) shift ;;
+        *) url=$1; shift ;;
+    esac
+done
+name=${url##*/}
+case $url in
+    https://github.com/*/releases/latest/download/*) ;;
+    *) echo "fake curl: $url" >&2; exit 22 ;;
+esac
+[ "$(cat "$release/draft")" = false ] || exit 22
+[ -f "$release/latest" ] || exit 22
+if [ -f "$SR_TMP/curl-slow-start" ]; then
+    n=$(cat "$SR_TMP/curl.n" 2>/dev/null || echo 0)
+    echo $((n + 1)) >"$SR_TMP/curl.n"
+    [ "$n" -ge 3 ] || exit 22
+fi
+[ ! -f "$SR_TMP/curl-404" ] || exit 22
+if [ -f "$SR_TMP/curl-stale" ]; then
+    printf 'an older copy\n' >"$out"
+    exit 0
+fi
+cp "$release/assets/$name" "$out"
+EOF
+
+# For package.sh on a Mac: joins nothing, and says nothing of interest.
+cat >"$tools/lipo" <<'EOF'
+#!/bin/sh
+case $1 in
+    -create)
+        cp "$4" "$3"
+        ;;
+esac
+exit 0
+EOF
+
 printf '#!/bin/sh\nexit 0\n' >"$tools/sleep"
 chmod 755 "$tools"/*
 
@@ -256,6 +319,16 @@ for package in $packages; do
 done
 macos=conbus-macos-universal.tar.gz
 
+# The team install.sh refuses every other signature without, read from there.
+team_required=$(sed -n 's/.*\[ "$team" = \([A-Z0-9]*\) \].*/\1/p' "$install_sh")
+[ -n "$team_required" ] || fail "install.sh names no team"
+
+# A stand-in conbus: its --version, and the stamp build_info.rs puts in a real one.
+binary_of_version() {
+    printf '#!/bin/sh\n# conbus-version %s;\n[ "$1" = --version ] && echo "conbus %s (f4k3)"\nexit 0\n' \
+        "$1" "$1"
+}
+
 # seed_release <package version> <tag> <draft: true|false> — the release as the
 # workflow leaves it: ad-hoc packages, each with its checksum, and install.sh.
 seed_release() {
@@ -263,15 +336,14 @@ seed_release() {
     mkdir -p "$tmp/pkg" "$tmp/release/assets"
     printf '%s\n' "$2" >"$tmp/release/tag"
     printf '%s\n' "$3" >"$tmp/release/draft"
-    printf '#!/bin/sh\n[ "$1" = --version ] && echo "conbus %s (f4k3)"\nexit 0\n' "$1" \
-        >"$tmp/pkg/conbus"
+    binary_of_version "$1" >"$tmp/pkg/conbus"
     chmod 755 "$tmp/pkg/conbus"
     printf 'the licence\n' >"$tmp/pkg/LICENSE"
     for package in $packages; do
         (cd "$tmp/pkg" && tar -czf "$tmp/release/assets/$package" conbus LICENSE)
         (cd "$tmp/release/assets" && shasum -a 256 "$package" >"$package.sha256")
     done
-    printf '#!/bin/sh\n# the installer\n' >"$tmp/release/assets/install.sh"
+    cp "$install_sh" "$tmp/release/assets/install.sh"
     cp -R "$tmp/release/assets" "$tmp/seed"
 }
 
@@ -288,8 +360,10 @@ run_sign() {
 scenario() {
     rm -f "$tmp"/{gh,codesign,spctl,xcrun,ditto}.calls "$tmp"/{sign.id,spctl.n,spctl.mode,notary.out} \
         "$tmp"/{no-runtime,team-notset,fail-verify,fail-testreq,fail-submit,break-binary} \
-        "$tmp"/{fail-upload,fail-edit,upload-lost,racing-job-takes} "$tmp/order.log"
+        "$tmp"/{fail-upload,fail-edit,upload-lost,racing-job-takes} "$tmp/order.log" \
+        "$tmp"/{curl.calls,curl.n,curl-404,curl-stale,curl-slow-start,latest-is-another}
     : >"$tmp/order.log"
+    echo "$team_required" >"$tmp/team"
     rm -rf "$tmp/run/target"
     seed_release "$1" "$2" "$3"
 }
@@ -319,7 +393,23 @@ expect_order() { # expect_order <line a> <line b> <what>
     echo "rehearsal: ok: $3"
 }
 
-devid="Developer ID Application: Deximple (ABCDE12345)"
+devid="Developer ID Application: Deximple ($team_required)"
+
+# A package's owner and group, as tar lists them: `root/root`, whichever tar it is.
+owners_of() {
+    tar -tvzf "$1" | awk '{ if ($2 ~ /\//) print $2; else print $3 "/" $4 }' | sort -u
+}
+
+# Put a package on the release in place of the seeded one, with a true checksum.
+replace_package() { # replace_package <name> <version in its binary>
+    rm -rf "$tmp/other"
+    mkdir -p "$tmp/other"
+    binary_of_version "$2" >"$tmp/other/conbus"
+    chmod 755 "$tmp/other/conbus"
+    (cd "$tmp/other" && tar -czf "$tmp/release/assets/$1" conbus)
+    (cd "$tmp/release/assets" && shasum -a 256 "$1" >"$1.sha256")
+    cp "$tmp/release/assets/$1" "$tmp/release/assets/$1.sha256" "$tmp/seed/"
+}
 
 # --- validation ---------------------------------------------------------------
 
@@ -378,6 +468,8 @@ expect_absent "$tmp/xcrun.calls" "a rehearsal never talks to Apple"
 expect "$(tar -tzf "$tmp/seed/$macos")" \
     "$(tar -tzf "$tmp/run/target/signed/$macos")" \
     "the signed package keeps the same members"
+expect root/root "$(owners_of "$tmp/run/target/signed/$macos")" \
+    "the signed package names no account in its tar headers"
 
 # --- signature checks that must fail ------------------------------------------
 
@@ -531,6 +623,15 @@ expect_order "$(order_of last upload)" "$(order_of last download)" \
     "the release is read back after the upload"
 expect_order "$(order_of last download)" "$(order_of first publish)" \
     "published only after it was read back"
+expect_order "$(order_of first publish)" "$(order_of first curl)" \
+    "what people get is fetched after publishing"
+for name in $required; do
+    expect_grep "releases/latest/download/$name -o" "$tmp/curl.calls" "$name is fetched as an install fetches it"
+done
+expect_grep 'is published and is now the latest release' "$tmp/t15.out" "it says it is published"
+expect_nogrep 'IS PUBLISHED, AND' "$tmp/t15.out" "and raises no alarm"
+expect root/root "$(owners_of "$tmp/release/assets/$macos")" \
+    "the package people get names no account in its tar headers"
 
 # A failed publish leaves a draft and says so through gh's own error.
 scenario 9.9.9 v9.9.9 true
@@ -540,15 +641,45 @@ code=0
 run_sign "$devid" v9.9.9 --upload >"$tmp/t15b.out" 2>&1 || code=$?
 expect 1 "$code" "a publish that fails fails the run"
 expect true "$(cat "$tmp/release/draft")" "a failed publish leaves the draft"
+expect_grep 'publishing it failed' "$tmp/t15b.out" "a failed publish says so"
+expect_grep 'run this again with --upload' "$tmp/t15b.out" "a failed publish says what to do"
 
-# An upload that fails stops before any publish.
+# An upload that fails stops before any publish. gh deleted what it was replacing,
+# and this first run has to say so: the next one would only find the assets missing.
 scenario 9.9.9 v9.9.9 true
 echo always >"$tmp/spctl.mode"
 touch "$tmp/fail-upload"
 code=0
 run_sign "$devid" v9.9.9 --upload >"$tmp/t15c.out" 2>&1 || code=$?
 expect 1 "$code" "an upload that fails fails the run"
-expect_untouched true "a failed upload"
+expect true "$(cat "$tmp/release/draft")" "a failed upload leaves the draft"
+expect_absent "$tmp/release/publishes" "a failed upload publishes nothing"
+expect_absent "$tmp/release/assets/$macos" "gh deleted the package before it failed"
+expect_file "$tmp/release/assets/conbus-linux-x86_64.tar.gz" "the Linux packages were not touched"
+expect_grep 'stays a draft' "$tmp/t15c.out" "a failed upload says the release stays a draft"
+expect_grep 'the upload failed' "$tmp/t15c.out" "a failed upload says so on its first run"
+expect_grep 'may now be gone' "$tmp/t15c.out" "a failed upload says what it left behind"
+expect_grep 'gh release upload v9.9.9 target/signed' "$tmp/t15c.out" "a failed upload gives the hand upload"
+expect_file "$tmp/run/target/signed/$macos" "the signed package is there for the hand upload"
+
+# The hand upload it gives, then the same command again: that publishes.
+rm -f "$tmp/fail-upload"
+(cd "$tmp/run" && env PATH="$tools:$PATH" SR_TMP="$tmp" gh release upload v9.9.9 \
+    "target/signed/$macos" "target/signed/$macos.sha256" --clobber)
+code=0
+run_sign "$devid" v9.9.9 --upload >"$tmp/t15e.out" 2>&1 || code=$?
+expect 0 "$code" "the hand upload, then the same command, publishes"
+expect 1 "$(cat "$tmp/release/publishes")" "and publishes once"
+
+# A failed upload on a release candidate, public as it is, says what it stays as.
+scenario 9.9.9-rc.1 v9.9.9-rc.1 false
+echo always >"$tmp/spctl.mode"
+touch "$tmp/fail-upload"
+code=0
+run_sign "$devid" v9.9.9-rc.1 --upload >"$tmp/t15f.out" 2>&1 || code=$?
+expect 1 "$code" "an rc upload that fails fails the run"
+expect_grep 'stays a prerelease' "$tmp/t15f.out" "and says what it stays"
+expect_grep 'may now be gone' "$tmp/t15f.out" "and says what it left behind"
 
 # gh says it uploaded, and the release still holds the ad-hoc package.
 scenario 9.9.9 v9.9.9 true
@@ -643,6 +774,192 @@ run_sign "$devid" v9.9.9-rc.1 --upload >"$tmp/t16b.out" 2>&1 || code=$?
 expect 1 "$code" "an rc with no Linux package is refused too"
 expect_grep 'stays a prerelease' "$tmp/t16b.out" "the refusal says what it stays"
 expect_untouched false "an rc with no Linux package"
+
+# --- what is on it has to be what an install needs ------------------------------
+
+# Signed by a team install.sh refuses: every macOS install of it would die.
+scenario 9.9.9 v9.9.9 true
+echo always >"$tmp/spctl.mode"
+echo ABCDE12345 >"$tmp/team"
+code=0
+run_sign "Developer ID Application: Someone Else (ABCDE12345)" v9.9.9 --upload >"$tmp/t22.out" 2>&1 || code=$?
+expect 1 "$code" "a signature from a team install.sh refuses is not published"
+expect_grep "$team_required" "$tmp/t22.out" "the refusal names the team install.sh requires"
+expect_grep 'ABCDE12345' "$tmp/t22.out" "the refusal names the team it got"
+expect_untouched true "a signature from the wrong team"
+
+# Without --upload too: finding out after Apple's review helps nobody.
+scenario 9.9.9 v9.9.9 true
+echo later >"$tmp/spctl.mode"
+printf '{"status":"Accepted","id":"abc-1"}\n' >"$tmp/notary.out"
+echo ABCDE12345 >"$tmp/team"
+code=0
+run_sign "Developer ID Application: Someone Else (ABCDE12345)" v9.9.9 >"$tmp/t22b.out" 2>&1 || code=$?
+expect 1 "$code" "the wrong team is refused before anything goes to Apple"
+expect_absent "$tmp/xcrun.calls" "nothing went to Apple"
+
+# A checksum file that names another file checks nothing for its own package.
+scenario 9.9.9 v9.9.9 true
+echo always >"$tmp/spctl.mode"
+cp "$tmp/release/assets/conbus-linux-x86_64.tar.gz.sha256" "$tmp/release/assets/conbus-linux-aarch64.tar.gz.sha256"
+printf 'torn' >>"$tmp/release/assets/conbus-linux-aarch64.tar.gz"
+code=0
+run_sign "$devid" v9.9.9 --upload >"$tmp/t21.out" 2>&1 || code=$?
+expect 1 "$code" "a checksum file naming another package is refused"
+expect_absent "$tmp/release/publishes" "nothing was published"
+expect_grep 'conbus-linux-aarch64.tar.gz.sha256 names conbus-linux-x86_64.tar.gz' "$tmp/t21.out" \
+    "the refusal says which file it names"
+
+# A checksum file holding two lines checks the second for nobody.
+scenario 9.9.9 v9.9.9 true
+echo always >"$tmp/spctl.mode"
+cat "$tmp/release/assets/conbus-linux-x86_64.tar.gz.sha256" \
+    >>"$tmp/release/assets/conbus-linux-aarch64.tar.gz.sha256"
+code=0
+run_sign "$devid" v9.9.9 --upload >"$tmp/t21b.out" 2>&1 || code=$?
+expect 1 "$code" "a checksum file of two lines is refused"
+expect_absent "$tmp/release/publishes" "nothing was published"
+
+# Each package has to hold this version. A Mac cannot run a Linux binary, so the
+# stamp is what is read, and 9.9.9 is inside 9.9.9-rc.1.
+for carrying in $packages; do
+    for wrong in 9.9.8 9.9.9-rc.1 19.9.9; do
+        scenario 9.9.9 v9.9.9 true
+        echo always >"$tmp/spctl.mode"
+        replace_package "$carrying" "$wrong"
+        code=0
+        run_sign "$devid" v9.9.9 --upload >"$tmp/t23.out" 2>&1 || code=$?
+        expect 1 "$code" "$carrying holding $wrong is refused for v9.9.9"
+        expect_grep "$carrying holds a binary that is not v9.9.9" "$tmp/t23.out" "the refusal names it"
+        expect_untouched true "$carrying holding $wrong"
+    done
+done
+
+# A package with no binary in it at all.
+scenario 9.9.9 v9.9.9 true
+echo always >"$tmp/spctl.mode"
+(cd "$tmp/pkg" && tar -czf "$tmp/release/assets/conbus-linux-x86_64.tar.gz" LICENSE)
+(cd "$tmp/release/assets" && shasum -a 256 conbus-linux-x86_64.tar.gz >conbus-linux-x86_64.tar.gz.sha256)
+code=0
+run_sign "$devid" v9.9.9 --upload >"$tmp/t23b.out" 2>&1 || code=$?
+expect 1 "$code" "a package with no binary is refused"
+expect_grep 'conbus-linux-x86_64.tar.gz holds' "$tmp/t23b.out" "the refusal names it"
+
+# install.sh has to be the script: one byte is an asset, and it installs nothing.
+for bad in 'x' '#!/bin/sh
+echo hello
+' '#!/bin/sh
+if then
+'; do
+    scenario 9.9.9 v9.9.9 true
+    echo always >"$tmp/spctl.mode"
+    printf '%s' "$bad" >"$tmp/release/assets/install.sh"
+    cp "$tmp/release/assets/install.sh" "$tmp/seed/install.sh"
+    code=0
+    run_sign "$devid" v9.9.9 --upload >"$tmp/t24.out" 2>&1 || code=$?
+    expect 1 "$code" "an install.sh that is not the script is refused"
+    expect_grep 'install.sh on it is not the installer' "$tmp/t24.out" "the refusal says so"
+    expect_untouched true "an install.sh that is not the script"
+done
+
+# Each thing that makes it the script, wrong on its own in an otherwise real copy.
+for wrong in first-line syntax team package; do
+    scenario 9.9.9 v9.9.9 true
+    echo always >"$tmp/spctl.mode"
+    case $wrong in
+        first-line) sed '1s/.*/#!\/bin\/bash/' "$install_sh" ;;
+        syntax) cat "$install_sh"; printf 'if then\n' ;;
+        team) sed "s/= $team_required \]/= ZZZZZZZZZZ ]/" "$install_sh" ;;
+        package) sed 's/conbus-linux-aarch64.tar.gz/conbus-linux-other.tar.gz/' "$install_sh" ;;
+    esac >"$tmp/release/assets/install.sh"
+    cmp -s "$install_sh" "$tmp/release/assets/install.sh" && fail "$wrong: the copy did not change"
+    cp "$tmp/release/assets/install.sh" "$tmp/seed/install.sh"
+    code=0
+    run_sign "$devid" v9.9.9 --upload >"$tmp/t24b.out" 2>&1 || code=$?
+    expect 1 "$code" "an install.sh with the wrong $wrong is refused"
+    expect_grep 'install.sh on it is not the installer' "$tmp/t24b.out" "the refusal says so"
+    expect_untouched true "an install.sh with the wrong $wrong"
+done
+
+# --- after publishing, what people really get ---------------------------------
+
+# GitHub's URLs can lag: a slow start is not an alarm.
+scenario 9.9.9 v9.9.9 true
+echo always >"$tmp/spctl.mode"
+touch "$tmp/curl-slow-start"
+code=0
+run_sign "$devid" v9.9.9 --upload >"$tmp/t25.out" 2>&1 || code=$?
+expect 0 "$code" "anonymous URLs that catch up are fine"
+expect_nogrep 'IS PUBLISHED, AND' "$tmp/t25.out" "and raise no alarm"
+
+for marker in curl-404 curl-stale latest-is-another; do
+    scenario 9.9.9 v9.9.9 true
+    echo always >"$tmp/spctl.mode"
+    touch "$tmp/$marker"
+    code=0
+    run_sign "$devid" v9.9.9 --upload >"$tmp/t26.out" 2>&1 || code=$?
+    expect 1 "$code" "$marker: a published release people cannot get fails the run"
+    expect_grep 'IS PUBLISHED, AND' "$tmp/t26.out" "$marker: it says so loudly"
+    case $marker in
+        curl-404) said='cannot be fetched' ;;
+        curl-stale) said='is not what was checked' ;;
+        latest-is-another) said='as the latest, not v9.9.9' ;;
+    esac
+    expect_grep "$said" "$tmp/t26.out" "$marker: it says what is wrong"
+    expect_grep 'gh release edit v9.9.9 --draft=true' "$tmp/t26.out" "$marker: it says how to take it back"
+    expect_grep 'docs/release.md' "$tmp/t26.out" "$marker: it says where the rest is"
+    expect false "$(cat "$tmp/release/draft")" "$marker: it does not undo anything by itself"
+done
+
+# --- packaging: no account's name in a public package ---------------------------
+
+# package.sh as the workflow runs it, on this machine's own tar: BSD on the gate, GNU
+# on Linux. rc.3's macOS package carried an operator's account name in its headers.
+pack=$tmp/pack
+mkdir -p "$pack/dist"
+binary_of_version 9.9.9 >"$pack/conbus"
+chmod 755 "$pack/conbus"
+printf 'the licence\n' >"$pack/LICENSE"
+printf 'the readme\n' >"$pack/README.md"
+printf '## [9.9.9] - today\n\nnotes\n' >"$pack/CHANGELOG.md"
+cp "$install_sh" "$pack/install.sh"
+case $(uname -s) in
+    Darwin)
+        mkdir -p "$pack/target/aarch64-apple-darwin/release" "$pack/target/x86_64-apple-darwin/release"
+        cp "$pack/conbus" "$pack/target/aarch64-apple-darwin/release/conbus"
+        cp "$pack/conbus" "$pack/target/x86_64-apple-darwin/release/conbus"
+        built=(conbus-macos-universal.tar.gz)
+        args=(dist)
+        ;;
+    *)
+        mkdir -p "$pack/target/x86_64-unknown-linux-musl/release"
+        cp "$pack/conbus" "$pack/target/x86_64-unknown-linux-musl/release/conbus"
+        built=(conbus-linux-x86_64.tar.gz)
+        args=(dist x86_64-unknown-linux-musl)
+        ;;
+esac
+: >"$tmp/codesign.calls"
+(cd "$pack" && env PATH="$tools:$PATH" SR_TMP="$tmp" sh "$here/package.sh" "${args[@]}" >"$tmp/t27.out" 2>&1) ||
+    { cat "$tmp/t27.out" >&2; fail "package.sh could not package a stand-in"; }
+expect root/root "$(owners_of "$pack/dist/${built[0]}")" "package.sh names no account in its tar headers"
+expect "conbus
+LICENSE
+README.md
+CHANGELOG.md" "$(tar -tzf "$pack/dist/${built[0]}")" "package.sh packs the same four members"
+
+# A binary without the stamp could not be checked at release time, so it stops here.
+case $(uname -s) in
+    Darwin)
+        printf '#!/bin/sh\necho "conbus 9.9.9 (f4k3)"\n' >"$pack/target/aarch64-apple-darwin/release/conbus"
+        ;;
+    *)
+        printf '#!/bin/sh\necho "conbus 9.9.9 (f4k3)"\n' >"$pack/target/x86_64-unknown-linux-musl/release/conbus"
+        ;;
+esac
+code=0
+(cd "$pack" && env PATH="$tools:$PATH" SR_TMP="$tmp" sh "$here/package.sh" "${args[@]}" >"$tmp/t28.out" 2>&1) || code=$?
+expect 1 "$code" "package.sh refuses a binary without the version stamp"
+expect_grep 'conbus-version 9.9.9;' "$tmp/t28.out" "it says what it looked for"
 
 # --- the workflow -------------------------------------------------------------
 

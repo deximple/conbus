@@ -61,6 +61,21 @@ conbus-linux-x86_64.tar.gz conbus-linux-x86_64.tar.gz.sha256
 conbus-linux-aarch64.tar.gz conbus-linux-aarch64.tar.gz.sha256
 install.sh"
 
+# install.sh is what people run, so what it demands is read from it: the team it
+# refuses every other signature without, and the repository it fetches from.
+installer=$(dirname "$0")/../install.sh
+[ -f "$installer" ] || die "missing $installer"
+team_required=$(sed -n 's/.*\[ "$team" = \([A-Z0-9]*\) \].*/\1/p' "$installer")
+[ -n "$team_required" ] || die "$installer names no signing team"
+repo=$(sed -n 's/^repo=\${CONBUS_REPO:-\(.*\)}$/\1/p' "$installer")
+[ -n "$repo" ] || die "$installer names no repository"
+
+# The owner fields of a package people download. The default records the account
+# that built it, and rc.3's macOS package named the operator's.
+pack() {
+  tar --owner=root:0 --group=root:0 -czf "$@"
+}
+
 case $tag in
   *-rc.*) stable=false held="a prerelease" ;;
   *) stable=true held="a draft" ;;
@@ -79,9 +94,22 @@ refuse() {
   Then run this again with --upload."
 }
 
-# Fetch everything an install fetches, as an install fetches it, and check each
-# checksum. gh fails only when no pattern matches, and reports its own error, so
-# what arrived is what counts.
+# Is this file the script people run? One byte is an asset as far as gh is concerned.
+is_the_installer() {
+  [ "$(head -n 1 "$1")" = "#!/bin/sh" ] && sh -n "$1" 2>/dev/null &&
+    grep -qF "[ \"\$team\" = $team_required ]" "$1" || return 1
+  for name in $required; do
+    case $name in
+      *.tar.gz) grep -qF "$name" "$1" || return 1 ;;
+    esac
+  done
+}
+
+# Fetch everything an install fetches, as an install fetches it, and check it is
+# what an install needs. gh fails only when no pattern matches, and reports its own
+# error, so what arrived is what counts. A checksum file names the file it checks, so
+# one naming another package would pass and check nothing for its own. A Mac cannot
+# run a Linux binary, so each package is asked for the stamp build_info.rs puts in it.
 check_release() {
   rm -rf "$work/check"
   mkdir "$work/check"
@@ -99,11 +127,56 @@ check_release() {
   for name in $required; do
     case $name in
       *.sha256)
+        named=$(awk 'NR == 1 { print $2 } NR > 1 { print "more than one file" }' "$work/check/$name")
+        [ "$named" = "${name%.sha256}" ] || refuse "$name names $named"
         (cd "$work/check" && shasum -a 256 -c "$name" >/dev/null 2>&1) ||
           refuse "${name%.sha256} does not match the checksum beside it"
         ;;
+      *.tar.gz)
+        tar -xOzf "$work/check/$name" conbus >"$work/check-binary" 2>/dev/null ||
+          refuse "$name holds no conbus"
+        LC_ALL=C grep -qaF "conbus-version ${tag#v};" "$work/check-binary" ||
+          refuse "$name holds a binary that is not $tag"
+        ;;
+      install.sh)
+        is_the_installer "$work/check/$name" ||
+          refuse "install.sh on it is not the installer"
+        ;;
     esac
   done
+}
+
+# What people get now that it is public. GitHub's latest-release URLs can lag a
+# moment, so this asks a few times before it says anything. It prints what is wrong.
+public_wrong() {
+  latest=$(gh release view --json tagName --jq .tagName 2>/dev/null) || latest=
+  if [ "$latest" != "$tag" ]; then
+    echo "gh names ${latest:-no release} as the latest, not $tag"
+    return
+  fi
+  for name in $required; do
+    if ! curl -fsSL "$base/$name" -o "$work/public" 2>/dev/null; then
+      echo "$base/$name cannot be fetched"
+      return
+    fi
+    if ! cmp -s "$work/public" "$work/check/$name"; then
+      echo "$base/$name is not what was checked"
+      return
+    fi
+  done
+}
+
+published_wrong() {
+  die "
+***
+*** $tag IS PUBLISHED, AND PEOPLE MAY NOT BE GETTING WHAT WAS CHECKED:
+*** $1
+***
+  To take it back, which makes it a draft again:
+    gh release edit $tag --draft=true
+  Then see which release people get now:
+    gh release view
+  docs/release.md, \"Taking a bad release back\", has the rest."
 }
 
 # Before any signing: Apple's first review of a release has taken hours, which is
@@ -152,6 +225,8 @@ if ! $rehearsal; then
   team=$(codesign -dv "$bin" 2>&1 | sed -n 's/^TeamIdentifier=//p')
   [ -n "$team" ] && [ "$team" != "not set" ] ||
     die "the signature names no team: $identity is not a Developer ID"
+  [ "$team" = "$team_required" ] ||
+    die "the signature's team is $team, and install.sh requires $team_required: every macOS install of this package would refuse it"
 fi
 "$bin" --version >/dev/null || die "the signed binary does not run"
 
@@ -201,12 +276,15 @@ fi
 rm -rf "$out"
 mkdir -p "$out"
 # shellcheck disable=SC2086 # the member names are the package's own
-tar -czf "$out/$asset" -C "$work/stage" $members
+pack "$out/$asset" -C "$work/stage" $members
 (cd "$out" && shasum -a 256 "$asset" > "$asset.sha256")
 echo "sign-release.sh: $out/$asset ($(cut -d' ' -f1 < "$out/$asset.sha256"))"
 
 if [ -n "$upload" ]; then
-  gh release upload "$tag" "$out/$asset" "$out/$asset.sha256" --clobber
+  # gh deletes each asset before it replaces it, so a failure leaves it gone, and on
+  # a release candidate that is a public release. Say so now, not on the next run.
+  gh release upload "$tag" "$out/$asset" "$out/$asset.sha256" --clobber ||
+    refuse "the upload failed, and gh deletes an asset before it replaces it, so $asset or its checksum may now be gone from it"
   # Read it back. A job still running, or run again, can have changed the release
   # since the first look, and this is the last look before people get it.
   check_release
@@ -217,7 +295,15 @@ if [ -n "$upload" ]; then
   # ad-hoc package; only now, signed, does it become the release people get.
   # A release candidate stays a prerelease and never becomes `latest`.
   if $stable; then
-    gh release edit "$tag" --draft=false --latest
+    gh release edit "$tag" --draft=false --latest ||
+      refuse "publishing it failed; what is on it was checked and need not change"
+    base="https://github.com/$repo/releases/latest/download"
+    tries=0
+    while wrong=$(public_wrong) && [ -n "$wrong" ]; do
+      tries=$((tries + 1))
+      [ "$tries" -lt 8 ] || published_wrong "$wrong"
+      sleep 15
+    done
     echo "sign-release.sh: $tag is published and is now the latest release"
   fi
 elif ! $rehearsal; then

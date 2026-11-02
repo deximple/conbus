@@ -100,6 +100,10 @@ jobs:
       - name: test
         run: cargo test --workspace --locked --no-fail-fast
 
+      # GNU tar here, where the gate has BSD tar: package.sh's owner flags need both.
+      - name: sign-release rehearsal
+        run: bash scripts/sign-release-rehearsal.sh
+
   linux-arm:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 40
