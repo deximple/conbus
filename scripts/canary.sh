@@ -1177,6 +1177,8 @@ verdict_activity() {
                 if (!(days[i] in day_seen)) empty = empty " " days[i]
             for (d in day_seen)
                 if (!(d in day_live)) recovered_days = recovered_days " " d
+            # No hook, nothing to go silent: this one arrives only by export.
+            delete active_before["claude_chat"]
             for (h in active_before)
                 if (!(h in harness_seen)) silent = silent " " h
             for (h in harness_seen) {
@@ -2635,8 +2637,14 @@ case $sub in
         state_extra=",\"drops_file\":\"$(file_identity "$drops_log")\",\"log_files\":\"$(log_segments | awk 'NR == 1 { first = $1 } { last = $1; n++ } END { printf "%d:%s:%s", n, first, last }')\""
         # The budgets this window runs on stay with it. A verdict a week later comes
         # from another shell, and a forgotten RSS budget has failed a healthy week twice.
-        state_extra="$state_extra,\"rss_mb\":\"$rss_budget_mb\",\"doctor_ms\":\"$doctor_ms_budget\",\"disk_warn_ok\":\"${CONBUS_CANARY_DISK_WARN_OK:-}\",\"serving_limit\":\"$serving_limit\""
-        say "budgets stored: recorder RSS $rss_budget_mb MB, doctor $doctor_ms_budget ms, serving limit $serving_limit s, disk warning accepted: ${CONBUS_CANARY_DISK_WARN_OK:-no}"
+        disk_ok=""
+        disk_said=no
+        if [ "${CONBUS_CANARY_DISK_WARN_OK:-}" = 1 ]; then
+            disk_ok=1
+            disk_said=yes
+        fi
+        state_extra="$state_extra,\"rss_mb\":\"$rss_budget_mb\",\"doctor_ms\":\"$doctor_ms_budget\",\"disk_warn_ok\":\"$disk_ok\",\"serving_limit\":\"$serving_limit\""
+        say "budgets stored: recorder RSS $rss_budget_mb MB, doctor $doctor_ms_budget ms, serving limit $serving_limit s, disk warning accepted: $disk_said"
         # A rotation can rename drops.jsonl mid-swap, so "drops since now"
         # is a timestamp cut across both generations, not a line offset.
         before_ts=$(now_iso_ms)

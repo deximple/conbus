@@ -3198,6 +3198,21 @@ printf '{"ts":"2026-1' >>"$home/.conbus/drops.jsonl"
 code=0; run verdict >/dev/null 2>&1 || code=$?
 expect 4 "$code" "a tear at the end of the file, with no time, leaves drops open"
 
+# A harness with no hook has nothing to go silent. claude_chat arrives only by export, so a month's quiet there is
+# no question: it was 18 of the 35 windows asked about on the real log.
+verdict_fixture
+usage_row "$(day_ago 10)" claude_chat >>"$home/.usage-rows"
+code=0; run verdict >"$tmp/verdict-chat-silent.out" 2>&1 || code=$?
+expect 0 "$code" "a harness that only arrives by export is not asked about"
+expect_no_grep 'claude_chat recorded' "$tmp/verdict-chat-silent.out" "not by name either"
+# It is still shown when it is there, and every harness with a hook is still asked about.
+verdict_fixture
+usage_row "$(day_ago 10)" cursor >>"$home/.usage-rows"
+usage_row "$(day_ago 10)" claude_chat >>"$home/.usage-rows"
+code=0; run verdict >"$tmp/verdict-chat-and-cursor.out" 2>&1 || code=$?
+expect 4 "$code" "a harness with a hook still is"
+expect_grep 'answer with --idle cursor$' "$tmp/verdict-chat-and-cursor.out" "and only that one"
+
 # A real build under this throwaway HOME would ask an agy that is not signed
 # in, and a build older than the sign-in check opens a browser tab doing it.
 expect_file "$tmp/agy-bin.seen" "the fakes saw doctor run"
