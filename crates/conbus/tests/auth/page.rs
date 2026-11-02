@@ -753,6 +753,9 @@ fn a_vendor_that_gave_no_answer_is_not_counted_as_fine() {
     let html = page_with(&[("CONBUS_AGY_BIN", agy.as_path())]);
 
     assert_eq!(banner(&html), "neutral", "{html}");
+    // The shape the review saw: agy's `models` failed, codex and gh not installed.
+    assert!(html.contains("<tr><td>agy</td><td>SKIP"), "{html}");
+    assert!(html.contains("not installed: codex, gh"), "{html}");
     assert!(html.contains("could not tell for: agy<"), "{html}");
     assert!(html.contains("could not tell: agy"), "{html}");
     assert!(html.contains("확인 못 함: agy"), "{html}");
