@@ -223,9 +223,22 @@ fn ends_in_a_number(host: &str) -> bool {
 /// The longest client name that is printed.
 const CLIENT_NAME_MAX: usize = 64;
 
+/// A name that can only read as a name: no quote to close, no colon or semicolon to
+/// start a sentence with, and no run of spaces to push the rest of it onto a row of
+/// its own at some terminal width.
+fn plain_name(name: &str) -> bool {
+    name.chars().count() <= CLIENT_NAME_MAX
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '.' | '_' | '-'))
+        && !name.starts_with(' ')
+        && !name.ends_with(' ')
+        && !name.contains("  ")
+}
+
 /// What a page's `client` parameter says about who asked. The whole address is
-/// attacker-controlled, so the name is printed only when it cannot move the
-/// cursor or start a line, and only as a claim.
+/// attacker-controlled, so a name is printed only when it is plain, and only as a
+/// claim. Any other is left out, and the line says one was given.
 pub(super) fn client_claim(value: &str) -> String {
     let parsed = serde_json::from_str::<serde_json::Value>(value).ok();
     let name = parsed
@@ -233,16 +246,10 @@ pub(super) fn client_claim(value: &str) -> String {
         .and_then(|client| client.get("name")?.as_str());
     match name.filter(|name| !name.is_empty()) {
         None => "a client it does not name".into(),
-        Some(name)
-            if name.chars().count() > CLIENT_NAME_MAX || !name.chars().all(super::printable) =>
-        {
-            format!(
-                "a client name conbus will not print: not printable, or over {CLIENT_NAME_MAX} characters"
-            )
-        }
-        Some(name) => {
+        Some(name) if plain_name(name) => {
             format!("asked by \"{name}\"; that is the URL's claim, and nothing checked it")
         }
+        Some(_) => "it gives a client name, not shown here because it is not plain".into(),
     }
 }
 

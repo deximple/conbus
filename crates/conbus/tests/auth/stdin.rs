@@ -40,13 +40,45 @@ fn a_url_on_stdin_gets_the_same_answer_and_no_warning() {
 }
 
 #[test]
-fn stdin_gives_the_first_line_that_is_not_blank() {
-    let output =
-        ask_on_stdin(b"\n  \nhttps://auth.openai.com/authorize\nhttps://github.com/login\n");
+fn blank_lines_around_the_address_do_not_matter() {
+    let output = ask_on_stdin(b"\n  \nhttps://auth.openai.com/authorize\n\n");
     let stdout = String::from_utf8_lossy(&output.stdout);
 
+    assert!(output.status.success());
     assert!(stdout.contains("OpenAI sign-in"), "{stdout}");
-    assert!(!stdout.contains("github.com"), "{stdout}");
+}
+
+#[test]
+fn stdin_holding_more_than_one_line_is_refused_not_guessed_at() {
+    // A browser reads this as auth.openai.com.evil.example. The first line alone
+    // used to be read, and it named OpenAI.
+    for input in [
+        &b"https://auth.openai.com\n.evil.example/\n"[..],
+        b"https://auth.openai.com/authorize\nhttps://github.com/login\n",
+        b"https://auth.openai.com\n\n.evil.example/",
+    ] {
+        let output = ask_on_stdin(input);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{input:?}");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "", "{input:?}");
+        assert!(stderr.contains("more than one line"), "{input:?}: {stderr}");
+        assert!(!stderr.contains("evil.example"), "{stderr}");
+    }
+}
+
+#[test]
+fn stdin_longer_than_any_address_is_refused() {
+    let mut input = b"https://auth.openai.com/?a=".to_vec();
+    input.extend(std::iter::repeat_n(b'x', 1024 * 1024 + 10));
+    let output = ask_on_stdin(&input);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("longer than"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]

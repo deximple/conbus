@@ -272,20 +272,7 @@ fn only_an_explicit_html_and_open_opens_the_page() {
     let page_arg = page.to_str().expect("utf8");
     let (_dir, calls, path) = opener();
 
-    for args in [
-        &["auth"][..],
-        &["auth", "--open"],
-        &["auth", "--html", page_arg],
-        &["auth", "--url", "https://x.example/", "--open"],
-        &[
-            "auth",
-            "--url",
-            "https://x.example/",
-            "--html",
-            page_arg,
-            "--open",
-        ],
-    ] {
+    for args in [&["auth"][..], &["auth", "--html", page_arg]] {
         let output = conbus(root.path())
             .args(args)
             .env("PATH", &path)
@@ -305,6 +292,50 @@ fn only_an_explicit_html_and_open_opens_the_page() {
         std::fs::read_to_string(&calls).expect("the page was opened"),
         format!("{page_arg}\n")
     );
+}
+
+#[test]
+fn flags_that_cannot_be_honoured_together_are_refused_and_open_nothing() {
+    // These used to be ignored without a word: the person asked for a page and got
+    // a verdict, or asked for it opened and nothing happened.
+    let root = tempfile::tempdir().expect("tempdir");
+    let page = root.path().join("page.html");
+    let page_arg = page.to_str().expect("utf8");
+    let (_dir, calls, path) = opener();
+
+    for (args, says) in [
+        (&["auth", "--open"][..], "--open"),
+        (&["auth", "--url", "https://x.example/", "--open"], "--url"),
+        (
+            &["auth", "--url", "https://x.example/", "--html", page_arg],
+            "--url",
+        ),
+        (
+            &[
+                "auth",
+                "--url",
+                "https://x.example/",
+                "--html",
+                page_arg,
+                "--open",
+            ],
+            "--url",
+        ),
+        (&["auth", "--url", "-", "--html"], "--url"),
+    ] {
+        let output = conbus(root.path())
+            .args(args)
+            .env("PATH", &path)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("run auth");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{args:?}: {stderr}");
+        assert!(stderr.contains(says), "{args:?}: {stderr}");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "", "{args:?}");
+        assert!(!calls.exists(), "{args:?} opened something");
+        assert!(!page.exists(), "{args:?} wrote a page");
+    }
 }
 
 #[test]

@@ -12,7 +12,7 @@
 //! vendor's own sign-in flow. Exit 0 regardless of vendor state — recording
 //! does not depend on any of it.
 
-use std::io::{self, BufRead, Read};
+use std::io::{self, BufRead, IsTerminal, Read};
 use std::time::Duration;
 
 use conbus_core::paths::Paths;
@@ -283,17 +283,55 @@ fn printable(c: char) -> bool {
 /// can make this read.
 const STDIN_MAX_BYTES: u64 = 1024 * 1024;
 
-/// `--url -`: the first line that is not blank. It stops at that line, so a URL
-/// pasted at a terminal needs only Return. Off the command line, a token reaches
-/// no shell history and no recorded tool call.
+/// `--url -`. Off the command line, a token reaches no shell history and no recorded
+/// tool call.
 fn url_from_stdin() -> io::Result<String> {
-    let mut reader = io::stdin().lock().take(STDIN_MAX_BYTES);
+    let stdin = io::stdin();
+    if stdin.is_terminal() {
+        first_line_of(stdin.lock())
+    } else {
+        the_one_line_of(stdin.lock())
+    }
+}
+
+fn no_url_on_stdin() -> io::Error {
+    io::Error::other("no URL on stdin; try pbpaste | conbus auth --url -")
+}
+
+/// A pipe: all of it, which must be one line. An address has no line breaks in it,
+/// and a browser given one with a break joins the parts, so the first line alone
+/// may name a different host from the page that opened.
+fn the_one_line_of(reader: impl Read) -> io::Result<String> {
+    let mut bytes = Vec::new();
+    reader.take(STDIN_MAX_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > STDIN_MAX_BYTES {
+        return Err(io::Error::other(
+            "stdin is longer than any address; nothing was looked up",
+        ));
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    match lines.as_slice() {
+        [] => Err(no_url_on_stdin()),
+        [line] => Ok((*line).to_string()),
+        _ => Err(io::Error::other(
+            "stdin holds more than one line, and an address is one line; nothing was looked up",
+        )),
+    }
+}
+
+/// A terminal: the first line that is not blank, so a pasted address needs only
+/// Return. Waiting for end of input here would look like a hang.
+fn first_line_of(reader: impl BufRead) -> io::Result<String> {
+    let mut reader = reader.take(STDIN_MAX_BYTES);
     loop {
         let mut line = Vec::new();
         if reader.read_until(b'\n', &mut line)? == 0 {
-            return Err(io::Error::other(
-                "no URL on stdin; try pbpaste | conbus auth --url -",
-            ));
+            return Err(no_url_on_stdin());
         }
         let text = String::from_utf8_lossy(&line);
         if !text.trim().is_empty() {
@@ -400,4 +438,31 @@ pub fn run(paths: &Paths, url: Option<&str>, html: Option<String>, open: bool) -
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn at_a_terminal_the_first_line_that_is_not_blank_is_enough() {
+        let read = |input: &[u8]| first_line_of(input).map_err(|err| err.to_string());
+        assert_eq!(
+            read(b"\n  \nhttps://x.example/\nmore\n").unwrap(),
+            "https://x.example/"
+        );
+        assert_eq!(read(b"https://x.example/").unwrap(), "https://x.example/");
+        assert!(read(b"\n\n").unwrap_err().contains("no URL"));
+    }
+
+    #[test]
+    fn from_a_pipe_it_must_be_one_line() {
+        let read = |input: &[u8]| the_one_line_of(input).map_err(|err| err.to_string());
+        assert_eq!(
+            read(b"\n https://x.example/ \n\n").unwrap(),
+            "https://x.example/"
+        );
+        assert!(read(b"\n\n").unwrap_err().contains("no URL"));
+        assert!(read(b"a\nb\n").unwrap_err().contains("more than one line"));
+    }
 }

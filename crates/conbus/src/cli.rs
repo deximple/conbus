@@ -306,15 +306,25 @@ where
             },
         },
         "doctor" => Command::Doctor,
-        "auth" => Command::Auth {
-            url: flag_value(&args, "--url"),
-            html: args.iter().any(|a| a == "--html").then(|| {
+        "auth" => {
+            let url = flag_value(&args, "--url");
+            let html = args.iter().any(|a| a == "--html").then(|| {
                 flag_value(&args, "--html")
                     .filter(|value| !value.starts_with('-'))
                     .unwrap_or_default()
-            }),
-            open: args.iter().any(|a| a == "--open"),
-        },
+            });
+            let open = args.iter().any(|a| a == "--open");
+            match (&url, &html, open) {
+                (Some(_), Some(_), _) | (Some(_), None, true) => Command::UsageError(
+                    "--url answers for one address, and --html and --open write and open the page; run them apart"
+                        .into(),
+                ),
+                (None, None, true) => {
+                    Command::UsageError("--open opens the page --html writes; use them together".into())
+                }
+                _ => Command::Auth { url, html, open },
+            }
+        }
         "status" => Command::Status,
         "quota" => Command::Quota,
         "policy" => Command::Policy {
@@ -1074,6 +1084,33 @@ mod tests {
         for args in [&["auth", "--url"][..], &["auth", "--url", "--open"]] {
             assert!(
                 matches!(parse(args, None), Command::UsageError(_)),
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn auth_refuses_flags_it_could_only_ignore() {
+        for args in [
+            &["auth", "--open"][..],
+            &["auth", "--url", "x", "--open"],
+            &["auth", "--url", "x", "--html"],
+            &["auth", "--url", "x", "--html", "p", "--open"],
+        ] {
+            assert!(
+                matches!(parse(args, None), Command::UsageError(_)),
+                "{args:?}"
+            );
+        }
+        for args in [
+            &["auth"][..],
+            &["auth", "--html"],
+            &["auth", "--html", "--open"],
+            &["auth", "--html", "p", "--open"],
+            &["auth", "--url", "x"],
+        ] {
+            assert!(
+                matches!(parse(args, None), Command::Auth { .. }),
                 "{args:?}"
             );
         }

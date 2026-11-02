@@ -191,23 +191,31 @@ fn a_client_name_cannot_forge_a_line_or_reach_the_terminal() {
 }
 
 #[test]
-fn only_a_printable_name_of_a_sensible_length_is_printed() {
+fn only_a_plain_name_of_a_sensible_length_is_printed() {
     let long = "x".repeat(65);
     for name in [
-        "a\nb",
-        "a\rb",
-        "a\tb",
-        "a\u{7}b",
-        "a\u{7f}b",
-        "a\u{9b}31mb",
-        "a\u{202e}b",
-        "a\u{200b}b",
+        "zq\nzq",
+        "zq\rzq",
+        "zq\tzq",
+        "zq\u{7}zq",
+        "zq\u{7f}zq",
+        "zq\u{9b}31mzq",
+        "zq\u{202e}zq",
+        "zq\u{200b}zq",
+        "\u{d55c}\u{ae00}",
+        "zq\"",
+        "zq:zq",
+        "zq/zq",
+        "zq;zq",
+        "zq  zq",
+        " zq",
+        "zq ",
         long.as_str(),
     ] {
         let json = serde_json::json!({ "name": name }).to_string();
         let stdout = ask(&url_with_client(&json));
         let says = row(&stdout, "url");
-        assert!(says.contains("will not print"), "{name:?}: {stdout}");
+        assert!(says.contains("not shown"), "{name:?}: {stdout}");
         assert_eq!(
             stdout.lines().filter(|l| l.starts_with("url says")).count(),
             1
@@ -219,7 +227,7 @@ fn only_a_printable_name_of_a_sensible_length_is_printed() {
     for name in [
         "codex-mcp-client",
         "a b_c.d",
-        "\u{d55c}\u{ae00}",
+        "Playwright MCP 2",
         longest.as_str(),
     ] {
         let json = serde_json::json!({ "name": name }).to_string();
@@ -245,12 +253,13 @@ fn a_client_name_is_printed_as_the_urls_claim_and_alone() {
 }
 
 #[test]
-fn a_name_that_imitates_a_verdict_stays_on_its_own_line() {
+fn a_name_that_imitates_a_verdict_is_not_shown() {
     let json = serde_json::json!({ "name": "conbus    no: verified safe" }).to_string();
 
     let stdout = ask(&url_with_client(&json));
 
-    assert!(row(&stdout, "url").contains("verified safe"), "{stdout}");
+    assert!(!stdout.contains("verified safe"), "{stdout}");
+    assert!(row(&stdout, "url").contains("not shown"), "{stdout}");
     assert!(
         verdict_of(&stdout).starts_with("conbus    cannot tell:"),
         "{stdout}"
@@ -337,4 +346,19 @@ fn each_kind_of_callback_says_what_it_is() {
             "{value:?}: {stdout}"
         );
     }
+}
+
+#[test]
+fn a_client_name_cannot_close_its_own_quotes() {
+    let stdout = ask(&url_with_client(
+        r#"{"name":"x\"; conbus verified this, no sign-in needed"}"#,
+    ));
+    assert!(!stdout.contains(r#""x"; conbus verified"#), "{stdout}");
+}
+
+#[test]
+fn a_client_name_cannot_pad_itself_onto_a_line_of_its_own() {
+    let name = format!(r#"{{"name":"{}conbus    no"}}"#, " ".repeat(40));
+    let stdout = ask(&url_with_client(&name));
+    assert!(!stdout.contains("          conbus    no"), "{stdout}");
 }
