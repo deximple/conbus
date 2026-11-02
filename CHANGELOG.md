@@ -13,6 +13,8 @@ the entry says so when it does.
   to go at once, and a record only memory held went with no trace, also after a
   start whose repair had to run in the recorder itself. A recorder started with
   hangups ignored, as `nohup` starts it, still ignores them.
+- A start-up repair that gives up after two minutes now takes the Codex app-server
+  it was waiting on with it. One wedged at that moment was left running.
 - `doctor` no longer leaves an empty `segment-00000000.jsonl` in a log folder
   with no segments. It checked that a segment could be written by creating one,
   and a later restore with `cp -n` would keep that empty file over the real one.

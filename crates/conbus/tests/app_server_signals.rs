@@ -354,6 +354,39 @@ fn sigterm_to_a_starting_daemons_group_kills_a_wedged_server() {
     assert_nothing_left(&pids);
 }
 
+#[test]
+fn a_repair_that_gives_up_takes_its_wedged_server_with_it() {
+    // The watchdog ends a `--prepare` child with `exit`, which runs no `Drop`, and the
+    // server is in a group of its own, so a server wedged at that moment stayed.
+    let case = a_case();
+    a_live_thread(&case);
+    let mut command = Command::new(bin());
+    command.arg("daemon").process_group(0);
+    env_for(&mut command, &case);
+    let mut daemon = DaemonGroup(
+        command
+            .env("CONBUS_TEST_PREPARE_LIMIT_MS", "8000")
+            // The server's own limit, which would otherwise end it first.
+            .env("CONBUS_GAP_BUDGET_MS", "120000")
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("daemon"),
+    );
+    let stderr = daemon.0.stderr.take().expect("stderr is piped");
+    let pids = wait_for_the_server(&case);
+
+    let served = serves_within_a_minute(&case, daemon.0.id());
+
+    drop(daemon);
+    let said = std::io::read_to_string(stderr).expect("stderr");
+    assert!(served, "the daemon never served:\n{said}");
+    assert!(
+        said.contains("gave up"),
+        "the watchdog did not fire:\n{said}"
+    );
+    assert_nothing_left(&pids);
+}
+
 fn parent_of(pid: i32) -> i32 {
     let out = Command::new("/bin/ps")
         .args(["-o", "ppid=", "-p", &pid.to_string()])

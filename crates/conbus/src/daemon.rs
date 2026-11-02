@@ -1567,9 +1567,14 @@ fn prepare_limit() -> Duration {
 /// End this process when `limit` is up, whatever the rest of it is stuck in. Its
 /// parent says so, if it still has one: a note from here could block on the same
 /// thing that stopped everything else.
+///
+/// `exit` runs no `Drop`, and a Codex app-server that gap fill started has a process
+/// group of its own, so it would outlive this process. One wedged right now is the
+/// likeliest reason this fired, so every server still running goes first.
 fn give_up_after(limit: Duration) {
     std::thread::spawn(move || {
         std::thread::sleep(limit);
+        crate::appserver::kill_every_server();
         std::process::exit(PREPARE_GAVE_UP);
     });
 }
