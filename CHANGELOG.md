@@ -31,6 +31,12 @@ the entry says so when it does.
   spool file it drained, no longer leaves a second copy. A new daemon now reads
   the newest hook ids back from the log at start, so a re-delivery is answered
   rather than written again.
+- A prompt drained from the spool no longer records a `briefed` or `continued`
+  line for a briefing nobody received, and a chat order that waited in the spool
+  is no longer carried out later with nobody told. The prompt itself is recorded;
+  a person who gave an order during a restart gives it again. A quota stop that
+  waited in the spool likewise starts no `hop --apply` on its own, however late it
+  lands. The decision stays in the log, for `conbus hop` and the next briefing.
 
 ## [1.0.0-rc.3] — 2026-11-01
 
