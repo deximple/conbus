@@ -1328,6 +1328,9 @@ pub fn doctor(paths: &Paths) -> io::Result<()> {
         "drops     {}",
         crate::drops::describe(&crate::drops::summary(paths))
     );
+    for held in crate::backfill::describe_held_ranges(paths) {
+        println!("gap fill  {held}");
+    }
 
     // The local PreToolUse policy: a file that cannot be a policy decides
     // nothing, and the line says so because fail-open is silent by design.

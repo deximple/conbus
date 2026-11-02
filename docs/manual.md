@@ -520,15 +520,44 @@ closed; a fill the budget cuts short is remembered in `cache/gap-since` and
 `cache/gap-read` and resumed on the next start from where it stopped, and
 `daemon.log` says so. A Codex pass that could not
 run, because `codex app-server` would not start or stopped answering, keeps its
-range in `cache/gap-since-codex` the same way, and one that stalled is left alone
-for an hour so it holds up one start, not all of them. `conbus backfill --gaps` fills the
+range in `cache/gap-since-codex` the same way, and a server or a thread that stalled
+is left alone for an hour so it holds up a start or two, not all of them. `conbus backfill --gaps` fills the
 same gaps on demand without a deadline, for Claude Code and Codex, across all
-history; with `--apply` it too needs the recorder stopped. Deleting `cache/` drops
+history; with `--apply` it too needs the recorder stopped, and once it has read every
+Codex thread the Codex range is done. Deleting `cache/` drops
 the remembered ranges — run `conbus backfill --gaps` after one.
+
+`conbus doctor` has a `gap fill` line for each range still held: since when, why, and what
+holds it. What ends each:
+
+- **The budget ran out.** The next start goes on from there, or
+  `conbus backfill --gaps --apply` does it all now.
+- **A transcript could not be read.** `doctor`, `daemon.log` and `conbus backfill --gaps`
+  name it. Fix it, or move it out of `~/.claude/projects`. The next start then finishes.
+- **`codex app-server` would not start.** Fix or install Codex, and the next start reads it.
+- **A thread stalled the server.** It is asked again after an hour, or at once by
+  `conbus backfill --gaps --apply`, which ends the wait if it reads the thread.
+- **The server refused a thread.** It is not asked again until its rollout changes, so this
+  costs nothing while it waits. `conbus backfill --gaps --apply` asks at once and shows the
+  answer.
+
+If you do not need what a range would fill, delete `cache/gap-since` or
+`cache/gap-since-codex` and that range is given up. No record already written is lost.
+
+A fill takes a line stamped over a minute before its transcript was created for a copy
+from another conversation, as a fork's opening lines are, and leaves it out. A transcript
+moved by `cp`, `rsync -a` or across volumes has a new creation time, so almost every line
+in it reads that way and nothing in it is filled. `conbus backfill --gaps` says how many
+lines it set aside. To fill them anyway add `--include-older-lines`. Use it when you know
+a transcript was moved, and look at a dry run first: those lines may really be another
+conversation's copies. On a fork they are its parent's prompts, and you would see them
+come up as the fork's own turns. A record written to the log stays there. A turn id
+another conversation holds is still left out.
 
 **Claude.ai conversations** have no hooks in the desktop app. Export your data
 from Claude.ai (Settings → Privacy → Export data) and drop the zip (or
-`conversations.json`) into `~/.conbus/chat-export/`; the recorder picks it up.
+`conversations.json`) into `~/.conbus/chat-export/`; the recorder picks it up, at
+the next start if it is down, whatever the file's date.
 `conbus backfill --chat-export PATH` reads one from anywhere and, with
 `--apply` and the recorder stopped, writes it. Organisations using Claude's
 Inference hooks can point them at `conbus hook --inference-listen`

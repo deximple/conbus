@@ -12,8 +12,9 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use conbus_core::backfill::{
-    CLAUDE_CHAT_EXPORT, CLAUDE_TRANSCRIPT, CODEX_THREAD, Recovered, parse_claude_chat_export,
-    parse_claude_transcript, parse_codex_thread,
+    CLAUDE_CHAT_EXPORT, CLAUDE_TRANSCRIPT, CODEX_THREAD, OLDER_THAN_ITS_FILE, Recovered,
+    oldest_first, parse_claude_chat_export, parse_claude_transcript, parse_claude_transcript_born,
+    parse_codex_thread,
 };
 
 use crate::appserver::AppServer;
@@ -44,6 +45,8 @@ pub struct Outcome {
     pub recorded_live: u64,
     /// Lines and files not read, counted by why.
     pub unread: BTreeMap<String, u64>,
+    /// What holds a range, each by name: a person cannot fix a count.
+    pub holding: Vec<String>,
     /// Codex threads recovered whole through the app-server.
     pub codex_threads: u64,
     pub codex_turns: u64,
@@ -114,7 +117,7 @@ pub fn run(paths: &Paths, apply: bool) -> io::Result<()> {
             outcome.codex_live
         ),
     }
-    println!("not read  {}", summarise_unread(&outcome.unread));
+    println!("not read  {}", summarise_unread(&outcome.unread, 6));
     if apply {
         println!("written to {}", paths.log_dir().display());
     } else {
@@ -130,17 +133,21 @@ pub fn run(paths: &Paths, apply: bool) -> io::Result<()> {
 /// fixture-protected parser, not the live hook path) is read only to find
 /// turns the log does not already hold, and those are appended to the
 /// conversation the recorder already bound.
-pub fn run_gaps(paths: &Paths, apply: bool) -> io::Result<()> {
+pub fn run_gaps(paths: &Paths, apply: bool, include_older_lines: bool) -> io::Result<()> {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .ok_or_else(|| io::Error::other("no HOME to read history from"))?;
     let transcripts = home.join(".claude").join("projects");
-    let outcome = fill_gaps(paths, &transcripts, apply, true)?;
+    let outcome = fill_gaps_with(paths, &transcripts, apply, true, include_older_lines)?;
 
     println!("history   {}", transcripts.display());
     println!(
         "gaps      {} conversation(s), {} turn(s), {} record(s)",
         outcome.gap_sessions, outcome.gap_turns, outcome.gap_records
+    );
+    println!(
+        "older     {}",
+        describe_older_lines(&outcome, include_older_lines)
     );
     match &outcome.codex_unavailable {
         Some(why) => println!("codex     history unavailable — {why}"),
@@ -149,13 +156,42 @@ pub fn run_gaps(paths: &Paths, apply: bool) -> io::Result<()> {
             outcome.gap_codex_threads, outcome.gap_codex_turns, outcome.gap_codex_records
         ),
     }
-    println!("not read  {}", summarise_unread(&outcome.unread));
+    println!(
+        "not read  {}",
+        summarise_unread(&outcome.unread, usize::MAX)
+    );
+    for holding in &outcome.holding {
+        println!("holding   {holding}");
+    }
     if apply {
         println!("written to {}", paths.log_dir().display());
     } else {
         println!("\nNothing was written. Re-run with --apply to record it, or restart the daemon.");
     }
     Ok(())
+}
+
+/// What `backfill --gaps` says about lines older than their own transcript: how many
+/// were set aside, the way to fill them, and what that risks.
+fn describe_older_lines(outcome: &Outcome, included: bool) -> String {
+    if included {
+        return "lines older than their file were read as its own, so what this fills may \
+                hold another conversation's copies"
+            .to_string();
+    }
+    let set_aside = outcome
+        .unread
+        .get(OLDER_THAN_ITS_FILE)
+        .copied()
+        .unwrap_or(0);
+    if set_aside == 0 {
+        return "0 lines older than their file set aside".to_string();
+    }
+    format!(
+        "{set_aside} line(s) older than their file set aside as copies; \
+         --include-older-lines fills from them too, and they may be another conversation's \
+         copies, so look at a dry run first"
+    )
 }
 
 /// Official Claude.ai / Desktop data export. Keeps the Chat conversation
@@ -201,7 +237,7 @@ pub fn run_chat_export(paths: &Paths, export: &str, apply: bool) -> io::Result<(
             outcome.recorded_live
         );
     }
-    println!("not read  {}", summarise_unread(&outcome.unread));
+    println!("not read  {}", summarise_unread(&outcome.unread, 6));
     if apply {
         println!("written to {}", paths.log_dir().display());
     } else {
@@ -221,7 +257,9 @@ fn ingest_chat_text(
 ) -> io::Result<Outcome> {
     let known = known_from(held.iter().chain(written.iter()));
     let mut outcome = Outcome::default();
-    for recovered in parse_claude_chat_export(text) {
+    let conversations = parse_claude_chat_export(text);
+    let of_conversation = held_by_conversation(held, &conversations);
+    for recovered in conversations {
         for (reason, count) in &recovered.skipped {
             *outcome.unread.entry(reason.clone()).or_default() += count;
         }
@@ -235,13 +273,15 @@ fn ingest_chat_text(
         let already = known.live.contains(&session) || known.backfilled.contains_key(&session);
         if already {
             let sid = session.to_string();
-            let mine: Vec<&Record> = held
-                .iter()
-                .chain(written.iter())
-                .filter(|record| {
+            let mine: Vec<&Record> = of_conversation
+                .get(&session)
+                .into_iter()
+                .flatten()
+                .copied()
+                .chain(written.iter().filter(|record| {
                     record.bus_id == session
                         || record.source.vendor_session_id.as_deref() == Some(sid.as_str())
-                })
+                }))
                 .collect();
             let Some(bus) = mine.last().map(|record| record.bus_id) else {
                 continue;
@@ -287,9 +327,48 @@ fn ingest_chat_text(
     Ok(outcome)
 }
 
+/// Each conversation's records, by its own id or by naming it, in the log's order. One
+/// pass, because a pass per conversation made a re-read of a 1,000-conversation export
+/// cost 14.4 s against a real log, at a start, with the socket closed.
+fn held_by_conversation<'a>(
+    held: &'a [Record],
+    conversations: &[Recovered],
+) -> HashMap<BusId, Vec<&'a Record>> {
+    let named: HashMap<&str, BusId> = conversations
+        .iter()
+        .filter_map(|recovered| {
+            let name = recovered.vendor_session_id.as_deref()?;
+            Some((name, name.parse().ok()?))
+        })
+        .collect();
+    let mut found: HashMap<BusId, Vec<&Record>> =
+        named.values().map(|bus| (*bus, Vec::new())).collect();
+    for record in held {
+        let by_name = record
+            .source
+            .vendor_session_id
+            .as_deref()
+            .and_then(|name| named.get(name).copied())
+            .filter(|bus| *bus != record.bus_id);
+        for bus in [Some(record.bus_id), by_name].into_iter().flatten() {
+            if let Some(records) = found.get_mut(&bus) {
+                records.push(record);
+            }
+        }
+    }
+    found
+}
+
 fn read_chat_export(path: &Path) -> io::Result<String> {
-    if path.is_dir() {
-        return fs::read_to_string(path.join("conversations.json"));
+    if fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir()) {
+        let inner = path.join("conversations.json");
+        if !is_regular(&inner) {
+            return Err(not_regular(&inner));
+        }
+        return fs::read_to_string(inner);
+    }
+    if !is_regular(path) {
+        return Err(not_regular(path));
     }
     let ext = path.extension().and_then(|ext| ext.to_str());
     if ext == Some("json")
@@ -372,6 +451,14 @@ pub struct GapTiming {
     /// The start budget cut the fill short; the deferred range is held in
     /// `cache/gap-since` and resumed on the next start.
     pub budget_exhausted: bool,
+    /// Transcripts in range that could not be read. Their range is held in
+    /// `cache/gap-since` too: nothing of them was compared with the log.
+    pub claude_unreadable: Vec<String>,
+    /// The threads that hold the Codex range, and why.
+    pub codex_holding: Vec<String>,
+    /// Transcripts, rollouts and exports in range that were not regular files, and
+    /// so were not read.
+    pub not_regular: u64,
     /// Why the Codex pass did not read everything it was asked to, when it did
     /// not. Its range is held in `cache/gap-since-codex` for the next start.
     pub codex_deferred: Option<String>,
@@ -439,6 +526,28 @@ impl ReadSoFar {
 
     fn note(&mut self, source: &str, state: i64) {
         self.0.insert(source.to_string(), state);
+    }
+
+    fn forget(&mut self, source: &str) {
+        self.0.remove(source);
+    }
+
+    /// What a fill by hand did, over what the starts before it noted. Whatever it
+    /// read is no longer stalled, and a server that answered is not either.
+    fn absorb(&mut self, ran: ReadSoFar) {
+        let answered = ran
+            .0
+            .iter()
+            .any(|(source, state)| was_read(*state) && !source.starts_with(STALLED));
+        for (source, state) in ran.0 {
+            if was_read(state) {
+                self.forget(&stalled_on(&source));
+            }
+            self.note(&source, state);
+        }
+        if answered {
+            self.forget(STALLED);
+        }
     }
 }
 
@@ -510,7 +619,7 @@ fn append_gaps_at_start_in(
     if let Some(since) = codex_since {
         write_since(paths, &codex_marker, since);
     }
-    let mut spool = Spool::new(paths.spool_dir());
+    let mut elsewhere = Elsewhere::new(paths.spool_dir(), held);
     let mut n = 0;
     if let Some(home) = home {
         let transcripts = home.join(".claude").join("projects");
@@ -519,19 +628,21 @@ fn append_gaps_at_start_in(
             let files = session_files(&transcripts)?;
             timing.claude_walk_ms = elapsed_ms(walk);
             let started = Instant::now();
-            n += append_gaps_files(
+            let outcome = append_gaps_files(
                 &files,
                 held,
                 Some(&mut *log),
                 since,
-                &mut spool,
+                &mut elsewhere,
                 Some(StartFill {
                     timing: &mut timing,
                     deadline,
                     read: &mut read,
                 }),
-            )?
-            .gap_records;
+                false,
+            )?;
+            n += outcome.gap_records;
+            timing.not_regular += outcome.unread.get(NOT_REGULAR).copied().unwrap_or(0);
             timing.claude_read_ms = elapsed_ms(started);
         }
     }
@@ -545,37 +656,111 @@ fn append_gaps_at_start_in(
             .checked_duration_since(Instant::now())
             .unwrap_or(std::time::Duration::ZERO)
             .min(std::time::Duration::from_secs(8));
-        n += fill_live_codex_gaps(
+        let fill = fill_live_codex_gaps(
+            &CodexSource::from_env(),
             held,
             Some(&mut *log),
             codex_since,
-            &mut spool,
+            &mut elsewhere,
             StartFill {
                 timing: &mut timing,
                 deadline,
                 read: &mut read,
             },
             server_limit,
-        )?
-        .records;
+        )?;
+        n += fill.records;
+        timing.not_regular += fill.not_regular;
+        if timing.codex_deferred.is_none() {
+            timing.codex_deferred = fill.refused_for_now;
+        }
     }
     if !timing.budget_exhausted {
         let export = Instant::now();
-        n += ingest_chat_exports_since(&paths.chat_export(), held, log, since)?;
+        n += ingest_chat_exports_at_start(paths, held, log, since, &mut timing.not_regular)?;
         timing.chat_export_ms = elapsed_ms(export);
     }
-    if !timing.budget_exhausted {
+    let transcripts_read = !timing.budget_exhausted && timing.claude_unreadable.is_empty();
+    if transcripts_read {
         let _ = std::fs::remove_file(&marker);
     }
     if timing.codex_deferred.is_none() {
         let _ = std::fs::remove_file(&codex_marker);
     }
-    if timing.budget_exhausted || timing.codex_deferred.is_some() {
+    if !transcripts_read || timing.codex_deferred.is_some() {
         read.save(paths, &read_marker);
     } else {
         let _ = std::fs::remove_file(&read_marker);
     }
+    say_what_holds_the_ranges(paths, &timing);
     Ok((n, timing))
+}
+
+/// Which range a line of `cache/gap-held` is about.
+const TRANSCRIPTS: &str = "transcripts";
+const CODEX: &str = "codex";
+
+/// Keep what holds each range where `doctor` can read it.
+fn say_what_holds_the_ranges(paths: &Paths, timing: &GapTiming) {
+    let mut lines = Vec::new();
+    if timing.budget_exhausted {
+        lines.push(format!("{TRANSCRIPTS}\tthe start's budget ran out"));
+    }
+    for file in &timing.claude_unreadable {
+        lines.push(format!("{TRANSCRIPTS}\tcould not read {file}"));
+    }
+    if let Some(why) = &timing.codex_deferred {
+        lines.push(format!("{CODEX}\t{why}"));
+    }
+    for holding in &timing.codex_holding {
+        lines.push(format!("{CODEX}\t{holding}"));
+    }
+    let marker = paths.cache_dir().join("gap-held");
+    if lines.is_empty() {
+        let _ = fs::remove_file(&marker);
+    } else {
+        write_cache_file(paths, &marker, &(lines.join("\n") + "\n"));
+    }
+}
+
+/// For `doctor`: each range still held, since when, why, and what ends it.
+pub fn describe_held_ranges(paths: &Paths) -> Vec<String> {
+    let cache = paths.cache_dir();
+    let reasons = fs::read_to_string(cache.join("gap-held")).unwrap_or_default();
+    let now = Timestamp::now();
+    let epoch = Timestamp::from_unix_seconds(0);
+    [
+        (TRANSCRIPTS, "gap-since", "The next start finishes it once every file reads, and `conbus backfill --gaps --apply` fills what it can now. A file named here has to be fixed or moved out first; deleting cache/gap-since gives it up"),
+        (CODEX, "gap-since-codex", "`conbus backfill --gaps --apply` asks at once; deleting cache/gap-since-codex gives it up"),
+    ]
+    .into_iter()
+    .filter_map(|(range, marker, way_out)| {
+        let path = cache.join(marker);
+        if !path.exists() {
+            return None;
+        }
+        let why: Vec<&str> = reasons
+            .lines()
+            .filter_map(|line| line.strip_prefix(range)?.strip_prefix('\t'))
+            .take(5)
+            .collect();
+        let why = if why.is_empty() {
+            "no reason recorded".to_string()
+        } else {
+            why.join("; ")
+        };
+        let since = match (read_since(&path), epoch) {
+            (Some(since), Some(epoch)) => {
+                let hours = (now.seconds_since(epoch) - since).max(0) / 3600;
+                let when = Timestamp::from_unix_seconds(since)
+                    .map_or_else(|| since.to_string(), |when| when.to_string());
+                format!("since {when}, {hours} h ago")
+            }
+            _ => "since a time that does not read".to_string(),
+        };
+        Some(format!("{range} range held {since}: {why}. {way_out}"))
+    })
+    .collect()
 }
 
 /// The time a marker under `cache/` holds, as unix seconds.
@@ -601,7 +786,7 @@ fn write_cache_file(paths: &Paths, target: &Path, text: &str) {
     let temp = paths
         .cache_dir()
         .join(format!(".gap.{}.tmp", std::process::id()));
-    let _ = fs::create_dir_all(paths.cache_dir());
+    let _ = conbus_core::paths::keep_dir_private(&paths.cache_dir());
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -638,6 +823,11 @@ pub fn defer_fill(paths: &Paths) {
         &marker,
         read_since(&marker).map_or(fresh, |old| old.min(fresh)),
     );
+    write_cache_file(
+        paths,
+        &paths.cache_dir().join("gap-held"),
+        &format!("{TRANSCRIPTS}\tthe log could not be read at a start\n"),
+    );
 }
 
 /// How long before the log's newest record a file may have last changed and
@@ -662,6 +852,38 @@ fn modified_unix(path: &Path) -> Option<i64> {
         .ok()?
         .as_secs();
     i64::try_from(seconds).ok()
+}
+
+/// How a skip of anything but a regular file is counted.
+const NOT_REGULAR: &str = "not a regular file";
+
+/// Whether a path is a regular file and not what a read could wait on for ever.
+/// Opening a FIFO waits for a writer, reading one waits for data, and a link can lead
+/// to one. A fill has a socket waiting, and by hand there is no deadline at all.
+fn is_regular(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|meta| meta.is_file())
+}
+
+/// The error for a path that is not one. `InvalidInput` tells it from a failed read.
+fn not_regular(path: &Path) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("{}: {NOT_REGULAR}", path.display()),
+    )
+}
+
+/// When a file was created, where the file system keeps that.
+fn born(path: &Path) -> Option<std::time::SystemTime> {
+    fs::metadata(path).ok()?.created().ok()
+}
+
+/// [`born`], as a stamp.
+fn born_at(path: &Path) -> Option<Timestamp> {
+    let seconds = born(path)?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    Timestamp::from_unix_seconds(i64::try_from(seconds).ok()?)
 }
 
 /// Whether a file is old enough that it cannot hold anything after `since`.
@@ -762,17 +984,44 @@ pub fn chat_export_signature_filtered(dir: &Path, official_only: bool) -> Vec<(S
 /// Official Claude.ai / Desktop export drop folder. Chat-only windows have
 /// no hook; a newer `conversations.json` is the identity-preserving channel.
 pub fn ingest_chat_exports(dir: &Path, held: &[Record], log: &mut SegmentLog) -> io::Result<u64> {
-    ingest_chat_exports_filtered(dir, held, log, false, None)
+    ingest_chat_exports_filtered(dir, held, log, false, None, None, &mut 0)
 }
 
-/// The drop folder at start: only exports written after `since`.
-fn ingest_chat_exports_since(
-    dir: &Path,
+/// The drop folder at start: what was written after `since`, and what it has not
+/// read at this size. An export moved in during a downtime keeps its old write time,
+/// and the watcher's first look at the folder already includes it, so neither would
+/// ever read it. `cache/chat-export-read` says what was read, and without it each
+/// export is read once more, which writes nothing.
+fn ingest_chat_exports_at_start(
+    paths: &Paths,
     held: &[Record],
     log: &mut SegmentLog,
     since: Option<i64>,
+    not_regular_seen: &mut u64,
 ) -> io::Result<u64> {
-    ingest_chat_exports_filtered(dir, held, log, false, since)
+    let marker = paths.cache_dir().join("chat-export-read");
+    let mut read = ReadSoFar::load(&marker);
+    let before = read.0.clone();
+    let filled = ingest_chat_exports_filtered(
+        &paths.chat_export(),
+        held,
+        log,
+        false,
+        since,
+        Some(&mut read),
+        not_regular_seen,
+    )?;
+    if read.0 != before {
+        read.save(paths, &marker);
+    }
+    Ok(filled)
+}
+
+/// The size of what a drop-folder entry holds: a folder stands for its export.
+fn export_size(path: &Path) -> i64 {
+    let inner = path.join("conversations.json");
+    let file = if path.is_dir() { &inner } else { path };
+    fs::symlink_metadata(file).map_or(-1, |meta| meta.len() as i64)
 }
 
 /// `~/Downloads` after Privacy → Export data. Only vendor-named zips / JSON.
@@ -781,7 +1030,7 @@ pub fn ingest_official_privacy_exports(
     held: &[Record],
     log: &mut SegmentLog,
 ) -> io::Result<u64> {
-    ingest_chat_exports_filtered(dir, held, log, true, None)
+    ingest_chat_exports_filtered(dir, held, log, true, None, None, &mut 0)
 }
 
 fn ingest_chat_exports_filtered(
@@ -790,6 +1039,8 @@ fn ingest_chat_exports_filtered(
     log: &mut SegmentLog,
     official_only: bool,
     since: Option<i64>,
+    mut consumed: Option<&mut ReadSoFar>,
+    not_regular_seen: &mut u64,
 ) -> io::Result<u64> {
     if !dir.is_dir() {
         return Ok(0);
@@ -799,15 +1050,27 @@ fn ingest_chat_exports_filtered(
     let mut entries: Vec<PathBuf> = fs::read_dir(dir)?
         .filter_map(|entry| entry.ok().map(|e| e.path()))
         .filter(|path| !official_only || is_official_privacy_export(path))
-        .filter(|path| !untouched_since(path, since))
+        .filter(|path| {
+            !untouched_since(path, since)
+                || consumed.as_deref().is_some_and(|read| {
+                    !read.is_current(&path.to_string_lossy(), export_size(path))
+                })
+        })
         .collect();
     entries.sort();
     for path in entries {
-        let Ok(text) = read_chat_export(&path) else {
-            continue;
+        let text = match read_chat_export(&path) {
+            Ok(text) => text,
+            Err(err) => {
+                *not_regular_seen += u64::from(err.kind() == io::ErrorKind::InvalidInput);
+                continue;
+            }
         };
         let outcome = ingest_chat_text(held, &mut written, &text, Some(log))?;
         filled += outcome.records + outcome.gap_records;
+        if let Some(read) = consumed.as_deref_mut() {
+            read.note(&path.to_string_lossy(), export_size(&path));
+        }
     }
     Ok(filled)
 }
@@ -821,11 +1084,104 @@ const STALLED: &str = "codex app-server stalled";
 /// not mean paying that on every restart. By hand, `backfill --gaps` always asks.
 const STALL_BACK_OFF_SECS: i64 = 3600;
 
+/// What a start says about a server or a thread it is leaving alone.
+const LEFT_ALONE: &str = "it stalled at an earlier start, and is asked again after an hour or by `conbus backfill --gaps --apply`";
+
+/// Noted in a held range for a thread the server refused, with the state of its rollout.
+/// Asking again gets the same answer until that changes, so it is left alone until then.
+/// "Retry later" is not noted: that one is asked at every start.
+fn refused_at(thread: &str) -> String {
+    format!("codex app-server refused {thread}")
+}
+
+/// How long a server or a thread has to have had before it can be called stalled. A real
+/// app-server has taken about 2 s to come up, so a limit the transcripts left under this
+/// says nothing about the server, and an hour without it would be for nothing.
+const FAIR_TRY: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Noted in a held range, with the time, for a thread the app-server had nearly the whole
+/// of its limit to answer about and did not. A thread that keeps growing answers first,
+/// so [`STALLED`] alone never gets noted and one slow thread behind it costs the whole
+/// limit at every start. What counts is the time it got: the thread in hand when a limit
+/// runs out behind another, slower one did nothing wrong, and it goes first next time.
+fn stalled_on(thread: &str) -> String {
+    format!("{STALLED} on {thread}")
+}
+
+/// Whether a note made at `at` still stands. A note from a clock that ran ahead does not:
+/// nothing says how long ago it was, and it would outlast the hour it promises.
+fn within_back_off(at: i64, now_unix: i64) -> bool {
+    (0..STALL_BACK_OFF_SECS).contains(&(now_unix - at))
+}
+
+/// Take out the threads the server stalled on within the back-off, and those it refused
+/// in the state they are in now. Their range stays held, and the ones behind them are
+/// still read.
+fn leave_alone(
+    threads: &mut Vec<(BusId, i64)>,
+    read: &ReadSoFar,
+    now_unix: i64,
+    timing: &mut GapTiming,
+) {
+    threads.retain(|(thread, state)| {
+        let name = thread.to_string();
+        if read
+            .state_of(&stalled_on(&name))
+            .is_some_and(|at| within_back_off(at, now_unix))
+        {
+            timing.codex_deferred = Some(LEFT_ALONE.to_string());
+            timing
+                .codex_holding
+                .push(format!("thread {name} stalled the server"));
+            return false;
+        }
+        if *state != NO_STATE && read.state_of(&refused_at(&name)) == Some(*state) {
+            timing.codex_deferred.get_or_insert_with(|| {
+                "the server refused a thread, and it has not changed since".to_string()
+            });
+            timing.codex_holding.push(format!(
+                "thread {name} was refused by the server, and its rollout has not changed"
+            ));
+            return false;
+        }
+        true
+    });
+}
+
 /// The state of a thread with no rollout on disk to give it one.
 const NO_STATE: i64 = i64::MIN;
 
 /// The state of a thread the app-server stopped answering on. Never current.
 const FAILED: i64 = i64::MIN + 1;
+
+/// The state of a thread a limit caught before it had a fair share of it. Never current,
+/// and it goes first next time.
+const CUT: i64 = i64::MIN + 2;
+
+/// Whether a thread noted in this state has been read.
+fn was_read(state: i64) -> bool {
+    state != FAILED && state != CUT
+}
+
+/// Where the Codex pass looks: which binary answers, and where its rollouts are.
+/// From the environment, except in a test, where setting that would not be sound.
+struct CodexSource {
+    binary: std::ffi::OsString,
+    home: Option<PathBuf>,
+}
+
+impl CodexSource {
+    fn from_env() -> Self {
+        CodexSource {
+            binary: crate::appserver::codex_binary(),
+            home: std::env::var_os("CODEX_HOME")
+                .map(PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex"))
+                }),
+        }
+    }
+}
 
 /// What the Codex pass found, whether or not it wrote any of it.
 #[derive(Default, Debug)]
@@ -833,9 +1189,14 @@ struct CodexFill {
     threads: u64,
     turns: u64,
     records: u64,
-    /// Threads the app-server said no about. Asking again gets the same answer,
-    /// so these do not hold the range.
+    /// Threads the app-server said no about.
     refused: u64,
+    /// The first of those answers that asking again could change, which holds the
+    /// range. `-32001`, "Server overloaded; retry later", is one the real server has.
+    refused_for_now: Option<String>,
+    /// Things named like a rollout that were not regular files, and so no sign of a
+    /// thread the server could read.
+    not_regular: u64,
 }
 
 /// Official app-server only. Live Codex threads the recorder already bound.
@@ -846,10 +1207,11 @@ struct CodexFill {
 /// `timing.codex_deferred`, because the range it leaves behind is not covered by
 /// any later start unless something holds it.
 fn fill_live_codex_gaps(
+    source: &CodexSource,
     held: &[Record],
     mut log: Option<&mut SegmentLog>,
     since: Option<i64>,
-    spool: &mut Spool,
+    elsewhere: &mut Elsewhere<'_>,
     start: StartFill<'_>,
     server_limit: std::time::Duration,
 ) -> io::Result<CodexFill> {
@@ -871,12 +1233,23 @@ fn fill_live_codex_gaps(
     // at all the ask falls back to `thread/list` as before.
     let walk = Instant::now();
     let mut unknown = 0;
-    let mut recent = codex_threads_touched_since(&known.live_codex, since, &mut unknown);
+    let mut recent = source.home.as_deref().and_then(|home| {
+        codex_threads_touched_since_in(
+            home,
+            &known.live_codex,
+            since.unwrap_or(i64::MIN),
+            &mut unknown,
+            &mut fill.not_regular,
+        )
+    });
     timing.codex_walk_ms = elapsed_ms(walk);
     timing.codex_unknown_files = unknown;
     timing.codex_layout_unknown = recent.is_none() && unknown > 0;
+    let now = Timestamp::now();
+    let now_unix = Timestamp::from_unix_seconds(0).map_or(0, |epoch| now.seconds_since(epoch));
     if let Some(recent) = recent.as_mut() {
         unread_first(recent, read);
+        leave_alone(recent, read, now_unix, timing);
     }
     if recent.as_ref().is_some_and(|recent| recent.is_empty()) {
         return Ok(fill);
@@ -889,24 +1262,18 @@ fn fill_live_codex_gaps(
         timing.codex_deferred = Some("no time left in the start's budget".to_string());
         return Ok(fill);
     }
-    let now = Timestamp::now();
-    let now_unix = Timestamp::from_unix_seconds(0).map_or(0, |epoch| now.seconds_since(epoch));
     if read
         .state_of(STALLED)
-        .is_some_and(|at| now_unix - at < STALL_BACK_OFF_SECS)
+        .is_some_and(|at| within_back_off(at, now_unix))
     {
-        timing.codex_deferred = Some(
-            "it stalled at an earlier start, and is asked again after an hour or by \
-             `conbus backfill --gaps`"
-                .to_string(),
-        );
+        timing.codex_deferred = Some(LEFT_ALONE.to_string());
         return Ok(fill);
     }
     let start = Instant::now();
-    let mut server = match AppServer::start(server_limit) {
+    let mut server = match AppServer::start_with(&source.binary, server_limit) {
         Ok(server) => server,
         Err(err) => {
-            if start.elapsed() >= server_limit {
+            if start.elapsed() >= server_limit && server_limit >= FAIR_TRY {
                 read.note(STALLED, now_unix);
             }
             timing.codex_deferred = Some(err.to_string());
@@ -934,6 +1301,7 @@ fn fill_live_codex_gaps(
             .collect(),
     };
     unread_first(&mut sessions, read);
+    leave_alone(&mut sessions, read, now_unix, timing);
     let names: Vec<(String, BusId, i64)> = sessions
         .iter()
         .filter_map(|(session, state)| {
@@ -958,6 +1326,7 @@ fn fill_live_codex_gaps(
             break;
         }
         timing.list_turns_attempted += 1;
+        let asked = Instant::now();
         let turns = match list_turns(&mut server, name) {
             Ok(turns) => turns,
             Err(err) => {
@@ -967,13 +1336,43 @@ fn fill_live_codex_gaps(
                 }
                 if crate::appserver::is_refusal(&err) {
                     fill.refused += 1;
+                    if !crate::appserver::is_unknown_method(&err, "thread/turns/list") {
+                        read.note(name, FAILED);
+                        if !crate::appserver::says_retry_later(&err) {
+                            read.note(&refused_at(name), *state);
+                        }
+                        timing
+                            .codex_holding
+                            .push(format!("thread {name} was refused by the server: {why}"));
+                        fill.refused_for_now.get_or_insert(why);
+                    }
                     continue;
                 }
                 // Nothing behind it will answer either. It goes behind the threads
                 // not yet asked next time, or it stops them being reached at all.
-                read.note(name, FAILED);
-                if timing.list_turns_threads == 0 && start.elapsed() >= server_limit {
-                    read.note(STALLED, now_unix);
+                let got = asked.elapsed();
+                let had_its_turn = got >= FAIR_TRY
+                    && got.as_secs_f64()
+                        >= 0.9
+                            * (start + server_limit)
+                                .duration_since(turns_at)
+                                .as_secs_f64();
+                let suspect = read.state_of(name) == Some(CUT);
+                if start.elapsed() < server_limit {
+                    read.note(name, FAILED);
+                } else if had_its_turn {
+                    read.note(name, FAILED);
+                    read.note(&stalled_on(name), now_unix);
+                    timing
+                        .codex_holding
+                        .push(format!("thread {name} stalled the server"));
+                    // Asked first because the last limit caught it, it says nothing of
+                    // the threads behind it.
+                    if timing.list_turns_threads == 0 && !suspect {
+                        read.note(STALLED, now_unix);
+                    }
+                } else {
+                    read.note(name, CUT);
                 }
                 timing.codex_deferred = Some(why);
                 break;
@@ -983,7 +1382,7 @@ fn fill_live_codex_gaps(
         let thread = serde_json::json!({"id": name, "sessionId": name});
         let recovered = parse_codex_thread(&thread, &turns);
         let mine = grouped.get(name).into_iter().flatten().copied();
-        let missing = still_missing(mine, spool, name, bus_id, recovered);
+        let missing = still_missing(mine, elsewhere, name, bus_id, recovered);
         if !missing.is_empty() {
             fill.threads += 1;
             fill.turns += missing
@@ -1007,11 +1406,41 @@ fn fill_live_codex_gaps(
     Ok(fill)
 }
 
-/// What a held range has read in this state is done. What it has not read at all
-/// goes first, or the threads a budget reaches are the same ones each start.
+/// Noted in a held range for the file a start was reading when its budget ran out.
+fn used_up_a_budget(file: &Path) -> String {
+    format!("used up a budget: {}", file.display())
+}
+
+/// What a cut range has read at this length is done, and what is left stays oldest
+/// first, so a parent still reaches a turn before its fork's copy does. Only a file
+/// that used a whole budget up goes behind the rest: if it also keeps growing, it would
+/// use every budget up and nothing behind it would ever be read. One that has stopped
+/// growing loses that mark, or it would go behind a fork of it the next time it grew.
+fn files_left_to_read(to_read: &mut Vec<(&PathBuf, &str, BusId)>, read: &mut ReadSoFar) {
+    to_read.retain(|(file, ..)| {
+        let current = fs::metadata(file)
+            .is_ok_and(|meta| read.is_current(&file.to_string_lossy(), meta.len() as i64));
+        if current {
+            read.forget(&used_up_a_budget(file));
+        }
+        !current
+    });
+    to_read.sort_by_key(|(file, ..)| read.knows(&used_up_a_budget(file)));
+}
+
+/// What a held range has read in this state is done. What a limit caught goes first, so
+/// it gets the whole of one, and then what the range has not read at all, or the threads
+/// a budget reaches are the same ones each start. A thread with no state cannot be
+/// current, since nothing says it has not changed since.
 fn unread_first(threads: &mut Vec<(BusId, i64)>, read: &ReadSoFar) {
-    threads.retain(|(thread, state)| !read.is_current(&thread.to_string(), *state));
-    threads.sort_by_key(|(thread, _)| read.knows(&thread.to_string()));
+    threads.retain(|(thread, state)| {
+        *state == NO_STATE || !read.is_current(&thread.to_string(), *state)
+    });
+    threads.sort_by_key(|(thread, _)| match read.state_of(&thread.to_string()) {
+        Some(CUT) => 0,
+        None => 1,
+        Some(_) => 2,
+    });
 }
 
 /// Threads `thread/list` says were updated at or after `since`, or `None`
@@ -1064,28 +1493,17 @@ fn threads_updated_since(
 /// directory could be walked, leaving the caller its `thread/list` fallback.
 /// With no `since` every thread with a rollout is asked, which is what a fill by
 /// hand wants.
-fn codex_threads_touched_since(
-    sessions: &HashSet<BusId>,
-    since: Option<i64>,
-    unknown: &mut u64,
-) -> Option<Vec<(BusId, i64)>> {
-    let since = since.unwrap_or(i64::MIN);
-    let home = std::env::var_os("CODEX_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))?;
-    codex_threads_touched_since_in(&home, sessions, since, unknown)
-}
-
 fn codex_threads_touched_since_in(
     codex_home: &Path,
     sessions: &HashSet<BusId>,
     since: i64,
     unknown: &mut u64,
+    not_regular_seen: &mut u64,
 ) -> Option<Vec<(BusId, i64)>> {
     let mut touched = HashMap::new();
     let sessions_dir = codex_home.join("sessions");
     for dir in [sessions_dir.clone(), codex_home.join("archived_sessions")] {
-        collect_rollout_mtimes(&dir, 6, &mut touched, unknown);
+        collect_rollout_mtimes(&dir, 6, &mut touched, unknown, not_regular_seen);
     }
     // Files are here but none parse as a rollout — the vendor changed the
     // layout under the build, and a silent empty list would mean "no
@@ -1125,6 +1543,7 @@ fn collect_rollout_mtimes(
     depth: u8,
     touched: &mut HashMap<BusId, i64>,
     unknown: &mut u64,
+    not_regular_seen: &mut u64,
 ) {
     if depth == 0 {
         return;
@@ -1135,13 +1554,17 @@ fn collect_rollout_mtimes(
     for entry in entries.filter_map(Result::ok) {
         let path = entry.path();
         if path.is_dir() {
-            collect_rollout_mtimes(&path, depth - 1, touched, unknown);
+            collect_rollout_mtimes(&path, depth - 1, touched, unknown, not_regular_seen);
             continue;
         }
         let Some(id) = entry.file_name().to_str().and_then(rollout_thread_id) else {
             *unknown += 1;
             continue;
         };
+        if !is_regular(&path) {
+            *not_regular_seen += 1;
+            continue;
+        }
         if let Some(mtime) = modified_unix(&path) {
             touched
                 .entry(id)
@@ -1156,11 +1579,18 @@ fn collect_rollout_mtimes(
 /// Refuses to write while a daemon is listening — the daemon fills the same gaps
 /// itself on restart. `codex` is a parameter for the reason it is one on
 /// [`recover`].
-pub fn fill_gaps(
+///
+/// With `include_older_lines` a line older than its own transcript is read as the file's
+/// own. A file moved by `cp`, `rsync -a` or across volumes has a new birth and almost
+/// every line older than it, and this is the one way to fill those. The id another
+/// conversation holds still decides, but a fork's copy of a turn nobody holds gets
+/// through: that is the risk a person takes by asking.
+pub fn fill_gaps_with(
     paths: &Paths,
     transcripts: &Path,
     apply: bool,
     codex: bool,
+    include_older_lines: bool,
 ) -> io::Result<Outcome> {
     if apply && std::os::unix::net::UnixStream::connect(paths.socket()).is_ok() {
         return Err(io::Error::other(format!(
@@ -1173,21 +1603,37 @@ pub fn fill_gaps(
     let mut log = apply
         .then(|| SegmentLog::open(paths.log_dir(), Retention::default()))
         .transpose()?;
-    let mut outcome = append_gaps(transcripts, &held, log.as_mut(), None, &paths.spool_dir())?;
+    let mut elsewhere = Elsewhere::new(paths.spool_dir(), &held);
+    let mut outcome = append_gaps_files(
+        &session_files(transcripts)?,
+        &held,
+        log.as_mut(),
+        None,
+        &mut elsewhere,
+        None,
+        include_older_lines,
+    )?;
     if codex {
         let mut timing = GapTiming::default();
+        // Empty, because by hand everything is asked whatever a start has noted.
+        let mut ran = ReadSoFar::default();
         let fill = fill_live_codex_gaps(
+            &CodexSource::from_env(),
             &held,
             log.as_mut(),
             None,
-            &mut Spool::new(paths.spool_dir()),
+            &mut elsewhere,
             StartFill {
                 timing: &mut timing,
                 deadline: Instant::now() + CODEX_DEADLINE,
-                read: &mut ReadSoFar::default(),
+                read: &mut ran,
             },
             CODEX_DEADLINE,
         )?;
+        if apply {
+            let read_everything = timing.codex_deferred.is_none() && fill.refused_for_now.is_none();
+            settle_codex_range(paths, ran, read_everything);
+        }
         outcome.gap_codex_threads = fill.threads;
         outcome.gap_codex_turns = fill.turns;
         outcome.gap_codex_records = fill.records;
@@ -1197,8 +1643,35 @@ pub fn fill_gaps(
                 .unread
                 .insert("thread/turns/list refused".into(), fill.refused);
         }
+        if fill.not_regular > 0 {
+            *outcome.unread.entry(NOT_REGULAR.into()).or_default() += fill.not_regular;
+        }
+        outcome.holding.extend(timing.codex_holding);
+    }
+    if elsewhere.claims.set_aside > 0 {
+        outcome.unread.insert(
+            "turn another conversation holds".into(),
+            elsewhere.claims.set_aside,
+        );
     }
     Ok(outcome)
+}
+
+/// Leave the starts after a fill by hand what it found. An entry stays true whatever
+/// range it was noted in, so the thread a start stalled on is not asked again until
+/// it changes, and with everything read no Codex range is left to hold.
+fn settle_codex_range(paths: &Paths, ran: ReadSoFar, read_everything: bool) {
+    let read_marker = paths.cache_dir().join("gap-read");
+    let mut read = ReadSoFar::load(&read_marker);
+    read.absorb(ran);
+    if read.0.is_empty() {
+        let _ = fs::remove_file(&read_marker);
+    } else {
+        read.save(paths, &read_marker);
+    }
+    if read_everything {
+        let _ = fs::remove_file(paths.cache_dir().join("gap-since-codex"));
+    }
 }
 
 /// Turns the official transcript has that the live log does not.
@@ -1318,12 +1791,18 @@ fn not_held<'a>(
 /// the transcript cannot, which is whether the vendor stopped.
 ///
 /// The spool is asked only when something looks missing, and after the source
-/// that made it look so: a hook that spooled before its line was written is seen
-/// here. One that spools in the moment between the two reads is not, and is
-/// written by both.
+/// that made it look so, so a hook that spooled before that read, or in the moment
+/// between the two, is seen here. What this cannot see is a hook that lands after
+/// the spool was read, for a line the source read already held. The fill and the
+/// drain then both write that turn's start, one extra `turn_started`. The hook must
+/// land in the seconds a restart takes, after the vendor wrote the line.
+///
+/// Nor does it hold what another conversation holds: see [`Claims`]. What it does
+/// leave counts as held from here on, so a second source listing the same turn
+/// leaves it too, in a dry run as well.
 fn still_missing<'a>(
     held: impl IntoIterator<Item = &'a Record>,
-    spool: &mut Spool,
+    elsewhere: &mut Elsewhere<'_>,
     session: &str,
     bus_id: BusId,
     recovered: Recovered,
@@ -1333,11 +1812,115 @@ fn still_missing<'a>(
     if missing.is_empty() {
         return missing;
     }
-    let waiting = spool.waiting(session, bus_id);
-    if waiting.is_empty() {
-        return missing;
+    let waiting = elsewhere.spool.waiting(session, bus_id);
+    let missing = if waiting.is_empty() {
+        missing
+    } else {
+        not_held(&waiting, &listed, session, bus_id, missing)
+    };
+    elsewhere.without_copies(missing, session, bus_id)
+}
+
+/// What a fill checks a source against besides the conversation it would write to.
+struct Elsewhere<'a> {
+    spool: Spool,
+    claims: Claims<'a>,
+}
+
+impl<'a> Elsewhere<'a> {
+    fn new(spool: PathBuf, log: &'a [Record]) -> Self {
+        Elsewhere {
+            spool: Spool::new(spool),
+            claims: Claims {
+                log,
+                holders: None,
+                set_aside: 0,
+            },
+        }
     }
-    not_held(&waiting, &listed, session, bus_id, missing)
+
+    /// `missing`, whole turns of it, without what another conversation holds or
+    /// has waiting in the spool. Each turn left is then claimed by this one.
+    fn without_copies(&mut self, missing: Vec<Entry>, session: &str, bus_id: BusId) -> Vec<Entry> {
+        let mut kept = Vec::with_capacity(missing.len());
+        let mut keep = true;
+        for entry in missing {
+            if matches!(entry.event, Event::TurnStarted { .. }) {
+                keep = entry.vendor_turn_id.as_ref().is_none_or(|id| {
+                    !self.claims.held_by_another(id.as_str(), session, bus_id)
+                        && !self.spool.waiting_for_another(id.as_str(), session)
+                });
+                self.claims.set_aside += u64::from(!keep);
+            }
+            if !keep {
+                continue;
+            }
+            if let (Event::TurnStarted { .. }, Some(id)) = (&entry.event, &entry.vendor_turn_id) {
+                self.claims.claim(id.as_str(), Some(session), bus_id);
+            }
+            kept.push(entry);
+        }
+        kept
+    }
+}
+
+/// Which conversations hold each turn id, as far as one fill can see: the log it
+/// read, and what it has decided to write since.
+///
+/// A vendor's turn id is a UUID, so another conversation holding one means this
+/// source's line was copied from there. Any record with the id counts, because a
+/// hook can lose a prompt and still report the turn's tools and its end. Built the
+/// first time anything looks missing, which at most starts is never.
+struct Claims<'a> {
+    log: &'a [Record],
+    holders: Option<Holders>,
+    /// Turns left out because another conversation holds them.
+    set_aside: u64,
+}
+
+/// Each turn id, with the session and conversation of every record holding it.
+type Holders = HashMap<String, Vec<(Option<String>, BusId)>>;
+
+impl Claims<'_> {
+    fn holders(&mut self) -> &mut Holders {
+        let log = self.log;
+        self.holders.get_or_insert_with(|| {
+            let mut holders = HashMap::new();
+            for record in log {
+                if let Some(id) = &record.vendor_turn_id {
+                    let session = record.source.vendor_session_id.as_deref();
+                    add_holder(&mut holders, id.as_str(), session, record.bus_id);
+                }
+            }
+            holders
+        })
+    }
+
+    /// Whether a conversation other than this one holds `id`. A split leaves one
+    /// session under two conversations and a hop leaves two sessions under one, and
+    /// neither is a copy, so another means both another session and another `bus_id`.
+    fn held_by_another(&mut self, id: &str, session: &str, bus_id: BusId) -> bool {
+        self.holders().get(id).is_some_and(|holders| {
+            holders
+                .iter()
+                .any(|(name, bus)| *bus != bus_id && name.as_deref() != Some(session))
+        })
+    }
+
+    fn claim(&mut self, id: &str, session: Option<&str>, bus_id: BusId) {
+        add_holder(self.holders(), id, session, bus_id);
+    }
+}
+
+fn add_holder(holders: &mut Holders, id: &str, session: Option<&str>, bus_id: BusId) {
+    let held = |(name, bus): &(Option<String>, BusId)| *bus == bus_id && name.as_deref() == session;
+    match holders.get_mut(id) {
+        Some(known) if known.iter().any(held) => {}
+        Some(known) => known.push((session.map(str::to_string), bus_id)),
+        None => {
+            holders.insert(id.to_string(), vec![(session.map(str::to_string), bus_id)]);
+        }
+    }
 }
 
 /// The spool as one fill sees it. Each entry is read once, however many sessions
@@ -1347,6 +1930,8 @@ struct Spool {
     dir: PathBuf,
     seen: HashSet<std::ffi::OsString>,
     by_session: HashMap<String, Vec<Request>>,
+    /// The sessions each turn id waits for.
+    by_turn: HashMap<String, HashSet<String>>,
 }
 
 impl Spool {
@@ -1355,6 +1940,7 @@ impl Spool {
             dir,
             seen: HashSet::new(),
             by_session: HashMap::new(),
+            by_turn: HashMap::new(),
         }
     }
 
@@ -1379,12 +1965,26 @@ impl Spool {
                 .flatten()
                 .and_then(|text| serde_json::from_str::<Request>(text.trim()).ok());
             if let Some(request) = request {
+                if let Some(turn) = &request.vendor_turn_id {
+                    self.by_turn
+                        .entry(turn.as_str().to_string())
+                        .or_default()
+                        .insert(request.vendor_session_id.clone());
+                }
                 self.by_session
                     .entry(request.vendor_session_id.clone())
                     .or_default()
                     .push(request);
             }
         }
+    }
+
+    /// Whether a hook of another session is waiting with this turn id. Asked after
+    /// [`Spool::waiting`], which is what reads it.
+    fn waiting_for_another(&self, turn: &str, session: &str) -> bool {
+        self.by_turn
+            .get(turn)
+            .is_some_and(|sessions| sessions.iter().any(|name| name != session))
     }
 
     /// What it holds for one session, as the records the drain will make of it.
@@ -1436,23 +2036,6 @@ fn prompt_text(body: &Body) -> Option<String> {
     }
 }
 
-fn append_gaps(
-    transcripts: &Path,
-    held: &[Record],
-    log: Option<&mut SegmentLog>,
-    since: Option<i64>,
-    spool: &Path,
-) -> io::Result<Outcome> {
-    append_gaps_files(
-        &session_files(transcripts)?,
-        held,
-        log,
-        since,
-        &mut Spool::new(spool.to_path_buf()),
-        None,
-    )
-}
-
 /// The per-file loop of `append_gaps`, lifted out of the walk so the start
 /// path can time each half separately and stop when its budget runs out.
 fn append_gaps_files(
@@ -1460,8 +2043,9 @@ fn append_gaps_files(
     held: &[Record],
     mut log: Option<&mut SegmentLog>,
     since: Option<i64>,
-    spool: &mut Spool,
+    elsewhere: &mut Elsewhere<'_>,
     mut start: Option<StartFill<'_>>,
+    include_older_lines: bool,
 ) -> io::Result<Outcome> {
     let known = known_from(held.iter());
     let mut outcome = Outcome::default();
@@ -1476,7 +2060,14 @@ fn append_gaps_files(
         .filter_map(|file| {
             let (stem, session) = session_of(file)?;
             let live_bus = *known.live_bus.get(&session)?;
-            (!untouched_since(file, since)).then_some((file, stem, live_bus))
+            if untouched_since(file, since) {
+                return None;
+            }
+            if !is_regular(file) {
+                *outcome.unread.entry(NOT_REGULAR.into()).or_default() += 1;
+                return None;
+            }
+            Some((file, stem, live_bus))
         })
         .collect();
     // One file per session, the most recently written. What this pass writes is
@@ -1485,39 +2076,59 @@ fn append_gaps_files(
     let mut sessions = HashSet::new();
     to_read.retain(|(_, stem, _)| sessions.insert(*stem));
     to_read.sort_by_key(|(file, ..)| *file);
-    // What a cut range has read at this length is done, and what it has not read
-    // at all goes first, or a file that keeps growing uses every budget up.
-    if let Some(read) = start.as_ref().map(|start| &*start.read) {
-        to_read.retain(|(file, ..)| {
-            !fs::metadata(file)
-                .is_ok_and(|meta| read.is_current(&file.to_string_lossy(), meta.len() as i64))
-        });
-        to_read.sort_by_key(|(file, ..)| read.knows(&file.to_string_lossy()));
+    // Oldest file first, so a parent reaches a turn before its fork's copy does.
+    // Neither holds it yet, the lines look the same, and what is read first is what
+    // writes. On all 57,608 real lines that still name their parent's session, the
+    // file they name was created first.
+    to_read.sort_by_cached_key(|(file, ..)| {
+        let born = born(file);
+        (born.is_none(), born)
+    });
+    if let Some(start) = start.as_mut() {
+        files_left_to_read(&mut to_read, start.read);
     }
     let targets: Vec<(&str, BusId)> = to_read.iter().map(|&(_, stem, bus)| (stem, bus)).collect();
     let grouped = records_of(held, &targets);
+    let mut read_last: Option<&Path> = None;
     for (file, stem, live_bus) in to_read {
-        if let Some(start) = start.as_mut()
-            && Instant::now() >= start.deadline
-        {
-            start.timing.budget_exhausted = true;
-            break;
+        if let Some(start) = start.as_mut() {
+            let last = read_last.take().map(used_up_a_budget);
+            if Instant::now() >= start.deadline {
+                start.timing.budget_exhausted = true;
+                if let Some(last) = last {
+                    start.read.note(&last, 1);
+                }
+                break;
+            }
+            if let Some(last) = last {
+                start.read.forget(&last);
+            }
         }
         let Ok(text) = fs::read_to_string(file) else {
             *outcome.unread.entry("unreadable file".into()).or_default() += 1;
+            outcome
+                .holding
+                .push(format!("could not read {}", file.display()));
+            if let Some(start) = start.as_mut() {
+                start
+                    .timing
+                    .claude_unreadable
+                    .push(file.display().to_string());
+            }
             continue;
         };
         if let Some(start) = start.as_mut() {
             start.timing.claude_files += 1;
             start.timing.claude_bytes += text.len() as u64;
         }
-        let recovered = parse_claude_transcript(&text, stem, live_bus);
+        let born = born_at(file).filter(|_| !include_older_lines);
+        let recovered = parse_claude_transcript_born(&text, stem, live_bus, born);
         for (reason, count) in &recovered.skipped {
             *outcome.unread.entry(reason.clone()).or_default() += count;
         }
         let missing = still_missing(
             grouped.get(stem).into_iter().flatten().copied(),
-            spool,
+            elsewhere,
             stem,
             live_bus,
             recovered,
@@ -1538,6 +2149,11 @@ fn append_gaps_files(
         if let Some(start) = start.as_mut() {
             start.read.note(&file.to_string_lossy(), text.len() as i64);
         }
+        read_last = Some(file.as_path());
+    }
+    // Set here only if the last file was read and the list ended, so it held nothing up.
+    if let (Some(start), Some(last)) = (start.as_mut(), read_last) {
+        start.read.forget(&used_up_a_budget(last));
     }
     Ok(outcome)
 }
@@ -1596,6 +2212,10 @@ pub fn recover(paths: &Paths, transcripts: &Path, apply: bool, codex: bool) -> i
         // Already complete: it is in the log and it knows where it happened.
         if already.get(&bus_id) == Some(&true) {
             outcome.already_backfilled += 1;
+            continue;
+        }
+        if !is_regular(&file) {
+            *outcome.unread.entry(NOT_REGULAR.into()).or_default() += 1;
             continue;
         }
         let Ok(text) = fs::read_to_string(&file) else {
@@ -1741,12 +2361,19 @@ fn recover_codex(
     Ok(())
 }
 
-/// Every turn of one thread, page by page.
+/// Every turn of one thread, oldest first, page by page.
+///
+/// The order has to be asked for: `sortDirection` "defaults to descending", in the
+/// schema of codex-cli 0.166.0. Read newest first, an older turn's reply lands on a
+/// newer prompt, a running turn gets an ending that is not its own, and a filled
+/// batch ends on its oldest turn. It is put in order here as well, for a server that
+/// does not do as it is asked.
 fn list_turns(server: &mut AppServer, thread_id: &str) -> io::Result<Vec<serde_json::Value>> {
     let mut turns = Vec::new();
     let mut cursor: Option<String> = None;
     loop {
-        let mut params = serde_json::json!({"threadId": thread_id, "limit": 100});
+        let mut params =
+            serde_json::json!({"threadId": thread_id, "limit": 100, "sortDirection": "asc"});
         if let Some(cursor) = &cursor {
             params["cursor"] = serde_json::json!(cursor);
         }
@@ -1754,6 +2381,7 @@ fn list_turns(server: &mut AppServer, thread_id: &str) -> io::Result<Vec<serde_j
         turns.extend(page["data"].as_array().into_iter().flatten().cloned());
         cursor = page["nextCursor"].as_str().map(str::to_string);
         if cursor.is_none() {
+            oldest_first(&mut turns);
             return Ok(turns);
         }
     }
@@ -1886,7 +2514,7 @@ fn session_files(root: &Path) -> io::Result<Vec<PathBuf>> {
     Ok(files)
 }
 
-fn summarise_unread(unread: &BTreeMap<String, u64>) -> String {
+fn summarise_unread(unread: &BTreeMap<String, u64>, reasons: usize) -> String {
     if unread.is_empty() {
         return "nothing".to_string();
     }
@@ -1894,7 +2522,7 @@ fn summarise_unread(unread: &BTreeMap<String, u64>) -> String {
     by_count.sort_by(|a, b| b.1.cmp(a.1));
     by_count
         .iter()
-        .take(6)
+        .take(reasons)
         .map(|(reason, count)| format!("{count} {reason}"))
         .collect::<Vec<_>>()
         .join(", ")
@@ -1936,18 +2564,25 @@ mod tests {
         }
     }
 
+    /// A stamp from now. A fill takes a line stamped well before its file was
+    /// created for a copy, so what a test wants filled cannot carry a fixed date.
+    fn stamp_now() -> String {
+        Timestamp::now().to_string()
+    }
+
     /// One Claude Code transcript for `session`, shaped like the real ones:
     /// a prompt line carrying the checkout and the front end, and a reply.
     fn transcript(machine: &Machine, session: &str) {
         let project = machine.transcripts.join("-Applications-conbus");
         fs::create_dir_all(&project).expect("project dir");
+        let now = stamp_now();
         fs::write(
             project.join(format!("{session}.jsonl")),
             format!(
-                "{{\"type\":\"user\",\"sessionId\":\"{session}\",\"timestamp\":\"2026-08-31T09:33:02.222Z\",\
+                "{{\"type\":\"user\",\"sessionId\":\"{session}\",\"timestamp\":\"{now}\",\
                  \"version\":\"2.1.241\",\"cwd\":\"/Applications/conbus\",\"entrypoint\":\"cli\",\
                  \"promptId\":\"P1\",\"message\":{{\"role\":\"user\",\"content\":\"Reply with OK\"}}}}\n\
-                 {{\"type\":\"assistant\",\"sessionId\":\"{session}\",\"timestamp\":\"2026-08-31T09:33:03.000Z\",\
+                 {{\"type\":\"assistant\",\"sessionId\":\"{session}\",\"timestamp\":\"{now}\",\
                  \"version\":\"2.1.241\",\"message\":{{\"role\":\"assistant\",\"stop_reason\":\"end_turn\",\"content\":[{{\"type\":\"text\",\
                  \"text\":\"OK\"}}]}}}}\n"
             ),
@@ -1981,6 +2616,33 @@ mod tests {
             },
         })
         .expect("append");
+    }
+
+    fn fill_gaps(
+        paths: &Paths,
+        transcripts: &Path,
+        apply: bool,
+        codex: bool,
+    ) -> io::Result<Outcome> {
+        fill_gaps_with(paths, transcripts, apply, codex, false)
+    }
+
+    fn append_gaps(
+        transcripts: &Path,
+        held: &[Record],
+        log: Option<&mut SegmentLog>,
+        since: Option<i64>,
+        spool: &Path,
+    ) -> io::Result<Outcome> {
+        append_gaps_files(
+            &session_files(transcripts)?,
+            held,
+            log,
+            since,
+            &mut Elsewhere::new(spool.to_path_buf(), held),
+            None,
+            false,
+        )
     }
 
     fn records_on_disk(machine: &Machine) -> usize {
@@ -2121,19 +2783,20 @@ mod tests {
     fn transcript_two_turns(machine: &Machine, session: &str) {
         let project = machine.transcripts.join("-Applications-conbus");
         fs::create_dir_all(&project).expect("project dir");
+        let now = stamp_now();
         fs::write(
             project.join(format!("{session}.jsonl")),
             format!(
-                "{{\"type\":\"user\",\"sessionId\":\"{session}\",\"timestamp\":\"2026-08-31T09:33:02.222Z\",\
+                "{{\"type\":\"user\",\"sessionId\":\"{session}\",\"timestamp\":\"{now}\",\
                  \"version\":\"2.1.241\",\"cwd\":\"/Applications/conbus\",\"entrypoint\":\"cli\",\
                  \"promptId\":\"P1\",\"message\":{{\"role\":\"user\",\"content\":\"Reply with OK\"}}}}\n\
-                 {{\"type\":\"assistant\",\"sessionId\":\"{session}\",\"timestamp\":\"2026-08-31T09:33:03.000Z\",\
+                 {{\"type\":\"assistant\",\"sessionId\":\"{session}\",\"timestamp\":\"{now}\",\
                  \"version\":\"2.1.241\",\"message\":{{\"role\":\"assistant\",\"stop_reason\":\"end_turn\",\"content\":[{{\"type\":\"text\",\
                  \"text\":\"OK\"}}]}}}}\n\
-                 {{\"type\":\"user\",\"sessionId\":\"{session}\",\"timestamp\":\"2026-08-31T09:34:00.000Z\",\
+                 {{\"type\":\"user\",\"sessionId\":\"{session}\",\"timestamp\":\"{now}\",\
                  \"version\":\"2.1.241\",\"cwd\":\"/Applications/conbus\",\"entrypoint\":\"cli\",\
                  \"promptId\":\"P2\",\"message\":{{\"role\":\"user\",\"content\":\"the turn the daemon missed\"}}}}\n\
-                 {{\"type\":\"assistant\",\"sessionId\":\"{session}\",\"timestamp\":\"2026-08-31T09:34:01.000Z\",\
+                 {{\"type\":\"assistant\",\"sessionId\":\"{session}\",\"timestamp\":\"{now}\",\
                  \"version\":\"2.1.241\",\"message\":{{\"role\":\"assistant\",\"stop_reason\":\"end_turn\",\"content\":[{{\"type\":\"text\",\
                  \"text\":\"caught up\"}}]}}}}\n"
             ),
@@ -2626,7 +3289,27 @@ mod tests {
     }
 
     #[test]
-    fn another_sessions_spool_entry_does_not_stand_in_for_this_turn() {
+    fn another_sessions_words_in_the_spool_do_not_stand_in_for_this_turn() {
+        let machine = machine();
+        recorded_live(&machine, SESSION);
+        transcript_two_turns(&machine, SESSION);
+        in_the_spool(
+            &machine,
+            "a",
+            "11111111-aaaa-bbbb-cccc-ddddeeeeffff",
+            "its-own-turn",
+            "the turn the daemon missed",
+        );
+
+        let outcome = fill_gaps(&machine.paths, &machine.transcripts, true, false).expect("fill");
+
+        assert_eq!(outcome.gap_records, 2);
+    }
+
+    #[test]
+    fn a_turn_waiting_in_the_spool_for_another_session_is_a_copy_here() {
+        // The parent's hook found no daemon, and the fork lists the same turn. The
+        // drain will write it under the parent, so the fork must not.
         let machine = machine();
         recorded_live(&machine, SESSION);
         transcript_two_turns(&machine, SESSION);
@@ -2640,7 +3323,132 @@ mod tests {
 
         let outcome = fill_gaps(&machine.paths, &machine.transcripts, true, false).expect("fill");
 
-        assert_eq!(outcome.gap_records, 2);
+        assert_eq!(outcome.gap_records, 0);
+        assert_eq!(
+            outcome.unread.get("turn another conversation holds"),
+            Some(&1)
+        );
+        assert_eq!(records_on_disk(&machine), 1);
+    }
+
+    /// A recorded prompt with this turn id, under its own session and conversation.
+    fn held_under_another_conversation(machine: &Machine, turn: &str) {
+        logged(
+            machine,
+            vec![live_prompt(
+                "11111111-aaaa-bbbb-cccc-ddddeeeeffff",
+                Harness::CLAUDE_CODE,
+                BusId::mint(),
+                Some(turn),
+                "said in the other conversation",
+            )],
+        );
+    }
+
+    #[test]
+    fn a_turn_another_conversation_holds_is_not_missing() {
+        let machine = machine();
+        recorded_live(&machine, SESSION);
+        transcript_two_turns(&machine, SESSION);
+        held_under_another_conversation(&machine, "P2");
+        let before = records_on_disk(&machine);
+
+        let outcome = fill_gaps(&machine.paths, &machine.transcripts, true, false).expect("fill");
+
+        assert_eq!(outcome.gap_turns, 0, "neither the prompt nor its ending");
+        assert_eq!(outcome.gap_records, 0);
+        assert_eq!(
+            outcome.unread.get("turn another conversation holds"),
+            Some(&1)
+        );
+        assert_eq!(records_on_disk(&machine), before);
+    }
+
+    #[test]
+    fn only_a_prompts_id_on_another_conversation_is_enough_to_leave_it() {
+        // Its prompt hook was lost and a tool or `Stop` hook still named the turn.
+        let machine = machine();
+        recorded_live(&machine, SESSION);
+        transcript_two_turns(&machine, SESSION);
+        let mut log =
+            SegmentLog::open(machine.paths.log_dir(), Retention::default()).expect("open");
+        let mut ending = live_prompt(
+            "11111111-aaaa-bbbb-cccc-ddddeeeeffff",
+            Harness::CLAUDE_CODE,
+            BusId::mint(),
+            Some("P2"),
+            "",
+        );
+        ending.event = Event::TurnEnded {
+            state: conbus_core::event::TurnState::Complete,
+            assistant_message: None,
+            tokens: None,
+        };
+        log.append(ending).expect("append");
+        drop(log);
+
+        let outcome = fill_gaps(&machine.paths, &machine.transcripts, true, false).expect("fill");
+
+        assert_eq!(outcome.gap_records, 0);
+    }
+
+    #[test]
+    fn the_same_session_under_a_second_conversation_is_not_another_conversation() {
+        // A split: one session under two ids. Its turn with no ending yet is filled
+        // as before, not taken for a copy of itself.
+        let machine = machine();
+        let bus = BusId::mint();
+        logged(
+            &machine,
+            vec![live_prompt(
+                SESSION,
+                Harness::CLAUDE_CODE,
+                bus,
+                Some("P9"),
+                "seen",
+            )],
+        );
+        let mut elsewhere = Elsewhere::new(machine.paths.spool_dir(), &[]);
+        let records = held(&machine);
+        elsewhere.claims.log = &records;
+
+        assert!(
+            !elsewhere
+                .claims
+                .held_by_another("P9", SESSION, BusId::mint())
+        );
+        assert!(
+            !elsewhere
+                .claims
+                .held_by_another("P9", "a-leg-of-the-hop", bus)
+        );
+        assert!(
+            elsewhere
+                .claims
+                .held_by_another("P9", "another", BusId::mint())
+        );
+    }
+
+    #[test]
+    fn a_dry_run_counts_a_turn_two_sources_list_once() {
+        // What a dry run says is what `--apply` would do, and it writes nothing for
+        // the second source to find.
+        let machine = machine();
+        let (older, newer) = (
+            "aaaaaaaa-0000-4000-8000-000000000001",
+            "ffffffff-0000-4000-8000-000000000002",
+        );
+        recorded_live(&machine, older);
+        recorded_live(&machine, newer);
+        transcript_two_turns(&machine, older);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        transcript_two_turns(&machine, newer);
+
+        let dry = fill_gaps(&machine.paths, &machine.transcripts, false, false).expect("dry");
+        let applied = fill_gaps(&machine.paths, &machine.transcripts, true, false).expect("apply");
+
+        assert_eq!(dry.gap_turns, 1, "P2, once: P1 is held by its words");
+        assert_eq!(dry, applied);
     }
 
     #[test]
@@ -2668,7 +3476,7 @@ mod tests {
             .map(|id| {
                 serde_json::json!({
                     "type": "user", "sessionId": SESSION, "promptId": id,
-                    "timestamp": "2026-08-31T09:33:02.222Z",
+                    "timestamp": stamp_now(),
                     "message": {"role": "user", "content": "continue"}
                 })
                 .to_string()
@@ -2721,6 +3529,343 @@ mod tests {
         let outcome = fill_gaps(&machine.paths, &machine.transcripts, true, false).expect("fill");
 
         assert_eq!(outcome.gap_records, 2);
+    }
+
+    #[test]
+    fn a_link_named_like_a_transcript_is_counted_and_not_followed() {
+        let machine = machine();
+        recorded_live(&machine, SESSION);
+        transcript_two_turns(&machine, SESSION);
+        let project = machine.transcripts.join("-Applications-conbus");
+        let file = project.join(format!("{SESSION}.jsonl"));
+        let elsewhere = machine.paths.root().join("elsewhere.jsonl");
+        fs::rename(&file, &elsewhere).expect("move");
+        std::os::unix::fs::symlink(&elsewhere, &file).expect("link");
+
+        let outcome = fill_gaps(&machine.paths, &machine.transcripts, true, false).expect("fill");
+
+        assert_eq!(outcome.gap_records, 0);
+        assert_eq!(outcome.unread.get(NOT_REGULAR), Some(&1));
+    }
+
+    #[test]
+    fn a_session_with_two_copies_is_read_from_the_most_recently_written() {
+        // Older by name as well, so the first by path would be the copy without it.
+        let machine = machine();
+        recorded_live(&machine, SESSION);
+        transcript(&machine, SESSION);
+        let moved = machine.transcripts.join("-Applications-conbus-moved");
+        fs::create_dir_all(&moved).expect("dir");
+        let original = machine
+            .transcripts
+            .join("-Applications-conbus")
+            .join(format!("{SESSION}.jsonl"));
+        let hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3_600);
+        fs::File::options()
+            .write(true)
+            .open(&original)
+            .expect("open")
+            .set_modified(hour_ago)
+            .expect("backdate");
+        let held_copy = fs::read_to_string(&original).expect("read");
+        transcript_two_turns(&machine, SESSION);
+        fs::rename(original.clone(), moved.join(format!("{SESSION}.jsonl")))
+            .expect("the newer copy");
+        fs::write(&original, held_copy).expect("the older copy");
+        fs::File::options()
+            .write(true)
+            .open(&original)
+            .expect("open")
+            .set_modified(hour_ago)
+            .expect("backdate");
+
+        let outcome = fill_gaps(&machine.paths, &machine.transcripts, true, false).expect("fill");
+
+        assert_eq!(outcome.gap_turns, 1, "the turn only the newer copy holds");
+        assert!(holds_prompt(&machine, "the turn the daemon missed"));
+    }
+
+    #[test]
+    fn a_spool_file_over_the_hooks_cap_is_not_on_its_way() {
+        // The drain will not read it, so it does not count as about to be written.
+        let machine = machine();
+        recorded_live(&machine, SESSION);
+        transcript_two_turns(&machine, SESSION);
+        in_the_spool(&machine, "big", SESSION, "P2", "the turn the daemon missed");
+        let path = machine.paths.spool_dir().join("big.json");
+        let mut text = fs::read_to_string(&path).expect("read");
+        text.push_str(&" ".repeat(1_048_576 + 1));
+        fs::write(&path, text).expect("pad");
+
+        let outcome = fill_gaps(&machine.paths, &machine.transcripts, true, false).expect("fill");
+
+        assert_eq!(outcome.gap_records, 2);
+    }
+
+    #[test]
+    fn a_budget_the_transcripts_used_up_holds_the_codex_range_too() {
+        // The Codex pass never ran, so nothing of its range has been read.
+        let machine = machine();
+        let home = tempfile::tempdir().expect("tempdir");
+        claude_transcript(home.path(), SESSION);
+        live_at(&machine, Timestamp::now(), SESSION);
+        let mut log =
+            SegmentLog::open(machine.paths.log_dir(), Retention::default()).expect("open");
+
+        let (_, timing) = append_gaps_at_start_in(
+            &machine.paths,
+            &held(&machine),
+            &mut log,
+            std::time::Duration::ZERO,
+            Some(home.path()),
+        )
+        .expect("fill");
+
+        assert!(timing.budget_exhausted);
+        assert!(timing.codex_deferred.is_some());
+        assert!(machine.paths.cache_dir().join("gap-since-codex").exists());
+    }
+
+    /// A live Codex thread with a rollout under `codex_home`, and what the pass needs
+    /// to ask about it through a stand-in that answers at once.
+    fn a_thread_a_stand_in_can_answer(
+        machine: &Machine,
+        codex_home: &Path,
+    ) -> (CodexSource, Vec<Record>) {
+        let thread = "01a19463-cbd4-7b50-b819-000000000abc";
+        logged(
+            machine,
+            vec![live_prompt(
+                thread,
+                Harness::CODEX,
+                BusId::mint(),
+                Some("t0"),
+                "seen",
+            )],
+        );
+        rollout(
+            &codex_home.join("sessions"),
+            &format!("rollout-2026-11-01T00-00-00-{thread}.jsonl"),
+            2_000_000_000,
+        );
+        let fake = codex_home.join("codex");
+        crate::test_support::write_executable(
+            &fake,
+            r#"#!/usr/bin/env python3
+import json, sys
+for line in sys.stdin:
+    msg = json.loads(line)
+    if msg.get("method") == "initialize":
+        print(json.dumps({"jsonrpc":"2.0","id":msg.get("id"),"result":{"userAgent":"fake"}}), flush=True)
+    elif msg.get("method") == "thread/turns/list":
+        print(json.dumps({"jsonrpc":"2.0","id":msg.get("id"),"result":{"data":[],"nextCursor":None}}), flush=True)
+"#,
+        );
+        let source = CodexSource {
+            binary: fake.into_os_string(),
+            home: Some(codex_home.to_path_buf()),
+        };
+        (source, held(machine))
+    }
+
+    #[test]
+    fn a_budget_that_runs_out_between_threads_defers_the_rest_unasked() {
+        // What the server's own limit does not catch: its limit can be the longer one.
+        let machine = machine();
+        let codex_home = tempfile::tempdir().expect("tempdir");
+        let (source, records) = a_thread_a_stand_in_can_answer(&machine, codex_home.path());
+        let mut elsewhere = Elsewhere::new(machine.paths.spool_dir(), &records);
+        let mut timing = GapTiming::default();
+
+        let fill = fill_live_codex_gaps(
+            &source,
+            &records,
+            None,
+            None,
+            &mut elsewhere,
+            StartFill {
+                timing: &mut timing,
+                deadline: Instant::now(),
+                read: &mut ReadSoFar::default(),
+            },
+            std::time::Duration::from_secs(60),
+        )
+        .expect("the pass");
+
+        assert_eq!(timing.list_turns_attempted, 0, "{fill:?}");
+        assert!(timing.budget_exhausted);
+        assert_eq!(
+            timing.codex_deferred.as_deref(),
+            Some("the start's budget ran out")
+        );
+    }
+
+    #[test]
+    fn a_thread_a_limit_caught_goes_first_then_what_is_unread_then_the_rest() {
+        let (cut, unread, failed): (BusId, BusId, BusId) = (
+            "00000000-0000-4000-8000-000000000003"
+                .parse()
+                .expect("uuid"),
+            "00000000-0000-4000-8000-000000000002"
+                .parse()
+                .expect("uuid"),
+            "00000000-0000-4000-8000-000000000001"
+                .parse()
+                .expect("uuid"),
+        );
+        let mut read = ReadSoFar::default();
+        read.note(&cut.to_string(), CUT);
+        read.note(&failed.to_string(), FAILED);
+        let mut threads = vec![(failed, 5), (unread, 5), (cut, 5)];
+
+        unread_first(&mut threads, &read);
+
+        assert_eq!(threads, vec![(cut, 5), (unread, 5), (failed, 5)]);
+    }
+
+    #[test]
+    fn a_note_from_the_future_or_over_an_hour_old_does_not_stand() {
+        assert!(within_back_off(1_000, 1_000));
+        assert!(within_back_off(1_000, 1_000 + STALL_BACK_OFF_SECS - 1));
+        assert!(!within_back_off(1_000, 1_000 + STALL_BACK_OFF_SECS));
+        assert!(!within_back_off(1_001, 1_000), "a clock that ran ahead");
+    }
+
+    #[test]
+    fn a_fill_by_hand_that_read_a_thread_clears_what_the_server_was_called() {
+        let thread = "00000000-0000-4000-8000-000000000001";
+        let mut read = ReadSoFar::default();
+        read.note(STALLED, 1_000);
+        read.note(&stalled_on(thread), 1_000);
+        let mut ran = ReadSoFar::default();
+        ran.note(thread, 5);
+
+        read.absorb(ran);
+
+        assert!(!read.knows(STALLED), "the server answered");
+        assert!(!read.knows(&stalled_on(thread)), "and about this thread");
+        assert!(read.is_current(thread, 5));
+    }
+
+    #[test]
+    fn a_fill_by_hand_that_read_nothing_clears_nothing() {
+        let thread = "00000000-0000-4000-8000-000000000001";
+        let mut read = ReadSoFar::default();
+        read.note(STALLED, 1_000);
+        read.note(&stalled_on(thread), 1_000);
+        let mut ran = ReadSoFar::default();
+        ran.note(thread, FAILED);
+
+        read.absorb(ran);
+
+        assert!(read.knows(STALLED));
+        assert!(read.knows(&stalled_on(thread)));
+    }
+
+    #[test]
+    fn no_time_left_for_the_server_defers_it_without_calling_it_stalled() {
+        // A server given no time has not stalled, so the next start asks it.
+        let machine = machine();
+        let codex_home = tempfile::tempdir().expect("tempdir");
+        let (source, records) = a_thread_a_stand_in_can_answer(&machine, codex_home.path());
+        let mut elsewhere = Elsewhere::new(machine.paths.spool_dir(), &records);
+        let mut timing = GapTiming::default();
+        let mut read = ReadSoFar::default();
+
+        fill_live_codex_gaps(
+            &source,
+            &records,
+            None,
+            None,
+            &mut elsewhere,
+            StartFill {
+                timing: &mut timing,
+                deadline: Instant::now(),
+                read: &mut read,
+            },
+            std::time::Duration::ZERO,
+        )
+        .expect("the pass");
+
+        assert!(timing.budget_exhausted);
+        assert_eq!(
+            timing.codex_deferred.as_deref(),
+            Some("no time left in the start's budget")
+        );
+        assert!(
+            !read.knows(STALLED),
+            "a stall note would leave it alone for an hour"
+        );
+    }
+
+    /// One conversation's export, of two turns.
+    fn an_export_of(conversation: &str) -> String {
+        serde_json::json!([{"uuid": conversation, "chat_messages": [
+            {"uuid": "m1", "sender": "human", "text": "said in the chat", "created_at": "2026-09-06T12:00:00.000Z"},
+            {"uuid": "m2", "sender": "assistant", "text": "answered", "created_at": "2026-09-06T12:01:00.000Z"},
+            {"uuid": "m3", "sender": "human", "text": "said later", "created_at": "2026-09-06T12:02:00.000Z"},
+            {"uuid": "m4", "sender": "assistant", "text": "answered later", "created_at": "2026-09-06T12:03:00.000Z"}
+        ]}])
+        .to_string()
+    }
+
+    #[test]
+    fn an_export_finds_a_conversation_by_its_id_or_by_a_record_naming_it() {
+        let chat = "00000000-1111-2222-3333-444444444444";
+        let bus: BusId = chat.parse().expect("uuid");
+        for (session, under) in [(chat, BusId::mint()), ("another-session", bus)] {
+            let machine = machine();
+            let records = logged(
+                &machine,
+                vec![live_prompt(
+                    session,
+                    Harness::CLAUDE_CHAT,
+                    under,
+                    Some("m1"),
+                    "said in the chat",
+                )],
+            );
+            // Makes it known as a chat conversation, under either shape.
+            let mut with_a_stamp = records.clone();
+            let mut stamp = records[0].clone();
+            stamp.source.vendor_session_id = Some(chat.to_string());
+            stamp.bus_id = bus;
+            stamp.vendor_turn_id = None;
+            stamp.event = Event::SessionCandidate { trigger: None };
+            with_a_stamp.push(stamp);
+            let mut log =
+                SegmentLog::open(machine.paths.log_dir(), Retention::default()).expect("open");
+
+            let outcome = ingest_chat_text(
+                &with_a_stamp,
+                &mut Vec::new(),
+                &an_export_of(chat),
+                Some(&mut log),
+            )
+            .expect("ingest");
+
+            // `m1` is held, so only `m3` is missing, and the conversation is not new.
+            assert_eq!(outcome.gap_turns, 1, "its record is {session}, {under:?}");
+            assert_eq!(outcome.records, 0);
+        }
+    }
+
+    #[test]
+    fn gaps_can_print_every_reason_and_the_others_the_biggest() {
+        let unread: BTreeMap<String, u64> =
+            (1..=8u64).map(|n| (format!("reason {n}"), n)).collect();
+
+        let all = summarise_unread(&unread, usize::MAX);
+        let some = summarise_unread(&unread, 6);
+
+        assert!(
+            all.contains("1 reason 1") && all.contains("8 reason 8"),
+            "{all}"
+        );
+        assert!(
+            !some.contains("1 reason 1") && some.contains("8 reason 8"),
+            "{some}"
+        );
     }
 
     #[test]
@@ -2898,7 +4043,8 @@ mod tests {
         let mut log =
             SegmentLog::open(machine.paths.log_dir(), Retention::default()).expect("open");
         let filled =
-            ingest_chat_exports_filtered(dir.path(), &[], &mut log, true, None).expect("ingest");
+            ingest_chat_exports_filtered(dir.path(), &[], &mut log, true, None, None, &mut 0)
+                .expect("ingest");
         assert!(filled >= 2, "{filled}");
         let all = SegmentLog::scan(machine.paths.log_dir())
             .expect("scan")
@@ -2972,15 +4118,17 @@ mod tests {
         // sessions/: the map still carries the thread id.
         let mut bound = HashSet::from([old, fresh, gone]);
         let mut unknown = 0;
-        let asked = codex_threads_touched_since_in(home.path(), &bound, 1_500, &mut unknown)
-            .expect("sessions dir read");
+        let asked =
+            codex_threads_touched_since_in(home.path(), &bound, 1_500, &mut unknown, &mut 0)
+                .expect("sessions dir read");
         // Asked about in most-recently-touched order.
         assert_eq!(asked, vec![(gone, 3_000), (fresh, 2_000)]);
         // A thread with no file anywhere cannot be hydrated by the
         // app-server — it is out rather than asked.
         bound.insert(BusId::mint());
-        let asked = codex_threads_touched_since_in(home.path(), &bound, 1_500, &mut unknown)
-            .expect("sessions dir read");
+        let asked =
+            codex_threads_touched_since_in(home.path(), &bound, 1_500, &mut unknown, &mut 0)
+                .expect("sessions dir read");
         assert_eq!(asked, vec![(gone, 3_000), (fresh, 2_000)]);
     }
 
@@ -2991,13 +4139,14 @@ mod tests {
             .join("projects")
             .join("-Applications-conbus");
         fs::create_dir_all(&project).expect("project dir");
+        let now = stamp_now();
         fs::write(
             project.join(format!("{session}.jsonl")),
             format!(
-                "{{\"type\":\"user\",\"sessionId\":\"{session}\",\"timestamp\":\"2026-08-31T09:33:02.222Z\",\
+                "{{\"type\":\"user\",\"sessionId\":\"{session}\",\"timestamp\":\"{now}\",\
                  \"version\":\"2.1.241\",\"cwd\":\"/Applications/conbus\",\"entrypoint\":\"cli\",\
                  \"promptId\":\"P1\",\"message\":{{\"role\":\"user\",\"content\":\"Reply with OK\"}}}}\n\
-                 {{\"type\":\"assistant\",\"sessionId\":\"{session}\",\"timestamp\":\"2026-08-31T09:33:03.000Z\",\
+                 {{\"type\":\"assistant\",\"sessionId\":\"{session}\",\"timestamp\":\"{now}\",\
                  \"version\":\"2.1.241\",\"message\":{{\"role\":\"assistant\",\"stop_reason\":\"end_turn\",\"content\":[{{\"type\":\"text\",\
                  \"text\":\"OK\"}}]}}}}\n"
             ),
@@ -3196,13 +4345,14 @@ mod tests {
     /// a read that takes longer than a tiny budget.
     fn a_big_transcript(project: &Path, session: &str, filler: usize) {
         let padding = "x".repeat(1024);
+        let now = stamp_now();
         let mut big = format!(
-            "{{\"type\":\"user\",\"sessionId\":\"{session}\",\"timestamp\":\"2026-11-01T00:00:00.000Z\",\
+            "{{\"type\":\"user\",\"sessionId\":\"{session}\",\"timestamp\":\"{now}\",\
              \"promptId\":\"seen\",\"message\":{{\"role\":\"user\",\"content\":\"a live prompt the transcript does not hold\"}}}}\n"
         );
         for _ in 0..filler {
             big.push_str(&format!(
-                "{{\"type\":\"assistant\",\"sessionId\":\"{session}\",\"timestamp\":\"2026-11-01T00:00:01.000Z\",\
+                "{{\"type\":\"assistant\",\"sessionId\":\"{session}\",\"timestamp\":\"{now}\",\
                  \"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"{padding}\"}}]}}}}\n"
             ));
         }
@@ -3210,11 +4360,12 @@ mod tests {
     }
 
     fn a_missed_turn(project: &Path, session: &str, words: &str) {
+        let now = stamp_now();
         fs::write(
             project.join(format!("{session}.jsonl")),
             format!(
-                "{{\"type\":\"user\",\"sessionId\":\"{session}\",\"timestamp\":\"2026-11-01T00:00:00.000Z\",\
-                 \"promptId\":\"missed\",\"message\":{{\"role\":\"user\",\"content\":\"{words}\"}}}}\n"
+                "{{\"type\":\"user\",\"sessionId\":\"{session}\",\"timestamp\":\"{now}\",\
+                 \"promptId\":\"missed-{session}\",\"message\":{{\"role\":\"user\",\"content\":\"{words}\"}}}}\n"
             ),
         )
         .expect("small");
@@ -3242,7 +4393,9 @@ mod tests {
         live_at(&machine, now, last);
         let mut log =
             SegmentLog::open(machine.paths.log_dir(), Retention::default()).expect("open");
-        let budget = std::time::Duration::from_millis(100);
+        // Setup alone has used 30 ms on a CI runner. It only needs to get past that at
+        // two starts in four, and a start that reads both files passes as well.
+        let budget = std::time::Duration::from_millis(300);
 
         for _ in 0..4 {
             let records = held(&machine);
@@ -3270,8 +4423,131 @@ mod tests {
         );
     }
 
+    /// Three files of a held range, oldest first, and what the range has read of them.
+    fn files_of_a_held_range(project: &Path) -> Vec<(PathBuf, &'static str)> {
+        fs::create_dir_all(project).expect("dir");
+        [
+            "aaaaaaaa-0000-4000-8000-000000000001",
+            "bbbbbbbb-0000-4000-8000-000000000003",
+            "ffffffff-0000-4000-8000-000000000002",
+        ]
+        .into_iter()
+        .map(|session| {
+            a_missed_turn(project, session, "a turn");
+            (project.join(format!("{session}.jsonl")), session)
+        })
+        .collect()
+    }
+
+    fn order_left(files: &[(PathBuf, &'static str)], read: &mut ReadSoFar) -> Vec<&'static str> {
+        let bus = BusId::mint();
+        let mut to_read: Vec<(&PathBuf, &str, BusId)> = files
+            .iter()
+            .map(|(file, stem)| (file, *stem, bus))
+            .collect();
+        files_left_to_read(&mut to_read, read);
+        to_read
+            .iter()
+            .map(|(file, ..)| files.iter().find(|(f, _)| f == *file).expect("listed").1)
+            .collect()
+    }
+
+    fn noted_at_an_old_length(read: &mut ReadSoFar, file: &Path) {
+        let length = fs::metadata(file).expect("meta").len() as i64;
+        read.note(&file.to_string_lossy(), length - 1);
+    }
+
     #[test]
-    fn a_file_that_grew_after_it_was_read_is_read_again_behind_the_unread_ones() {
+    fn a_file_read_at_this_length_is_done_and_the_rest_stay_oldest_first() {
+        // A file a range read when it was shorter keeps its place. Put behind one it has
+        // not read, a fork would reach a parent's turn before the parent does. What
+        // goes first is decided by what the range has read, so this reads no clock.
+        let home = tempfile::tempdir().expect("tempdir");
+        let files = files_of_a_held_range(&home.path().join("-repo"));
+        let mut read = ReadSoFar::default();
+        noted_at_an_old_length(&mut read, &files[0].0);
+        read.note(
+            &files[1].0.to_string_lossy(),
+            fs::metadata(&files[1].0).expect("meta").len() as i64,
+        );
+
+        assert_eq!(order_left(&files, &mut read), [files[0].1, files[2].1]);
+    }
+
+    #[test]
+    fn a_file_that_used_up_a_budget_goes_behind_the_rest() {
+        // If it keeps growing it would use every budget up, and nothing behind it would
+        // ever be read.
+        let home = tempfile::tempdir().expect("tempdir");
+        let files = files_of_a_held_range(&home.path().join("-repo"));
+        let mut read = ReadSoFar::default();
+        noted_at_an_old_length(&mut read, &files[0].0);
+        read.note(&used_up_a_budget(&files[0].0), 1);
+
+        assert_eq!(
+            order_left(&files, &mut read),
+            [files[1].1, files[2].1, files[0].1]
+        );
+    }
+
+    #[test]
+    fn a_file_that_stopped_growing_loses_its_mark_for_using_up_a_budget() {
+        // Left marked, it would go behind a fork of it whenever it next grew, for as long
+        // as anything held a range.
+        let home = tempfile::tempdir().expect("tempdir");
+        let files = files_of_a_held_range(&home.path().join("-repo"));
+        let mut read = ReadSoFar::default();
+        read.note(
+            &files[0].0.to_string_lossy(),
+            fs::metadata(&files[0].0).expect("meta").len() as i64,
+        );
+        read.note(&used_up_a_budget(&files[0].0), 1);
+
+        assert_eq!(order_left(&files, &mut read), [files[1].1, files[2].1]);
+
+        assert!(!read.knows(&used_up_a_budget(&files[0].0)));
+    }
+
+    #[test]
+    fn a_file_read_last_with_time_left_loses_its_mark_for_using_up_a_budget() {
+        // There is no next file to clear it, and the unreadable one keeps the range held.
+        let machine = machine();
+        let home = tempfile::tempdir().expect("tempdir");
+        let project = home.path().join(".claude/projects/-repo");
+        let marked = "aaaaaaaa-0000-4000-8000-000000000001";
+        let unreadable = "bbbbbbbb-0000-4000-8000-000000000003";
+        fs::create_dir_all(&project).expect("dir");
+        a_missed_turn(&project, marked, "a turn");
+        fs::write(project.join(format!("{unreadable}.jsonl")), b"\xff\xfe\n").expect("write");
+        let now = Timestamp::now();
+        live_at(&machine, now, marked);
+        live_at(&machine, now, unreadable);
+        let file = project.join(format!("{marked}.jsonl"));
+        let marker = machine.paths.cache_dir().join("gap-read");
+        let mut read = ReadSoFar::default();
+        read.note(&used_up_a_budget(&file), 1);
+        read.save(&machine.paths, &marker);
+        let mut log =
+            SegmentLog::open(machine.paths.log_dir(), Retention::default()).expect("open");
+
+        append_gaps_at_start_in(
+            &machine.paths,
+            &held(&machine),
+            &mut log,
+            std::time::Duration::from_secs(60),
+            Some(home.path()),
+        )
+        .expect("fill");
+
+        let read = ReadSoFar::load(&marker);
+        assert!(read.knows(&file.to_string_lossy()), "it was read");
+        assert!(!read.knows(&used_up_a_budget(&file)));
+    }
+
+    #[test]
+    fn a_file_that_keeps_growing_does_not_use_up_every_start() {
+        // A real cut, so this leans on the clock: the file must take longer to read than
+        // the budget, and setup less. A slow machine only costs another try.
         let machine = machine();
         let home = tempfile::tempdir().expect("tempdir");
         let first = "aaaaaaaa-0000-4000-8000-000000000001";
@@ -3285,23 +4561,7 @@ mod tests {
         live_at(&machine, now, last);
         let mut log =
             SegmentLog::open(machine.paths.log_dir(), Retention::default()).expect("open");
-        let budget = std::time::Duration::from_millis(100);
-        let records = held(&machine);
-        let (_, timing) = append_gaps_at_start_in(
-            &machine.paths,
-            &records,
-            &mut log,
-            budget,
-            Some(home.path()),
-        )
-        .expect("the cut");
-        assert!(timing.budget_exhausted, "the big file used the budget up");
-        assert!(!holds_prompt(&machine, "the turn nobody reaches"));
-
-        // The big file changes before every start, and a read of it would use that
-        // budget up as well. So a start that read it first would never reach the
-        // other file, and a slow machine only costs another try.
-        let grow = || {
+        for _ in 0..8 {
             let mut grown = fs::OpenOptions::new()
                 .append(true)
                 .open(project.join(format!("{first}.jsonl")))
@@ -3309,35 +4569,53 @@ mod tests {
             std::io::Write::write_all(
                 &mut grown,
                 format!(
-                    "{{\"type\":\"user\",\"sessionId\":\"{first}\",\"timestamp\":\"2026-11-01T00:01:00.000Z\",\
+                    "{{\"type\":\"user\",\"sessionId\":\"{first}\",\"timestamp\":\"{}\",\
                      \"promptId\":\"{}\",\"message\":{{\"role\":\"user\",\"content\":\"it grew\"}}}}\n",
+                    stamp_now(),
                     BusId::mint()
                 )
                 .as_bytes(),
             )
             .expect("grow");
-        };
-        for _ in 0..6 {
-            grow();
             let records = held(&machine);
             let _ = append_gaps_at_start_in(
                 &machine.paths,
                 &records,
                 &mut log,
-                budget,
+                std::time::Duration::from_millis(100),
                 Some(home.path()),
             )
-            .expect("the next start");
+            .expect("a start");
             if holds_prompt(&machine, "the turn nobody reaches") {
-                break;
+                return;
             }
         }
-        assert!(
-            holds_prompt(&machine, "the turn nobody reaches"),
-            "what the range has not read at all goes first"
-        );
+        panic!("eight starts in, the file behind it has never been read");
+    }
 
-        // Given the time, the change is read in the end.
+    #[test]
+    fn a_range_read_in_part_reads_the_rest_and_ends() {
+        let machine = machine();
+        let home = tempfile::tempdir().expect("tempdir");
+        let (grew, unread) = (
+            "aaaaaaaa-0000-4000-8000-000000000001",
+            "ffffffff-0000-4000-8000-000000000002",
+        );
+        let project = home.path().join(".claude/projects/-repo");
+        fs::create_dir_all(&project).expect("dir");
+        a_missed_turn(&project, grew, "it grew");
+        a_missed_turn(&project, unread, "the turn nobody reaches");
+        let now = conbus_core::clock::Timestamp::now();
+        live_at(&machine, now, grew);
+        live_at(&machine, now, unread);
+        // Where a cut leaves it: one file read when it was shorter.
+        let mut read = ReadSoFar::default();
+        read.note(&project.join(format!("{grew}.jsonl")).to_string_lossy(), 1);
+        let read_marker = machine.paths.cache_dir().join("gap-read");
+        read.save(&machine.paths, &read_marker);
+        let mut log =
+            SegmentLog::open(machine.paths.log_dir(), Retention::default()).expect("open");
+
         let records = held(&machine);
         let _ = append_gaps_at_start_in(
             &machine.paths,
@@ -3346,11 +4624,14 @@ mod tests {
             std::time::Duration::from_secs(60),
             Some(home.path()),
         )
-        .expect("the one after");
+        .expect("the next start");
+
+        assert!(holds_prompt(&machine, "the turn nobody reaches"));
         assert!(
             holds_prompt(&machine, "it grew"),
             "a change is read in the end"
         );
+        assert!(!read_marker.exists(), "and nothing is held after");
     }
 
     #[test]
@@ -3369,7 +4650,7 @@ mod tests {
         fs::write(dir.join("foo.jsonl"), "{}\n").expect("file");
         let mut unknown = 0;
         assert_eq!(
-            codex_threads_touched_since_in(home.path(), &bound, 1_500, &mut unknown),
+            codex_threads_touched_since_in(home.path(), &bound, 1_500, &mut unknown, &mut 0),
             None,
             "unrecognised files mean the walk cannot be trusted"
         );
@@ -3379,7 +4660,7 @@ mod tests {
         fs::create_dir_all(empty.path().join("sessions")).expect("dir");
         let mut unknown = 0;
         assert_eq!(
-            codex_threads_touched_since_in(empty.path(), &bound, 1_500, &mut unknown),
+            codex_threads_touched_since_in(empty.path(), &bound, 1_500, &mut unknown, &mut 0),
             Some(vec![])
         );
     }
@@ -3389,7 +4670,7 @@ mod tests {
         let home = tempfile::tempdir().expect("tempdir");
         let bound = HashSet::from([SESSION.parse::<BusId>().expect("uuid")]);
         assert_eq!(
-            codex_threads_touched_since_in(home.path(), &bound, 1_500, &mut 0),
+            codex_threads_touched_since_in(home.path(), &bound, 1_500, &mut 0, &mut 0),
             None
         );
     }

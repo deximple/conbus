@@ -49,6 +49,51 @@ the entry says so when it does.
 - Gap fill and `backfill` no longer copy a parent Codex thread into its fork. A
   forked thread lists its parent's turns as its own, under the parent's turn ids.
   A turn older than its thread is now counted as not read.
+- A fork's copy of its parent's turn is no longer written under the fork when the
+  copied lines carry the fork's own id. A turn id another conversation holds, or has
+  waiting in the spool, is not missing here; transcripts are read oldest file first,
+  so a parent gets to a turn neither holds, unless the parent used up a budget; a line
+  stamped well before its own file was created is taken for a copy, in a fill only; and
+  one prompt id with different words on its prompt lines is left out whole. Records
+  already written stay.
+- `conbus backfill --gaps` prints how many lines it set aside as older than their file,
+  and `--include-older-lines` fills from them too. A transcript moved by `cp`, `rsync -a`
+  or across volumes has a new creation time, so nothing else could fill it. Those lines
+  may be another conversation's copies: on a fork they are its parent's prompts, so look
+  at a dry run first. A start never does this.
+- Codex turns are now asked for oldest first, and sorted here by start time as well in
+  case a server ignores the request. `thread/turns/list` lists newest first unless
+  asked, so a running turn could get an older turn's reply as a false ending, and a
+  filled batch ended on its oldest turn. Threads already recovered in the wrong order
+  stay as they are.
+- A missed turn a tool call ended gets its ending again, from the vendor's
+  `toolEndsTurn`, with no message when the turn had no text. Turns that end on a tool
+  call without that flag still get none.
+- One Codex thread slower than the app-server's limit costs one start, or two when a
+  slower-growing thread uses the time ahead of it, not every start. It is called stalled
+  only on the time it actually got, a note from a clock that ran ahead does not stand,
+  and `conbus backfill --gaps --apply` ends the wait once it has read the thread.
+- A deadline now ends an app-server read or write whatever the process tree does. The
+  server runs in its own process group and the whole group is killed, so a wrapper's
+  child can no longer hold a start for as long as it lives. Ctrl-C, a closed terminal or
+  SIGTERM takes a wedged server and its group along, in any command that started one.
+- A refusal from the app-server keeps the Codex range unless the server says it has
+  no such method. A temporary refusal used to lose the range. A thread the server
+  refuses is asked again only when its rollout changes or by hand, so it stops costing
+  a start.
+- `conbus doctor` has a `gap fill` line for each range still held: since when, why, and
+  the file or thread that holds it. `conbus backfill --gaps` prints every reason it did
+  not read something, and `daemon.log` names each file.
+- In the `thread/list` fallback a thread is read again at each start while a range is
+  held, so a new turn in it is no longer skipped as already read.
+- A transcript that could not be read keeps the fill's range.
+- `cache/` is `0700` from the first time gap fill makes it.
+- A chat export moved into the drop folder during a downtime is now read, whatever
+  its file time. `cache/chat-export-read` says what a start has read. Reading one again
+  no longer scans the log once per conversation.
+- Gap fill reads only regular files. A FIFO named like a transcript or an export
+  blocked a start, or `conbus backfill`, for good. Anything else is skipped and
+  counted as not read, and a link is not followed.
 
 ## [1.0.0-rc.3] — 2026-11-01
 
