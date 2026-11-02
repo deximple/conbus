@@ -112,6 +112,10 @@ usage_rows() { # usage_rows <first-iso> <harness>...
 #   slowonly  — the same, and no hook line that runs
 #   mismatch  — a plugin written for a major this vendor does not load
 #   orphans   — its `install --apply` writes a tool event that has no conversation
+#   coldboot  — its first stamp comes before its socket, as a real daemon's does
+#   stampnolisten — a stamp, and never a socket
+#   stampdiffers — a stamp, and a doctor saying another build answers
+#   noinstall — its `install --apply` fails
 #   refusing  — doctor says the recorder is holding what the log refuses, right now
 #   lowdisk   — doctor's 10% warning, which this Mac is always under
 #   eventgap  — hooks run, but a registered hook misses events
@@ -152,6 +156,11 @@ write_fake() {
         slowvendor) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "disk      log 1.0 MB — 1.0 GB free of 2.0 GB (50.0%)"; echo "log       5 record(s), 1 conversation(s), 0 unreadable line(s)"; echo "hooks     claude_code  runs — x"; echo "hooks     opencode     could not read which version this is (opencode did not answer within 2s), so whether x loads is not known"' ;;
         slowonly) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "log       5 record(s), 1 conversation(s), 0 unreadable line(s)"; echo "hooks     opencode     could not read which version this is (opencode did not answer within 2s), so whether x loads is not known"' ;;
         mismatch) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "log       5 record(s), 1 conversation(s), 0 unreadable line(s)"; echo "hooks     claude_code  runs — x"; echo "hooks     opencode     MISMATCH — x is written for OpenCode 1.x, which this OpenCode does not load; run \`conbus install --apply\`"' ;;
+        coldboot) doctor='printf "{\"build\":\"'"$tag"'\",\"pid\":$$,\"started\":\"2026-11-01T10:00:00.000Z\"}\n" > "$HOME/.conbus/daemon.build"; n=$(cat "$HOME/.cold" 2>/dev/null || echo 0); echo $((n + 1)) > "$HOME/.cold"; if [ "$n" -lt 2 ]; then echo "socket    $HOME/.conbus/conbus.sock — not answering"; else echo "socket    $HOME/.conbus/conbus.sock — listening"; fi; echo "log       5 record(s), 1 conversation(s), 0 unreadable line(s)"; echo "hooks     claude_code  runs — x"' ;;
+        stampnolisten) doctor='printf "{\"build\":\"'"$tag"'\",\"pid\":$$,\"started\":\"2026-11-01T10:00:00.000Z\"}\n" > "$HOME/.conbus/daemon.build"; echo "socket    $HOME/.conbus/conbus.sock — not answering"' ;;
+        stampdiffers) doctor='printf "{\"build\":\"'"$tag"'\",\"pid\":$$,\"started\":\"2026-11-01T10:00:00.000Z\"}\n" > "$HOME/.conbus/daemon.build"; echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build aaaa pid 9999 since 2026-11-01T10:00:00.000Z — DIFFERS from this binary ('"$tag"'); restart the daemon"' ;;
+        noinstall) doctor='echo "socket    $HOME/.conbus/conbus.sock — not answering"'
+            install_body='exit 1' ;;
         lowdisk) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "disk      log 1.0 MB — 100.0 GB free of 2000.0 GB (5.0%) — WARNING: under 10% free"; echo "log       5 record(s), 1 conversation(s), 0 unreadable line(s)"; echo "hooks     claude_code  runs — x"' ;;
         eventgap) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "log       5 record(s), 1 conversation(s), 0 unreadable line(s)"; echo "hooks     claude_code  runs — x"; echo "events    claude_code  MISSING Stop, SessionEnd — run \`conbus install --apply\`"' ;;
         untrusted) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "log       5 record(s), 1 conversation(s), 0 unreadable line(s)"; echo "hooks     codex        runs — x"; echo "codex     2 of 2 hook(s) Codex will not spawn:"; echo "          NOT TRUSTED: PreToolUse, PostToolUse"' ;;
@@ -2952,6 +2961,80 @@ for d in 0 1 2 3 4 5 6; do repeated_on "$d" 6; done
 code=0; run verdict >"$tmp/verdict-repeated-three.out" 2>&1 || code=$?
 expect 1 "$code" "three a day above it is not"
 expect_grep '^FAIL twins-repeated.*median 6' "$tmp/verdict-repeated-three.out" "and the medians are shown"
+
+# The rollback copy is what was kept at the first swap, not always the build being replaced. Verify what was restored.
+write_fake 02b old "$install_dir/conbus"; write_fake 01d old "$rollback_bin"
+rm -f "$home/.conbus/canary.json"; daemon_boot beef 4262
+cat >"$home/.conbus/drops.jsonl" <<'EOF'
+{"ts":"2026-10-30T09:00:00.000Z","reason":"socket closed early"}
+EOF
+code=0; SERVING_LIMIT=2 run start --from "$tmp/stage/conbus-dropper" >"$tmp/rb-older.out" 2>&1 || code=$?
+expect 1 "$code" "a rollback to an older copy verifies against what it restored (P12)"
+expect_grep 'rollback verified: 01d' "$tmp/rb-older.out" "the build it names is the one restored"
+expect_no_grep 'ROLLBACK NOT VERIFIED' "$tmp/rb-older.out" "and it does not say otherwise"
+# The restored daemon's first stamp comes before its socket.
+write_fake beef live "$install_dir/conbus"; write_fake 01d coldboot "$rollback_bin"
+write_stamp beef 4401; rm -f "$home/.cold"
+code=0; run rollback >"$tmp/rb-cold.out" 2>&1 || code=$?
+expect 0 "$code" "a rollback waits for the restored daemon to listen (P11)"
+expect_grep 'rollback verified: 01d' "$tmp/rb-cold.out" "and says so"
+# NOT VERIFIED means what it says, for each thing a verification looks at.
+write_fake beef live "$install_dir/conbus"; write_fake 01d stampnolisten "$rollback_bin"
+write_stamp beef 4405
+code=0; SERVING_LIMIT=2 run rollback >"$tmp/rb-nolisten.out" 2>&1 || code=$?
+expect 3 "$code" "a restored daemon that never listens is not verified"
+expect_grep 'ROLLBACK NOT VERIFIED.*not listening' "$tmp/rb-nolisten.out" "and says that"
+write_fake beef live "$install_dir/conbus"; write_fake 01d stampdiffers "$rollback_bin"
+write_stamp beef 4406
+code=0; SERVING_LIMIT=2 run rollback >"$tmp/rb-differs.out" 2>&1 || code=$?
+expect 3 "$code" "a doctor saying DIFFERS is not verified"
+expect_grep 'ROLLBACK NOT VERIFIED.*different build' "$tmp/rb-differs.out" "and says that"
+# A rollback copy that does not say what it is.
+write_fake beef live "$install_dir/conbus"; printf '#!/bin/sh\nexit 1\n' >"$rollback_bin"; chmod 755 "$rollback_bin"
+write_stamp beef 4407
+code=0; SERVING_LIMIT=1 run rollback >"$tmp/rb-unnamed.out" 2>&1 || code=$?
+expect 3 "$code" "a copy that does not run cannot be verified"
+expect_grep 'ROLLBACK NOT VERIFIED.*does not say which build' "$tmp/rb-unnamed.out" "and says that"
+# An install failure says that, on the real path, and is still exit 3: the old daemon may still be the one running.
+write_fake beef live "$install_dir/conbus"; write_fake 01d noinstall "$rollback_bin"
+write_stamp beef 4408
+code=0; SERVING_LIMIT=1 run_real rollback >"$tmp/rb-noinstall.out" 2>&1 || code=$?
+expect 3 "$code" "a restored build whose install --apply fails is not verified"
+expect_grep "ROLLBACK NOT VERIFIED.*'conbus install --apply' failed" "$tmp/rb-noinstall.out" "and it is the install it blames"
+expect_no_grep 'no 01d stamp' "$tmp/rb-noinstall.out" "not a stamp that was never going to come"
+# So does the automatic one.
+write_fake 02b old "$install_dir/conbus"; write_fake 01d noinstall "$rollback_bin"
+rm -f "$home/.install-called" "$home/.conbus/canary.json"
+cat >"$home/.conbus/drops.jsonl" <<'EOF'
+{"ts":"2026-10-30T09:00:00.000Z","reason":"socket closed early"}
+EOF
+daemon_boot beef 4409
+code=0; SERVING_LIMIT=1 run_real start --from "$tmp/stage/conbus-dropper" >"$tmp/rb-auto-noinstall.out" 2>&1 || code=$?
+expect 3 "$code" "the automatic rollback too"
+expect_grep "ROLLBACK NOT VERIFIED.*'conbus install --apply' failed" "$tmp/rb-auto-noinstall.out" "with the same words"
+expect_grep 'rolled_back' "$home/.conbus/canary.json" "and the rollback is still recorded"
+# An unreadable spool does not end a rollback.
+if [ "$(id -u)" != 0 ]; then
+    write_fake beef live "$install_dir/conbus"; write_fake 01d old "$rollback_bin"
+    write_stamp beef 4410
+    mkdir -p "$home/.conbus/spool"; chmod 000 "$home/.conbus/spool"
+    code=0; run rollback >"$tmp/rb-nospool.out" 2>&1 || code=$?
+    chmod 700 "$home/.conbus/spool"
+    expect 0 "$code" "a spool that cannot be read does not end a rollback"
+    expect_grep 'rollback verified' "$tmp/rb-nospool.out" "it is verified"
+    expect_grep 'spool: .*could not be read' "$tmp/rb-nospool.out" "and the spool is said"
+fi
+rm -rf "$home/.conbus/spool"
+# A restart whose daemon never served is no success.
+cat >"$home/.conbus/canary.json" <<EOF
+{"swapped":"$(iso_ago $((7 * DAY)))","prev_build":"01d","candidate_build":"beef","candidate_sha256":"x","restarts":[]}
+EOF
+write_fake beef silent "$install_dir/conbus"
+write_stamp beef 5020
+code=0; SERVING_LIMIT=1 run_real restart >"$tmp/restart-noserve.out" 2>&1 || code=$?
+expect 1 "$code" "a restart that never served exits non-zero"
+expect_grep '"serving_ms":-1' "$home/.conbus/canary.json" "and is recorded as such"
+expect_grep 'no new serving stamp' "$tmp/restart-noserve.out" "and says so"
 
 # A real build under this throwaway HOME would ask an agy that is not signed
 # in, and a build older than the sign-in check opens a browser tab doing it.

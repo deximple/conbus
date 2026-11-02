@@ -49,7 +49,7 @@
 #     restarts (each with its start->serving milliseconds and the number
 #     of drop lines added during it — not new-reason strings).
 #   - `restart` performs a planned restart (`install --apply`) and records
-#     its measurements. `verdict` bounds its window by the recorded swap
+#     its measurements, and exits 1 if the daemon never served. `verdict` bounds its window by the recorded swap
 #     time unless --since overrides it; its budgets come from
 #     CONBUS_CANARY_TAIL_MS / _USAGE_MS / _DOCTOR_MS / _SERVING_MS /
 #     _RSS_MB / _WINDOW_DAYS, defaulting to the plan's M3 targets.
@@ -62,9 +62,10 @@
 #   - preflight fails on doctor's `disk` warning unless
 #     CONBUS_CANARY_DISK_WARN_OK=1 downgrades it to WARN.
 #   - every rollback — the automatic one after a failed start and the
-#     `rollback` subcommand — is verified: the restored build must write a
-#     daemon.build stamp with a new pid and doctor must listen with no
-#     DIFFERS, else the script exits 3.
+#     `rollback` subcommand — is verified: the build the rollback copy says it
+#     is must write a daemon.build stamp with a new pid and doctor must listen
+#     with no DIFFERS, within the serving limit, else the script exits 3 and
+#     says which it was. An `install --apply` that failed says that.
 #   - every doctor call is capped at CONBUS_CANARY_DOCTOR_LIMIT seconds
 #     (default 120): an old build's vendor probes are unbounded, and a
 #     wedged one must fail the check it is in — not hang it. A cap hit in
@@ -440,6 +441,17 @@ wait_for_serving() {
     return 1
 }
 
+# The build a binary says it is, empty when it does not run.
+build_of() { # build_of <binary>
+    "$1" --version 2>/dev/null | sed -n 's/.*(\([0-9a-f]*\)).*/\1/p' || true
+}
+
+# Something accepts a connection on the socket. For waiting only: it says nothing about
+# whether the daemon behind it answers.
+socket_accepts() {
+    perl -MIO::Socket::UNIX -e 'exit(IO::Socket::UNIX->new(Type => SOCK_STREAM(), Peer => $ARGV[0]) ? 0 : 1)' "$root/conbus.sock"
+}
+
 # Wait for the stamp to name <build> with a pid that is not <not_pid> — the
 # proof a rollback actually booted. A restored 0.2.x stamp carries no
 # `serving` key, so unlike wait_for_serving this never asks for one.
@@ -463,38 +475,63 @@ wait_for_build() {
     return 1
 }
 
-# After a rollback the old build must come back: a stamp naming it with a
-# pid the candidate never had, then a doctor that is listening and agrees.
-# Verified prints and returns; anything else exits 3 — a rollback nobody
-# verified is worse news than the failure that caused it.
+# After a rollback the build that was restored must come back: a stamp naming it with
+# a pid the candidate never had, a socket, then a doctor that is listening and agrees.
+# Its first stamp comes before its socket, by 6 s on a real log, so one look at doctor
+# reads a rollback that worked as one that did not. Verified prints and returns;
+# anything else exits 3 and says which of these it was. <restored> is what the rollback
+# copy says it is: that can be older than the build being replaced.
 verify_rollback() {
-    prev_build=$1
+    restored=$1
     cand_pid=$2
     mode=$3
+    if [ -z "$restored" ]; then
+        say "ROLLBACK NOT VERIFIED — the rollback copy does not say which build it is; run 'canary.sh status'"
+        exit 3
+    fi
     if [ "$mode" = rehearsal ]; then
         # The reload is skipped under rehearsal; let the fake boot the old
         # build's daemon the way install --apply would have.
         run_doctor >/dev/null 2>&1 || true
     fi
-    rb_pid=$(wait_for_build "$prev_build" "$cand_pid") || {
-        say "ROLLBACK NOT VERIFIED — no $prev_build stamp inside ${serving_limit}s; run 'canary.sh status'"
+    rb_pid=$(wait_for_build "$restored" "$cand_pid") || {
+        say "ROLLBACK NOT VERIFIED — no $restored stamp inside ${serving_limit}s; run 'canary.sh status'"
         exit 3
     }
-    doctor_rc=0
-    doctor_out=$(run_doctor) || doctor_rc=$?
-    if [ "$doctor_rc" -eq 142 ]; then
-        say "ROLLBACK NOT VERIFIED — doctor did not answer inside ${doctor_limit_s}s; run 'canary.sh status'"
+    n=0
+    while ! socket_accepts && [ "$n" -lt $((serving_limit * 2)) ]; do
+        sleep 0.5
+        n=$((n + 1))
+    done
+    rb_until=$(($(date +%s) + serving_limit))
+    while :; do
+        doctor_rc=0
+        doctor_out=$(run_doctor) || doctor_rc=$?
+        if [ "$doctor_rc" -eq 142 ]; then
+            say "ROLLBACK NOT VERIFIED — doctor did not answer inside ${doctor_limit_s}s; run 'canary.sh status'"
+            exit 3
+        fi
+        if grep -q 'DIFFERS' <<<"$doctor_out"; then
+            say "ROLLBACK NOT VERIFIED — doctor reports a different build; run 'canary.sh status'"
+            exit 3
+        fi
+        grep -q 'listening' <<<"$doctor_out" && break
+        if [ "$(date +%s)" -ge "$rb_until" ]; then
+            say "ROLLBACK NOT VERIFIED — $restored wrote a stamp and the daemon is not listening after ${serving_limit}s; run 'canary.sh status'"
+            exit 3
+        fi
+        sleep 1
+    done
+    say "rollback verified: $restored pid $rb_pid listening"
+}
+
+# The reload after a rollback. A failed one has nothing to verify: the old daemon may
+# never have stopped, and waiting for a stamp would only blame the wrong thing.
+rollback_reload() { # rollback_reload <mode>
+    if ! reregister_daemon "$1" && [ "$1" = real ]; then
+        say "ROLLBACK NOT VERIFIED — the binary is back, and 'conbus install --apply' failed, so what is running is not known; run 'canary.sh status'"
         exit 3
     fi
-    if grep -q 'DIFFERS' <<<"$doctor_out"; then
-        say "ROLLBACK NOT VERIFIED — doctor reports a different build; run 'canary.sh status'"
-        exit 3
-    fi
-    if ! grep -q 'listening' <<<"$doctor_out"; then
-        say "ROLLBACK NOT VERIFIED — the daemon is not listening; run 'canary.sh status'"
-        exit 3
-    fi
-    say "rollback verified: $prev_build pid $rb_pid listening"
 }
 
 # Report the socket state and fail (1) only when a real reload did not come
@@ -557,13 +594,19 @@ state_add_restart() { # state_add_restart <ts> <serving_ms|-> <new_drops>
     mv -f "$state_file.tmp" "$state_file"
 }
 
-# Spool files left after a rollback — the restored 0.2.x build does not
-# read a spool, so they sit until a newer daemon drains them. Reported,
-# never deleted here.
+# Spool files left after a rollback. A 0.2.x build does not read a spool, so there they
+# sit until a build that does. Reported, never deleted here, and never the reason a
+# rollback stops short of its verification.
 say_spool() {
+    if [ -d "$root/spool" ] && [ ! -r "$root/spool" ]; then
+        say "spool: $root/spool could not be read — whatever it holds is still there"
+        return 0
+    fi
     n=0
-    [ -d "$root/spool" ] && n=$(ls "$root/spool" 2>/dev/null | wc -l | tr -d ' ')
-    say "spool: $n file(s) — the old build does not drain them; they wait for the next daemon"
+    if [ -d "$root/spool" ]; then
+        n=$({ ls "$root/spool" 2>/dev/null || true; } | wc -l | tr -d ' ')
+    fi
+    say "spool: $n file(s), left in place — a build that reads the spool drains them; 0.2.x does not"
 }
 
 # What a drop line means. The classes come from what the hook and the daemon
@@ -2507,7 +2550,9 @@ case $sub in
             die "conbus install --apply failed — restart not recorded; check 'canary.sh status'"
         fi
         serving_ms=-1
+        served=0
         if wait_for_serving "$old_stamp_pid"; then
+            served=1
             started=$(sed -n 's/.*"started":"\([^"]*\)".*/\1/p' "$stamp")
             serving=$(sed -n 's/.*"serving":"\([^"]*\)".*/\1/p' "$stamp")
             e0=$(ts_ms "$started") e1=$(ts_ms "$serving")
@@ -2537,6 +2582,7 @@ case $sub in
         [ "$sessionless" -gt 0 ] && extra=" ($sessionless sessionless refusal(s) not counted)"
         [ "$not_lost" -gt 0 ] && extra="$extra ($not_lost line(s) that lost no record not counted)"
         say "recorded planned restart at $ts: serving ${serving_ms} ms, $new_drops drop(s)$extra"
+        [ "$served" = 1 ] || die "restart: the daemon never served"
         ;;
 
     start)
@@ -2661,15 +2707,16 @@ case $sub in
             if [ -f "$stamp" ]; then
                 cand_pid=$(sed -n 's/.*"pid":\([0-9]*\).*/\1/p' "$stamp")
             fi
+            restored_build=$(build_of "$rollback_bin")
             mv -f "$rollback_bin" "$bin"
-            reregister_daemon "$mode" || true
             # The rollback happened whether or not it boots — record it
             # before verification, which exits 3 when it cannot confirm.
             state_write "$swapped_ts" "$prev_build" "$cand_build" "$cand_sha" '[]' \
                 "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
             say "rolled back $bin to $("$bin" --version 2>&1 || echo unknown)"
             say_spool
-            verify_rollback "$prev_build" "$cand_pid" "$mode"
+            rollback_reload "$mode"
+            verify_rollback "$restored_build" "$cand_pid" "$mode"
             die "start failed: $fail_reason (rolled back automatically)"
         fi
 
@@ -2697,11 +2744,10 @@ case $sub in
         fi
         cand_pid=$old_stamp_pid
         mv -f "$rollback_bin" "$bin"
-        restored_version=$("$bin" --version 2>&1 || echo unknown)
-        say "rolled back $bin to $restored_version ($mode)"
-        prev_build=$(echo "$restored_version" | sed -n 's/.*(\([0-9a-f]*\)).*/\1/p')
-        reregister_daemon "$mode" || true
-        verify_rollback "$prev_build" "$cand_pid" "$mode"
+        restored_build=$(build_of "$bin")
+        say "rolled back $bin to $("$bin" --version 2>&1 || echo unknown) ($mode)"
+        rollback_reload "$mode"
+        verify_rollback "$restored_build" "$cand_pid" "$mode"
         say_spool
         ;;
 
