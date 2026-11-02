@@ -730,7 +730,7 @@ pub fn describe_held_ranges(paths: &Paths) -> Vec<String> {
     let now = Timestamp::now();
     let epoch = Timestamp::from_unix_seconds(0);
     [
-        (TRANSCRIPTS, "gap-since", "`conbus backfill --gaps --apply` fills it by hand"),
+        (TRANSCRIPTS, "gap-since", "The next start finishes it once every file reads, and `conbus backfill --gaps --apply` fills what it can now. A file named here has to be fixed or moved out first; deleting cache/gap-since gives it up"),
         (CODEX, "gap-since-codex", "`conbus backfill --gaps --apply` asks at once; deleting cache/gap-since-codex gives it up"),
     ]
     .into_iter()

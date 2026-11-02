@@ -3591,6 +3591,15 @@ fn a_transcript_that_holds_the_range_is_named_where_a_person_looks() {
                 && line.contains("--gaps --apply")),
         "not from doctor: {said}"
     );
+    // A fill by hand fails on the same file, so that alone would end nothing.
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("transcripts range held")
+                && line.contains("next start")
+                && line.contains("fixed or moved")),
+        "doctor does not say what ends it: {said}"
+    );
 }
 
 #[test]
