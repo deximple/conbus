@@ -33,10 +33,19 @@ then opens the app it lands on: `open -b` for Codex or Claude and, on a person's
 these vendors may ask for theirs";
 
 const CODEX_NEEDED_FOR: &str = "for quota, gap fill, hop";
-const AGY_NEEDED_FOR: &str = "`conbus quota` and `conbus auth` ask it, `auth` with `agy models` \
-alone; a hop to it or `conbus run` starts it as a session; recording is unaffected";
+const AGY_NEEDED_FOR: &str = "only its quota line needs this: `conbus quota` and `conbus auth` ask \
+it, `auth` with `agy models` alone; a hop to it or `conbus run` starts it as a session; recording \
+is unaffected";
 const GH_NEEDED_FOR: &str = "for hop's pull request lookup";
 const CANNOT_BE_TOLD: &str = "its sign-in could not be told";
+
+/// What Codex's app-server says with no account at all. Its error for an API-key
+/// login differs by one word, and a proxy's 407 says "authentication" too; neither
+/// is a reason to sign in.
+const CODEX_SIGNED_OUT: &str = "codex account authentication required";
+
+/// `gh auth status --json hosts` could not be understood.
+const GH_UNREADABLE: &str = "gh gave no answer this build can read";
 
 /// A condition, because nothing here saw what the page says or read a token: a
 /// URL's token is not compared with anything, and Chrome's storage and the
@@ -49,13 +58,18 @@ const BRIDGE_FIX: &str = "fix       copy the token from the extension's page int
 /// What a row of the table means for the `--html` banner.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Standing {
-    /// Nothing about it stands in the way: signed in, not checked, or not on
-    /// this machine at all.
-    Clear,
-    /// A feature that needs it is signed out.
+    /// Not a vendor: what the row says of conbus itself.
+    Note,
+    /// Asked, and nothing conbus needs stands in the way.
+    Asked,
+    /// Asked, and something conbus needs is signed out.
     SignedOut,
-    /// It is there, and it could not be told.
+    /// Asked, and something conbus needs could not be told.
     CannotTell,
+    /// Not on this machine, so there is nothing to ask.
+    NotInstalled,
+    /// Never asked: this says nothing either way.
+    NotChecked,
 }
 
 /// One line of the `auth` table.
@@ -71,7 +85,7 @@ fn note(name: &'static str, status: &str) -> Row {
         name,
         status: status.into(),
         why: "",
-        standing: Standing::Clear,
+        standing: Standing::Note,
     }
 }
 
@@ -81,12 +95,12 @@ fn not_checked(name: &'static str, why: &'static str) -> Row {
         name,
         status: "not checked".into(),
         why,
-        standing: Standing::Clear,
+        standing: Standing::NotChecked,
     }
 }
 
 /// What asking a vendor came to.
-enum Asked {
+enum Answer {
     SignedIn,
     /// With the words for it.
     SignedOut(&'static str),
@@ -94,17 +108,38 @@ enum Asked {
     Failed(String),
 }
 
-fn asked_row(name: &'static str, needed_for: &'static str, asked: Asked) -> Row {
-    let (status, why, standing) = match asked {
-        Asked::SignedIn => ("signed in".to_string(), needed_for, Standing::Clear),
-        Asked::SignedOut(words) => (words.to_string(), needed_for, Standing::SignedOut),
-        Asked::Failed(failure) if not_installed(&failure) => {
-            ("not installed".to_string(), needed_for, Standing::Clear)
+/// `conbus_needs` is whether a feature depends on this vendor. One that does not
+/// says what it found in its row and leaves the banner alone: a person should not
+/// sign in for nothing.
+fn asked_row(
+    name: &'static str,
+    needed_for: &'static str,
+    answer: Answer,
+    conbus_needs: bool,
+) -> Row {
+    let if_needed = |standing| {
+        if conbus_needs {
+            standing
+        } else {
+            Standing::Asked
         }
-        Asked::Failed(failure) => (
+    };
+    let (status, why, standing) = match answer {
+        Answer::SignedIn => ("signed in".to_string(), needed_for, Standing::Asked),
+        Answer::SignedOut(words) => (
+            words.to_string(),
+            needed_for,
+            if_needed(Standing::SignedOut),
+        ),
+        Answer::Failed(failure) if not_installed(&failure) => (
+            "not installed".to_string(),
+            needed_for,
+            Standing::NotInstalled,
+        ),
+        Answer::Failed(failure) => (
             format!("SKIP — {}", shown(&failure)),
             CANNOT_BE_TOLD,
-            Standing::CannotTell,
+            if_needed(Standing::CannotTell),
         ),
     };
     Row {
@@ -153,49 +188,81 @@ fn probe_rows() -> Vec<Row> {
     ]
 }
 
-/// Codex is asked through its own read: an `authentication` refusal is the
-/// logged-out answer, anything else is not a clean no.
+/// Codex is asked through its own read. Only its words for no account are a
+/// sign-out; anything else is not a clean no.
 fn codex_row() -> Row {
-    let asked = match crate::quota::read() {
-        Ok(_) => Asked::SignedIn,
-        Err(err)
-            if err
-                .to_string()
-                .to_ascii_lowercase()
-                .contains("authentication") =>
-        {
-            Asked::SignedOut("AUTH_REQUIRED")
+    let answer = match crate::quota::read() {
+        Ok(_) => Answer::SignedIn,
+        Err(err) if err.to_string().contains(CODEX_SIGNED_OUT) => {
+            Answer::SignedOut("AUTH_REQUIRED")
         }
-        Err(err) => Asked::Failed(err.to_string()),
+        Err(err) => Answer::Failed(err.to_string()),
     };
-    asked_row("codex", CODEX_NEEDED_FOR, asked)
+    asked_row("codex", CODEX_NEEDED_FOR, answer, true)
 }
 
-/// `agy models` only — never `-p`, which opens OAuth when logged out.
+/// `agy models` only — never `-p`, which opens OAuth when logged out. Nothing
+/// conbus needs depends on it, so whatever it says, the banner stays out of it.
 fn agy_row() -> Row {
-    let asked =
+    let answer =
         match crate::quota::agy_signed_in(&crate::quota::agy_binary(), Duration::from_secs(5)) {
-            Ok(()) => Asked::SignedIn,
+            Ok(()) => Answer::SignedIn,
             Err(crate::quota::AgyNotAsked::AuthRequired) => {
-                Asked::SignedOut("AUTH_REQUIRED, run `agy` to sign in")
+                Answer::SignedOut("AUTH_REQUIRED, sign in with `agy` only if you use it")
             }
-            Err(crate::quota::AgyNotAsked::Skip(why)) => Asked::Failed(why),
+            Err(crate::quota::AgyNotAsked::Skip(why)) => Answer::Failed(why),
         };
-    asked_row("agy", AGY_NEEDED_FOR, asked)
+    asked_row("agy", AGY_NEEDED_FOR, answer, false)
 }
 
-/// `gh auth status`, five seconds. Exit 0 means a token exists; anything
-/// else is reported, never a refusal of the command itself.
+/// `gh auth status --json hosts`, five seconds. With `--json` it exits 0 whatever
+/// the accounts' state, and says for each whether it worked, so a timeout is not a
+/// sign-out and another account's bad token is not this one's.
 fn gh_row() -> Row {
     let bin = std::env::var("CONBUS_GH").unwrap_or_else(|_| "gh".into());
     let mut command = std::process::Command::new(bin);
-    command.args(["auth", "status"]);
-    let asked = match crate::code::output_within(command, Duration::from_secs(5)) {
-        Ok(output) if output.status.success() => Asked::SignedIn,
-        Ok(_) => Asked::SignedOut("not signed in"),
-        Err(err) => Asked::Failed(err),
+    command.args(["auth", "status", "--json", "hosts"]);
+    let answer = match crate::code::output_within(command, Duration::from_secs(5)) {
+        Ok(output) => gh_answer(&output.stdout),
+        Err(err) => Answer::Failed(err),
     };
-    asked_row("gh", GH_NEEDED_FOR, asked)
+    asked_row("gh", GH_NEEDED_FOR, answer, true)
+}
+
+/// The active account decides, on github.com if it has one there, because that is
+/// where a hop's lookup goes. Only `state` and `active` are read.
+fn gh_answer(stdout: &[u8]) -> Answer {
+    let unreadable = || Answer::Failed(GH_UNREADABLE.to_string());
+    let parsed = serde_json::from_slice::<serde_json::Value>(stdout).ok();
+    let Some(hosts) = parsed
+        .as_ref()
+        .and_then(|value| value.get("hosts")?.as_object())
+    else {
+        return unreadable();
+    };
+    if hosts.is_empty() {
+        return Answer::SignedOut("not signed in");
+    }
+    let accounts: Vec<&serde_json::Value> = match hosts.get("github.com") {
+        Some(host) => vec![host],
+        None => hosts.values().collect(),
+    };
+    let active: Vec<&str> = accounts
+        .iter()
+        .filter_map(|host| host.as_array())
+        .flatten()
+        .filter(|account| account.get("active").and_then(|a| a.as_bool()) == Some(true))
+        .filter_map(|account| account.get("state")?.as_str())
+        .collect();
+    if active.contains(&"success") {
+        Answer::SignedIn
+    } else if active.contains(&"timeout") {
+        Answer::Failed("gh could not reach GitHub in time".to_string())
+    } else if active.contains(&"error") {
+        Answer::SignedOut("not signed in")
+    } else {
+        unreadable()
+    }
 }
 
 /// What of `text` may reach a terminal: printable characters, and `?` for the

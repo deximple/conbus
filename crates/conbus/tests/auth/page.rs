@@ -152,8 +152,14 @@ fn the_banner_is_green_only_with_nothing_signed_out() {
         ("CONBUS_GH", &gh),
     ]);
     assert_eq!(banner(&all_in), "ok");
-    assert!(all_in.contains("conbus needs no login right now"));
-    assert!(all_in.contains("conbus에 지금 필요한 로그인은 없습니다"));
+    assert!(
+        all_in.contains("nothing it needs is signed out"),
+        "{all_in}"
+    );
+    assert!(
+        all_in.contains("필요한 로그인이 빠진 곳은 없습니다"),
+        "{all_in}"
+    );
 
     // `gh` signed out: a hop's pull request lookup needs it, and this page
     // used to stay green.
@@ -166,15 +172,8 @@ fn the_banner_is_green_only_with_nothing_signed_out() {
     assert_eq!(banner(&gh_signed_out), "warn");
     assert!(gh_signed_out.contains("<td>not signed in</td>"));
 
-    let (_agy_out_dir, agy_out, _calls) = fake_logged_out_agy();
-    let agy_signed_out = page_with(&[
-        ("CONBUS_CODEX_BIN", &codex),
-        ("CONBUS_AGY_BIN", &agy_out),
-        ("CONBUS_GH", &gh),
-    ]);
-    assert_eq!(banner(&agy_signed_out), "warn");
-
-    let (_refused_dir, refused) = codex_refusing_with("authentication required");
+    let (_refused_dir, refused) =
+        codex_refusing_with("codex account authentication required to read rate limits");
     let codex_signed_out = page_with(&[
         ("CONBUS_CODEX_BIN", &refused),
         ("CONBUS_AGY_BIN", &agy),
@@ -198,8 +197,9 @@ fn a_vendor_that_is_not_installed_is_neutral() {
         );
     }
 
+    // Nothing was asked at all, so nothing can be green.
     let all_missing = page_with(&[]);
-    assert_eq!(banner(&all_missing), "ok", "{all_missing}");
+    assert_eq!(banner(&all_missing), "neutral", "{all_missing}");
     assert!(all_missing.contains("<tr><td>codex</td><td>not installed</td>"));
 
     let table = the_table();
@@ -415,8 +415,8 @@ fn auth_html_is_self_contained_and_owner_only() {
         "a hop opens vendor apps, so this cannot be promised"
     );
     for phrase in [
-        "conbus needs no login",
-        "conbus에 지금 필요한 로그인은 없습니다",
+        "nothing it needs is signed out",
+        "필요한 로그인이 빠진 곳은 없습니다",
         "conbus has no sign-in page of its own",
         "conbus에는 자체 로그인 페이지가 없습니다",
     ] {
@@ -439,4 +439,233 @@ fn auth_html_is_self_contained_and_owner_only() {
         let mode = std::fs::metadata(&page).expect("stat").permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "the page is owner-only: {mode:o}");
     }
+}
+
+#[test]
+fn an_api_key_login_is_not_called_signed_out() {
+    let (_dir, codex) = codex_refusing_with("chatgpt authentication required to read rate limits");
+    let html = page_with(&[("CONBUS_CODEX_BIN", codex.as_path())]);
+    assert!(!html.contains("AUTH_REQUIRED"), "{html}");
+    assert_ne!(banner(&html), "warn", "{html}");
+}
+
+#[test]
+fn gh_that_could_not_reach_github_is_not_called_signed_out() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("gh");
+    support::write_executable(
+        &path,
+        "#!/bin/sh\n[ \"$1\" = --warm ] && exit 0\necho '  X Timeout trying to log in to github.com account someone' >&2\nexit 1\n",
+    );
+    warmed(&path);
+    let html = page_with(&[("CONBUS_GH", path.as_path())]);
+    assert!(!html.contains("not signed in"), "{html}");
+}
+
+#[test]
+fn a_vendor_conbus_does_not_need_right_now_does_not_turn_the_banner() {
+    let (_dir, agy, _calls) = fake_logged_out_agy();
+    let html = page_with(&[("CONBUS_AGY_BIN", agy.as_path())]);
+    assert_ne!(banner(&html), "warn", "{html}");
+}
+
+#[test]
+fn only_the_words_of_a_missing_codex_login_are_a_sign_out() {
+    for message in [
+        "407 Proxy Authentication Required",
+        "authentication failed talking to the workspace",
+        "chatgpt authentication required to read rate limits",
+    ] {
+        let (_dir, codex) = codex_refusing_with(message);
+        let html = page_with(&[("CONBUS_CODEX_BIN", codex.as_path())]);
+        assert!(!html.contains("AUTH_REQUIRED"), "{message}: {html}");
+        assert_ne!(banner(&html), "warn", "{message}");
+    }
+
+    let (_dir, codex) =
+        codex_refusing_with("codex account authentication required to read rate limits");
+    let html = page_with(&[("CONBUS_CODEX_BIN", codex.as_path())]);
+    assert!(html.contains("<td>AUTH_REQUIRED</td>"), "{html}");
+    assert_eq!(banner(&html), "warn", "{html}");
+}
+
+/// The page with a signed-in Codex and `gh` saying `json`.
+fn page_with_gh_saying(json: &str) -> String {
+    let (_codex_dir, codex) = codex_signed_in();
+    let (_gh_dir, gh) = gh_saying(json);
+    page_with(&[("CONBUS_CODEX_BIN", &codex), ("CONBUS_GH", &gh)])
+}
+
+fn gh_account(state: &str, active: bool) -> String {
+    format!(
+        r#"{{"state":"{state}","active":{active},"host":"github.com","login":"someone","tokenSource":"keyring","token":"gho_NOT_FOR_PRINTING","gitProtocol":"https"}}"#
+    )
+}
+
+#[test]
+fn gh_is_read_account_by_account() {
+    // The active account decides. `state` is gh's own word for each.
+    for (accounts, want_status, want_banner) in [
+        (gh_account("success", true), "signed in", "ok"),
+        (gh_account("error", true), "not signed in", "warn"),
+        (gh_account("timeout", true), "SKIP", "neutral"),
+        (
+            format!(
+                "{},{}",
+                gh_account("success", true),
+                gh_account("error", false)
+            ),
+            "signed in",
+            "ok",
+        ),
+        (
+            format!(
+                "{},{}",
+                gh_account("error", false),
+                gh_account("success", true)
+            ),
+            "signed in",
+            "ok",
+        ),
+        (
+            format!(
+                "{},{}",
+                gh_account("success", true),
+                gh_account("timeout", false)
+            ),
+            "signed in",
+            "ok",
+        ),
+        (gh_account("something new", true), "SKIP", "neutral"),
+        (gh_account("success", false), "SKIP", "neutral"),
+    ] {
+        let html = page_with_gh_saying(&format!(r#"{{"hosts":{{"github.com":[{accounts}]}}}}"#));
+        assert!(
+            html.contains(&format!("<tr><td>gh</td><td>{want_status}")),
+            "{accounts}: {html}"
+        );
+        assert_eq!(banner(&html), want_banner, "{accounts}");
+        assert!(!html.contains("gho_NOT_FOR_PRINTING"), "{html}");
+    }
+}
+
+#[test]
+fn gh_logged_in_nowhere_is_signed_out_and_nonsense_is_not() {
+    let html = page_with_gh_saying(r#"{"hosts":{}}"#);
+    assert!(html.contains("<tr><td>gh</td><td>not signed in"), "{html}");
+    assert_eq!(banner(&html), "warn", "{html}");
+
+    for nonsense in ["", "not json", "[]", r#"{"hosts":7}"#, r#"{"other":{}}"#] {
+        let html = page_with_gh_saying(nonsense);
+        assert!(
+            html.contains("<tr><td>gh</td><td>SKIP"),
+            "{nonsense:?}: {html}"
+        );
+        assert_eq!(banner(&html), "neutral", "{nonsense:?}");
+    }
+}
+
+#[test]
+fn gh_com_decides_when_another_host_disagrees() {
+    let enterprise = gh_account("error", true).replace("github.com", "ghe.example");
+    let html = page_with_gh_saying(&format!(
+        r#"{{"hosts":{{"ghe.example":[{enterprise}],"github.com":[{}]}}}}"#,
+        gh_account("success", true)
+    ));
+    assert!(html.contains("<tr><td>gh</td><td>signed in"), "{html}");
+
+    let enterprise_in = gh_account("success", true).replace("github.com", "ghe.example");
+    let html = page_with_gh_saying(&format!(
+        r#"{{"hosts":{{"ghe.example":[{enterprise_in}],"github.com":[{}]}}}}"#,
+        gh_account("error", true)
+    ));
+    assert!(html.contains("<tr><td>gh</td><td>not signed in"), "{html}");
+
+    // A machine on an enterprise host alone is judged by that host.
+    let html = page_with_gh_saying(&format!(r#"{{"hosts":{{"ghe.example":[{enterprise}]}}}}"#));
+    assert!(html.contains("<tr><td>gh</td><td>not signed in"), "{html}");
+}
+
+#[test]
+fn gh_is_asked_for_its_json() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let (dir, gh) = fake_gh(0);
+    let output = conbus(root.path())
+        .arg("auth")
+        .env("CONBUS_GH", &gh)
+        .output()
+        .expect("run auth");
+    assert!(output.status.success());
+    let calls = std::fs::read_to_string(dir.path().join("calls")).expect("calls");
+    assert_eq!(calls, "auth status --json hosts\n");
+    assert!(
+        !calls.contains("--show-token"),
+        "no token is ever asked for"
+    );
+}
+
+#[test]
+fn the_banner_says_what_was_asked_and_what_was_not() {
+    let (_codex_dir, codex) = codex_signed_in();
+    let (_gh_dir, gh) = fake_gh(0);
+
+    let html = page_with(&[("CONBUS_CODEX_BIN", &codex), ("CONBUS_GH", &gh)]);
+
+    // Automatic hops run `claude -p`, and nothing here asked Claude.
+    assert!(!html.contains("conbus needs no login right now"), "{html}");
+    assert!(!html.contains("지금 필요한 로그인은 없습니다"), "{html}");
+    assert!(html.contains("asked: codex, gh"), "{html}");
+    assert!(html.contains("not installed: agy"), "{html}");
+    assert!(
+        html.contains("not asked: claude, cursor, grok, opencode"),
+        "{html}"
+    );
+}
+
+#[test]
+fn the_banner_names_what_it_is_yellow_or_grey_about() {
+    let (_codex_dir, codex) = codex_signed_in();
+    let (_gh_dir, gh) = fake_gh(1);
+    let html = page_with(&[("CONBUS_CODEX_BIN", &codex), ("CONBUS_GH", &gh)]);
+    assert!(html.contains("that is missing: gh<"), "{html}");
+
+    let (_broken_dir, broken) = codex_refusing_with("the server is on fire");
+    let (_gh_in_dir, gh_in) = fake_gh(0);
+    let html = page_with(&[("CONBUS_CODEX_BIN", &broken), ("CONBUS_GH", &gh_in)]);
+    assert!(html.contains("could not tell for: codex<"), "{html}");
+}
+
+#[test]
+fn a_signed_out_agy_is_told_not_to_sign_in_for_nothing() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let (_dir, agy, _calls) = fake_logged_out_agy();
+    let output = conbus(root.path())
+        .arg("auth")
+        .env("CONBUS_AGY_BIN", &agy)
+        .output()
+        .expect("run auth");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = row(&stdout, "agy");
+    assert!(line.contains("AUTH_REQUIRED"), "{line}");
+    assert!(line.contains("only if you use it"), "{line}");
+    assert!(!line.contains("run `agy` to sign in"), "{line}");
+}
+
+#[test]
+fn a_broken_agy_does_not_turn_the_banner_either() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let agy = dir.path().join("agy");
+    support::write_executable(&agy, "#!/bin/sh\nexit 3\n");
+    warmed(&agy);
+    let (_codex_dir, codex) = codex_signed_in();
+    let (_gh_dir, gh) = fake_gh(0);
+
+    let html = page_with(&[
+        ("CONBUS_AGY_BIN", agy.as_path()),
+        ("CONBUS_CODEX_BIN", codex.as_path()),
+        ("CONBUS_GH", gh.as_path()),
+    ]);
+
+    assert_eq!(banner(&html), "ok", "{html}");
+    assert!(html.contains("<tr><td>agy</td><td>SKIP"), "{html}");
 }

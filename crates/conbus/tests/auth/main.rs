@@ -56,18 +56,30 @@ fn fake_logged_out_agy() -> (tempfile::TempDir, std::path::PathBuf, std::path::P
     (dir, path, calls)
 }
 
-/// A `gh` that answers `auth status` like a signed-in one.
-fn fake_gh(exit_code: i32) -> (tempfile::TempDir, std::path::PathBuf) {
+/// A `gh` whose `auth status --json hosts` prints `json`, exiting 0 as the real one
+/// does with `--json` whatever the accounts' state. It also keeps its arguments.
+fn gh_saying(json: &str) -> (tempfile::TempDir, std::path::PathBuf) {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("gh");
+    let calls = dir.path().join("calls");
     support::write_executable(
         &path,
         &format!(
-            "#!/bin/sh\nif [ \"$1 $2\" = 'auth status' ]; then exit {exit_code}; fi\nexit 1\n"
+            "#!/bin/sh\n[ \"$1\" = --warm ] && exit 0\nprintf '%s\\n' \"$*\" >>'{}'\ncat <<'JSON'\n{json}\nJSON\n",
+            calls.display()
         ),
     );
     warmed(&path);
     (dir, path)
+}
+
+/// `gh` with one active account on github.com: signed in when `exit_code` is 0,
+/// and otherwise with a token GitHub refuses.
+fn fake_gh(exit_code: i32) -> (tempfile::TempDir, std::path::PathBuf) {
+    let state = if exit_code == 0 { "success" } else { "error" };
+    gh_saying(&format!(
+        r#"{{"hosts":{{"github.com":[{{"state":"{state}","active":true,"host":"github.com","login":"someone","tokenSource":"keyring","gitProtocol":"https"}}]}}}}"#
+    ))
 }
 
 /// The one line of the table for `name`.

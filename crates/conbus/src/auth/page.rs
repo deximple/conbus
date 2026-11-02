@@ -27,30 +27,70 @@ fn escape(text: &str) -> String {
     out
 }
 
-/// The banner's class and its two languages. Yellow for a feature signed out,
-/// grey when a vendor could not be told, green only when neither is so. A vendor
-/// that is not installed changes none of this: nothing of it is signed out.
-fn banner(rows: &[Row]) -> (&'static str, &'static str, &'static str) {
-    let any = |standing| rows.iter().any(|row| row.standing == standing);
-    if any(Standing::SignedOut) {
+/// The banner's class and its two languages. It speaks only for what conbus needs
+/// right now and only from what it asked: yellow for a needed sign-in that is
+/// missing, grey when a needed vendor could not be told or nothing could be asked.
+/// A vendor conbus does not depend on, one not installed and one not asked change
+/// none of this, and `asked_and_not` says which were which.
+fn banner(rows: &[Row]) -> (&'static str, String, String) {
+    let missing = names(rows, |standing| standing == Standing::SignedOut);
+    let unknown = names(rows, |standing| standing == Standing::CannotTell);
+    if !missing.is_empty() {
         (
             "warn",
-            "a login below needs the vendor's own sign-in",
-            "아래 로그인은 벤더 자체 로그인이 필요합니다",
+            format!("conbus needs a sign-in that is missing: {missing}"),
+            format!("conbus에 필요한 로그인이 없습니다: {missing}"),
         )
-    } else if any(Standing::CannotTell) {
+    } else if !unknown.is_empty() {
         (
             "neutral",
-            "conbus could not tell for every vendor below",
-            "아래 벤더 중 conbus가 확인하지 못한 곳이 있습니다",
+            format!("conbus could not tell for: {unknown}"),
+            format!("conbus가 확인하지 못했습니다: {unknown}"),
+        )
+    } else if names(rows, |standing| standing == Standing::Asked).is_empty() {
+        (
+            "neutral",
+            "conbus asked nothing: no vendor it can ask is installed".to_string(),
+            "conbus가 물어본 곳이 없습니다. 물어볼 수 있는 벤더가 설치돼 있지 않습니다".to_string(),
         )
     } else {
         (
             "ok",
-            "conbus needs no login right now",
-            "conbus에 지금 필요한 로그인은 없습니다",
+            "of what conbus asked, nothing it needs is signed out".to_string(),
+            "conbus가 물어본 곳 중 필요한 로그인이 빠진 곳은 없습니다".to_string(),
         )
     }
+}
+
+fn names(rows: &[Row], matches: impl Fn(Standing) -> bool) -> String {
+    let matching: Vec<&str> = rows
+        .iter()
+        .filter(|row| matches(row.standing))
+        .map(|row| row.name)
+        .collect();
+    matching.join(", ")
+}
+
+/// `asked: codex, gh · not installed: agy · not asked: claude, …`, with the labels
+/// given, leaving out what is empty.
+fn asked_and_not(rows: &[Row], labels: [&str; 3]) -> String {
+    let asked = |standing| {
+        matches!(
+            standing,
+            Standing::Asked | Standing::SignedOut | Standing::CannotTell
+        )
+    };
+    let parts = [
+        (labels[0], names(rows, asked)),
+        (labels[1], names(rows, |s| s == Standing::NotInstalled)),
+        (labels[2], names(rows, |s| s == Standing::NotChecked)),
+    ];
+    let said: Vec<String> = parts
+        .iter()
+        .filter(|(_, names)| !names.is_empty())
+        .map(|(label, names)| format!("{label}: {names}"))
+        .collect();
+    said.join(" · ")
 }
 
 fn render(rows: &[Row]) -> String {
@@ -73,6 +113,8 @@ fn render(rows: &[Row]) -> String {
         })
         .collect();
     let (banner_class, banner_en, banner_ko) = banner(rows);
+    let asked_en = asked_and_not(rows, ["asked", "not installed", "not asked"]);
+    let asked_ko = asked_and_not(rows, ["물어봄", "설치 안 됨", "묻지 않음"]);
     let now = Timestamp::now();
     format!(
         r##"<!doctype html>
@@ -93,7 +135,7 @@ td:first-child {{ font-weight: 600; }}
 input[type=text] {{ width: 34em; max-width: 90%; font: inherit; padding: .4em; }}
 #verdict {{ white-space: pre-wrap; font-family: ui-monospace, monospace; margin-top: 1em; }}
 </style>
-<div class="banner {banner_class}">{banner_en}<small>{banner_ko}</small></div>
+<div class="banner {banner_class}">{banner_en}<small>{banner_ko}</small><small>{asked_en}</small><small>{asked_ko}</small></div>
 <p class="sub">conbus has no sign-in page of its own; a vendor program it starts may ask for that vendor's, and a row marked not checked was not asked · conbus에는 자체 로그인 페이지가 없습니다. conbus가 실행한 벤더 프로그램은 그 벤더의 로그인을 요구할 수 있고, not checked 행은 묻지 않았습니다 — generated {now}</p>
 <table>{table}</table>
 <h2>a tab opened — paste its URL</h2>
