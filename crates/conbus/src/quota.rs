@@ -216,7 +216,7 @@ pub fn read_agy() -> io::Result<Quota> {
     parse_agy(&value)
 }
 
-fn agy_binary() -> std::ffi::OsString {
+pub(crate) fn agy_binary() -> std::ffi::OsString {
     std::env::var_os("CONBUS_AGY_BIN")
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "agy".into())
@@ -224,7 +224,7 @@ fn agy_binary() -> std::ffi::OsString {
 
 /// Why `agy` was not asked for its usage. Neither is a reading.
 #[derive(Debug)]
-enum AgyNotAsked {
+pub(crate) enum AgyNotAsked {
     /// `agy models` says there is no login.
     AuthRequired,
     /// `agy models` said neither yes nor no.
@@ -254,7 +254,10 @@ impl std::error::Error for AgyNotAsked {}
 /// listing counts as a login: a request to sign in outranks a clean exit, and
 /// anything else leaves the login unknown, which is not asked either. The
 /// wording decides only which of the two refusals is reported.
-fn agy_signed_in(binary: &std::ffi::OsStr, deadline: Duration) -> Result<(), AgyNotAsked> {
+pub(crate) fn agy_signed_in(
+    binary: &std::ffi::OsStr,
+    deadline: Duration,
+) -> Result<(), AgyNotAsked> {
     let mut command = Command::new(binary);
     command.arg("models");
     let output = crate::code::output_within(command, deadline).map_err(AgyNotAsked::Skip)?;
