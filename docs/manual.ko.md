@@ -475,8 +475,8 @@ conbus install --apply     # 레코더를 다시 켭니다
 레코더가 꺼져 있던 동안 실시간 세션에서 **놓친 턴**은 레코더가 켜질 때 자동으로
 채워집니다. Claude Code 트랜스크립트, Codex 스레드, 채팅 내보내기에서 가져옵니다.
 시작 시 이 작업에는 최대 15초를 씁니다(`CONBUS_GAP_BUDGET_MS`로 바꿀 수 있습니다).
-예산이 부족해 다 채우지 못한 범위는 `cache/gap-since`에 기억했다가 다음 시작 때
-이어서 채우고, `daemon.log`에도 남깁니다. `codex app-server`가 시작되지 않거나
+예산이 부족해 다 채우지 못한 범위는 `cache/gap-since`와 `cache/gap-read`에
+기억했다가 다음 시작 때 멈춘 곳부터 이어서 채우고, `daemon.log`에도 남깁니다. `codex app-server`가 시작되지 않거나
 응답을 멈춰 Codex 단계가 돌지 못하면 그 범위는 `cache/gap-since-codex`에 따로
 기억합니다. `conbus backfill --gaps`는 같은 빈틈을 시간 제한 없이 필요할 때
 채우며, Claude Code와 Codex에 대해 전체 기록에 걸쳐 동작합니다. `--apply`를

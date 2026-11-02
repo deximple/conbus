@@ -50,12 +50,24 @@ fn stamp(home: &Path) -> Value {
         .unwrap_or(Value::Null)
 }
 
+/// A daemon this test owns, stopped when the test ends however it ends. A failing
+/// test that only stopped it on the way out left one serving a deleted root.
+struct Daemon(Child);
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 /// Wait until the stamp says this daemon serves: its start-up fill is done.
-fn wait_serving(home: &Path, daemon: Child) -> Child {
+fn wait_serving(home: &Path, daemon: Child) -> Daemon {
+    let daemon = Daemon(daemon);
     let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
         let stamped = stamp(home);
-        if stamped["pid"].as_u64() == Some(u64::from(daemon.id()))
+        if stamped["pid"].as_u64() == Some(u64::from(daemon.0.id()))
             && stamped.get("serving").is_some()
         {
             return daemon;
@@ -65,13 +77,12 @@ fn wait_serving(home: &Path, daemon: Child) -> Child {
     panic!("the daemon never served");
 }
 
-fn start(home: &Path) -> Child {
+fn start(home: &Path) -> Daemon {
     wait_serving(home, daemon_command(home).spawn().expect("daemon"))
 }
 
-fn stop(mut daemon: Child) {
-    let _ = daemon.kill();
-    let _ = daemon.wait();
+fn stop(daemon: Daemon) {
+    drop(daemon);
 }
 
 fn hook(home: &Path, payload: &str) {
@@ -1174,4 +1185,135 @@ fn backfill_gaps_says_when_codex_could_not_be_read_and_still_fills_the_rest() {
 
     assert!(ok, "{said}");
     assert!(said.contains("codex     history unavailable"), "{said}");
+}
+
+const THREADS: [&str; 6] = [
+    "01a19463-0000-7000-8000-000000000001",
+    "01a19463-0000-7000-8000-000000000002",
+    "01a19463-0000-7000-8000-000000000003",
+    "01a19463-0000-7000-8000-000000000004",
+    "01a19463-0000-7000-8000-000000000005",
+    "01a19463-0000-7000-8000-000000000006",
+];
+
+/// A stand-in that answers one thread per call, slowly, so a budget covers only
+/// some of them.
+const SLOW_APP_SERVER: &str = r#"#!/usr/bin/env python3
+import json, sys, time
+for line in sys.stdin:
+    msg = json.loads(line)
+    m = msg.get("method"); i = msg.get("id")
+    if m == "initialize":
+        print(json.dumps({"jsonrpc":"2.0","id":i,"result":{"userAgent":"fake"}}), flush=True)
+    elif m == "thread/turns/list":
+        time.sleep(0.5)
+        t = msg["params"]["threadId"]
+        data = [{"id":"turn-of-"+t,"items":[{"type":"userMessage","content":[{"type":"text","text":"said in "+t}]},{"type":"agentMessage","text":"a"}],
+                 "status":"completed","startedAt":1788368800,"completedAt":1788368801}]
+        print(json.dumps({"jsonrpc":"2.0","id":i,"result":{"data":data,"nextCursor":None}}), flush=True)
+"#;
+
+/// Every thread live, the first of them the most recently touched: the order the
+/// pass asks them in.
+fn live_threads_touched_in_order(home: &Path) {
+    let daemon = start(home);
+    for thread in THREADS {
+        let payload = json!({"session_id": thread, "hook_event_name": "UserPromptSubmit",
+            "prompt": "seen", "turn_id": "seen", "cwd": "/repo", "model": "m",
+            "permission_mode": "default", "transcript_path": null});
+        hook_as(home, "codex", &payload.to_string());
+    }
+    stop(daemon);
+    let rollouts = home.join(".codex/sessions/2026/11/01");
+    std::fs::create_dir_all(&rollouts).expect("dir");
+    for (age, thread) in THREADS.iter().enumerate() {
+        let path = rollouts.join(format!("rollout-2026-11-01T00-00-00-{thread}.jsonl"));
+        let file = std::fs::File::create(&path).expect("rollout");
+        file.set_modified(std::time::SystemTime::now() - Duration::from_secs(10 + age as u64 * 10))
+            .expect("mtime");
+    }
+}
+
+#[test]
+fn threads_a_budget_cut_off_are_reached_by_later_starts() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let (_stub, fake) = stand_in(SLOW_APP_SERVER);
+    live_threads_touched_in_order(home);
+
+    let reached = |home: &Path, thread: &str| {
+        log_lines(home)
+            .iter()
+            .any(|record| record["prompt"]["text"] == format!("said in {thread}"))
+    };
+    for _ in 0..8 {
+        let daemon = wait_serving(
+            home,
+            daemon_command(home)
+                .env("CONBUS_CODEX_BIN", &fake)
+                .env("CONBUS_GAP_BUDGET_MS", "2000")
+                .spawn()
+                .expect("daemon"),
+        );
+        stop(daemon);
+        if THREADS.iter().all(|thread| reached(home, thread)) {
+            break;
+        }
+    }
+
+    for thread in THREADS {
+        assert!(reached(home, thread), "{thread} was never reached");
+    }
+    let turns = log_lines(home)
+        .into_iter()
+        .filter(|record| {
+            record["event"] == "turn_started"
+                && record["prompt"]["text"]
+                    .as_str()
+                    .is_some_and(|text| text.starts_with("said in"))
+        })
+        .count();
+    assert_eq!(turns, THREADS.len(), "each thread's turn once");
+}
+
+#[test]
+fn a_thread_that_kills_the_app_server_does_not_starve_the_ones_behind_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let (_stub, fake) = stand_in(&format!(
+        r#"#!/usr/bin/env python3
+import json, sys
+for line in sys.stdin:
+    msg = json.loads(line)
+    m = msg.get("method"); i = msg.get("id")
+    if m == "initialize":
+        print(json.dumps({{"jsonrpc":"2.0","id":i,"result":{{"userAgent":"fake"}}}}), flush=True)
+    elif m == "thread/turns/list":
+        t = msg["params"]["threadId"]
+        if t == {first:?}:
+            sys.exit(1)
+        data = [{{"id":"turn-of-"+t,"items":[{{"type":"userMessage","content":[{{"type":"text","text":"said in "+t}}]}},{{"type":"agentMessage","text":"a"}}],
+                 "status":"completed","startedAt":1788368800,"completedAt":1788368801}}]
+        print(json.dumps({{"jsonrpc":"2.0","id":i,"result":{{"data":data,"nextCursor":None}}}}), flush=True)
+"#,
+        first = THREADS[0]
+    ));
+    live_threads_touched_in_order(home);
+
+    start_with_codex(home, &fake);
+    start_with_codex(home, &fake);
+
+    let all = log_lines(home);
+    for thread in &THREADS[1..] {
+        assert!(
+            all.iter()
+                .any(|record| record["prompt"]["text"] == format!("said in {thread}")),
+            "{thread} never reached behind the thread that dies:\n{}",
+            show(&all)
+        );
+    }
+    assert!(
+        home.join("cache/gap-since-codex").exists(),
+        "the thread that dies is still unread"
+    );
 }
