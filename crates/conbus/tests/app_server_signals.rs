@@ -12,16 +12,16 @@ mod support;
 const THREAD: &str = "01a19463-cbd4-7b50-b819-000000000abc";
 
 /// Starts a helper, says who they both are, answers `initialize`, then hangs on anything
-/// else unless told to answer.
+/// else unless told to answer. One write in append mode, as `doctor` starts two at once.
 const SERVER: &str = r#"#!/usr/bin/env python3
 import json, os, subprocess, sys, time
 here = os.path.dirname(os.path.abspath(sys.argv[0]))
 if len(sys.argv) < 2:
     sys.exit(0)
 helper = subprocess.Popen(["/bin/sleep", "120"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-with open(os.path.join(here, "pids.tmp"), "w") as pids:
-    pids.write(f"{os.getpid()} {helper.pid}\n")
-os.rename(os.path.join(here, "pids.tmp"), os.path.join(here, "pids"))
+pids = os.open(os.path.join(here, "pids"), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+os.write(pids, f"{os.getpid()} {helper.pid}\n".encode())
+os.close(pids)
 for line in sys.stdin:
     msg = json.loads(line)
     m = msg.get("method"); i = msg.get("id")
@@ -138,10 +138,14 @@ fn pids_in(stub: &Path) -> Vec<i32> {
 }
 
 fn wait_for_the_server(case: &Case) -> Vec<i32> {
+    wait_for_servers(case, 1)
+}
+
+fn wait_for_servers(case: &Case, servers: usize) -> Vec<i32> {
     let end = Instant::now() + Duration::from_secs(60);
     while Instant::now() < end {
         let pids = pids_in(&case.stub);
-        if pids.len() == 2 {
+        if pids.len() >= 2 * servers {
             // Past its `initialize`, so it is wedged on the real question.
             std::thread::sleep(Duration::from_millis(300));
             return pids;
@@ -219,11 +223,12 @@ fn ctrl_c_on_status_kills_a_wedged_server() {
 
 #[test]
 fn ctrl_c_on_doctor_kills_a_wedged_server() {
-    // Its probes have two seconds, and it may be past them by the time the signal lands,
-    // so what it dies of is not the point here.
+    // One server for the quota with two seconds, and one for the hooks with eight. The
+    // first may be past its limit when the signal lands, so what conbus dies of is not the
+    // point here, but the second is still wedged then.
     let case = a_case();
     let mut child = conbus(&case, &["doctor"]);
-    let pids = wait_for_the_server(&case);
+    let pids = wait_for_servers(&case, 2);
 
     send(child.id(), libc::SIGINT);
 
