@@ -514,14 +514,16 @@ Measured at 1.0 (2026-11-01, a 10 GB real log; `docs/plan-1.0.md`):
 1.0 is cut from `docs/plan-1.0.md`; its progress table at the end says what
 landed, what was measured and what was cut. What is left needs a person:
 
-1. **Canary verdict and release.** `v1.0.0-rc.3` was swapped onto the live
-   recorder on 2026-11-01 — the seven-day window is running; `verdict` exits
-   3 until it closes. While it ran, the pre-release sweep opened PRs for the
-   remaining fixes and coverage (the plan table's "출시 전 점검" row lists
-   them and which ones change the recorder path). Merge decisions and the
-   operator sequence — merge → possible `rc.4` → verdict → `v1.0.0` tag →
-   sign → publish — are in the session's `final-stage.md`. `v1.0.0` is
-   tagged only on a passing verdict (`docs/plan-1.0.md` §7).
+1. **rc.4, its canary, and the release.** `v1.0.0-rc.3` was swapped onto the
+   live recorder on 2026-11-01. The pre-release sweep's PRs were reviewed and
+   merged in order as the 1.0 candidate (#188), with the fixes after it in #189
+   and the version in #190. Those change the recorder path, so the verdict that
+   decides `v1.0.0` comes from a new seven-day canary on `v1.0.0-rc.4`
+   (`docs/plan-1.0.md` §7). What is left is the operator's or a later
+   session's: merge #189 and #190, tag `v1.0.0-rc.4` and sign it, start the
+   canary (O2), read the verdict when its window closes, and only on a pass tag,
+   sign and publish `v1.0.0` (O3). The stable release path, a draft upload and
+   then publishing it, runs on GitHub for the first time at `v1.0.0`.
 2. **RFD 0002 and 0003** stay drafts until the operator accepts them; no sync
    service exists.
 3. Then back to `docs/self-improve.md`, from live evidence rather than this
