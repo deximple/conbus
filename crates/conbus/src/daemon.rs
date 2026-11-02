@@ -23,7 +23,7 @@ use conbus_core::paths::Paths;
 use conbus_core::record::{Entry, Record};
 use conbus_core::registry::{Disposition, Observed, Registry, SessionKey};
 use conbus_core::retention::Retention;
-use conbus_core::segment::{Scan, SegmentLog};
+use conbus_core::segment::SegmentLog;
 
 use crate::harden;
 use crate::wire::{Request, Response};
@@ -1677,14 +1677,21 @@ pub fn prepare(paths: &Paths, retention: Retention) -> io::Result<()> {
         std::thread::sleep(Duration::from_millis(ms));
     }
     let t0 = std::time::Instant::now();
-    let mut scan =
-        SegmentLog::scan_meta(paths.log_dir(), Some(&paths.cache_dir())).unwrap_or_else(|err| {
+    // A log that cannot be read is not an empty log. Everything the fill reads is
+    // compared against it, so nothing can be said to be missing: read as empty,
+    // every conversation in a chat export looked new and was appended again.
+    let mut scan = match SegmentLog::scan_meta(paths.log_dir(), Some(&paths.cache_dir())) {
+        Ok(scan) => scan,
+        Err(err) => {
             note!(
-                "could not read {} ({err}); nothing to fill or repair from",
+                "could not read {} ({err}); gap fill and split repair skipped, \
+                 and the next start fills the range",
                 paths.log_dir().display()
             );
-            Scan::default()
-        });
+            crate::backfill::defer_fill(paths);
+            return Ok(());
+        }
+    };
     let t_scan = t0.elapsed();
     let mut log = SegmentLog::open(paths.log_dir(), retention)?;
     // Official transcripts only, same parser as `backfill --gaps`. Turns
@@ -1703,7 +1710,7 @@ pub fn prepare(paths: &Paths, retention: Retention) -> io::Result<()> {
             scan.records
                 .extend(written.iter().map(conbus_core::segment::meta));
         }
-        Err(err) => note!("gap fill skipped ({err})"),
+        Err(err) => note!("gap fill stopped ({err}); the next start fills the range"),
     }
     let t_gaps = t0.elapsed() - t_scan;
     match repair_splits(&scan.records, &mut log) {
