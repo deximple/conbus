@@ -40,6 +40,9 @@ the entry says so when it does.
 - `usage` no longer counts a spool re-delivery twice in `records`. A second line
   under one hook id adds one to `records` and one to `repeated`, as a twin
   delivery does.
+- `log --tail N --bus-id ID` now follows aliases, as a full read does. It used to
+  match the id alone, so a split conversation showed part of itself. Naming a
+  conversation now costs one pass over the cache; a plain `--tail` is unchanged.
 
 ## [1.0.0-rc.3] — 2026-11-01
 

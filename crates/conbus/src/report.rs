@@ -22,15 +22,30 @@ pub fn log(paths: &Paths, json: bool, filter: &LogFilter) -> io::Result<()> {
     // filters still apply below, so --tail --bus-id/--grep stay exact.
     let scan = match filter.tail {
         Some(n) => {
+            // The `aliased` lines joining two ids can be anywhere in the log, so
+            // a read that names a conversation pays for one pass of the cache to
+            // find them. A plain `--tail` still opens only what it needs.
+            let aliased = filter.bus_id.as_deref().and_then(|wanted| {
+                conbus_core::identity::expand_aliases_in_log(
+                    paths.log_dir(),
+                    Some(&paths.cache_dir()),
+                    wanted,
+                )
+                .map_err(|err| {
+                    eprintln!("could not read the log's aliases ({err}); showing this id alone");
+                })
+                .ok()
+            });
             let (records, defects) = SegmentLog::tail(paths.log_dir(), n, |record| {
-                filter
-                    .bus_id
-                    .as_ref()
-                    .is_none_or(|wanted| record.bus_id.to_string().starts_with(wanted.as_str()))
-                    && filter
-                        .since
+                filter.bus_id.as_ref().is_none_or(|wanted| {
+                    aliased
                         .as_ref()
-                        .is_none_or(|from| record.ts.to_string().as_str() >= from.as_str())
+                        .is_some_and(|set| set.contains(&record.bus_id))
+                        || record.bus_id.to_string().starts_with(wanted.as_str())
+                }) && filter
+                    .since
+                    .as_ref()
+                    .is_none_or(|from| record.ts.to_string().as_str() >= from.as_str())
                     && filter
                         .grep
                         .as_ref()
@@ -40,7 +55,13 @@ pub fn log(paths: &Paths, json: bool, filter: &LogFilter) -> io::Result<()> {
         }
         None => SegmentLog::scan(paths.log_dir())?,
     };
-    for record in select(&scan.records, filter) {
+    // A tail has already chosen by conversation, and the `aliased` lines that
+    // joined the ids are usually outside what it read.
+    let selecting = LogFilter {
+        bus_id: filter.bus_id.clone().filter(|_| filter.tail.is_none()),
+        ..filter.clone()
+    };
+    for record in select(&scan.records, &selecting) {
         let revealed;
         let record = if filter.reveal {
             revealed = Record {
