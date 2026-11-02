@@ -38,13 +38,15 @@
 #     fails. After the swap it requires, inside
 #     CONBUS_CANARY_SERVING_LIMIT seconds (default 30): a new daemon pid
 #     serving, a doctor with no DIFFERS against the candidate build and a log
-#     that can take a record,
-#     every installed vendor's hooks line `runs` with no event missing, a daemon that answers on
-#     its socket, and zero drop reasons that were not there before — except
-#     the two a normal swap window produces (a protocol refusal while the old
-#     daemon still answers, or no listener mid-restart), which are counted
-#     into canary.json as swap_window_drops instead, and lines that lost no
-#     record. Any other failure rolls back automatically and exits 1. The
+#     that can take a record, every installed vendor's hooks line `runs` with no
+#     event missing (a vendor CLI too slow to say its version is a note, not a
+#     failure), a daemon that answers on its socket, and zero drop reasons that
+#     were not there before. Three kinds of line are excepted: the two reasons a
+#     normal swap window produces in its first 60 s (a protocol refusal while the
+#     old daemon still answers, or no listener mid-restart), counted into
+#     canary.json as swap_window_drops; lines that lost no record; and a tool event
+#     with no prompt, which the verdict judges against its rate. Any other failure
+#     rolls back automatically and exits 1. The
 #     5-second serving goal is a verdict criterion, not a rollback one —
 #     current measurements sit above it and would undo every cutover.
 #   - `hooks ... runs` is not a round trip: doctor starts the command with a
