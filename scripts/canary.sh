@@ -177,25 +177,38 @@ passwd_home() {
     env -u HOME bash -c 'cd ~ && pwd -P' 2>/dev/null
 }
 
+# The same directory by device and inode, not the same text. This volume is
+# case-insensitive and firmlinked, so /users/me and /System/Volumes/Data/Users/me
+# are the real home under other spellings. A HOME that links to the real root or
+# the real install is the real one as well.
 is_passwd_home() {
     local pw
     pw=$(passwd_home) || return 1
     [ -n "$pw" ] || return 1
-    [ "$(cd "$HOME" && pwd -P)" = "$(cd "$pw" && pwd -P)" ]
+    [ "$HOME" -ef "$pw" ] || [ "$root" -ef "$pw/.conbus" ] || [ "$install_dir" -ef "$pw/.local/bin" ]
+}
+
+# A stand-in, not a build. The seam below walks the real swap path, and `install
+# --apply` from a real binary takes the live recorder down whatever HOME says:
+# launchctl answers by uid.
+is_stand_in() { # is_stand_in <binary>
+    [ "$(LC_ALL=C head -c 2 "$1" 2>/dev/null)" = '#!' ]
 }
 
 # The real environment: HOME is this user's passwd home and nothing asked
 # that launchctl be skipped. CONBUS_CANARY_TEST_REAL_HOME is the
-# rehearsal's seam into the real code path: honoured only when it resolves
-# to the same throwaway HOME the script sees, which by construction is not
-# the passwd home. Naming the passwd home through it can never launder a
-# real swap.
+# rehearsal's seam into the real code path: honoured only when it is the same
+# throwaway HOME the script sees, which by construction is not the passwd home,
+# and when the binaries are stand-ins. Naming the passwd home through it can never
+# launder a real swap. Set at all counts as asked, empty too, because that is how
+# the binary reads it.
 is_real_env() {
-    [ -z "${CONBUS_SKIP_LAUNCHCTL:-}" ] || return 1
+    [ -z "${CONBUS_SKIP_LAUNCHCTL+set}" ] || return 1
     is_passwd_home && return 0
     [ -n "${CONBUS_CANARY_TEST_REAL_HOME:-}" ] || return 1
-    this_home=$(cd "$HOME" && pwd -P)
-    [ "$(cd "$CONBUS_CANARY_TEST_REAL_HOME" 2>/dev/null && pwd -P)" = "$this_home" ]
+    [ "$CONBUS_CANARY_TEST_REAL_HOME" -ef "$HOME" ] || return 1
+    is_stand_in "$bin" || return 1
+    [ -z "${from:-}" ] || is_stand_in "$from"
 }
 
 # True when `agy models` lists models. With no login it fails and opens nothing.
@@ -219,8 +232,9 @@ agy_signed_in() {
 # terminal, and doctor on a build older than conbus's own sign-in check still
 # runs it. That build may be the one installed or the one rolled back to, so
 # the check is made here too. A throwaway HOME has no login to ask about, and a
-# quota line is not what this script tests.
-if ! is_real_env || ! agy_signed_in; then
+# quota line is not what this script tests. A rehearsal never asks: under the real
+# HOME it is about to be refused, and a real vendor must not run before that.
+if [ -n "${CONBUS_CANARY_REHEARSAL:-}" ] || ! is_real_env || ! agy_signed_in; then
     export CONBUS_AGY_BIN=/usr/bin/false
 fi
 

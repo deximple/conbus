@@ -5,9 +5,9 @@
 # skipped), and CONBUS_CANARY_TEST_REAL_HOME=<the same throwaway HOME>
 # which walks the real code path — the fake's `install --apply` answers
 # for the reload. Nothing here can touch the real ~/.local/bin or
-# ~/.conbus — every swapping invocation uses a mktemp HOME, and the one
-# guard test that points HOME at the passwd home must be refused before
-# anything moves.
+# ~/.conbus — every swapping invocation uses a mktemp HOME, and the guard
+# tests that point HOME at the passwd home pass `--from /nonexistent`, so
+# even a broken guard dies before anything moves.
 #
 #   scripts/canary-rehearsal.sh
 set -euo pipefail
@@ -238,9 +238,22 @@ EOF
 touch "$home/Library/LaunchAgents/sh.conbus.daemon.plist"
 for i in 1 2 3 4 5; do touch "$tmp/evidence/s$i.txt"; done
 
+# Every run here is under a HOME this script made. Checked where the run starts, not
+# only once: a failed setup or a subshell must never carry on with another HOME.
+home_is_throwaway() {
+    case $home in
+        "$tmp"/*) ;;
+        *)
+            echo "rehearsal: FAIL: HOME '$home' is not this rehearsal's own" >&2
+            exit 1
+            ;;
+    esac
+}
+
 # The read budgets are wide here: a scenario is not about this machine's load
 # unless it sets one itself.
 run() {
+    home_is_throwaway
     env -u CONBUS_HOME -u XDG_STATE_HOME \
         HOME="$home" CONBUS_SKIP_LAUNCHCTL=1 CONBUS_CANARY_REHEARSAL=1 \
         CONBUS_CANARY_TAIL_MS=${TAIL_MS:-20000} CONBUS_CANARY_USAGE_MS=${USAGE_MS:-20000} \
@@ -250,6 +263,7 @@ run() {
 }
 
 run_norehearsal() {
+    home_is_throwaway
     env -u CONBUS_HOME -u XDG_STATE_HOME \
         HOME="$home" CONBUS_SKIP_LAUNCHCTL=1 \
         CONBUS_CANARY_SERVING_LIMIT=${SERVING_LIMIT:-30} \
@@ -260,6 +274,7 @@ run_norehearsal() {
 # walks the real code path — swap runs, the fake's `install --apply`
 # answers for the reload. No SKIP, no REHEARSAL.
 run_real() {
+    home_is_throwaway
     env -u CONBUS_HOME -u XDG_STATE_HOME -u CONBUS_SKIP_LAUNCHCTL \
         -u CONBUS_CANARY_REHEARSAL \
         HOME="$home" CONBUS_CANARY_TEST_REAL_HOME="$home" \
@@ -452,36 +467,92 @@ code=0
 run start --live --from "$tmp/stage/conbus-good" >/dev/null 2>&1 || code=$?
 expect 2 "$code" "--live is refused (exit 2)"
 
-# A rehearsal under the real passwd HOME is refused BEFORE anything moves —
-# this is the guard that makes a stray REHEARSAL flag safe. The refusal must
-# come before preflight or the file swap, and the live binary must not move.
-# Resolve the passwd home the same way canary.sh does — `cd ~` with HOME
-# unset answers from getpwuid; plain `cd` needs HOME itself.
+# The guards themselves. Nothing here may move, so nothing is handed to move: with `--from /nonexistent`, a broken
+# guard dies right after it, before preflight, any doctor or the swap, and fails the expectation on its exit code.
 real_home=$(env -u HOME bash -c 'cd ~ && pwd -P' 2>/dev/null)
-live_bin=$real_home/.local/bin/conbus
-live_sha=""
-[ -f "$live_bin" ] && live_sha=$(shasum -a 256 "$live_bin" | awk '{print $1}')
+guard_witness=$tmp/witness
+mkdir -p "$guard_witness"
+for witness in agy launchctl; do
+    printf '#!/bin/sh\necho %s >>"%s/witness.calls"\nexit 1\n' "$witness" "$tmp" >"$guard_witness/$witness"
+    chmod 755 "$guard_witness/$witness"
+done
+real_home_state() { # everything a broken guard would have touched, read only
+    for f in .local/bin/conbus .local/bin/conbus.rollback .conbus/canary.json; do
+        if [ -f "$real_home/$f" ]; then shasum -a 256 "$real_home/$f"; else echo "absent $f"; fi
+    done
+    for f in .local/bin/conbus.new .conbus/fake-records; do
+        if [ -e "$real_home/$f" ]; then echo "present $f"; fi
+    done
+    ls -lT "$real_home/Library/LaunchAgents/sh.conbus.daemon.plist.bak" 2>/dev/null || true
+}
+guard_refuses() { # guard_refuses <what> <HOME spelling> [env...]
+    guard_what=$1 guard_home=$2
+    shift 2
+    guard_before=$(real_home_state)
+    : >"$tmp/witness.calls"
+    code=0
+    env -u CONBUS_HOME -u XDG_STATE_HOME -u CONBUS_AGY_BIN -u CONBUS_SKIP_LAUNCHCTL \
+        HOME="$guard_home" CONBUS_CANARY_REHEARSAL=1 PATH="$guard_witness:$PATH" "$@" \
+        bash "$canary" start --from /nonexistent >"$tmp/guard.out" 2>&1 || code=$?
+    expect 2 "$code" "$guard_what: refused (exit 2)"
+    expect_grep 'CONBUS_CANARY_REHEARSAL is set under the real HOME' "$tmp/guard.out" "$guard_what: by the guard, not by something later"
+    expect 0 "$(wc -l <"$tmp/witness.calls" | tr -d ' ')" "$guard_what: no vendor and no launchctl ran before the refusal"
+    expect "$guard_before" "$(real_home_state)" "$guard_what: nothing under the real HOME moved"
+}
+guard_refuses "REHEARSAL under the real HOME" "$real_home"
+guard_refuses "REHEARSAL + SKIP under the real HOME" "$real_home" CONBUS_SKIP_LAUNCHCTL=1
+# The same home under other spellings: this volume is case-insensitive and firmlinked, and a string compare reads
+# these as somewhere else. Only where they really are the same directory.
+guard_upper=$(printf '%s' "$real_home" | tr '[:lower:]' '[:upper:]')
+if [ "$guard_upper" -ef "$real_home" ]; then
+    guard_refuses "the real HOME in other case" "$guard_upper"
+fi
+guard_firmlink=/System/Volumes/Data$real_home
+if [ "$guard_firmlink" -ef "$real_home" ]; then
+    guard_refuses "the real HOME through its firmlink" "$guard_firmlink"
+fi
+# A throwaway HOME whose root or install is the real one is the real one.
+guard_links=$tmp/guard-links
+mkdir -p "$guard_links/.local"
+if [ -d "$real_home/.conbus" ]; then
+    ln -s "$real_home/.conbus" "$guard_links/.conbus"
+    guard_refuses "a HOME whose .conbus is the real one" "$guard_links"
+    rm -f "$guard_links/.conbus"
+fi
+if [ -d "$real_home/.local/bin" ]; then
+    ln -s "$real_home/.local/bin" "$guard_links/.local/bin"
+    guard_refuses "a HOME whose install is the real one" "$guard_links"
+    rm -f "$guard_links/.local/bin"
+fi
+
+# An empty CONBUS_SKIP_LAUNCHCTL is set as far as the binary goes, so the script must not call that the real path.
 code=0
-env -u CONBUS_HOME -u XDG_STATE_HOME HOME="$real_home" CONBUS_CANARY_REHEARSAL=1 \
-    bash "$canary" start --from "$tmp/stage/conbus-good" >"$tmp/realhome.out" 2>&1 || code=$?
-if [ "${code:-0}" != 2 ]; then
-    say "diagnostic: real_home='$real_home' pw='$(env -u HOME bash -c 'cd ~ && pwd -P' 2>/dev/null)'"
-    sed 's/^/  canary: /' "$tmp/realhome.out" | head -8
-fi
-expect 2 "$code" "REHEARSAL under the real HOME refuses (exit 2)"
-if [ -n "$live_sha" ]; then
-    expect "$live_sha" "$(shasum -a 256 "$live_bin" | awk '{print $1}')" \
-        "the live binary is untouched"
-fi
+env -u CONBUS_HOME -u XDG_STATE_HOME -u CONBUS_CANARY_REHEARSAL HOME="$home" CONBUS_SKIP_LAUNCHCTL= \
+    CONBUS_CANARY_TEST_REAL_HOME="$home" bash "$canary" start --from "$tmp/stage/conbus-good" >"$tmp/guard-empty.out" 2>&1 || code=$?
+expect 2 "$code" "an empty CONBUS_SKIP_LAUNCHCTL is no real path"
+
+# The seam walks the real swap path, whose `install --apply` from a real binary would take the live recorder down
+# whatever HOME says: launchctl answers by uid. So it is for stand-ins only. Both sides refuse before anything moves.
+native=$tmp/stage/conbus-native
+cp /usr/bin/true "$native"
+installed_before=$(shasum -a 256 "$install_dir/conbus" | awk '{ print $1 }')
 code=0
-env -u CONBUS_HOME -u XDG_STATE_HOME HOME="$real_home" \
-    CONBUS_CANARY_REHEARSAL=1 CONBUS_SKIP_LAUNCHCTL=1 \
-    bash "$canary" start --from "$tmp/stage/conbus-good" >/dev/null 2>&1 || code=$?
-expect 2 "$code" "REHEARSAL + SKIP under the real HOME still refuses (exit 2)"
-if [ -n "$live_sha" ]; then
-    expect "$live_sha" "$(shasum -a 256 "$live_bin" | awk '{print $1}')" \
-        "no half deploy — the binary is still untouched"
-fi
+env -u CONBUS_HOME -u XDG_STATE_HOME -u CONBUS_SKIP_LAUNCHCTL -u CONBUS_CANARY_REHEARSAL HOME="$home" \
+    CONBUS_CANARY_TEST_REAL_HOME="$home" CONBUS_AGY_BIN="$tmp/agy-no-login" \
+    bash "$canary" start --from "$native" >"$tmp/guard-native-from.out" 2>&1 || code=$?
+expect 2 "$code" "the seam refuses a candidate that is a real binary"
+expect_grep "the real swap needs the real HOME" "$tmp/guard-native-from.out" "by the guard, before preflight"
+expect "$installed_before" "$(shasum -a 256 "$install_dir/conbus" | awk '{ print $1 }')" "and nothing moved"
+stand_in_copy=$tmp/stand-in-copy
+cp -p "$install_dir/conbus" "$stand_in_copy"
+cp /usr/bin/true "$install_dir/conbus"
+code=0
+env -u CONBUS_HOME -u XDG_STATE_HOME -u CONBUS_SKIP_LAUNCHCTL -u CONBUS_CANARY_REHEARSAL HOME="$home" \
+    CONBUS_CANARY_TEST_REAL_HOME="$home" CONBUS_AGY_BIN="$tmp/agy-no-login" \
+    bash "$canary" start --from "$tmp/stage/conbus-good" >"$tmp/guard-native-bin.out" 2>&1 || code=$?
+expect 2 "$code" "the seam refuses an installed binary that is a real one"
+expect_grep "the real swap needs the real HOME" "$tmp/guard-native-bin.out" "by the guard, before preflight"
+cp -p "$stand_in_copy" "$install_dir/conbus"
 
 # The test seam only accepts a throwaway HOME that names itself.
 code=0
