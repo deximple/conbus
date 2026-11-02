@@ -26,6 +26,34 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# The OS boot times a verdict compares start lines with. No window here has a reboot
+# unless a scenario says so, and nothing here asks the real machine.
+mkdir -p "$tmp/boot"
+cat >"$tmp/boot/sysctl" <<EOF
+#!/bin/sh
+[ -f "$tmp/boot/unreadable" ] && exit 1
+printf '{ sec = %s, usec = 846817 } Sat Oct 31 23:04:19 2026\n' "\$(cat "$tmp/boot/boottime")"
+EOF
+cat >"$tmp/boot/last" <<EOF
+#!/bin/sh
+cat "$tmp/boot/reboots" 2>/dev/null
+echo
+echo "wtmp begins Wed Oct 15 14:44"
+EOF
+chmod 755 "$tmp/boot/sysctl" "$tmp/boot/last"
+echo 1577836800 >"$tmp/boot/boottime"
+PATH="$tmp/boot:$PATH"
+export PATH
+boot_at() { # boot_at <iso>: the boot kern.boottime knows, and only that one
+    rm -f "$tmp/boot/unreadable" "$tmp/boot/reboots"
+    perl -MTime::Local -e 'my ($y, $mo, $d, $h, $mi, $s) = $ARGV[0] =~ /^(\d+)-(\d+)-(\d+)T(\d+):(\d+):(\d+)/; print timegm($s, $mi, $h, $d, $mo - 1, $y), "\n"' "$1" >"$tmp/boot/boottime"
+}
+boot_at_none() { rm -f "$tmp/boot/unreadable" "$tmp/boot/reboots"; echo 1577836800 >"$tmp/boot/boottime"; }
+boot_unreadable() { touch "$tmp/boot/unreadable"; rm -f "$tmp/boot/reboots"; }
+reboot_listed() { # reboot_listed <seconds ago>: a line in `last reboot`, to the minute, in local time
+    LC_ALL=C date -r "$(($(date +%s) - $1))" "+reboot time                                %a %b %e %H:%M" >>"$tmp/boot/reboots"
+}
+
 home=$tmp/home
 install_dir=$home/.local/bin
 rollback_bin=$install_dir/conbus.rollback
@@ -1029,7 +1057,7 @@ code=0
 run verdict >"$tmp/verdict.out" 2>&1 || code=$?
 if [ "$code" != 0 ]; then cat "$tmp/verdict.out" >&2; fi
 expect 0 "$code" "verdict exits 0 on a completed clean window"
-for name in build hooks recorder-serving restarts unreadable log-files disk drops log-outages tool-bodies harness-activity twins-repeated \
+for name in build hooks recorder-serving restarts reboots unreadable log-files disk drops log-outages tool-bodies harness-activity twins-repeated \
     usage-parity rss-budget time-budget serving-budget policy sync operator-feel; do
     grep -qE "^(PASS|FAIL|UNCHECKED) $name " "$tmp/verdict.out"
     expect 0 $? "verdict prints a $name line"
@@ -2306,6 +2334,89 @@ code=0
 run verdict >"$tmp/verdict-fell.out" 2>&1 || code=$?
 expect 1 "$code" "a record count that falls across a restart fails"
 expect_grep '^FAIL unreadable.*from 10 to 0' "$tmp/verdict-fell.out" "the fall is named"
+
+# A reboot makes launchd start the recorder, and that start line is nobody's plan and nobody's crash.
+reboot_fixture() { # reboot_fixture <start line, seconds after the boot> <boot, seconds ago>
+    verdict_fixture
+    boot_at "$(iso_ago "$2")"
+    printf '%s conbus daemon: beef: socket /x/sock log /x/log (10 record(s), 0 unreadable)\n' \
+        "$(iso_ago $(($2 - $1)))" >>"$home/.conbus/daemon.log"
+}
+reboot_fixture 200 $((3 * DAY))
+code=0; run verdict >"$tmp/verdict-reboot.out" 2>&1 || code=$?
+expect 0 "$code" "a start shortly after a reboot is not an unplanned restart"
+expect_grep '^PASS restarts' "$tmp/verdict-reboot.out" "restarts passes"
+expect_grep '^PASS reboots — 1 reboot(s) in the window' "$tmp/verdict-reboot.out" "and the reboot has its own line"
+boot_at_none
+verdict_fixture
+code=0; run verdict >"$tmp/verdict-noreboot.out" 2>&1 || code=$?
+expect_grep '^PASS reboots — 0 reboot(s) in the window' "$tmp/verdict-noreboot.out" "a window with none says so"
+# kern.boottime has only the latest. An earlier one comes from `last reboot`, to the minute and in local time.
+verdict_fixture
+boot_at "$(iso_ago $((2 * DAY)))"
+reboot_listed $((5 * DAY))
+for reboot_ago in $((5 * DAY - 200)) $((2 * DAY - 180)); do
+    printf '%s conbus daemon: beef: socket /x/sock log /x/log (10 record(s), 0 unreadable)\n' "$(iso_ago "$reboot_ago")" >>"$home/.conbus/daemon.log"
+done
+code=0; run verdict >"$tmp/verdict-reboot-two.out" 2>&1 || code=$?
+expect 0 "$code" "two reboots in a window, one of them only in last reboot"
+expect_grep '^PASS reboots — 2 reboot(s) in the window' "$tmp/verdict-reboot-two.out" "both are counted"
+# The latest boot in both sources is one boot.
+verdict_fixture
+boot_at "$(iso_ago $((2 * DAY)))"
+reboot_listed $((2 * DAY))
+printf '%s conbus daemon: beef: socket /x/sock log /x/log (10 record(s), 0 unreadable)\n' "$(iso_ago $((2 * DAY - 180)))" >>"$home/.conbus/daemon.log"
+code=0; run verdict >"$tmp/verdict-reboot-same.out" 2>&1 || code=$?
+expect 0 "$code" "the same boot from both sources"
+expect_grep '^PASS reboots — 1 reboot(s) in the window' "$tmp/verdict-reboot-same.out" "counts once"
+# A crash relaunch is still a fail: with no boot near it, and as a second start after one.
+verdict_fixture
+boot_at "$(iso_ago $((3 * DAY)))"
+printf '%s conbus daemon: beef: socket /x/sock log /x/log (10 record(s), 0 unreadable)\n%s conbus daemon: beef: socket /x/sock log /x/log (10 record(s), 0 unreadable)\n' \
+    "$(iso_ago $((3 * DAY - 200)))" "$(iso_ago $((3 * DAY - 400)))" >>"$home/.conbus/daemon.log"
+code=0; run verdict >"$tmp/verdict-reboot-crash.out" 2>&1 || code=$?
+expect 1 "$code" "a second start in the same boot is a crash"
+expect_grep '^FAIL restarts — 1 unplanned' "$tmp/verdict-reboot-crash.out" "and is counted"
+verdict_fixture
+boot_at "$(iso_ago $((3 * DAY)))"
+printf '%s conbus daemon: beef: socket /x/sock log /x/log (10 record(s), 0 unreadable)\n' "$(iso_ago $((DAY)))" >>"$home/.conbus/daemon.log"
+code=0; run verdict >"$tmp/verdict-reboot-late.out" 2>&1 || code=$?
+expect 1 "$code" "a start long after the boot is not the boot's"
+expect_grep '^FAIL restarts — 1 unplanned' "$tmp/verdict-reboot-late.out" "and is counted"
+# A boot before the swap explains no start after it.
+verdict_fixture "$(iso_ago $((7 * DAY + 3600)))"
+boot_at "$(iso_ago $((7 * DAY + 3700)))"
+printf '%s conbus daemon: beef: socket /x/sock log /x/log (10 record(s), 0 unreadable)\n' "$(iso_ago $((7 * DAY + 3000)))" >>"$home/.conbus/daemon.log"
+code=0; run verdict >"$tmp/verdict-reboot-before.out" 2>&1 || code=$?
+expect 1 "$code" "a boot before the swap explains no start after it"
+# A recorder that did not come back. The start line is what a reboot would have left, so with none:
+verdict_fixture
+boot_at "$(iso_ago $((2 * DAY)))"
+sleep 0 &
+gone_pid=$!
+wait "$gone_pid"
+printf '{"build":"beef","pid":%s,"started":"%s","serving":"%s"}\n' "$gone_pid" "$(iso_after "$fx_swapped" 1)" "$(iso_after "$fx_swapped" 4)" >"$home/.conbus/daemon.build"
+mv "$home/.conbus/conbus.sock" "$home/.conbus/conbus.sock.moved"
+code=0; run verdict >"$tmp/verdict-reboot-noreturn.out" 2>&1 || code=$?
+mv "$home/.conbus/conbus.sock.moved" "$home/.conbus/conbus.sock"
+expect 1 "$code" "a recorder that never came back after a reboot fails"
+expect_grep '^FAIL recorder-serving.*nothing answers' "$tmp/verdict-reboot-noreturn.out" "on recorder-serving"
+expect_grep '^FAIL rss-budget.*not up' "$tmp/verdict-reboot-noreturn.out" "and on rss-budget"
+expect_grep '^PASS reboots — 1 reboot(s) in the window' "$tmp/verdict-reboot-noreturn.out" "and the reboot is named"
+# Up again with no start line since the boot: the stamp says so, and its boot is not accounted for.
+verdict_fixture
+boot_at "$(iso_ago $((2 * DAY)))"
+printf '{"build":"beef","pid":%s,"started":"%s","serving":"%s"}\n' "$recorder_pid" "$(iso_ago $((2 * DAY - 100)))" "$(iso_ago $((2 * DAY - 98)))" >"$home/.conbus/daemon.build"
+code=0; run verdict >"$tmp/verdict-reboot-noline.out" 2>&1 || code=$?
+expect 4 "$code" "a boot with no start line leaves restarts open"
+expect_grep '^UNCHECKED restarts.*stamp says it started' "$tmp/verdict-reboot-noline.out" "and says so"
+# A boot time that cannot be read cannot excuse anything.
+verdict_fixture
+boot_unreadable
+code=0; run verdict >"$tmp/verdict-reboot-unread.out" 2>&1 || code=$?
+expect 4 "$code" "an OS boot time that cannot be read leaves it open"
+expect_grep '^UNCHECKED reboots' "$tmp/verdict-reboot-unread.out" "and says so"
+boot_at_none
 
 # Trimming daemon.log must not read as zero restarts. Only a planned restart's
 # line left: the swap's own boot is gone, so nothing can be said before that line.

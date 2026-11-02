@@ -1302,11 +1302,41 @@ verdict_recorder() {
     fi
 }
 
-# Every boot since the swap should be one the script knows about: the swap's own,
-# or a planned restart's. Paired by time, so a planned restart that never served
-# cannot cancel out a crash, and a log trimmed down to one line cannot read as
-# zero restarts.
+# Every boot of this machine this script can find, as epochs. macOS keeps only the
+# latest in kern.boottime, and the ones before it in `last reboot`, to the minute, in
+# local time, with no year. A window can hold several, so both. Linux has only the
+# latest here: an earlier reboot in the window still reads as a restart there.
+boot_epochs() {
+    if [ "$(uname -s)" = Darwin ]; then
+        { sysctl -n kern.boottime 2>/dev/null || true; } | sed -n 's/.*sec = \([0-9]*\),.*/\1/p'
+        { last reboot 2>/dev/null || true; } | perl -MPOSIX=mktime -ne '
+            my %month; @month{qw(Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec)} = (0 .. 11);
+            next unless /^reboot\b.*\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d+)\s+(\d\d):(\d\d)/;
+            my $year = (localtime)[5];
+            my $at = mktime(0, $4, $3, $2, $month{$1}, $year);
+            $at = mktime(0, $4, $3, $2, $month{$1}, $year - 1) if $at > time + 86400;
+            print "$at\n";'
+    else
+        perl -e 'open(my $f, "<", "/proc/uptime") or exit 0; my ($up) = split(" ", <$f>); printf "%d\n", time - $up'
+    fi
+}
+
+# Every start since the swap should be one the script knows about: the swap's own, a
+# planned restart's, or a reboot's. Paired by time, so a planned restart that never
+# served cannot cancel out a crash, and a log trimmed down to one line cannot read as
+# zero restarts. launchd starts the recorder at login, 177 to 224 s after each boot
+# measured here. A boot's first start line within boot_grace_s is its own, and a second
+# one in that boot is a crash; so is the first if it comes later than that.
+boot_grace_s=1800
 verdict_restarts() {
+    # One boot from each source is one boot: the minute in `last reboot` is at most a
+    # minute before the second in kern.boottime.
+    vs_boot_all=$(boot_epochs)
+    vs_boots=$(printf '%s\n' "$vs_boot_all" | sort -n | awk -v from="$(ts_epoch "$since")" '
+        $1 + 0 <= from + 0 { next }
+        n && $1 - last <= 120 { list[n] = $1; last = $1; next }
+        { list[++n] = $1; last = $1 }
+        END { for (i = 1; i <= n; i++) printf "%s ", list[i] }')
     if [ ! -r "$daemon_log" ]; then
         line UNCHECKED restarts "no readable $daemon_log"
         return
@@ -1334,7 +1364,8 @@ verdict_restarts() {
     # `start` and `restart` each allow the serving limit for install --apply and
     # again for the boot; a start line later than that is its own boot.
     vs_rows=$(awk -v starts="$vs_starts" -v planned="$vs_planned" -v grace=$((serving_limit * 2 + 30)) \
-        -v swap="$(ts_epoch "${recorded_swap:-$since}")" -v exact="$([ "$since" = "$recorded_swap" ] && echo 1)" '
+        -v swap="$(ts_epoch "${recorded_swap:-$since}")" -v exact="$([ "$since" = "$recorded_swap" ] && echo 1)" \
+        -v boots="$vs_boots" -v boot_grace="$boot_grace_s" '
         function take(from,    i) {
             for (i = 1; i <= n; i++)
                 if (!(i in used) && st[i] >= from && st[i] <= from + grace) { used[i] = 1; return 1 }
@@ -1354,11 +1385,20 @@ verdict_restarts() {
                 if (part[2] < 0) printf "never_served %s\n", when
                 else if (!got) printf "no_line %s\n", when
             }
+            b = split(boots, boot, " ")
+            for (j = 1; j <= b; j++) {
+                for (i = 1; i <= n; i++) {
+                    if (st[i] < boot[j] - 60) continue
+                    if (st[i] <= boot[j] + boot_grace && !(i in used)) { used[i] = 1; rebooted++ }
+                    break
+                }
+            }
             for (i = 1; i <= n; i++) if (!(i in used)) unplanned++
-            printf "seen %d\nplanned %d\nunplanned %d\n", n, m, unplanned
+            printf "seen %d\nplanned %d\nrebooted %d\nunplanned %d\n", n, m, rebooted, unplanned
         }')
     vs_seen=$(row_value "$vs_rows" seen)
     vs_count=$(row_value "$vs_rows" planned)
+    vs_rebooted=$(row_value "$vs_rows" rebooted)
     vs_unplanned=$(row_value "$vs_rows" unplanned)
     vs_never=$(row_value "$vs_rows" never_served | tr '\n' ' ')
     vs_noline=$(row_value "$vs_rows" no_line | tr '\n' ' ')
@@ -1367,7 +1407,7 @@ verdict_restarts() {
 
     vs_faults="" vs_open=""
     if [ "$vs_unplanned" -gt 0 ]; then
-        vs_faults="$vs_faults; $vs_unplanned unplanned daemon start(s) since $since ($vs_seen seen: 1 swap + $vs_count planned)"
+        vs_faults="$vs_faults; $vs_unplanned unplanned daemon start(s) since $since ($vs_seen seen: 1 swap + $vs_count planned + $vs_rebooted after a reboot)"
     fi
     if [ -n "$vs_never" ]; then
         vs_faults="$vs_faults; a planned restart never served: $vs_never"
@@ -1387,8 +1427,18 @@ verdict_restarts() {
         line UNCHECKED restarts "${vs_open#; }"
     else
         line PASS restarts \
-            "0 unplanned daemon start(s) since $since ($vs_seen seen: 1 swap + $vs_count planned)"
+            "0 unplanned daemon start(s) since $since ($vs_seen seen: 1 swap + $vs_count planned + $vs_rebooted after a reboot)"
     fi
+}
+
+verdict_reboots() {
+    if [ -z "$vs_boot_all" ]; then
+        line UNCHECKED reboots "the OS boot time could not be read, so a start line cannot be told from a crash"
+        return
+    fi
+    vr_n=0
+    for _ in $vs_boots; do vr_n=$((vr_n + 1)); done
+    line PASS reboots "$vr_n reboot(s) in the window; a boot's first start within ${boot_grace_s}s is its own. Whether the recorder came back is what restarts, recorder-serving and rss-budget judge"
 }
 
 # Unreadable lines across the window, not the last boot. Each boot reports the whole
@@ -1999,6 +2049,7 @@ case $sub in
 
         verdict_recorder
         verdict_restarts
+        verdict_reboots
         verdict_unreadable
         verdict_log_files
         verdict_disk
