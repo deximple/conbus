@@ -30,6 +30,7 @@ else `~/.conbus`.
 | `log/segment-*.jsonl` | prompts and replies; tool bodies only if `CONBUS_RETENTION` says so | directory `0700`, files `0600` |
 | `conbus.sock` | the recorder's socket | `0600` |
 | `facts.jsonl`, `links.jsonl`, `takeover.json`, `quota/`, `drops.jsonl`, `daemon.log`, `chat-export/` | derived state, and the recorder's own messages | inside the `0700` root |
+| `daemon.lock` | empty; the running recorder holds a lock on it, so a second daemon writes nothing | `0600` |
 | `policy.json` | the person's own `PreToolUse` rules, if they wrote any — off otherwise | inside the `0700` root |
 | `cache/meta/` | a derived read cache: the log's records with tool bodies replaced by SHA-256 digests (prompts and replies as in the log); deleting it loses nothing | directories `0700`, files `0600` |
 | `spool/` | hook requests waiting for a recorder that is restarting: retention applied before writing (tool bodies elided unless `full`), at most 1 MiB each and 16 MiB in all, deleted once ingested, never written where no recorder ever ran | directory `0700`, files `0600` |

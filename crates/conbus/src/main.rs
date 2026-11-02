@@ -72,6 +72,22 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let command = cli::parse(&args, std::env::var("CONBUS_HARNESS").ok());
     leave_quietly_when_the_output_is_gone(matches!(command, Command::Hook { .. }));
+    // `backfill --apply` and its kin write the log themselves, so they hold the
+    // recorder's claim until they are done, or refuse before writing anything.
+    let _claim = match &command {
+        Command::Backfill { apply: true, .. } => match Paths::resolve() {
+            Ok(paths) => match daemon::claim_for_a_fill(&paths) {
+                Ok(claim) => claim,
+                Err(err) => {
+                    eprintln!("conbus: {err}");
+                    return ExitCode::FAILURE;
+                }
+            },
+            // `run` says this one.
+            Err(_) => None,
+        },
+        _ => None,
+    };
     match command {
         // A hook must never fail the turn it is attached to, so every failure
         // below leaves on stderr and exits zero.
@@ -157,7 +173,7 @@ fn main() -> ExitCode {
             run(|paths| daemon::serve(paths, Retention::from_env()))
         }
         Command::Daemon { prepare: true } => {
-            run(|paths| daemon::prepare(paths, Retention::from_env()))
+            run(|paths| daemon::prepare_command(paths, Retention::from_env()))
         }
         Command::Log { json, filter } => run(|paths| report::log(paths, json, &filter)),
         Command::LogIndex => run(report::log_index),
