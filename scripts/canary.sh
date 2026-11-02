@@ -1280,16 +1280,28 @@ verdict_recorder() {
         2) vr_faults="$vr_faults; nothing answers at $root/conbus.sock" ;;
         *) vr_faults="$vr_faults; something holds $root/conbus.sock and did not answer in three tries of ${probe_s}s" ;;
     esac
-    # An idle daemon drains the spool every two seconds, so an old entry is a
-    # record that has not reached the log.
-    vr_stale=0
+    # An idle daemon drains the spool every two seconds, so an old entry is a record
+    # that has not reached the log. Except what #157 holds on purpose: a tool event or a
+    # notification whose session has no conversation yet waits a day for its prompt.
+    # Its kind is in the entry, and a kind that cannot be read gets no such allowance.
+    vr_stale=0 vr_parked=0
     if [ -d "$root/spool" ] && [ ! -r "$root/spool" ]; then
         vr_faults="$vr_faults; $root/spool cannot be read"
     elif [ -d "$root/spool" ]; then
-        vr_stale=$(find "$root/spool" -maxdepth 1 -name '*.json' -mmin +10 | wc -l | tr -d ' ')
+        vr_stale=$(find "$root/spool" -maxdepth 1 -name '*.json' -mmin +1440 | wc -l | tr -d ' ')
+        while IFS= read -r vr_entry; do
+            [ -n "$vr_entry" ] || continue
+            vr_kind=$(grep -ao '"event":"[a-z_]*"' "$vr_entry" 2>/dev/null | sed -n '1p' || true)
+            case $vr_kind in
+                '"event":"tool_requested"' | '"event":"tool_use"' | '"event":"tool_denied"' | \
+                    '"event":"tool_batch_ended"' | '"event":"permission_asked"' | '"event":"notified"')
+                    vr_parked=$((vr_parked + 1)) ;;
+                *) vr_stale=$((vr_stale + 1)) ;;
+            esac
+        done <<<"$(find "$root/spool" -maxdepth 1 -name '*.json' -mmin +10 ! -mmin +1440)"
     fi
     if [ "$vr_stale" -gt 0 ]; then
-        vr_faults="$vr_faults; $vr_stale spooled record(s) older than 10 minutes have not reached the log"
+        vr_faults="$vr_faults; $vr_stale spooled record(s) have not reached the log: older than 10 minutes, or 24 hours for a tool event or a notification"
     fi
     vr_write=$(log_cannot_take "$doctor_out")
     if [ -n "$vr_write" ]; then
@@ -1298,7 +1310,11 @@ verdict_recorder() {
     if [ -n "$vr_faults" ]; then
         line FAIL recorder-serving "${vr_faults#; }"
     else
-        line PASS recorder-serving "the daemon answered a request on its socket, and nothing is stuck in the spool"
+        vr_waiting=""
+        if [ "$vr_parked" -gt 0 ]; then
+            vr_waiting="; $vr_parked tool event(s) or notification(s) waiting up to 24 hours for a prompt from their session"
+        fi
+        line PASS recorder-serving "the daemon answered a request on its socket, and nothing is stuck in the spool$vr_waiting"
     fi
 }
 

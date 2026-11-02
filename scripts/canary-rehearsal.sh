@@ -2709,6 +2709,51 @@ code=0; run start --from "$tmp/stage/conbus-good" >/dev/null 2>&1 || code=$?
 expect 0 "$code" "start with segments"
 expect_grep '"log_files":"2:00000005:00000006"' "$home/.conbus/canary.json" "records them"
 
+# #157 holds a tool event or a notification for a day on purpose: its session's prompt may still come. Parked is not stuck.
+for parked_kind in tool_requested tool_use tool_denied tool_batch_ended permission_asked notified; do
+    verdict_fixture
+    spool_entry parked "$parked_kind" -002000
+    code=0; run verdict >"$tmp/verdict-parked.out" 2>&1 || code=$?
+    expect 0 "$code" "a $parked_kind entry parked twenty minutes is no fault of a serving recorder (P6)"
+    expect_grep '^PASS recorder-serving.*1 tool event(s) or notification(s) waiting' "$tmp/verdict-parked.out" "and it is shown"
+done
+# Everything else keeps the ten minutes. A prompt or a stop has no reason to wait.
+verdict_fixture
+spool_entry stuck turn_started -002000
+code=0; run verdict >"$tmp/verdict-parked-prompt.out" 2>&1 || code=$?
+expect 1 "$code" "a prompt twenty minutes old is stuck"
+expect_grep '^FAIL recorder-serving.*1 spooled record' "$tmp/verdict-parked-prompt.out" "and counted"
+verdict_fixture
+spool_entry stuck turn_ended -002000
+code=0; run verdict >/dev/null 2>&1 || code=$?
+expect 1 "$code" "so is a stop"
+# Parked past its day, it should have gone.
+verdict_fixture
+spool_entry parked notified -235900
+code=0; run verdict >/dev/null 2>&1 || code=$?
+expect 0 "$code" "a parked entry just inside its day is still waiting"
+verdict_fixture
+spool_entry parked notified -250000
+code=0; run verdict >"$tmp/verdict-parked-old.out" 2>&1 || code=$?
+expect 1 "$code" "one past its day is stuck"
+expect_grep '^FAIL recorder-serving.*1 spooled record' "$tmp/verdict-parked-old.out" "and counted"
+# An entry whose kind cannot be read gets no such allowance.
+if [ "$(id -u)" != 0 ]; then
+    verdict_fixture
+    spool_entry unread notified -002000
+    chmod 000 "$home/.conbus/spool/unread.json"
+    code=0; run verdict >/dev/null 2>&1 || code=$?
+    chmod 600 "$home/.conbus/spool/unread.json"
+    expect 1 "$code" "an entry that cannot be read is stuck"
+fi
+# A tool body that quotes the words is not its kind.
+verdict_fixture
+mkdir -p "$home/.conbus/spool"
+printf '{"pv":6,"harness":"claude_code","event":{"event":"turn_started","prompt":"\\"event\\":\\"notified\\""}}' >"$home/.conbus/spool/quoted.json"
+touch -A -002000 "$home/.conbus/spool/quoted.json"
+code=0; run verdict >/dev/null 2>&1 || code=$?
+expect 1 "$code" "words quoted in a prompt do not make it parked"
+
 # A real build under this throwaway HOME would ask an agy that is not signed
 # in, and a build older than the sign-in check opens a browser tab doing it.
 expect_file "$tmp/agy-bin.seen" "the fakes saw doctor run"
