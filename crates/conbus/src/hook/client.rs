@@ -200,6 +200,15 @@ pub fn briefing_reply(harness: &str, hook_event_name: &str, context: &str, messa
     reply.to_string()
 }
 
+/// What a hook whose stdin could not be read has to say: the record did not land.
+/// A session this tool started is answered silently here too, as in [`run_in`].
+pub fn payload_unread(harness: &str, err: &std::io::Error) -> Result<Reply, Dropped> {
+    if std::env::var_os(INTERNAL_MARKER).is_some_and(|value| !value.is_empty()) {
+        return Ok(silent_reply(harness).to_string());
+    }
+    Err(Dropped::new(hook::PAYLOAD_UNREAD).with_detail(err.to_string()))
+}
+
 /// Mirror one hook payload. Returns the line to print, or a diagnostic when the
 /// record did not land; the caller reports it, prints the silent reply, and
 /// still exits zero.
