@@ -528,9 +528,9 @@ impl ReadSoFar {
         let answered = ran
             .0
             .iter()
-            .any(|(source, state)| *state != FAILED && !source.starts_with(STALLED));
+            .any(|(source, state)| was_read(*state) && !source.starts_with(STALLED));
         for (source, state) in ran.0 {
-            if state != FAILED {
+            if was_read(state) {
                 self.forget(&stalled_on(&source));
             }
             self.note(&source, state);
@@ -1004,14 +1004,24 @@ const STALL_BACK_OFF_SECS: i64 = 3600;
 /// What a start says about a server or a thread it is leaving alone.
 const LEFT_ALONE: &str = "it stalled at an earlier start, and is asked again after an hour or by `conbus backfill --gaps`";
 
-/// Noted in a held range, with the time, for a thread the app-server was given at
-/// least half its limit to answer about and did not. A thread that keeps growing
-/// answers first, so [`STALLED`] alone never gets noted and one slow thread behind
-/// it costs the whole limit at every start. Half, because the thread in hand when a
-/// limit runs out did nothing wrong: it goes behind the others, and if it really is
-/// that slow, it gets its share when it comes to the front.
+/// How long a server or a thread has to have had before it can be called stalled. A real
+/// app-server has taken about 2 s to come up, so a limit the transcripts left under this
+/// says nothing about the server, and an hour without it would be for nothing.
+const FAIR_TRY: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Noted in a held range, with the time, for a thread the app-server had nearly the whole
+/// of its limit to answer about and did not. A thread that keeps growing answers first,
+/// so [`STALLED`] alone never gets noted and one slow thread behind it costs the whole
+/// limit at every start. What counts is the time it got: the thread in hand when a limit
+/// runs out behind another, slower one did nothing wrong, and it goes first next time.
 fn stalled_on(thread: &str) -> String {
     format!("{STALLED} on {thread}")
+}
+
+/// Whether a note made at `at` still stands. A note from a clock that ran ahead does not:
+/// nothing says how long ago it was, and it would outlast the hour it promises.
+fn within_back_off(at: i64, now_unix: i64) -> bool {
+    (0..STALL_BACK_OFF_SECS).contains(&(now_unix - at))
 }
 
 /// Take out the threads the server stalled on within the back-off. Their range
@@ -1026,7 +1036,7 @@ fn leave_stalled_alone(
     threads.retain(|(thread, _)| {
         !read
             .state_of(&stalled_on(&thread.to_string()))
-            .is_some_and(|at| now_unix - at < STALL_BACK_OFF_SECS)
+            .is_some_and(|at| within_back_off(at, now_unix))
     });
     if threads.len() < asked {
         timing.codex_deferred = Some(LEFT_ALONE.to_string());
@@ -1038,6 +1048,15 @@ const NO_STATE: i64 = i64::MIN;
 
 /// The state of a thread the app-server stopped answering on. Never current.
 const FAILED: i64 = i64::MIN + 1;
+
+/// The state of a thread a limit caught before it had a fair share of it. Never current,
+/// and it goes first next time.
+const CUT: i64 = i64::MIN + 2;
+
+/// Whether a thread noted in this state has been read.
+fn was_read(state: i64) -> bool {
+    state != FAILED && state != CUT
+}
 
 /// Where the Codex pass looks: which binary answers, and where its rollouts are.
 /// From the environment, except in a test, where setting that would not be sound.
@@ -1140,7 +1159,7 @@ fn fill_live_codex_gaps(
     }
     if read
         .state_of(STALLED)
-        .is_some_and(|at| now_unix - at < STALL_BACK_OFF_SECS)
+        .is_some_and(|at| within_back_off(at, now_unix))
     {
         timing.codex_deferred = Some(LEFT_ALONE.to_string());
         return Ok(fill);
@@ -1149,7 +1168,7 @@ fn fill_live_codex_gaps(
     let mut server = match AppServer::start_with(&source.binary, server_limit) {
         Ok(server) => server,
         Err(err) => {
-            if start.elapsed() >= server_limit {
+            if start.elapsed() >= server_limit && server_limit >= FAIR_TRY {
                 read.note(STALLED, now_unix);
             }
             timing.codex_deferred = Some(err.to_string());
@@ -1220,12 +1239,26 @@ fn fill_live_codex_gaps(
                 }
                 // Nothing behind it will answer either. It goes behind the threads
                 // not yet asked next time, or it stops them being reached at all.
-                read.note(name, FAILED);
-                if asked.elapsed() * 2 >= server_limit {
+                let got = asked.elapsed();
+                let had_its_turn = got >= FAIR_TRY
+                    && got.as_secs_f64()
+                        >= 0.9
+                            * (start + server_limit)
+                                .duration_since(turns_at)
+                                .as_secs_f64();
+                let suspect = read.state_of(name) == Some(CUT);
+                if start.elapsed() < server_limit {
+                    read.note(name, FAILED);
+                } else if had_its_turn {
+                    read.note(name, FAILED);
                     read.note(&stalled_on(name), now_unix);
-                }
-                if timing.list_turns_threads == 0 && start.elapsed() >= server_limit {
-                    read.note(STALLED, now_unix);
+                    // Asked first because the last limit caught it, it says nothing of
+                    // the threads behind it.
+                    if timing.list_turns_threads == 0 && !suspect {
+                        read.note(STALLED, now_unix);
+                    }
+                } else {
+                    read.note(name, CUT);
                 }
                 timing.codex_deferred = Some(why);
                 break;
@@ -1276,14 +1309,19 @@ fn files_left_to_read(to_read: &mut Vec<(&PathBuf, &str, BusId)>, read: &ReadSoF
     to_read.sort_by_key(|(file, ..)| read.knows(&used_up_a_budget(file)));
 }
 
-/// What a held range has read in this state is done. What it has not read at all
-/// goes first, or the threads a budget reaches are the same ones each start. A thread
-/// with no state cannot be current, since nothing says it has not changed since.
+/// What a held range has read in this state is done. What a limit caught goes first, so
+/// it gets the whole of one, and then what the range has not read at all, or the threads
+/// a budget reaches are the same ones each start. A thread with no state cannot be
+/// current, since nothing says it has not changed since.
 fn unread_first(threads: &mut Vec<(BusId, i64)>, read: &ReadSoFar) {
     threads.retain(|(thread, state)| {
         *state == NO_STATE || !read.is_current(&thread.to_string(), *state)
     });
-    threads.sort_by_key(|(thread, _)| read.knows(&thread.to_string()));
+    threads.sort_by_key(|(thread, _)| match read.state_of(&thread.to_string()) {
+        Some(CUT) => 0,
+        None => 1,
+        Some(_) => 2,
+    });
 }
 
 /// Threads `thread/list` says were updated at or after `since`, or `None`
@@ -3530,6 +3568,68 @@ for line in sys.stdin:
             timing.codex_deferred.as_deref(),
             Some("the start's budget ran out")
         );
+    }
+
+    #[test]
+    fn a_thread_a_limit_caught_goes_first_then_what_is_unread_then_the_rest() {
+        let (cut, unread, failed): (BusId, BusId, BusId) = (
+            "00000000-0000-4000-8000-000000000003"
+                .parse()
+                .expect("uuid"),
+            "00000000-0000-4000-8000-000000000002"
+                .parse()
+                .expect("uuid"),
+            "00000000-0000-4000-8000-000000000001"
+                .parse()
+                .expect("uuid"),
+        );
+        let mut read = ReadSoFar::default();
+        read.note(&cut.to_string(), CUT);
+        read.note(&failed.to_string(), FAILED);
+        let mut threads = vec![(failed, 5), (unread, 5), (cut, 5)];
+
+        unread_first(&mut threads, &read);
+
+        assert_eq!(threads, vec![(cut, 5), (unread, 5), (failed, 5)]);
+    }
+
+    #[test]
+    fn a_note_from_the_future_or_over_an_hour_old_does_not_stand() {
+        assert!(within_back_off(1_000, 1_000));
+        assert!(within_back_off(1_000, 1_000 + STALL_BACK_OFF_SECS - 1));
+        assert!(!within_back_off(1_000, 1_000 + STALL_BACK_OFF_SECS));
+        assert!(!within_back_off(1_001, 1_000), "a clock that ran ahead");
+    }
+
+    #[test]
+    fn a_fill_by_hand_that_read_a_thread_clears_what_the_server_was_called() {
+        let thread = "00000000-0000-4000-8000-000000000001";
+        let mut read = ReadSoFar::default();
+        read.note(STALLED, 1_000);
+        read.note(&stalled_on(thread), 1_000);
+        let mut ran = ReadSoFar::default();
+        ran.note(thread, 5);
+
+        read.absorb(ran);
+
+        assert!(!read.knows(STALLED), "the server answered");
+        assert!(!read.knows(&stalled_on(thread)), "and about this thread");
+        assert!(read.is_current(thread, 5));
+    }
+
+    #[test]
+    fn a_fill_by_hand_that_read_nothing_clears_nothing() {
+        let thread = "00000000-0000-4000-8000-000000000001";
+        let mut read = ReadSoFar::default();
+        read.note(STALLED, 1_000);
+        read.note(&stalled_on(thread), 1_000);
+        let mut ran = ReadSoFar::default();
+        ran.note(thread, FAILED);
+
+        read.absorb(ran);
+
+        assert!(read.knows(STALLED));
+        assert!(read.knows(&stalled_on(thread)));
     }
 
     #[test]

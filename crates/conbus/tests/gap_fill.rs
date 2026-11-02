@@ -1659,7 +1659,7 @@ fn start_with_stalled_codex(home: &Path, codex: &Path) {
         home,
         daemon_command(home)
             .env("CONBUS_CODEX_BIN", codex)
-            .env("CONBUS_GAP_BUDGET_MS", "1000")
+            .env("CONBUS_GAP_BUDGET_MS", "2500")
             .stderr(Stdio::from(notes))
             .spawn()
             .expect("daemon"),
@@ -1988,7 +1988,7 @@ fn a_thread_that_wedges_the_server_costs_one_start_not_every_start() {
     for _ in 0..4 {
         rollout_of(home, THREAD_A, 0); // the person keeps using A
         let before = std::fs::read_to_string(&notes).unwrap_or_default().len();
-        times.push(timed_start(home, &fake, "1500", &notes));
+        times.push(timed_start(home, &fake, "4000", &notes));
         let said = std::fs::read_to_string(&notes).unwrap_or_default();
         if !said[before..].contains("it stalled at an earlier start") {
             asked += 1;
@@ -2012,7 +2012,7 @@ fn a_by_hand_fill_that_reads_a_stalled_thread_ends_the_cost() {
     let (stub, fake) = codex_stand_in(WEDGED_ON_B);
     a_thread_behind_one_that_keeps_growing(home);
     let notes = home.join("notes");
-    timed_start(home, &fake, "1500", &notes);
+    timed_start(home, &fake, "4000", &notes);
     assert!(
         home.join("cache/gap-since-codex").exists(),
         "the range is held"
@@ -2036,7 +2036,7 @@ fn a_by_hand_fill_that_reads_a_stalled_thread_ends_the_cost() {
 
     // B would hang now, so a start that asked it again would hold the range again.
     rollout_of(home, THREAD_A, 0);
-    timed_start(home, &fake, "1500", &notes);
+    timed_start(home, &fake, "4000", &notes);
     assert!(
         !home.join("cache/gap-since-codex").exists(),
         "after a by-hand fill read the thread, the next start asked it again"
@@ -2050,7 +2050,7 @@ fn a_dry_run_by_hand_leaves_a_stalled_threads_marks_alone() {
     let home = dir.path();
     let (stub, fake) = codex_stand_in(WEDGED_ON_B);
     a_thread_behind_one_that_keeps_growing(home);
-    timed_start(home, &fake, "1500", &home.join("notes"));
+    timed_start(home, &fake, "4000", &home.join("notes"));
     let held = std::fs::read_to_string(home.join("cache/gap-read")).expect("noted");
 
     std::fs::write(stub.path().join("answer-b"), "").expect("flag");
@@ -2071,7 +2071,7 @@ fn a_stalled_thread_is_asked_again_once_the_back_off_has_passed() {
     let (stub, fake) = codex_stand_in(WEDGED_ON_B);
     a_thread_behind_one_that_keeps_growing(home);
     let notes = home.join("notes");
-    timed_start(home, &fake, "1500", &notes);
+    timed_start(home, &fake, "4000", &notes);
 
     // Two hours ago, as far as the record of it goes.
     let read = home.join("cache/gap-read");
@@ -2090,7 +2090,7 @@ fn a_stalled_thread_is_asked_again_once_the_back_off_has_passed() {
     std::fs::write(&read, rewound.join("\n") + "\n").expect("rewind");
     std::fs::write(stub.path().join("answer-b"), "").expect("flag");
 
-    timed_start(home, &fake, "1500", &notes);
+    timed_start(home, &fake, "4000", &notes);
 
     assert!(
         log_lines(home)
@@ -2112,8 +2112,8 @@ fn a_server_that_stalls_on_its_first_thread_is_left_alone_after() {
     rollout_of(home, THREAD_B, 0);
     let notes = home.join("notes");
 
-    let first = timed_start(home, &fake, "1500", &notes);
-    let second = timed_start(home, &fake, "1500", &notes);
+    let first = timed_start(home, &fake, "4000", &notes);
+    let second = timed_start(home, &fake, "4000", &notes);
 
     let said = std::fs::read_to_string(&notes).unwrap_or_default();
     assert!(
@@ -2129,7 +2129,7 @@ fn a_start_with_only_a_stalled_thread_left_does_not_bring_the_server_up() {
     let (stub, fake) = codex_stand_in(WEDGED_ON_B);
     a_thread_behind_one_that_keeps_growing(home);
     let notes = home.join("notes");
-    timed_start(home, &fake, "1500", &notes);
+    timed_start(home, &fake, "4000", &notes);
     let launches = || {
         std::fs::read_to_string(stub.path().join("launches"))
             .unwrap_or_default()
@@ -2139,7 +2139,7 @@ fn a_start_with_only_a_stalled_thread_left_does_not_bring_the_server_up() {
     let before = launches();
 
     // A has not changed since it was read, and B is being left alone.
-    timed_start(home, &fake, "1500", &notes);
+    timed_start(home, &fake, "4000", &notes);
 
     assert_eq!(launches(), before, "brought up with nothing to ask");
     let said = std::fs::read_to_string(&notes).unwrap_or_default();
@@ -2901,7 +2901,7 @@ for line in sys.stdin:
     rollout_of(home, THREAD_A, 0);
     rollout_of(home, THREAD_B, 60);
     let notes = home.join("notes");
-    timed_start(home, &fake, "1500", &notes);
+    timed_start(home, &fake, "4000", &notes);
     let launches = || {
         std::fs::read_to_string(stub.path().join("launches"))
             .unwrap_or_default()
@@ -2910,7 +2910,7 @@ for line in sys.stdin:
     };
     let before = launches();
 
-    timed_start(home, &fake, "1500", &notes);
+    timed_start(home, &fake, "4000", &notes);
 
     assert_eq!(launches(), before, "brought up again within the hour");
 }
@@ -3230,5 +3230,181 @@ fn the_flag_for_older_lines_only_goes_with_gaps() {
         String::from_utf8_lossy(&output.stderr).contains("goes with --gaps"),
         "{}",
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// A stand-in on which thread A answers after `a_secs` and thread B never does.
+fn a_slow_a_and_a_wedged_b(a_secs: f64) -> String {
+    format!(
+        r#"
+here = os.path.dirname(os.path.abspath(sys.argv[0]))
+for line in sys.stdin:
+    msg = json.loads(line)
+    m = msg.get("method"); i = msg.get("id")
+    if m == "initialize":
+        print(json.dumps({{"jsonrpc":"2.0","id":i,"result":{{"userAgent":"fake"}}}}), flush=True)
+    elif m == "thread/turns/list":
+        t = msg["params"]["threadId"]
+        if t.endswith("b"):
+            time.sleep(600)
+        open(os.path.join(here, "a-asked"), "a").write("x\n")
+        time.sleep({a_secs})
+        print(json.dumps(turns_page(msg, [])), flush=True)
+"#
+    )
+}
+
+#[test]
+fn a_wedged_thread_behind_a_slow_growing_one_costs_two_starts_not_every_start() {
+    // At the first it gets what the slow thread leaves, which says nothing, so it goes
+    // first at the second, gets the whole limit, and is then left alone.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let (stub, fake) = codex_stand_in(&a_slow_a_and_a_wedged_b(2.0));
+    let daemon = start(home);
+    codex_thread_live(home, THREAD_A, "a0", "before");
+    codex_thread_live(home, THREAD_B, "b0", "before");
+    stop(daemon);
+    rollout_of(home, THREAD_B, 60);
+    let notes = home.join("notes");
+    let mut asked = 0;
+    let mut times = Vec::new();
+    for _ in 0..4 {
+        rollout_of(home, THREAD_A, 0); // the person keeps using A
+        let before = std::fs::read_to_string(&notes).unwrap_or_default().len();
+        times.push(timed_start(home, &fake, "4000", &notes));
+        let said = std::fs::read_to_string(&notes).unwrap_or_default();
+        if !said[before..].contains("it stalled at an earlier start") {
+            asked += 1;
+        }
+    }
+    assert_eq!(asked, 2, "asked at {asked} of 4 starts: {times:?}");
+    // The stall is put down to the thread, so the one that grows is still read after it.
+    let a_asked = std::fs::read_to_string(stub.path().join("a-asked"))
+        .unwrap_or_default()
+        .lines()
+        .count();
+    assert!(a_asked >= 2, "A was asked at {a_asked} of 4 starts");
+}
+
+#[test]
+fn a_healthy_server_given_a_sliver_of_the_budget_is_not_left_alone_for_an_hour() {
+    // What the transcripts leave of the budget is the server's limit. It takes 400 ms to
+    // come up here, and a real one takes longer than that.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let (_stub, fake) = codex_stand_in(
+        r#"
+for line in sys.stdin:
+    msg = json.loads(line)
+    m = msg.get("method"); i = msg.get("id")
+    if m == "initialize":
+        time.sleep(0.4)
+        print(json.dumps({"jsonrpc":"2.0","id":i,"result":{"userAgent":"fake"}}), flush=True)
+    elif m == "thread/turns/list":
+        data=[{"id":"t1","items":[{"type":"userMessage","content":[{"type":"text","text":"missed"}]},{"type":"agentMessage","text":"a1"}],"status":"completed","startedAt":1788368800,"completedAt":1788368801}]
+        print(json.dumps(turns_page(msg, data)), flush=True)
+"#,
+    );
+    a_live_codex_thread(home);
+    let notes = home.join("notes");
+
+    timed_start(home, &fake, "200", &notes);
+    timed_start(home, &fake, "15000", &notes);
+
+    let all = log_lines(home);
+    assert!(
+        all.iter().any(|record| record["vendor_turn_id"] == "t1"),
+        "not asked at the next start with its whole budget.\n{}\n{}",
+        std::fs::read_to_string(&notes).unwrap_or_default(),
+        show(&all)
+    );
+}
+
+#[test]
+fn a_thread_given_a_sliver_of_the_budget_is_not_called_stalled_either() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let (stub, fake) = codex_stand_in(WEDGED_ON_B);
+    a_thread_behind_one_that_keeps_growing(home);
+    let notes = home.join("notes");
+
+    timed_start(home, &fake, "1000", &notes);
+
+    std::fs::write(stub.path().join("answer-b"), "").expect("flag");
+    rollout_of(home, THREAD_A, 0);
+    timed_start(home, &fake, "4000", &notes);
+    assert!(
+        log_lines(home)
+            .iter()
+            .any(|record| record["prompt"]["text"] == format!("said in {THREAD_B}")),
+        "left alone: {}",
+        std::fs::read_to_string(&notes).unwrap_or_default()
+    );
+}
+
+#[test]
+fn a_stall_note_from_a_clock_that_ran_ahead_does_not_outlast_its_hour() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let (_stub, fake) = codex_stand_in(FAKE_APP_SERVER);
+    a_live_codex_thread(home);
+    std::fs::create_dir_all(home.join("cache")).expect("cache");
+    let epoch = conbus_core::clock::Timestamp::from_unix_seconds(0).expect("epoch");
+    let thirty_days_on = conbus_core::clock::Timestamp::now().seconds_since(epoch) + 30 * 86_400;
+    std::fs::write(
+        home.join("cache/gap-read"),
+        format!("{thirty_days_on}\tcodex app-server stalled\n"),
+    )
+    .expect("marker");
+
+    start_with_codex(home, &fake);
+
+    assert!(
+        log_lines(home)
+            .iter()
+            .any(|record| record["vendor_turn_id"] == "t1"),
+        "left alone for 30 days"
+    );
+}
+
+#[test]
+fn a_thread_that_fits_the_limit_is_not_left_out_for_an_hour() {
+    // B answers in 4 s and the limit is 5 s. Behind a thread that took 1.5 s it was cut,
+    // well past a fair try, which still says nothing about it, so it goes first next
+    // time and answers.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let (_stub, fake) = codex_stand_in(
+        r#"
+for line in sys.stdin:
+    msg = json.loads(line)
+    m = msg.get("method"); i = msg.get("id")
+    if m == "initialize":
+        print(json.dumps({"jsonrpc":"2.0","id":i,"result":{"userAgent":"fake"}}), flush=True)
+    elif m == "thread/turns/list":
+        t = msg["params"]["threadId"]
+        time.sleep(4.0 if t.endswith("b") else 1.5)
+        data = [{"id":"turn-of-"+t,"items":[{"type":"userMessage","content":[{"type":"text","text":"said in "+t}]},{"type":"agentMessage","text":"a"}],"status":"completed","startedAt":1788368800,"completedAt":1788368801}]
+        print(json.dumps(turns_page(msg, data)), flush=True)
+"#,
+    );
+    let daemon = start(home);
+    codex_thread_live(home, THREAD_A, "a0", "before");
+    codex_thread_live(home, THREAD_B, "b0", "before");
+    stop(daemon);
+    rollout_of(home, THREAD_B, 60);
+    rollout_of(home, THREAD_A, 0);
+    let notes = home.join("notes");
+
+    timed_start(home, &fake, "5000", &notes);
+    timed_start(home, &fake, "5000", &notes);
+
+    assert!(
+        log_lines(home)
+            .iter()
+            .any(|record| record["vendor_turn_id"] == format!("turn-of-{THREAD_B}")),
+        "left out, though it fits the limit alone.\n{}",
+        std::fs::read_to_string(&notes).unwrap_or_default()
     );
 }
