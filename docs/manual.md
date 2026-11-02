@@ -754,7 +754,7 @@ On a Mac:
   set -e
   disk="/Volumes/My Disk"
   conbus backup --verify --to "$disk"
-  find "$disk/conbus-backup/log" -name 'segment-*.jsonl' | grep . >/dev/null
+  find "$disk/conbus-backup/log/" -name 'segment-*.jsonl' | grep . >/dev/null
   launchctl bootout "gui/$(id -u)/sh.conbus.daemon" || true
   report="$(conbus doctor || true)"
   printf '%s\n' "$report" | grep '^socket'
@@ -779,7 +779,7 @@ On Linux:
   set -e
   disk="/Volumes/My Disk"
   conbus backup --verify --to "$disk"
-  find "$disk/conbus-backup/log" -name 'segment-*.jsonl' | grep . >/dev/null
+  find "$disk/conbus-backup/log/" -name 'segment-*.jsonl' | grep . >/dev/null
   systemctl --user disable --now sh.conbus.daemon.service || true
   report="$(conbus doctor || true)"
   printf '%s\n' "$report" | grep '^socket'

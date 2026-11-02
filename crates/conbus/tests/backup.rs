@@ -2956,6 +2956,26 @@ fn a_backup_with_nothing_closed_stops_cleanly_in_an_interactive_zsh() {
 }
 
 #[test]
+fn a_backup_whose_log_folder_is_a_link_still_restores() {
+    // Someone moved the copies to a bigger disk and left a link. --verify and the
+    // block's glob both go through it, so the check before them has to as well.
+    let world = World::with_log();
+    roll_with_nothing_written(&world);
+    let before = world.reads();
+    let folder = world.base.join("dest");
+    ok(&world.backup(&folder));
+    let log = backup_log(&folder);
+    let moved = world.base.join("moved");
+    fs::rename(&log, &moved).expect("move");
+    symlink(&moved, &log).expect("link");
+    fs::remove_dir_all(world.log()).expect("lost");
+
+    restore(&world, &folder);
+
+    assert_eq!(world.reads(), before);
+}
+
+#[test]
 fn a_backup_with_no_copy_left_stops_the_block_without_its_verify_line_too() {
     // That line is left out on purpose to save what is left of a damaged backup.
     // With nothing left at all, the recorder must still not be stopped for it.
