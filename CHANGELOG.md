@@ -6,6 +6,8 @@ the entry says so when it does.
 
 ## [Unreleased]
 
+## [1.0.0-rc.4] — 2026-11-03
+
 The candidate the 1.0 canary runs on. Most of it keeps records through trouble: a
 full disk, a restart, a second recorder, a signal, a hook that arrives at the wrong
 moment and a fill beside a start could each lose a record without a word or write it
