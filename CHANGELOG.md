@@ -21,6 +21,9 @@ the entry says so when it does.
 - `install` waits ten seconds to hear which OpenCode this is, not two, and says when
   it could not tell. A slow answer used to write the plugin for the wrong major with
   no word. `doctor` says it could not read the version, rather than `runs`.
+- `conbus log | head -1` and the like no longer end in a panic. A command whose
+  reader went away exits 141, as if SIGPIPE had ended it, and prints nothing. A
+  hook that cannot print exits 0, because it must never fail the turn it answers.
 
 ## [1.0.0-rc.3] — 2026-11-01
 

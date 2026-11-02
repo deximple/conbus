@@ -45,9 +45,34 @@ use conbus_core::retention::Retention;
 
 use cli::Command;
 
+/// `println!` panics when it cannot write, and `conbus log | head -1` is ordinary
+/// use. A reader that went away ends a command the way SIGPIPE ends any other
+/// Unix tool. SIGPIPE itself stays ignored, because a write to a socket or to a
+/// vendor process that has gone has to come back as an error, not end this one.
+///
+/// A hook exits zero whatever it could not print: it answers a turn, and its
+/// record has already gone where it was going.
+fn leave_quietly_when_the_output_is_gone(is_hook: bool) {
+    let report = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic| {
+        let text = panic.payload_as_str().unwrap_or_default();
+        if text.starts_with("failed printing to std") {
+            if is_hook {
+                std::process::exit(0);
+            }
+            if text.contains("Broken pipe") {
+                std::process::exit(128 + libc::SIGPIPE);
+            }
+        }
+        report(panic);
+    }));
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match cli::parse(&args, std::env::var("CONBUS_HARNESS").ok()) {
+    let command = cli::parse(&args, std::env::var("CONBUS_HARNESS").ok());
+    leave_quietly_when_the_output_is_gone(matches!(command, Command::Hook { .. }));
+    match command {
         // A hook must never fail the turn it is attached to, so every failure
         // below leaves on stderr and exits zero.
         Command::Hook {
