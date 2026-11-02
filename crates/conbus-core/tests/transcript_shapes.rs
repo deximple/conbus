@@ -66,6 +66,7 @@ fn the_turns_of_a_real_transcripts_shapes_are_the_ones_the_hook_fires_for() {
             ("P11", "a turn the vendor could not finish"),
             ("P12", "a turn the recorder went down in"),
             ("P13", "the last turn"),
+            ("P14", "a turn a tool ended"),
         ]
     );
 }
@@ -96,6 +97,7 @@ fn only_a_turn_the_model_finished_has_an_ending() {
             "seventh answer",
             "ninth answer",
             "the last answer",
+            "the closing words",
         ],
         "not the stopped turn, the failed one, or the one the recorder went down in"
     );
@@ -112,5 +114,5 @@ fn what_is_not_a_turn_is_counted_under_its_own_name() {
     assert_eq!(skipped("interrupt line"), 2);
     assert_eq!(skipped("local command output"), 1);
     assert_eq!(skipped("assistant line the vendor wrote"), 2);
-    assert_eq!(skipped("user line with no text"), 2, "two tool results");
+    assert_eq!(skipped("user line with no text"), 3, "three tool results");
 }

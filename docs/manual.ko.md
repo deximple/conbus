@@ -478,15 +478,42 @@ conbus install --apply     # 레코더를 다시 켭니다
 예산이 부족해 다 채우지 못한 범위는 `cache/gap-since`와 `cache/gap-read`에
 기억했다가 다음 시작 때 멈춘 곳부터 이어서 채우고, `daemon.log`에도 남깁니다. `codex app-server`가 시작되지 않거나
 응답을 멈춰 Codex 단계가 돌지 못하면 그 범위는 `cache/gap-since-codex`에 따로
-기억하고, 멈춰 버린 app-server는 시작을 매번 붙잡지 않도록 한 시간 동안 다시
-묻지 않습니다. `conbus backfill --gaps`는 같은 빈틈을 시간 제한 없이 필요할 때
+기억하고, 멈춰 버린 app-server나 스레드는 시작을 매번 붙잡지 않도록 한 시간 동안
+다시 묻지 않습니다. `conbus backfill --gaps`는 같은 빈틈을 시간 제한 없이 필요할 때
 채우며, Claude Code와 Codex에 대해 전체 기록에 걸쳐 동작합니다. `--apply`를
-붙이면 이것 역시 레코더를 멈춰야 합니다. `cache/`를 지우면 기억한 범위도
+붙이면 이것 역시 레코더를 멈춰야 하고, Codex 스레드를 모두 읽고 나면 Codex 범위는
+끝납니다. `cache/`를 지우면 기억한 범위도
 사라지므로 그 뒤에는 `conbus backfill --gaps`를 실행하세요.
+
+`conbus doctor`는 아직 붙잡고 있는 범위마다 `gap fill` 줄을 보여 줍니다. 언제부터인지, 왜인지,
+무엇이 붙잡고 있는지 나옵니다. 각각을 끝내는 방법은 이렇습니다.
+
+- **예산이 부족했습니다.** 다음 시작이 이어서 하거나 `conbus backfill --gaps --apply`가 지금 전부
+  합니다.
+- **트랜스크립트를 읽을 수 없습니다.** `doctor`, `daemon.log`, `conbus backfill --gaps`가 파일을
+  알려 줍니다. 고치거나 `~/.claude/projects` 밖으로 옮기면 다음 시작이 마칩니다.
+- **`codex app-server`가 시작되지 않습니다.** Codex를 고치거나 설치하면 다음 시작이 읽습니다.
+- **스레드가 서버를 멈췄습니다.** 한 시간 뒤에 다시 묻습니다. `conbus backfill --gaps --apply`는
+  바로 묻고, 그 스레드를 읽으면 기다림이 끝납니다.
+- **서버가 스레드를 거절했습니다.** 롤아웃이 바뀔 때까지 다시 묻지 않으므로 기다리는 동안 비용이
+  없습니다. `conbus backfill --gaps --apply`는 바로 묻고 답을 보여 줍니다.
+
+그 범위가 채울 내용이 필요 없다면 `cache/gap-since`나 `cache/gap-since-codex`를 지우세요. 그
+범위를 포기하는 것이고 이미 쓴 레코드는 사라지지 않습니다.
+
+트랜스크립트가 만들어지기 1분 넘게 전에 찍힌 줄은 포크의 앞부분처럼 다른 대화에서 복사된
+것으로 보고 채우지 않습니다. `cp`, `rsync -a`로 옮기거나 다른 볼륨으로 옮긴 트랜스크립트는
+생성 시각이 새로 찍혀 거의 모든 줄이 그렇게 보이므로 아무것도 채워지지 않습니다.
+`conbus backfill --gaps`는 이렇게 제쳐 둔 줄 수를 알려 줍니다. 그래도 채우려면
+`--include-older-lines`를 붙이세요. 트랜스크립트를 옮긴 것이 확실할 때 쓰고, 먼저 dry run을
+보세요. 그 줄이 정말 다른 대화의 복사본일 수 있습니다. 포크라면 부모의 프롬프트이고, 포크 자신의
+턴처럼 나타납니다. 로그에 쓴 레코드는 지울 수 없습니다. 다른 대화가 가진 턴 id는 이때도
+채우지 않습니다.
 
 **Claude.ai 대화**는 데스크톱 앱에 훅이 없습니다. Claude.ai에서 데이터를
 내보내고(Settings → Privacy → Export data) 그 zip(또는 `conversations.json`)을
-`~/.conbus/chat-export/`에 넣으면 레코더가 가져갑니다.
+`~/.conbus/chat-export/`에 넣으면 레코더가 가져갑니다. 레코더가 꺼져 있었다면 파일 날짜와
+상관없이 다음 시작 때 가져갑니다.
 `conbus backfill --chat-export PATH`는 어디에 있는 파일이든 읽고, `--apply`를 붙이고
 레코더를 멈춘 상태에서는 기록합니다. Claude의 Inference hooks를 쓰는 조직은 그것을
 `conbus hook --inference-listen`(기본 `127.0.0.1:8787`)에 연결해 대화를 실시간으로
