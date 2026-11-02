@@ -79,6 +79,14 @@ root=$HOME/.conbus
 stamp=$root/daemon.build
 daemon_log=$root/daemon.log
 drops_log=$root/drops.jsonl
+# A build that rotates its drop log renames a full drops.jsonl here and
+# starts fresh; the file sits beside the live one, never nested further.
+drops_rotated=$root/drops.1.jsonl
+# crates/conbus/src/drops.rs CAP_BYTES. A build that does not rotate (0.2.x,
+# rc.3) stops recording the moment its log reaches this size, so a file at
+# it is blind: every later drop was silently discarded and any "0 drops"
+# verdict on it has no basis.
+drops_cap_bytes=$((4 * 1024 * 1024))
 state_file=$root/canary.json
 
 serving_limit=${CONBUS_CANARY_SERVING_LIMIT:-30}
@@ -92,6 +100,15 @@ serving_ms_budget=${CONBUS_CANARY_SERVING_MS:-5000}
 doctor_limit_s=${CONBUS_CANARY_DOCTOR_LIMIT:-120}
 
 is_uint() { case $1 in '' | *[!0-9]*) return 1 ;; *) return 0 ;; esac }
+
+# An ISO-8601 UTC timestamp with real milliseconds — `date` only writes a
+# literal .000, and drop lines carry true ms, so a same-second boundary
+# needs the fraction to order them.
+now_iso_ms() {
+    perl -MTime::HiRes=gettimeofday -MPOSIX=strftime -e \
+        '($s, $u) = gettimeofday;
+         printf "%s.%03dZ", strftime("%Y-%m-%dT%H:%M:%S", gmtime($s)), int($u / 1000)'
+}
 
 # doctor under a wall-clock cap — CONBUS_CANARY_DOCTOR_LIMIT seconds
 # (default 120). 0.2.x's vendor probes have no bound and a wedged probe has
@@ -518,10 +535,33 @@ say_spool() {
     say "spool: $n file(s) — the old build does not drain them; they wait for the next daemon"
 }
 
-# The distinct drop reasons in drops.jsonl, one per line.
+# The distinct drop reasons across the live file and its rotated
+# generation — a flood that rotated the log mid-window put its reason in
+# drops.1, and reading drops.jsonl alone would miss it.
 drop_reasons() {
-    [ -f "$drops_log" ] || return 0
-    sed -n 's/.*"reason":"\([^"]*\)".*/\1/p' "$drops_log" | LC_ALL=C sort -u
+    for f in "$drops_rotated" "$drops_log"; do
+        [ -f "$f" ] && sed -n 's/.*"reason":"\([^"]*\)".*/\1/p' "$f"
+    done | LC_ALL=C sort -u
+}
+
+# Drop lines with a timestamp later than $1, from both generations. A
+# rotation can rename the file mid-window, so "after this moment" is a
+# timestamp cut, not a line count.
+drop_lines_after() {
+    for f in "$drops_rotated" "$drops_log"; do
+        [ -f "$f" ] || continue
+        awk -v s="$1" '
+            match($0, /"ts":"[^"]*"/) &&
+                substr($0, RSTART + 6, RLENGTH - 7) > s { print }
+        ' "$f"
+    done
+}
+
+# True when drops.jsonl reached the cap on a build that does not rotate:
+# it stopped recording and nothing after that point is observable.
+drops_blind() {
+    [ -f "$drops_log" ] || return 1
+    [ "$(wc -c <"$drops_log" | tr -d ' ')" -ge "$drops_cap_bytes" ]
 }
 
 # Reasons in the second file/list that the first did not have.
@@ -652,6 +692,16 @@ do_preflight() {
         check 1 evidence "directory not found: $evidence_dir"
     else
         check 2 evidence "no $evidence_dir — pass --evidence DIR when it lives elsewhere"
+    fi
+
+    # A drop log at the cap on a build that does not rotate has been blind
+    # since it filled — swapping over it would carry the blind spot into
+    # the new window's verdict. Move it aside first.
+    if drops_blind; then
+        check 1 drops-cap \
+            "$drops_log is at the 4 MiB cap and blind — rotate it aside before a swap"
+    else
+        check 0 drops-cap "drops.jsonl below the cap"
     fi
 
     # The rollback copy: present already, or makeable from the install.
@@ -903,8 +953,16 @@ case $sub in
         #    A swap-window reason — the old daemon's protocol refusal or a
         #    dropped connection mid-restart — is exempt only inside 60
         #    seconds after the swap; the same reason later is a fault.
-        if [ -f "$drops_log" ]; then
-            new_reasons=$(awk -v s="$since" '
+        #    A log at the cap on a build that does not rotate recorded
+        #    nothing after it filled: drops is UNCHECKED, never a pass —
+        #    the live file sat blind like that for seven days in October.
+        if drops_blind; then
+            line UNCHECKED drops \
+                "$drops_log hit the cap and stopped recording — drops after that point are not observable"
+        elif [ -f "$drops_log" ]; then
+            new_reasons=$(for f in "$drops_rotated" "$drops_log"; do
+                [ -f "$f" ] && cat "$f"
+            done | awk -v s="$since" '
                 {
                     ts = ""; r = ""
                     if (match($0, /"ts":"[^"]*"/)) ts = substr($0, RSTART + 6, RLENGTH - 7)
@@ -913,7 +971,7 @@ case $sub in
                     if (ts > s) { after[r] = 1; n++ } else { before[r] = 1 }
                 }
                 END { print n + 0; for (r in after) if (!(r in before)) print r }
-            ' "$drops_log")
+            ')
             drop_count=$(echo "$new_reasons" | head -1)
             new_reasons=$(echo "$new_reasons" | tail -n +2 | LC_ALL=C sort)
             s_epoch=$(ts_epoch "$since")
@@ -931,7 +989,9 @@ case $sub in
                         if ! is_uint "${e:-}" || [ "$e" -gt $((s_epoch + 60)) ]; then
                             late=1
                         fi
-                    done <<< "$(grep -F "\"reason\":\"$r\"" "$drops_log" || true)"
+                    done <<< "$(for f in "$drops_rotated" "$drops_log"; do
+                        [ -f "$f" ] && grep -F "\"reason\":\"$r\"" "$f"
+                    done || true)"
                     if [ "$late" = 1 ]; then
                         real_new="$real_new ${r} (persisted >60s after the swap)"
                     else
@@ -1166,8 +1226,7 @@ case $sub in
         if [ -f "$stamp" ]; then
             old_stamp_pid=$(sed -n 's/.*"pid":\([0-9]*\).*/\1/p' "$stamp")
         fi
-        before_lines=0
-        [ -f "$drops_log" ] && before_lines=$(wc -l <"$drops_log" | tr -d ' ')
+        before_ts=$(now_iso_ms)
         ts=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
         if [ "$mode" = rehearsal ]; then
             say "rehearsal: 'conbus install --apply' skipped (it would hit launchctl)"
@@ -1192,17 +1251,17 @@ case $sub in
         # new_drops is the number of drop lines the restart added — the
         # plan's "유실 0", not a new-reason count. A sessionless refusal is
         # the vendor's payload, not a lost record: excluded, shown aside.
+        # A timestamp cut: a rotation can rename the file mid-restart, so
+        # line numbers no longer mark "since".
         new_drops=0 sessionless=0
-        if [ -f "$drops_log" ]; then
-            while IFS= read -r l; do
-                [ -z "$l" ] && continue
-                case $l in
-                    *'"reason":"the hook payload names no session'*)
-                        sessionless=$((sessionless + 1)) ;;
-                    *) new_drops=$((new_drops + 1)) ;;
-                esac
-            done <<< "$(tail -n "+$((before_lines + 1))" "$drops_log" 2>/dev/null || true)"
-        fi
+        while IFS= read -r l; do
+            [ -z "$l" ] && continue
+            case $l in
+                *'"reason":"the hook payload names no session'*)
+                    sessionless=$((sessionless + 1)) ;;
+                *) new_drops=$((new_drops + 1)) ;;
+            esac
+        done <<< "$(drop_lines_after "$before_ts")"
         state_add_restart "$ts" "$serving_ms" "$new_drops"
         extra=""
         [ "$sessionless" -gt 0 ] && extra=" ($sessionless sessionless refusal(s) not counted)"
@@ -1244,8 +1303,9 @@ case $sub in
         fi
         before_drops=$(mktemp)
         drop_reasons >"$before_drops"
-        before_lines=0
-        [ -f "$drops_log" ] && before_lines=$(wc -l <"$drops_log" | tr -d ' ')
+        # A rotation can rename drops.jsonl mid-swap, so "drops since now"
+        # is a timestamp cut across both generations, not a line offset.
+        before_ts=$(now_iso_ms)
 
         # Stage the candidate beside the target first, then swap names.
         cp "$from" "$new_bin"
@@ -1287,7 +1347,7 @@ case $sub in
         fi
 
         swap_window_drops=0
-        if [ -z "$fail_reason" ] && [ -f "$drops_log" ]; then
+        if [ -z "$fail_reason" ]; then
             while IFS= read -r l; do
                 [ -z "$l" ] && continue
                 r=${l#*'"reason":"'}; r=${r%%'"'*}
@@ -1297,7 +1357,7 @@ case $sub in
                     fail_reason="new drop reason(s) since the swap: $r"
                     break
                 fi
-            done <<< "$(tail -n "+$((before_lines + 1))" "$drops_log" 2>/dev/null || true)"
+            done <<< "$(drop_lines_after "$before_ts")"
         fi
         if [ "$swap_window_drops" -gt 0 ]; then
             say "start: $swap_window_drops swap-window drop(s) — the old daemon" \
