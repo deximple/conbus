@@ -151,6 +151,19 @@ being replaced. It is copied first, so `--parity ~/.local/bin/conbus.rollback` c
 against an older copy before `start` replaces it. `preflight` and `start` print both
 builds by version and hash.
 
+What the verdict cannot see, so a PASS does not rule it out:
+
+- A drop log truncated back to its size at the swap. It is the same file with the same
+  first bytes, and the lines written since are simply gone.
+- A crash loop at login that ends in a running recorder within 30 minutes. A start that
+  never wrote its start line is not counted, and the first start after a boot is the
+  boot's own.
+- An `--idle` answer given in advance. It covers a later question about that harness or
+  day, and the PASS line names it.
+
+One case cannot pass and has nothing to answer: an empty drop log at the swap followed
+by one rotation reads as evidence rotated away, and gives exit 4.
+
 `start` exits 1 when it rolled back, or when it found no candidate or install to swap.
 It exits 2 when it refused before anything moved.
 `start` and `rollback` exit 3 when the rollback could not be verified, and say which
