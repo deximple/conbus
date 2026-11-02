@@ -108,6 +108,9 @@ usage_rows() { # usage_rows <first-iso> <harness>...
 #   tornlive  — doctor counts an unreadable line the last boot never saw
 #   nocount   — doctor fails before its log count, as with an unreadable segment
 #   readonly  — doctor says the log cannot be appended to
+#   slowvendor — a vendor CLI missed doctor's 2 s, so its version is not known
+#   slowonly  — the same, and no hook line that runs
+#   mismatch  — a plugin written for a major this vendor does not load
 #   refusing  — doctor says the recorder is holding what the log refuses, right now
 #   lowdisk   — doctor's 10% warning, which this Mac is always under
 #   eventgap  — hooks run, but a registered hook misses events
@@ -145,6 +148,9 @@ write_fake() {
         nocount) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "disk      log 1.0 MB — 1.0 GB free of 2.0 GB (50.0%)"; echo "hooks     claude_code  runs — x"; exit 1' ;;
         readonly) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "writable  NOT APPENDABLE: Read-only file system — records will be refused"; echo "disk      log 1.0 MB — 1.0 GB free of 2.0 GB (50.0%)"; echo "log       5 record(s), 1 conversation(s), 0 unreadable line(s)"; echo "hooks     claude_code  runs — x"' ;;
         refusing) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "writable  REFUSING since 2026-11-01T00:00:00.000Z — 20 record(s) in memory only, lost if the recorder stops; free space, do not restart it"; echo "disk      log 1.0 MB — 0.0 GB free of 2.0 GB (0.0%) — WARNING: under 10% free"; echo "log       5 record(s), 1 conversation(s), 0 unreadable line(s)"; echo "hooks     claude_code  runs — x"' ;;
+        slowvendor) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "disk      log 1.0 MB — 1.0 GB free of 2.0 GB (50.0%)"; echo "log       5 record(s), 1 conversation(s), 0 unreadable line(s)"; echo "hooks     claude_code  runs — x"; echo "hooks     opencode     could not read which version this is (opencode did not answer within 2s), so whether x loads is not known"' ;;
+        slowonly) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "log       5 record(s), 1 conversation(s), 0 unreadable line(s)"; echo "hooks     opencode     could not read which version this is (opencode did not answer within 2s), so whether x loads is not known"' ;;
+        mismatch) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "log       5 record(s), 1 conversation(s), 0 unreadable line(s)"; echo "hooks     claude_code  runs — x"; echo "hooks     opencode     MISMATCH — x is written for OpenCode 1.x, which this OpenCode does not load; run \`conbus install --apply\`"' ;;
         lowdisk) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "disk      log 1.0 MB — 100.0 GB free of 2000.0 GB (5.0%) — WARNING: under 10% free"; echo "log       5 record(s), 1 conversation(s), 0 unreadable line(s)"; echo "hooks     claude_code  runs — x"' ;;
         eventgap) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "log       5 record(s), 1 conversation(s), 0 unreadable line(s)"; echo "hooks     claude_code  runs — x"; echo "events    claude_code  MISSING Stop, SessionEnd — run \`conbus install --apply\`"' ;;
         untrusted) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "log       5 record(s), 1 conversation(s), 0 unreadable line(s)"; echo "hooks     codex        runs — x"; echo "codex     2 of 2 hook(s) Codex will not spawn:"; echo "          NOT TRUSTED: PreToolUse, PostToolUse"' ;;
@@ -2753,6 +2759,37 @@ printf '{"pv":6,"harness":"claude_code","event":{"event":"turn_started","prompt"
 touch -A -002000 "$home/.conbus/spool/quoted.json"
 code=0; run verdict >/dev/null 2>&1 || code=$?
 expect 1 "$code" "words quoted in a prompt do not make it parked"
+
+# A vendor CLI that missed doctor's 2 s, or is gone with its directory left behind, says nothing about the swap.
+write_fake beef slowvendor "$tmp/stage/conbus-slowvendor"
+write_fake 01d old "$install_dir/conbus"; rm -f "$rollback_bin" "$home/.conbus/canary.json"
+daemon_boot beef 4261
+code=0; run start --from "$tmp/stage/conbus-slowvendor" >"$tmp/start-slowvendor.out" 2>&1 || code=$?
+expect 0 "$code" "a vendor CLI that missed doctor's 2 s does not roll a healthy swap back (P10)"
+expect_grep 'canary is live' "$tmp/start-slowvendor.out" "the swap stays"
+verdict_fixture
+install_persona slowvendor
+code=0; run verdict >"$tmp/verdict-slowvendor.out" 2>&1 || code=$?
+expect 0 "$code" "nor does it fail hooks"
+expect_grep '^PASS hooks' "$tmp/verdict-slowvendor.out" "hooks passes"
+expect_grep '^  not judged: opencode could not read which version' "$tmp/verdict-slowvendor.out" "and the line shows as a note"
+# A real mismatch still fails, at start and at the verdict.
+write_fake beef mismatch "$tmp/stage/conbus-mismatch"
+write_fake 01d old "$install_dir/conbus"; rm -f "$rollback_bin" "$home/.conbus/canary.json"
+daemon_boot beef 4263
+code=0; SERVING_LIMIT=5 run start --from "$tmp/stage/conbus-mismatch" >"$tmp/start-mismatch.out" 2>&1 || code=$?
+expect 1 "$code" "a plugin this vendor does not load rolls back"
+expect_grep "a hook is not 'runs'.*MISMATCH" "$tmp/start-mismatch.out" "and says so"
+verdict_fixture
+install_persona mismatch
+code=0; run verdict >"$tmp/verdict-mismatch.out" 2>&1 || code=$?
+expect 1 "$code" "and fails the verdict"
+expect_grep '^FAIL hooks.*MISMATCH' "$tmp/verdict-mismatch.out" "by name"
+# With that the only line, no hook is known to run.
+verdict_fixture
+install_persona slowonly
+code=0; run verdict >"$tmp/verdict-slowonly.out" 2>&1 || code=$?
+expect 4 "$code" "a slow vendor alone proves no hook runs"
 
 # A real build under this throwaway HOME would ask an agy that is not signed
 # in, and a build older than the sign-in check opens a browser tab doing it.

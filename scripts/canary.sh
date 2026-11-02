@@ -1214,9 +1214,12 @@ verdict_build() {
 
 # The lines doctor prints that mean a vendor's events will not reach the recorder.
 # `not installed here` is a vendor this machine does not have, not a broken hook.
+# `could not read which version` says the vendor's CLI missed doctor's 2 s, or is gone
+# with its directory left behind: nothing is known to be wrong, and a slow CLI must not
+# undo a healthy swap. A real mismatch has its own word.
 hook_problems() { # hook_problems <doctor output>
     printf '%s\n' "$1" | awk '
-        /^hooks / && !/ runs / && !/ not installed here/ { print; next }
+        /^hooks / && !/ runs / && !/ not installed here/ && !/could not read which version/ { print; next }
         /^events / && /MISSING/ { print; next }
         /^ +(NOT TRUSTED|MODIFIED)/ { print }'
 }
@@ -1236,6 +1239,7 @@ verdict_hooks() {
     else
         line PASS hooks "$vh_runs hook line(s) runs; what that proves: the command starts and answers, or for cursor and opencode that it is registered. harness-activity is the proof that vendors fire them"
     fi
+    printf '%s\n' "$doctor_out" | sed -n 's/^hooks  *\(.*could not read which version.*\)$/\1/p' | sed -E 's/  +/ /g; s/^/  not judged: /' | cut -c1-170
 }
 
 # Ask the recorder something it must answer and will not record. A line that is
