@@ -218,6 +218,11 @@ the entry says so when it does.
 - `conbus uninstall` now finds the log under `$XDG_STATE_HOME/conbus` when that is
   set, as every other command does. It named no log there, and left the spool it
   says it removes.
+- The shell examples in the README and the manuals can be pasted into zsh, the shell
+  a Mac opens. Interactive zsh has comments off, so a trailing `# ...` became
+  arguments to the command before it, and a line that was only a comment was a
+  command not found. What each line does is now said beside its block, and
+  `scripts/check-docs.sh` fails on a comment in one.
 ### Added
 
 - `conbus auth` (experimental): for when a sign-in tab opens and you should not have

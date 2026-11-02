@@ -34,10 +34,14 @@ client ships in 0.2.9; **there is still no service to join.** Until a pilot
 asks, the rows go nowhere:
 
 ```bash
-conbus usage --shareable                       # print those rows locally
-conbus usage --otlp http://127.0.0.1:4318      # counts only, to a collector on this Mac
-conbus sync --join INVITE                      # preview an invite; writes nothing
+conbus usage --shareable
+conbus usage --otlp http://127.0.0.1:4318
+conbus sync --join INVITE
 ```
+
+- `usage --shareable` prints those rows locally.
+- `usage --otlp` sends counts only, to a collector on this Mac.
+- `sync --join INVITE` previews an invite and writes nothing.
 
 ## Architecture
 
@@ -83,15 +87,16 @@ at `~/.local/bin/conbus`, and shows what it would register. **Nothing in your
 vendor settings changes yet.** Then:
 
 ```bash
-conbus install --apply   # register the hooks, start the recorder
-conbus doctor            # what is wired up, and what is not
+conbus install --apply
+conbus doctor
 ```
 
-`install --apply` merges one hook into each vendor it finds — `~/.claude/settings.json`
-(and the StatusLine, wrapped so yours still shows), `~/.codex/hooks.json`,
-`~/.cursor/hooks.json`, `~/.grok/hooks/conbus.json`, an opencode plugin — keeps a
-`.conbus-backup` of every file it changes, and starts the recorder as a launchd
-agent (`sh.conbus.daemon`) on a Mac or a systemd user unit
+The first registers the hooks and starts the recorder, and the second says what is
+wired up and what is not. `install --apply` merges one hook into each vendor it finds —
+`~/.claude/settings.json` (and the StatusLine, wrapped so yours still shows),
+`~/.codex/hooks.json`, `~/.cursor/hooks.json`, `~/.grok/hooks/conbus.json`, an opencode
+plugin — keeps a `.conbus-backup` of every file it changes, and starts the recorder as a
+launchd agent (`sh.conbus.daemon`) on a Mac or a systemd user unit
 (`~/.config/systemd/user/sh.conbus.daemon.service`) on Linux. Where no
 `systemctl --user` answers — a container, a remote shell — install still writes
 everything and prints the one command that runs `conbus daemon` by hand. Your
@@ -119,14 +124,23 @@ cargo build --release -p conbus
 ## Daily use
 
 ```bash
-conbus run claude_code   # start a leg; a hop execs the next one in this terminal
-conbus go cursor         # hop the current conversation now
-conbus hop               # preview where the next hop would go
-conbus status            # routing rules, quota, hop history, cost
-conbus usage             # what the agents did this week: stops, failures, permission asks
-conbus progress          # the same, per folder: which agents worked there, and the commits
-conbus log --bus-id ID   # one conversation, across every harness it touched
+conbus run claude_code
+conbus go cursor
+conbus hop
+conbus status
+conbus usage
+conbus progress
+conbus log --bus-id ID
 ```
+
+- `conbus run claude_code` starts a leg; a hop execs the next one in this terminal.
+- `conbus go cursor` hops the current conversation now.
+- `conbus hop` previews where the next hop would go.
+- `conbus status` shows routing rules, quota, hop history and cost.
+- `conbus usage` shows what the agents did this week: stops, failures, permission asks.
+- `conbus progress` shows the same per folder: which agents worked there, and the
+  commits.
+- `conbus log --bus-id ID` shows one conversation, across every harness it touched.
 
 A chat line that is only an order — `이제 커서로 작업할거야`, "switch to cursor" —
 is treated like `conbus go cursor`.
@@ -172,13 +186,13 @@ is treated like `conbus go cursor`.
 ## Take it back out
 
 ```bash
-conbus uninstall          # what would be removed
-conbus uninstall --apply  # remove it
+conbus uninstall
+conbus uninstall --apply
 ```
 
-Every hook entry that runs conbus comes out of every vendor file — nothing
-else does — the StatusLine goes back to yours, and the plugin, launchd agent
-and binary are deleted. **Your log is kept**; uninstall prints where it is,
+The first says what would be removed, and the second removes it. Every hook entry
+that runs conbus comes out of every vendor file — nothing else does — the StatusLine
+goes back to yours, and the plugin, launchd agent and binary are deleted. **Your log is kept**; uninstall prints where it is,
 and `rm -rf ~/.conbus` removes it if you want it gone. A backup you made stays
 in plain text in the folder you named until you delete it. Uninstall prints every
 folder a backup went to; `rm -rf ~/.conbus` takes that list with it.
