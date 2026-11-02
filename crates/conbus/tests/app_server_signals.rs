@@ -61,6 +61,20 @@ impl Drop for Case {
     }
 }
 
+/// A daemon does not end when a test fails, and would stay up on a folder that has gone.
+struct DaemonGroup(Child);
+
+impl Drop for DaemonGroup {
+    fn drop(&mut self) {
+        if matches!(self.0.try_wait(), Ok(None)) {
+            // SAFETY: `killpg` takes no pointers, and this child has not been reaped, so
+            // the group is still its own.
+            unsafe { libc::killpg(self.0.id() as i32, libc::SIGKILL) };
+            let _ = self.0.wait();
+        }
+    }
+}
+
 fn a_case() -> Case {
     let dir = tempfile::tempdir().expect("tempdir");
     let home = dir.path().join("home");
@@ -317,13 +331,13 @@ fn sigterm_on_a_starts_prepare_kills_a_wedged_server() {
 fn sigterm_to_a_starting_daemons_group_kills_a_wedged_server() {
     let case = a_case();
     a_live_thread(&case);
-    let mut child = conbus(&case, &["daemon"]);
+    let mut daemon = DaemonGroup(conbus(&case, &["daemon"]));
     let pids = wait_for_the_server(&case);
 
     // SAFETY: `killpg` takes no pointers, and this group is this test's own child's.
-    unsafe { libc::killpg(child.id() as i32, libc::SIGTERM) };
+    unsafe { libc::killpg(daemon.0.id() as i32, libc::SIGTERM) };
 
-    let _ = wait_for_exit(&mut child);
+    let _ = wait_for_exit(&mut daemon.0);
     assert_nothing_left(&pids);
 }
 

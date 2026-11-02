@@ -455,11 +455,12 @@ time.sleep(60)
                 .stdin(Stdio::null())
                 .output()
                 .expect("ran alone");
+            let said = String::from_utf8_lossy(&out.stdout);
+            // Asked for a name that no longer exists, it would run nothing and exit 0.
             assert!(
-                out.status.success(),
-                "{:?}\n{}\n{}",
+                out.status.success() && said.contains("1 passed"),
+                "{:?}\n{said}\n{}",
                 out.status,
-                String::from_utf8_lossy(&out.stdout),
                 String::from_utf8_lossy(&out.stderr)
             );
             return;
