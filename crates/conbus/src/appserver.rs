@@ -99,6 +99,132 @@ pub struct AppServer {
     next_id: u64,
 }
 
+/// What a signal has to do before this process goes.
+///
+/// The server is in a process group of its own, so Ctrl-C, a closed terminal or a TERM
+/// does not reach it, and the watchdog dies with this process. A wedged server would stay
+/// until it ended by itself. So while one lives, these three signals kill its group first
+/// and then go on to whatever they did before: the default, which ends this process the
+/// way it always did, or the handler `serve` installs, which is left to do its work.
+/// SIGKILL cannot be caught, so a service manager's kill of this process still leaves a
+/// wedged server behind.
+mod on_signal {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicI32, AtomicPtr, Ordering};
+
+    const SIGNALS: [libc::c_int; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
+
+    /// The groups of the servers alive now, 0 for a free slot. A signal handler cannot
+    /// take a lock, and more than a few servers at once does not happen.
+    static GROUPS: [AtomicI32; 8] = [const { AtomicI32::new(0) }; 8];
+
+    /// What each of [`SIGNALS`] did before. Each one published here is never changed or
+    /// freed, so a handler can read it whenever it runs.
+    static BEFORE: [AtomicPtr<libc::sigaction>; 3] =
+        [const { AtomicPtr::new(std::ptr::null_mut()) }; 3];
+
+    /// Keeps two servers starting at once from taking each other's handler for the one
+    /// to go on to.
+    static INSTALLING: Mutex<()> = Mutex::new(());
+
+    /// Only what is async-signal-safe: atomics, `killpg`, `sigaction` and `raise`.
+    extern "C" fn kill_servers_and_go_on(signal: libc::c_int) {
+        // SAFETY: each of these calls is async-signal-safe and takes either plain values
+        // or a pointer to a `sigaction` that is never changed or freed. errno is saved
+        // and put back, as the code this interrupted may be about to read it.
+        unsafe {
+            let errno = errno_location();
+            let saved = *errno;
+            for slot in &GROUPS {
+                let group = slot.load(Ordering::SeqCst);
+                if group > 0 {
+                    libc::killpg(group, libc::SIGKILL);
+                }
+            }
+            let before = SIGNALS
+                .iter()
+                .position(|known| *known == signal)
+                .map_or(std::ptr::null_mut(), |at| BEFORE[at].load(Ordering::SeqCst));
+            if before.is_null() {
+                libc::signal(signal, libc::SIG_DFL);
+            } else {
+                libc::sigaction(signal, before, std::ptr::null_mut());
+            }
+            // Blocked until this handler returns, and then what it did before happens.
+            libc::raise(signal);
+            *errno = saved;
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    unsafe fn errno_location() -> *mut libc::c_int {
+        // SAFETY: returns this thread's errno, and is safe to call at any time.
+        unsafe { libc::__error() }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    unsafe fn errno_location() -> *mut libc::c_int {
+        // SAFETY: returns this thread's errno, and is safe to call at any time.
+        unsafe { libc::__errno_location() }
+    }
+
+    /// Have the signals kill this group too, from now until [`forget`].
+    pub fn watch(group: libc::pid_t) {
+        let Ok(_installing) = INSTALLING.lock() else {
+            return;
+        };
+        for slot in &GROUPS {
+            if slot
+                .compare_exchange(0, group, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                break;
+            }
+        }
+        let ours = kill_servers_and_go_on as *const () as usize;
+        for (at, signal) in SIGNALS.iter().enumerate() {
+            // SAFETY: both `sigaction` values are fully initialised before a call reads
+            // them, and the handler is async-signal-safe.
+            unsafe {
+                let mut before: libc::sigaction = std::mem::zeroed();
+                if libc::sigaction(*signal, std::ptr::null(), &mut before) != 0 {
+                    continue;
+                }
+                // Already ours, or ignored on purpose, as `nohup` does.
+                if before.sa_sigaction == ours || before.sa_sigaction == libc::SIG_IGN {
+                    continue;
+                }
+                BEFORE[at].store(Box::into_raw(Box::new(before)), Ordering::SeqCst);
+                let mut action: libc::sigaction = std::mem::zeroed();
+                action.sa_sigaction = ours;
+                libc::sigemptyset(&mut action.sa_mask);
+                // What a call in progress does when interrupted stays as it was.
+                action.sa_flags = before.sa_flags & libc::SA_RESTART;
+                libc::sigaction(*signal, &action, std::ptr::null_mut());
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub fn watching(group: libc::pid_t) -> bool {
+        GROUPS
+            .iter()
+            .any(|slot| slot.load(Ordering::SeqCst) == group)
+    }
+
+    /// Stop killing this group. Before it is reaped, when its id can be someone else's.
+    pub fn forget(group: libc::pid_t) {
+        for slot in &GROUPS {
+            if slot
+                .compare_exchange(group, 0, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                break;
+            }
+        }
+    }
+}
+
 /// Kill the server and whatever it started. An npm `codex` is a node script spawning
 /// the native binary with stdout inherited, so the process we started is not the one
 /// that wedges. Started in a group of its own, all of them go together.
@@ -144,6 +270,7 @@ impl AppServer {
                     binary.to_string_lossy()
                 ))
             })?;
+        on_signal::watch(child.id() as libc::pid_t);
         let stdin = child
             .stdin
             .take()
@@ -246,6 +373,7 @@ impl Drop for AppServer {
             && let Some(mut child) = child.take()
         {
             kill_group(&child);
+            on_signal::forget(child.id() as libc::pid_t);
             let _ = child.wait();
         }
     }
@@ -291,6 +419,31 @@ mod tests {
             "codex app-server closed without answering unknown variant `thread/turns/list`",
         );
         assert!(!is_unknown_method(&gone, method));
+    }
+
+    #[test]
+    fn a_server_gone_is_not_a_group_a_signal_would_kill() {
+        // Its id can be someone else's once it has been reaped.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake = dir.path().join("codex");
+        crate::test_support::write_executable(
+            &fake,
+            "#!/usr/bin/env python3\nimport json, sys\nfor line in sys.stdin:\n    msg = json.loads(line)\n    print(json.dumps({\"jsonrpc\":\"2.0\",\"id\":msg.get(\"id\"),\"result\":{}}), flush=True)\n",
+        );
+        let server =
+            AppServer::start_with(fake.as_os_str(), Duration::from_secs(30)).expect("started");
+        let group = server
+            .child
+            .lock()
+            .expect("lock")
+            .as_ref()
+            .expect("alive")
+            .id() as libc::pid_t;
+        assert!(on_signal::watching(group));
+
+        drop(server);
+
+        assert!(!on_signal::watching(group));
     }
 
     #[test]
