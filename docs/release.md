@@ -53,7 +53,8 @@ steps that stay with the operator.
 
 The asset names carry no version so `install.sh` can fetch
 `releases/latest/download/<name>`. A specific version is
-`CONBUS_VERSION=vX.Y.Z sh install.sh`.
+`CONBUS_VERSION=vX.Y.Z sh install.sh`. A package records `root` as its owner rather
+than the account that built it, on macOS and on Linux.
 
 ## Checking a package before it ships
 
@@ -107,29 +108,57 @@ This writes `target/signed/` and uploads nothing. Run it again with
 publish it. The script:
 
 - with `--upload`, before anything else, refuses a stable release that is no
-  longer a draft, and a release that lacks anything an install fetches: the macOS
-  package, both Linux tarballs, the checksum of each, and `install.sh`. It fetches
-  them and checks each checksum, so a package that does not match its checksum is
-  refused too;
+  longer a draft, and a release an install would fail on. It fetches the macOS
+  package, both Linux tarballs, the checksum of each, and `install.sh`, and requires
+  that each `.sha256` names its own file and matches it, that each tarball holds a
+  binary of this version (read from the `conbus-version X.Y.Z;` stamp in the binary,
+  since a Mac cannot run a Linux one), and that `install.sh` is really the script;
 - checks the published package against its checksum;
 - signs both slices with the hardened runtime, a secure timestamp, the
   `sh.conbus` identifier and `scripts/conbus.entitlements`;
-- refuses a signature that names no team;
+- refuses a signature that names no team, or a team other than the one `install.sh`
+  requires, which it reads from `install.sh`;
 - submits a zip to Apple and waits for `Accepted`, printing Apple's log when
   it is not;
 - asks Gatekeeper to assess the result, then repackages;
-- with `--upload`, uploads the signed package and checksum, fetches everything
-  again, compares the macOS package with the signed one, and only then publishes.
+- with `--upload`, uploads the signed package and checksum, makes those same checks
+  again, compares the macOS package with the signed one, and only then publishes;
+- after publishing, asks `gh` which release is the latest and fetches every asset
+  from its anonymous `releases/latest/download/` URL, comparing the bytes. If that
+  stays wrong for two minutes it fails loudly and says how to take the release back.
 
 A refusal leaves the release a draft (a release candidate stays a prerelease) and
 says what is missing and what to do: `gh run list --workflow release.yml --branch
 vX.Y.Z` to see the jobs, `gh run rerun RUN_ID --failed` for one that failed, and
-then `--upload` again. If an upload from here stopped part way, `target/signed/`
-holds the signed package to upload by hand. A re-run finds Apple's ticket by code
-hash and does not wait on Apple twice.
+then `--upload` again. Rerun failed jobs only: `gh` skips its check for an existing
+release when it creates a draft, so running the whole workflow again could make a
+second one. A failed upload says so on that run, because `gh` deletes an asset before
+it replaces it: `target/signed/` holds the signed package to upload by hand, and on a
+release candidate the public prerelease is missing it until then. A re-run finds
+Apple's ticket by code hash and does not wait on Apple twice.
 
 `scripts/sign-release-rehearsal.sh` runs all of this on a fake toolchain, and CI
-runs it on every pull request. A real draft release has never been through it.
+runs it on every pull request. **`gh release upload` from a job onto a draft with
+`GITHUB_TOKEN`, and `gh release edit` publishing a draft, have never run for real:
+their first run is the first stable tag, in public, and a scratch repository could
+rehearse them first, which is the operator's call.**
+
+### Taking a bad release back
+
+If `latest` is wrong, whether the script said so or a person found it:
+
+1. `gh release edit vX.Y.Z --draft=true` makes it a draft again. People stop getting
+   it, and the assets stay on it.
+2. `gh release view` names the release people get now. If that is not the one before
+   it, `gh release edit vPREVIOUS --latest`.
+3. Fix what was wrong. For an asset, rerun the job that attached it, or upload it by
+   hand with `--clobber`, and run `sign-release.sh vX.Y.Z --upload` again. It works on
+   the draft and checks everything once more.
+4. A wrong binary needs a new version: bump it, write its changelog section and cut a
+   new tag. Do not move a tag people may already have fetched.
+
+Anyone who installed in between has that binary until they install again, so say so
+where they will see it.
 
 A bare binary cannot carry a stapled ticket, so Gatekeeper looks the
 notarization up online the first time it checks it. Apple publishes the ticket
