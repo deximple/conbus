@@ -505,11 +505,6 @@ state_get() { # state_get <dotted key> — flat fields only
     sed -n "s/.*\"$1\":\"\\([^\"]*\\)\".*/\\1/p" "$state_file" | sed -n '1p'
 }
 
-state_restart_count() {
-    [ -f "$state_file" ] || { echo 0; return; }
-    { grep -o '"serving_ms"' "$state_file" || true; } | wc -l | tr -d ' '
-}
-
 state_restart_drop_total() {
     [ -f "$state_file" ] || { echo 0; return; }
     { grep -o '"new_drops":[0-9]*' "$state_file" || true; } | cut -d: -f2 |
@@ -530,6 +525,10 @@ state_restarts_json() { # echoes the restarts array as stored, [] when absent
     sed -n 's/.*"restarts":\(\[.*\]\).*/\1/p' "$state_file" | sed -n '1p'
 }
 
+state_swap_window_drops() {
+    sed -n 's/.*"swap_window_drops":\([0-9]*\).*/\1/p' "$state_file"
+}
+
 state_add_restart() { # state_add_restart <ts> <serving_ms|-> <new_drops>
     restarts=$(state_restarts_json)
     entry=$(printf '{"ts":"%s","serving_ms":%s,"new_drops":%s}' "$1" "${2:--1}" "${3:-0}")
@@ -538,8 +537,11 @@ state_add_restart() { # state_add_restart <ts> <serving_ms|-> <new_drops>
     else
         new="${restarts%\]},$entry]"
     fi
+    # All of it: dropping rolled_back here would turn a rolled-back window back
+    # into a live one the moment anyone restarted.
     state_write "$(state_get swapped)" "$(state_get prev_build)" \
-        "$(state_get candidate_build)" "$(state_get candidate_sha256)" "$new"
+        "$(state_get candidate_build)" "$(state_get candidate_sha256)" "$new" \
+        "$(state_get rolled_back)" "$(state_swap_window_drops)"
 }
 
 # Spool files left after a rollback — the restored 0.2.x build does not
@@ -1062,6 +1064,241 @@ verdict_hooks() {
     fi
 }
 
+# Ask the recorder something it must answer and will not record. A line that is
+# not a request comes back as `failed` from the loop that serves hooks: no record,
+# no drop line, no daemon.log line. Connecting proves only that the socket exists;
+# a daemon wedged in its accept loop still lets you connect. A busy daemon gets
+# three tries before it counts as not serving.
+probe_recorder() { # exits 0 answered, 1 connected and no answer, 2 nothing there
+    probe_try=0
+    while [ "$probe_try" -lt 3 ]; do
+        probe_rc=0
+        perl -MIO::Socket::UNIX -MIO::Select -e '
+            $SIG{PIPE} = "IGNORE";
+            my ($path, $limit) = @ARGV;
+            my $s = IO::Socket::UNIX->new(Type => SOCK_STREAM(), Peer => $path) or exit 2;
+            $s->autoflush(1);
+            print $s "{}\n";
+            IO::Select->new($s)->can_read($limit) or exit 1;
+            sysread($s, my $reply, 4096) or exit 1;
+            exit($reply =~ /"status"/ ? 0 : 1);' "$root/conbus.sock" "${CONBUS_CANARY_PROBE_S:-5}" || probe_rc=$?
+        [ "$probe_rc" -eq 1 ] || return "$probe_rc"
+        probe_try=$((probe_try + 1))
+    done
+    return 1
+}
+
+verdict_recorder() {
+    vr_faults=""
+    vr_rc=0
+    probe_recorder || vr_rc=$?
+    case $vr_rc in
+        0) ;;
+        2) vr_faults="$vr_faults; nothing answers at $root/conbus.sock" ;;
+        *) vr_faults="$vr_faults; something holds $root/conbus.sock and did not answer in three tries of ${CONBUS_CANARY_PROBE_S:-5}s" ;;
+    esac
+    # An idle daemon drains the spool every two seconds, so an old entry is a
+    # record that has not reached the log.
+    vr_stale=0
+    if [ -d "$root/spool" ] && [ ! -r "$root/spool" ]; then
+        vr_faults="$vr_faults; $root/spool cannot be read"
+    elif [ -d "$root/spool" ]; then
+        vr_stale=$(find "$root/spool" -maxdepth 1 -name '*.json' -mmin +10 | wc -l | tr -d ' ')
+    fi
+    if [ "$vr_stale" -gt 0 ]; then
+        vr_faults="$vr_faults; $vr_stale spooled record(s) older than 10 minutes have not reached the log"
+    fi
+    if [ -n "$vr_faults" ]; then
+        line FAIL recorder-serving "${vr_faults#; }"
+    else
+        line PASS recorder-serving "the daemon answered a request on its socket, and nothing is stuck in the spool"
+    fi
+}
+
+# Every boot since the swap should be one the script knows about: the swap's own,
+# or a planned restart's. Paired by time, so a planned restart that never served
+# cannot cancel out a crash, and a log trimmed down to one line cannot read as
+# zero restarts.
+verdict_restarts() {
+    if [ ! -r "$daemon_log" ]; then
+        line UNCHECKED restarts "no readable $daemon_log"
+        return
+    fi
+    vs_lines=$(awk -v s="$since" '$1 ~ /^[0-9]/ && $1 > s && /conbus daemon: .*: socket .* log / { print $1 }' "$daemon_log")
+    if [ -z "$vs_lines" ]; then
+        # The swap itself boots once: a log that names no start since
+        # the swap was rotated or truncated underneath it — counting
+        # unplanned restarts against a window the log cannot see is
+        # checking nothing.
+        line UNCHECKED restarts \
+            "$daemon_log names no start since $since — the log does not reach back to the swap"
+        return
+    fi
+    vs_starts=""
+    for vs_ts in $vs_lines; do
+        vs_starts="$vs_starts $(ts_epoch "$vs_ts")"
+    done
+    vs_planned=""
+    for vs_row in $(grep -o '"ts":"[^"]*","serving_ms":-\{0,1\}[0-9]*' "$state_file" 2>/dev/null || true); do
+        vs_ts=${vs_row#*'"ts":"'}
+        vs_ts=${vs_ts%%'"'*}
+        vs_planned="$vs_planned $(ts_epoch "$vs_ts"):${vs_row##*:}:$vs_ts"
+    done
+    # `start` and `restart` each allow the serving limit for install --apply and
+    # again for the boot; a start line later than that is its own boot.
+    vs_rows=$(awk -v starts="$vs_starts" -v planned="$vs_planned" -v grace=$((serving_limit * 2 + 30)) \
+        -v swap="$(ts_epoch "${recorded_swap:-$since}")" -v exact="$([ "$since" = "$recorded_swap" ] && echo 1)" '
+        function take(from,    i) {
+            for (i = 1; i <= n; i++)
+                if (!(i in used) && st[i] >= from && st[i] <= from + grace) { used[i] = 1; return 1 }
+            return 0
+        }
+        BEGIN {
+            n = split(starts, st, " ")
+            m = split(planned, pl, " ")
+            if (exact == 1) {
+                if (!take(swap)) printf "no_swap_boot 1\n"
+            } else used[1] = 1
+            for (j = 1; j <= m; j++) {
+                split(pl[j], part, ":")
+                # The stamp is the 3rd field onward: colons in the time split too.
+                when = pl[j]; sub(/^[^:]*:[^:]*:/, "", when)
+                got = take(part[1])
+                if (part[2] < 0) printf "never_served %s\n", when
+                else if (!got) printf "no_line %s\n", when
+            }
+            for (i = 1; i <= n; i++) if (!(i in used)) unplanned++
+            printf "seen %d\nplanned %d\nunplanned %d\n", n, m, unplanned
+        }')
+    vs_seen=$(row_value "$vs_rows" seen)
+    vs_count=$(row_value "$vs_rows" planned)
+    vs_unplanned=$(row_value "$vs_rows" unplanned)
+    vs_never=$(row_value "$vs_rows" never_served | tr '\n' ' ')
+    vs_noline=$(row_value "$vs_rows" no_line | tr '\n' ' ')
+    vs_newest=$(printf '%s\n' "$vs_lines" | sed -n '$p')
+    vs_stamped=$(sed -n 's/.*"started":"\([^"]*\)".*/\1/p' "$stamp" 2>/dev/null || true)
+
+    vs_faults="" vs_open=""
+    if [ "$vs_unplanned" -gt 0 ]; then
+        vs_faults="$vs_faults; $vs_unplanned unplanned daemon start(s) since $since ($vs_seen seen: 1 swap + $vs_count planned)"
+    fi
+    if [ -n "$vs_never" ]; then
+        vs_faults="$vs_faults; a planned restart never served: $vs_never"
+    fi
+    if [ -n "$(row_value "$vs_rows" no_swap_boot)" ]; then
+        vs_open="$vs_open; the first start line since the swap is at ${vs_lines%%[[:space:]]*}, too late to be the swap's own boot — the log does not reach back to the swap"
+    fi
+    if [ -n "$vs_noline" ]; then
+        vs_open="$vs_open; no start line for the planned restart at: ${vs_noline}— the log was trimmed"
+    fi
+    if [ -n "$vs_stamped" ] && [ "$vs_stamped" \> "$vs_newest" ]; then
+        vs_open="$vs_open; the running daemon's stamp says it started at $vs_stamped, after the newest start line ($vs_newest) — the log was trimmed, or that boot never finished"
+    fi
+    if [ -n "$vs_faults" ]; then
+        line FAIL restarts "${vs_faults#; }${vs_open}"
+    elif [ -n "$vs_open" ]; then
+        line UNCHECKED restarts "${vs_open#; }"
+    else
+        line PASS restarts \
+            "0 unplanned daemon start(s) since $since ($vs_seen seen: 1 swap + $vs_count planned)"
+    fi
+}
+
+# Unreadable lines across the window, not the last boot. Each boot reports the whole
+# log, so the worst one counts, with doctor's read for what landed after it. A boot
+# that could not read the log prints a zero, so that case needs its own look.
+verdict_unreadable() {
+    vu_rows=""
+    if [ -r "$daemon_log" ]; then
+        vu_rows=$(awk -v s="$since" '
+            $1 ~ /^[0-9]/ && $1 > s {
+                if (/starting with no bindings/) failed++
+                if (match($0, /\([0-9]+ record\(s\), [0-9]+ unreadable\)/)) {
+                    split(substr($0, RSTART + 1, RLENGTH - 2), word, " ")
+                    boots++
+                    if (word[3] + 0 > worst + 0) worst = word[3]
+                    if (boots > 1 && word[1] + 0 < previous + 0) fell = previous " to " word[1]
+                    previous = word[1]
+                }
+            }
+            END { printf "boots %d\nworst %d\nfailed %d\nfell %s\n", boots, worst, failed, fell }' "$daemon_log")
+    fi
+    vu_boots=$(row_value "$vu_rows" boots)
+    vu_worst=$(row_value "$vu_rows" worst)
+    vu_failed=$(row_value "$vu_rows" failed)
+    vu_fell=$(row_value "$vu_rows" fell)
+    vu_now=$(printf '%s\n' "$doctor_out" | sed -n 's/^log.* \([0-9][0-9]*\) unreadable line(s)/\1/p' | sed -n '$p')
+
+    if [ "${vu_failed:-0}" -gt 0 ]; then
+        line FAIL unreadable "$vu_failed boot(s) since $since could not read the log and started with no bindings"
+    elif [ -n "$vu_fell" ]; then
+        line FAIL unreadable "the log's record count fell across a restart, from $vu_fell"
+    elif [ "${vu_worst:-0}" -gt 0 ] || [ "${vu_now:-0}" -gt 0 ]; then
+        line FAIL unreadable "unreadable line(s): worst boot since the swap ${vu_worst:-unknown}, doctor now ${vu_now:-unknown}"
+    elif [ -z "$vu_now" ]; then
+        line UNCHECKED unreadable "doctor named no count${doctor_failed:+ ($doctor_failed)}; ${vu_boots:-0} boot(s) since the swap reported 0, and they read the log earlier"
+    else
+        line PASS unreadable "0 unreadable line(s) across ${vu_boots:-0} boot(s) since the swap and in doctor's read now"
+    fi
+}
+
+# Space, and anything else the log refused. A full disk can take the record, the
+# spool entry and the drop line together, and daemon.log is the one trace left when
+# that write lands. A build that holds refused records (#155) says so at each end
+# instead, and its drop line covers an outage that ended; one that has not ended is
+# read here. Doctor's 10% warning stays a note: this Mac lives under it.
+verdict_disk() {
+    vd_rows=""
+    if [ -r "$daemon_log" ]; then
+        vd_rows=$(awk -v s="$since" '
+            $1 ~ /^[0-9]/ && $1 > s && /record\(s\) refused by the log/ {
+                lines++
+                if (first == "") { first = $0; sub(/^.*refused by the log: */, "", first) }
+                for (i = 1; i <= NF; i++) if ($i == "of") { total += $(i - 1); break }
+            }
+            $1 ~ /^[0-9]/ && $1 > s && /the log refused a write / {
+                refusing = $0
+                sub(/^.*the log refused a write /, "", refusing)
+            }
+            $1 ~ /^[0-9]/ && $1 > s && /the log takes writes again/ { refusing = "" }
+            END { printf "lines %d\ntotal %d\nfirst %s\nrefusing %s\n", lines, total, first, refusing }' "$daemon_log")
+    fi
+    vd_lines=$(row_value "$vd_rows" lines)
+    vd_total=$(row_value "$vd_rows" total)
+    vd_first=$(row_value "$vd_rows" first | cut -c1-120)
+    vd_refusing=$(row_value "$vd_rows" refusing | cut -c1-120)
+    vd_line=$(printf '%s\n' "$doctor_out" | sed -n 's/^disk  *//p' | sed -n '1p')
+    vd_write=$(printf '%s\n' "$doctor_out" | sed -n 's/^writable  *//p' | sed -n '1p')
+    case $vd_write in
+        NOT\ APPENDABLE*) vd_write_bad=$vd_write ;;
+        *) vd_write_bad="" ;;
+    esac
+    if [ "${vd_lines:-0}" -gt 0 ]; then
+        line FAIL disk "$vd_total record(s) refused by the log since $since, $vd_lines time(s) in daemon.log: $vd_first"
+    elif [ -n "$vd_refusing" ]; then
+        line FAIL disk "the log refused a write and daemon.log does not say it stopped: $vd_refusing"
+    elif [ -n "$vd_write_bad" ]; then
+        line FAIL disk "$vd_write_bad"
+    elif [ ! -r "$daemon_log" ] || [ -z "$vd_line" ]; then
+        line UNCHECKED disk "needs daemon.log and doctor's disk line${doctor_failed:+ ($doctor_failed)}"
+    else
+        line PASS disk "no record refused by the log since $since, as far as a write to daemon.log could say; now: $vd_line"
+    fi
+}
+
+# UTC ISO-8601 to epoch milliseconds, the fraction kept. Empty on failure.
+ts_ms() {
+    tm_epoch=$(ts_epoch "$1")
+    is_uint "$tm_epoch" || return 0
+    tm_frac=${1#*.}
+    tm_frac=${tm_frac%Z}
+    case $tm_frac in
+        [0-9][0-9][0-9]) ;;
+        *) tm_frac=000 ;;
+    esac
+    echo $((tm_epoch * 1000 + 10#$tm_frac))
+}
+
 is_idle() { # is_idle <harness or day>
     case ",$idle," in
         *,"$1",*) return 0 ;;
@@ -1457,54 +1694,10 @@ case $sub in
         verdict_build
         verdict_hooks
 
-        # 1. Unplanned recorder restarts: daemon start lines after since,
-        #    minus the swap's own boot and each planned restart — each of
-        #    those is one `install --apply`, one boot.
-        starts=0
-        if [ -r "$daemon_log" ]; then
-            starts=$(awk -v s="$since" '
-                $1 > s && /conbus daemon: .*: socket .* log / { n++ }
-                END { print n + 0 }
-            ' "$daemon_log")
-        else
-            line UNCHECKED restarts "no readable $daemon_log"
-        fi
-        planned=$(state_restart_count)
-        unplanned=$((starts - 1 - planned))
-        [ "$unplanned" -lt 0 ] && unplanned=0
-        if [ -r "$daemon_log" ] && [ "$starts" -eq 0 ]; then
-            # The swap itself boots once: a log that names no start since
-            # the swap was rotated or truncated underneath it — counting
-            # unplanned restarts against a window the log cannot see is
-            # checking nothing.
-            line UNCHECKED restarts \
-                "$daemon_log names no start since $since — the log does not reach back to the swap"
-        elif [ -r "$daemon_log" ]; then
-            if [ "$unplanned" -eq 0 ]; then
-                line PASS restarts \
-                    "0 unplanned daemon start(s) since $since ($starts seen: 1 swap + $planned planned)"
-            else
-                line FAIL restarts \
-                    "$unplanned unplanned daemon start(s) since $since ($starts seen: 1 swap + $planned planned)"
-            fi
-        fi
-
-        # 2. Unreadable log lines: the newest start line's report, else the
-        #    doctor's log line.
-        unreadable=""
-        if [ -r "$daemon_log" ]; then
-            unreadable=$(sed -n 's/.*(\([0-9][0-9]*\) record(s), \([0-9][0-9]*\) unreadable).*/\2/p' \
-                "$daemon_log" | tail -1)
-        fi
-        if [ -z "$unreadable" ]; then
-            unreadable=$(echo "$doctor_out" |
-                sed -n 's/^log.* \([0-9][0-9]*\) unreadable line(s)/\1/p' | tail -1)
-        fi
-        case ${unreadable:-x} in
-            x) line UNCHECKED unreadable "no report line names a count" ;;
-            0) line PASS unreadable "0 unreadable line(s)" ;;
-            *) line FAIL unreadable "$unreadable unreadable line(s)" ;;
-        esac
+        verdict_recorder
+        verdict_restarts
+        verdict_unreadable
+        verdict_disk
 
         # A read that failed and a log with no rows are different facts, and
         # neither is evidence of activity.
@@ -1644,14 +1837,19 @@ case $sub in
         # 7. rss-budget + M3 time budgets: the running recorder's RSS and
         #    three re-measured reads against the plan's targets.
         rss_kb=""
+        rss_who=""
         if [ -f "$stamp" ]; then
             pid=$(sed -n 's/.*"pid":\([0-9]*\).*/\1/p' "$stamp" 2>/dev/null || true)
             # `ps` exits 1 for a dead pid, which is the case this item is for.
             if [ -n "$pid" ]; then
                 rss_kb=$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ' || true)
+                rss_who=$(ps -o command= -p "$pid" 2>/dev/null || true)
             fi
         fi
-        if is_uint "${rss_kb:-}"; then
+        # A reused pid has a size too. Only a conbus daemon's counts.
+        if [ -n "$rss_who" ] && case $rss_who in *conbus*daemon*) false ;; *) true ;; esac; then
+            line FAIL rss-budget "pid $pid in the stamp is not a conbus daemon: $(echo "$rss_who" | cut -c1-60)"
+        elif is_uint "${rss_kb:-}"; then
             rss_mb=$((rss_kb / 1024))
             if [ "$rss_mb" -le "$rss_budget_mb" ]; then
                 line PASS rss-budget "recorder RSS ${rss_mb} MB ≤ ${rss_budget_mb} MB"
@@ -1722,11 +1920,13 @@ case $sub in
         if [ -f "$stamp" ]; then
             started=$(sed -n 's/.*"started":"\([^"]*\)".*/\1/p' "$stamp" 2>/dev/null || true)
             serving=$(sed -n 's/.*"serving":"\([^"]*\)".*/\1/p' "$stamp" 2>/dev/null || true)
-            e0=$(ts_epoch "$started") e1=$(ts_epoch "$serving")
+            e0=$(ts_ms "$started") e1=$(ts_ms "$serving")
             if is_uint "${e0:-}" && is_uint "${e1:-}"; then
-                serving_ms=$(( (e1 - e0) * 1000 ))
+                serving_ms=$((e1 - e0))
+                # Shown, not judged: one reading under load cannot be taken again.
+                recorded_servings=$(grep -o '"serving_ms":-\{0,1\}[0-9]*' "$state_file" 2>/dev/null | cut -d: -f2 | tr '\n' ' ' || true)
                 if [ "$serving_ms" -le "$serving_ms_budget" ]; then
-                    line PASS serving-budget "start->serving ${serving_ms} ms ≤ ${serving_ms_budget}"
+                    line PASS serving-budget "start->serving ${serving_ms} ms ≤ ${serving_ms_budget}${recorded_servings:+; planned restarts recorded: ${recorded_servings}ms}"
                 else
                     line FAIL serving-budget "start->serving ${serving_ms} ms > ${serving_ms_budget}"
                 fi
@@ -1829,9 +2029,9 @@ case $sub in
         if wait_for_serving "$old_stamp_pid"; then
             started=$(sed -n 's/.*"started":"\([^"]*\)".*/\1/p' "$stamp")
             serving=$(sed -n 's/.*"serving":"\([^"]*\)".*/\1/p' "$stamp")
-            e0=$(ts_epoch "$started") e1=$(ts_epoch "$serving")
+            e0=$(ts_ms "$started") e1=$(ts_ms "$serving")
             if is_uint "${e0:-}" && is_uint "${e1:-}"; then
-                serving_ms=$(( (e1 - e0) * 1000 ))
+                serving_ms=$((e1 - e0))
             fi
         else
             say "restart: no new serving stamp inside ${serving_limit}s — check 'canary.sh status'"
