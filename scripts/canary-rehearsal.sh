@@ -2917,11 +2917,26 @@ verdict_fixture
 orphan_lines "$home/.conbus/drops.jsonl" 100 3600
 code=0; run verdict >/dev/null 2>&1 || code=$?
 expect 0 "$code" "a hundred is at the floor"
-# The same count, against a history that had as many: a baseline from the live log, and only from before the swap.
+orphan_days() { # orphan_days <file> <lines a day> <first day ago> <last day ago>
+    od_day=$3
+    while [ "$od_day" -le "$4" ]; do
+        orphan_lines "$1" "$2" $((od_day * DAY))
+        od_day=$((od_day + 1))
+    done
+}
+# A flood before the swap is one day of 28. A mean let 2,000 lines raise the bar to 4,226, and 1,400 lost tool events
+# in the window passed. The median a day does not move for one day.
+verdict_fixture
+perl -e 'for (1..2000) { printf qq({"ts":"%s","reason":"no conversation for this session; the daemon has no binding for it (no prompt from this session has reached it)","detail":"PreToolUse for session a%07d"}\n), $ARGV[0], $_ }' "$(iso_ago $((17 * DAY)))" >"$home/.conbus/drops.archived.jsonl"
+orphan_lines "$home/.conbus/drops.jsonl" 1400 $((3 * DAY))
+code=0; run verdict >"$tmp/v-afterflood.out" 2>&1 || code=$?; rm -f "$home/.conbus/drops.archived.jsonl"
+expect 1 "$code" "1,400 tool events lost after a flood before the swap fail"
+expect_grep '^FAIL orphan-tools — 1400 tool event(s) lost.*median 0.0 a day.*over the limit of 100' "$tmp/v-afterflood.out" "against a median of 0 and the floor"
+# A rate held every day before the swap is the baseline: 15 a day, so 150 in the window is no regression and 400 is.
 verdict_fixture
 : >"$home/.pre"
 old_line "$home/.pre"
-orphan_lines "$home/.pre" 300 $((10 * DAY))
+orphan_days "$home/.pre" 15 8 35
 cat "$home/.conbus/drops.jsonl" >>"$home/.pre"
 cat "$home/.pre" >"$home/.conbus/drops.jsonl"
 rm -f "$home/.pre"
@@ -2929,21 +2944,21 @@ state_with drops_file "$(drops_identity)"
 orphan_lines "$home/.conbus/drops.jsonl" 150 3600
 code=0; run verdict >"$tmp/verdict-orphans-base.out" 2>&1 || code=$?
 expect 0 "$code" "a rate no higher than before the swap is not a regression"
-expect_grep '^PASS orphan-tools — 150 tool event(s) lost.*10.7/day in the 28 days before the swap' "$tmp/verdict-orphans-base.out" "and the baseline is said"
+expect_grep '^PASS orphan-tools — 150 tool event(s) lost.*median 15.0 a day over the 28 day(s) before the swap' "$tmp/verdict-orphans-base.out" "and the median is said"
 orphan_lines "$home/.conbus/drops.jsonl" 250 3600
 code=0; run verdict >"$tmp/verdict-orphans-above.out" 2>&1 || code=$?
 expect 1 "$code" "over three times that rate is"
-# The baseline comes from what the file was rotated or archived to as well, once each.
+# From what the file was rotated or archived to as well, each line once.
 verdict_fixture
 old_line "$home/.conbus/drops.1.jsonl"
-orphan_lines "$home/.conbus/drops.1.jsonl" 150 $((10 * DAY))
-orphan_lines "$home/.conbus/drops.capped-20261025.jsonl" 150 $((12 * DAY))
+orphan_days "$home/.conbus/drops.1.jsonl" 15 8 21
+orphan_days "$home/.conbus/drops.capped-20261025.jsonl" 15 22 35
 cat "$home/.conbus/drops.capped-20261025.jsonl" >"$home/.conbus/drops.capped-copy.jsonl"
 orphan_lines "$home/.conbus/drops.jsonl" 150 3600
 code=0; run verdict >"$tmp/verdict-orphans-archive.out" 2>&1 || code=$?
 rm -f "$home/.conbus/drops.capped-20261025.jsonl" "$home/.conbus/drops.capped-copy.jsonl"
 expect 0 "$code" "rotated and archived logs count toward the baseline"
-expect_grep '10.7/day in the 28 days before the swap' "$tmp/verdict-orphans-archive.out" "each line once"
+expect_grep 'median 15.0 a day over the 28 day(s) before the swap' "$tmp/verdict-orphans-archive.out" "each line once"
 # A flood older than four weeks does not inflate it.
 verdict_fixture
 orphan_lines "$home/.conbus/drops.capped-20261025.jsonl" 5000 $((60 * DAY))

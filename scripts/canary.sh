@@ -1055,17 +1055,23 @@ verdict_log_outages() {
     row_value "$dt_rows" "item held" | sort | sed 's/^/  /'
 }
 
-# Orphan tool lines in the 28 days before the swap, each line once, from every drop log
-# beside this one: the live file, its rotated generation, and what an operator archived.
-# Prints "<lines> <oldest time any of them reach>".
-orphan_baseline() { # orphan_baseline <from> <to>
-    ob_from=$1 ob_to=$2
+# Orphan tool lines a day on the 28 days before the swap, each line once, from every drop
+# log beside this one: the live file, its rotated generation, and what an operator
+# archived. A median, as for `repeated`: a mean let one flood day raise the bar for a
+# month. A day before the oldest line any of them reach is not a day with none, so it is
+# left out. Prints "<median a day> <days it covers> <lines on them>".
+orphan_baseline() { # orphan_baseline <swap time>
+    ob_days=$(perl -MTime::Local -MPOSIX=strftime -e '
+        my ($y, $m, $d) = $ARGV[0] =~ /^(\d+)-(\d+)-(\d+)/;
+        my $t = timegm(0, 0, 0, $d, $m - 1, $y);
+        print join(" ", map { strftime("%Y-%m-%d", gmtime($t - $_ * 86400)) } 1 .. 28)' "$1")
     set --
     for ob_file in "$root"/drops*.jsonl; do
         if [ -f "$ob_file" ] && [ -r "$ob_file" ]; then set -- "$@" "$ob_file"; fi
     done
-    [ $# -gt 0 ] || { echo "0 "; return 0; }
-    LC_ALL=C awk -v from="$ob_from" -v to="$ob_to" "$drop_awk_lib"'
+    [ $# -gt 0 ] || { echo "0 0 0"; return 0; }
+    LC_ALL=C awk -v days="$ob_days" "$drop_awk_lib"'
+        BEGIN { n_days = split(days, list, " "); for (i = 1; i <= n_days; i++) wanted[list[i]] = 1 }
         seen[$0]++ { next }
         {
             drop_split($0)
@@ -1074,46 +1080,51 @@ orphan_baseline() { # orphan_baseline <from> <to>
                 drop_parse(frag[f])
                 if (d_ts == "" || d_reason == "") continue
                 if (oldest == "" || d_ts < oldest) oldest = d_ts
-                if (d_ts > from && !(d_ts > to) && drop_class(d_reason, d_detail) == "orphan") n++
+                day = substr(d_ts, 1, 10)
+                if ((day in wanted) && drop_class(d_reason, d_detail) == "orphan") per_day[day]++
             }
         }
-        END { print n + 0, oldest }' "$@"
+        END {
+            k = 0; lines = 0
+            for (i = 1; i <= n_days; i++) {
+                if (oldest == "" || list[i] < substr(oldest, 1, 10)) continue
+                v[++k] = per_day[list[i]] + 0
+                lines += v[k]
+            }
+            for (i = 2; i <= k; i++) { x = v[i]; for (j = i - 1; j >= 1 && v[j] > x; j--) v[j + 1] = v[j]; v[j + 1] = x }
+            middle = 0
+            if (k) middle = k % 2 ? v[(k + 1) / 2] : (v[k / 2] + v[k / 2 + 1]) / 2
+            printf "%.1f %d %d\n", middle, k, lines
+        }' "$@"
 }
 
 # A tool event whose session never got a prompt is lost, and has been at a known rate
 # since long before this build, so a week is not failed for having one. It fails when
-# the rate is clearly above that: three times the 28 days before the swap, and never
-# under 100 lines, so that a quiet month cannot make the next stray one a fault. What
-# that leaves: up to the limit, real tool events can go this way unfailed, only shown.
+# the rate is clearly above that: three times the median day of the 28 before the swap,
+# and never under 100 lines, so that a quiet month cannot make the next stray one a
+# fault. What that leaves: up to the limit, real tool events can go this way unfailed,
+# only shown.
 orphan_floor=100
 verdict_orphan_tools() {
     if [ -n "$dt_problem" ]; then
         line UNCHECKED orphan-tools "the drop log could not be read:$dt_problem"
         return
     fi
-    vo_swap=$(ts_epoch "${recorded_swap:-$since}")
-    vo_from=$(perl -MPOSIX=strftime -e 'print strftime("%Y-%m-%dT%H:%M:%S.000Z", gmtime($ARGV[0] - 28 * 86400))' "$vo_swap")
-    read -r vo_base vo_oldest <<<"$(orphan_baseline "$vo_from" "${recorded_swap:-$since}")"
-    vo_oldest_epoch=""
-    [ -z "${vo_oldest:-}" ] || vo_oldest_epoch=$(ts_epoch "$vo_oldest")
-    read -r vo_limit vo_rate vo_before vo_covered <<<"$(awk -v n="${n_orphan:-0}" -v base="$vo_base" -v swap="$vo_swap" \
-        -v from="$(ts_epoch "$since")" -v now="$(date +%s)" -v oldest="$vo_oldest_epoch" -v floor="$orphan_floor" '
+    read -r vo_median vo_covered vo_base <<<"$(orphan_baseline "${recorded_swap:-$since}")"
+    read -r vo_limit vo_rate <<<"$(awk -v n="${n_orphan:-0}" -v median="$vo_median" \
+        -v from="$(ts_epoch "$since")" -v now="$(date +%s)" -v floor="$orphan_floor" '
         BEGIN {
             days = (now - from) / 86400
             if (days < 1) days = 1
-            covered = 28
-            if (oldest != "" && (swap - oldest) / 86400 < 28) covered = (swap - oldest) / 86400
-            if (covered < 1) covered = 1
-            before = base / covered
-            limit = 3 * before * days
+            limit = 3 * median * days
             if (limit < floor) limit = floor
-            printf "%d %.1f %.1f %d\n", limit + 0.999, n / days, before, covered
+            printf "%d %.1f\n", limit + 0.999, n / days
         }')"
-    vo_said="${held_floor}${n_orphan:-0} tool event(s) lost with no prompt from their session since $since, $vo_rate/day; $vo_before/day in the $vo_covered days before the swap"
+    vo_said="${held_floor}${n_orphan:-0} tool event(s) lost with no prompt from their session since $since, $vo_rate/day; a median $vo_median a day over the $vo_covered day(s) before the swap that the drop logs reach ($vo_base line(s))"
     if [ "${n_orphan:-0}" -gt "$vo_limit" ]; then
-        line FAIL orphan-tools "$vo_said; over the limit of $vo_limit (3× that rate, at least $orphan_floor)"
+        line FAIL orphan-tools "$vo_said; over the limit of $vo_limit (3× that median, at least $orphan_floor)"
     else
-        line PASS orphan-tools "$vo_said; fails over $vo_limit (3× that rate, at least $orphan_floor)"
+        line PASS orphan-tools "$vo_said; fails over $vo_limit (3× that median, at least $orphan_floor)"
     fi
     row_value "$dt_rows" "item orphan" | sort | sed 's/^/  /'
 }
