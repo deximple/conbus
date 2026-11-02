@@ -283,3 +283,54 @@ fn a_grown_segment_is_rebuilt_not_served_from_its_old_sidecar() {
         "the grown segment was served from a stale sidecar"
     );
 }
+
+#[test]
+fn a_same_length_change_is_rebuilt_not_served_from_its_old_sidecar() {
+    // Damage in place, or a good copy restored over a damaged one: the name and
+    // the length both stay. Served from the sidecar, a damaged segment reads as
+    // healthy, and a restored one keeps reporting damage it no longer has.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let log_dir = dir.path().join("log");
+    std::fs::create_dir(&log_dir).expect("mkdir");
+    let mut log =
+        SegmentLog::open_with_segment_size(&log_dir, Retention::default(), 400).expect("open");
+    let bus = BusId::mint();
+    for n in 0..6u64 {
+        log.append(entry(
+            bus,
+            Event::SessionCandidate {
+                trigger: Some(n.to_string()),
+            },
+        ))
+        .expect("append");
+    }
+    drop(log);
+
+    let cache = dir.path().join("cache");
+    let first = SegmentLog::build_cache(&log_dir, &cache).expect("build");
+    assert!(first.built >= 1);
+    let again = SegmentLog::build_cache(&log_dir, &cache).expect("build again");
+    assert_eq!(again.built, 0, "an unchanged segment keeps its sidecar");
+    let closed = std::fs::read_dir(&log_dir)
+        .expect("read")
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .min()
+        .expect("a segment");
+    let mut bytes = std::fs::read(&closed).expect("read");
+    bytes[0] = b'z';
+    std::fs::write(&closed, &bytes).expect("damage");
+    // Set outright: two writes can share a time on a coarse clock.
+    std::fs::File::options()
+        .write(true)
+        .open(&closed)
+        .expect("open")
+        .set_modified(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1 << 30))
+        .expect("set time");
+
+    let scan = SegmentLog::scan_meta(&log_dir, Some(&cache)).expect("scan_meta");
+    assert!(
+        scan.defects.iter().any(|defect| defect.segment == closed),
+        "the changed segment was served from a stale sidecar"
+    );
+}

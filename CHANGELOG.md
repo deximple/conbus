@@ -6,6 +6,282 @@ the entry says so when it does.
 
 ## [Unreleased]
 
+### Fixed
+
+- `doctor` no longer leaves an empty `segment-00000000.jsonl` in a log folder
+  with no segments. It checked that a segment could be written by creating one,
+  and a later restore with `cp -n` would keep that empty file over the real one.
+- A `cache/meta` sidecar now also has to match its segment's write time, so a
+  segment changed without changing length is read again. Before, a damaged
+  segment could read as healthy, and a restored one could keep reporting damage
+  it no longer had.
+- `install` and `doctor` now ask the binary `CONBUS_OPENCODE_BIN` names which
+  OpenCode this is, as every other use of that binary does, and `cargo test` no
+  longer runs the real `opencode` or `codex app-server` when they are on `PATH`.
+- `install` waits ten seconds to hear which OpenCode this is, not two, and says when
+  it could not tell. A slow answer used to write the plugin for the wrong major with
+  no word. `doctor` says it could not read the version, rather than `runs`.
+- `conbus log | head -1` and the like no longer end in a panic. A command whose
+  reader went away exits 141, as if SIGPIPE had ended it, and prints nothing. A
+  hook that cannot print exits 0, because it must never fail the turn it answers.
+- `install` now quotes the binary's path in the hooks it registers when the path
+  needs it. With a space in the home folder, every hook failed to start, so nothing
+  was recorded. `conbus doctor` reported it, and nothing else did.
+- A daemon that writes a record and dies before replying, or before deleting the
+  spool file it drained, no longer leaves a second copy. A new daemon now reads
+  the newest hook ids back from the log at start, so a re-delivery is answered
+  rather than written again.
+- A prompt drained from the spool no longer records a `briefed` or `continued`
+  line for a briefing nobody received, and a chat order that waited in the spool
+  is no longer carried out later with nobody told. The prompt itself is recorded;
+  a person who gave an order during a restart gives it again. A quota stop that
+  waited in the spool likewise starts no `hop --apply` on its own, however late it
+  lands. The decision stays in the log, for `conbus hop` and the next briefing.
+- `usage` no longer counts a spool re-delivery twice in `records`. A second line
+  under one hook id adds one to `records` and one to `repeated`, as a twin
+  delivery does.
+- `log --tail N --bus-id ID` now follows aliases, as a full read does. It used to
+  match the id alone, so a split conversation showed part of itself. Naming a
+  conversation now costs one pass over the cache; a plain `--tail` is unchanged.
+- `docs/stability.md` said `spool/` and `cache/` can be deleted without losing a
+  record. A spool file can be the only copy of its record, and `cache/gap-since`
+  holds a range still to fill; only `cache/meta/` is safe to delete.
+- A second `conbus daemon` no longer writes anything before it gives up. It used
+  to overwrite the live daemon's stamp, fill gaps and drain the spool, and only
+  then lose the socket, which could leave a duplicate `seq` on disk. A daemon now
+  takes a lock on `daemon.lock` first, waits up to five seconds for the recorder
+  already there to go, and otherwise exits having written nothing. A start-up repair
+  that outlives its daemon holds that lock until it ends, so the next daemon waits
+  for it rather than writing beside it. A repair that never returns gives up after
+  two minutes, and the daemon serves without it. `backfill --apply`, `--gaps
+  --apply` and `--chat-export --apply` take the same lock before writing and hold it
+  until they are done, or refuse at once if a recorder or its start-up repair holds
+  it: a fill beside a start used to write every turn it filled twice.
+- A Cursor tool call or completed turn from an unbound session no longer takes a
+  conversation reserved for a directed hop. Only a prompt takes the seat, as the
+  hop's own comment always said. Such a call also gives the seat up, including
+  across a restart, so a stranger's later prompt cannot take it instead: both
+  sessions hold fresh ids.
+- A daemon and a restart now work out seats the same way, from the records in the
+  log. A hop the log refused no longer costs anyone a seat or leaves one behind, a
+  prompt that used up a contested seat stays used up after a restart, and a leg
+  that has arrived ends a second hop live as well as in a replay, so a stranger
+  cannot sit on that conversation.
+- A seat reserved for a directed hop now lasts a day, counted from the `routed`
+  record. A hop nobody followed up used to hold it for ever, and an unrelated prompt
+  days later bound to the conversation for good. A hop followed up after a day gets
+  a fresh id.
+- Under `encrypted_tools`, a tool body that reached the log elided rather than
+  sealed is now counted, and `doctor` shows the total under `drops`. One line,
+  `tool bodies elided, not sealed`, says how many since the last: at the end of a
+  drain pass that added to the count, otherwise at most every ten minutes, and on
+  shutdown, so a restart with a full spool cannot fill the drop log. Spooled tool
+  bodies are still elided, because sealing in a hook would mean reading the key
+  there. A Keychain that does not answer is counted the same way.
+- A recorder asked to stop now lands what the log will take first, for up to five
+  seconds, and leaves `the recorder stopped with records it could not land` for what
+  it could not, with no copy on disk. A record only in memory used to go with no
+  trace. It also goes when asked with a client still talking.
+- `doctor` no longer puts an orphan down to a restart. Bindings come back from the
+  log, so it is a session whose prompt hook never reached the recorder.
+- A tool event that arrives before its session has a conversation now waits in the
+  spool for up to a day for the prompt that binds it, up to 8 MiB, instead of being
+  deleted at the next two-second tick. Whether it survived used to come down to
+  timing. A turn's end or a session's end with no conversation still goes at once.
+  The drop text no longer blames a restart: bindings come back from the log.
+- A record that waited on its way to the log no longer reopens a turn that ended
+  after it. A finished conversation was briefed to the next session as still
+  mid-turn, and a quota stop stopped reading as one, once a late tool event landed
+  behind the turn's end. The fold reads `spooled_at`, which the log already has, so
+  an old log needs no migration. Only a main-thread turn end counts, a record counts
+  as late only if it also reached the log after that end, and a late turn end does
+  not close a turn that started after it.
+- A newer hook's new event kind now waits in the spool for a daemon that can read
+  it, as `docs/log-format.md` always said. It used to be refused as unreadable and
+  dropped live, and deleted from the spool. It waits up to seven days and then goes
+  with a drop line, as does an entry from a newer protocol, which used to wait for
+  ever.
+- A log that refuses a write, as a full disk or a read-only segment does, no
+  longer destroys the record. The daemon holds it in memory, up to 16 MiB, and the
+  hook spools a copy if it can. The record lands once, in arrival order, when the
+  log takes writes again, its spool copy goes with it, and the outage leaves a drop
+  line. A spooled entry goes with a drop line only once the file is seven days old
+  and the log has refused for seven days without one write working. Only a hook's
+  request is held: `conbus hop` and a lease are told the write failed, and it stays
+  failed. A short write no longer leaves a torn line. A spooled Inference frame
+  still answers `allow`. A record only in memory is lost if the recorder stops before
+  the log takes it, so `conbus doctor` says on its `writable` line when the log is
+  refusing and how many are at risk, by asking the daemon. A nearly full disk that
+  takes short records and refuses a long one leaves no drop line while nothing has
+  waited or been lost, and `daemon.log` hears about it at most every ten minutes.
+- A hook that connects to a daemon just as it closes now spools its record instead
+  of dropping it. On macOS that failure shows up as `could not bound the daemon
+  call`, which is a restart like any other.
+- A log deleted or moved while the recorder runs no longer swallows what comes
+  after it. The recorder kept writing to the file it held open, so each record
+  reported success and nothing could ever read it, even after a restart. It now
+  checks that the file is still at its name before each write, and starts again
+  at that name if not.
+- Gap fill and `backfill` no longer copy a parent conversation into its fork. A
+  transcript's session is its file name, and lines naming another session are
+  counted as not read. Before this, a Claude Desktop continuation that changed
+  near a restart could gain every turn of its parent under its own `bus_id`.
+- Gap fill and `backfill` no longer record vendor bookkeeping as turns: lines
+  marked `isMeta` without a `promptSource`, compaction summaries, interrupts,
+  local-command output and the vendor's own error messages. A skill's body or a
+  compaction no longer ends the turn it sits inside. A turn the person
+  interrupted now has no ending, as on the live path. Records already in the log
+  stay: the log is append-only.
+- Gap fill dedupes on the right keys. A vendor turn id decides, so a missed turn
+  whose words were said before is filled instead of skipped. Every conversation
+  a split session was written under is consulted, so its older turns are not
+  written again. A prompt whose hook was lost is filled even when the turn's other
+  events arrived, without a second ending.
+- A restart no longer writes a spooled turn twice, through the transcript pass or
+  the Codex pass. Gap fill leaves what the spool holds to the drain, so the hook's
+  records are the ones written, and a turn still running at the restart does not
+  get an ending from its partial text.
+- A recovered turn ends only when the transcript shows the model stopped. Before,
+  any reply counted, so a turn still running or cut off on a tool call was recorded
+  as `Complete` with partial text, and its real `Stop` wrote a second ending.
+- A log that cannot be read at start is no longer read as empty. Every
+  conversation in a chat export looked new and was appended again. The fill now
+  skips that start and keeps its range for the next one, as it does when the log
+  refuses a write part way through.
+- A Codex pass that could not run no longer loses its fill range. The range is
+  held in `cache/gap-since-codex` until a start can read it, without holding back
+  the Claude Code transcripts. `conbus backfill --gaps` now fills live Codex
+  threads too, and says when it could not read them.
+- A wedged `codex app-server` now costs one start, not every start while its range
+  is held. A start that used up its limit on one leaves it alone for an hour; by
+  hand, `conbus backfill --gaps` always asks.
+- A budget cut can no longer starve the transcripts or threads behind it. What a
+  held range has read is kept in `cache/gap-read`, so the next start goes on from
+  there instead of repeating the same prefix.
+- Two chat exports in one pass no longer write a conversation twice. Each export
+  now sees what the one before it appended.
+- Gap fill and `backfill` no longer copy a parent Codex thread into its fork. A
+  forked thread lists its parent's turns as its own, under the parent's turn ids.
+  A turn older than its thread is now counted as not read.
+- A fork's copy of its parent's turn is no longer written under the fork when the
+  copied lines carry the fork's own id. A turn id another conversation holds, or has
+  waiting in the spool, is not missing here; transcripts are read oldest file first,
+  so a parent gets to a turn neither holds, unless the parent used up a budget; a line
+  stamped well before its own file was created is taken for a copy, in a fill only; and
+  one prompt id with different words on its prompt lines is left out whole. Records
+  already written stay.
+- `conbus backfill --gaps` prints how many lines it set aside as older than their file,
+  and `--include-older-lines` fills from them too. A transcript moved by `cp`, `rsync -a`
+  or across volumes has a new creation time, so nothing else could fill it. Those lines
+  may be another conversation's copies: on a fork they are its parent's prompts, so look
+  at a dry run first. A start never does this.
+- Codex turns are now asked for oldest first, and sorted here by start time as well in
+  case a server ignores the request. `thread/turns/list` lists newest first unless
+  asked, so a running turn could get an older turn's reply as a false ending, and a
+  filled batch ended on its oldest turn. Threads already recovered in the wrong order
+  stay as they are.
+- A missed turn a tool call ended gets its ending again, from the vendor's
+  `toolEndsTurn`, with no message when the turn had no text. Turns that end on a tool
+  call without that flag still get none.
+- One Codex thread slower than the app-server's limit costs one start, or two when a
+  slower-growing thread uses the time ahead of it, not every start. It is called stalled
+  only on the time it actually got, a note from a clock that ran ahead does not stand,
+  and `conbus backfill --gaps --apply` ends the wait once it has read the thread.
+- A deadline now ends an app-server read or write whatever the process tree does. The
+  server runs in its own process group and the whole group is killed, so a wrapper's
+  child can no longer hold a start for as long as it lives. Ctrl-C, a closed terminal or
+  SIGTERM takes a wedged server and its group along, in any command that started one.
+- A refusal from the app-server keeps the Codex range unless the server says it has
+  no such method. A temporary refusal used to lose the range. A thread the server
+  refuses is asked again only when its rollout changes or by hand, so it stops costing
+  a start.
+- `conbus doctor` has a `gap fill` line for each range still held: since when, why, and
+  the file or thread that holds it. `conbus backfill --gaps` prints every reason it did
+  not read something, and `daemon.log` names each file.
+- In the `thread/list` fallback a thread is read again at each start while a range is
+  held, so a new turn in it is no longer skipped as already read.
+- A transcript that could not be read keeps the fill's range.
+- `cache/` is `0700` from the first time gap fill makes it.
+- A chat export moved into the drop folder during a downtime is now read, whatever
+  its file time. `cache/chat-export-read` says what a start has read. Reading one again
+  no longer scans the log once per conversation.
+- Gap fill reads only regular files. A FIFO named like a transcript or an export
+  blocked a start, or `conbus backfill`, for good. Anything else is skipped and
+  counted as not read, and a link is not followed.
+### Added
+
+- `conbus auth` (experimental): for when a sign-in tab opens and you should not have
+  to guess whose it is. It asks Codex, agy and gh whether they are signed in, says
+  which vendors it did not ask, and lists what conbus runs with nobody at the
+  keyboard; conbus itself needs no login, and recording needs none.
+  `pbpaste | conbus auth --url -` names a page from its scheme and host and, when it
+  calls back to a port on this machine, walks every process listening there. It says
+  `yes` only when a conbus command is above what listens and the page belongs to a
+  vendor conbus starts itself, and `no` only when the chain goes up to an app or a
+  person's session with no conbus in it, with what such a walk cannot see. Otherwise
+  it says `cannot tell` and what would tell: a listener hanging straight from the root
+  or a service manager, an unknown page, and anything under `conbus run`, which is
+  your own agent, all read that way. `--url URL` works too, and warns when the URL has
+  a query, because that is now in shell history. It reads no vendor config. It prints
+  no query value but a callback's port and, as the URL's claim, a plain `client` name.
+  `--html` writes the table and a paste box as one offline page.
+
+### Fixed
+
+- A drop log at its 4 MiB cap silently recorded nothing more. From this build on,
+  a full `drops.jsonl` is rotated to `drops.1.jsonl` and a fresh file takes new
+  drops. One generation is kept, so the rotation before last is gone. Summaries
+  read both generations, say `at least` once a rotation has happened, and lose only
+  the line when a line is torn or holds a byte that is not UTF-8. A drop after a torn
+  line starts on a fresh one, so the next reason is kept. New drop logs are `0600`.
+  `the hook payload names no session` now names the payload's field names (never
+  values), so the cause of a flood is visible.
+- `scripts/canary.sh` reads both generations and compares drop reasons by
+  timestamp instead of line offsets. A drop log at its cap that it cannot see past no
+  longer reads `PASS`: its `drops` item says `UNCHECKED`.
+- Release packages name no account in their tar headers. `scripts/sign-release.sh
+  --upload` refuses to publish a release an install would refuse: the wrong signing
+  team, a checksum naming another file, a package of another version, or an
+  `install.sh` that is not the script. After publishing it fetches what people get
+  and says loudly if that is wrong.
+- `doctor`, `status` and the quota read behind a hop's decision no longer run
+  `agy`. They read what `conbus quota`, a command a person ran, cached. `doctor` and
+  `status` show the reading with its age; past 90 minutes they say `last read 2h
+  ago, so the numbers are not counted`, and with none, `no reading yet; conbus
+  quota reads it`. `conbus auth` runs `agy models`, never `-p`. A hop to `agy` on a
+  person's order and `conbus run` still start `agy` itself as an interactive
+  session. `scripts/check-no-browser.sh` now fails if `doctor` or `status` leaves
+  the vendor's own `~/.gemini` directory behind.
+- Release packages now carry `THIRD_PARTY_NOTICES.txt`, the license text of every
+  crate built into the binary. They went out without it, though BSD-3-Clause asks
+  for it in a binary distribution and MIT for a copy of its notice.
+### Added
+
+- `conbus backup --to FOLDER` (experimental) copies closed log segments that are
+  not yet there into `FOLDER/conbus-backup/log/`, with a manifest of each one's
+  name, size and SHA-256, and says how many records are newer than the backup.
+  Each copy is read back before it gets its real name. On the same APFS volume
+  it is a clone, which costs almost no space, and it says so.
+  `conbus backup --verify --to FOLDER` rechecks the whole backup and names any
+  file that differs or is missing. It runs only when a person or their own
+  scheduler runs it: nothing in conbus does, because a hidden copy would outlive
+  someone deleting `~/.conbus` to remove their prompts.
+- `backup` refuses a folder inside the data root or holding it, a cloud-synced
+  folder (also through a symlink), `~/Desktop` and `~/Documents`, a folder whose
+  parent is missing, a folder under where this system mounts disks with no disk
+  mounted, one that held a backup and holds none now, a volume without room, and a
+  log that does not match what the folder holds. There is no override. Prompts and
+  replies are plain text at the destination, and the key that opens sealed tool
+  bodies is not copied. The first run to a folder says so, and manual section 11
+  has that and the restore, which is a documented block to paste rather than a
+  command.
+- `conbus doctor` has a `backup` line, read from `<root>/backup.json` alone: when
+  the last good run was, where to and how many segments, whether that is the
+  log's own disk or a network share, or `none: this log has one copy`.
+- `conbus uninstall` prints every folder a backup went to, from a list in
+  `backup.json` that gets each folder before the first copy lands there, because
+  those copies are plain text and nothing else says where they are.
+
 ## [1.0.0-rc.3] — 2026-11-01
 
 ### Fixed

@@ -497,7 +497,6 @@ impl Tally {
             .as_ref()
             .is_some_and(|h| !self.seen_hook_ids.insert(h.clone()))
         {
-            self.records += 1;
             self.repeated += 1;
             self.rows.entry(key).or_default().1.repeated += 1;
             self.harnesses.entry(harness).or_default().1.repeated += 1;
@@ -1728,6 +1727,22 @@ mod tests {
         assert_eq!(ledger.failing_tools, vec![("Bash".to_string(), 1)]);
         assert_eq!(ledger.records, 2, "both copies are records");
         assert_eq!(ledger.repeated, 1);
+    }
+
+    #[test]
+    fn a_spool_redelivery_counts_as_one_more_record_not_two() {
+        // Two lines on disk under one hook id. The second is a `repeated`, and
+        // `records` says how many lines the window held, so it adds one.
+        let s = || claude_in(Some("/w"), Some("cli"));
+        let mut first = at(&on_day("09:00:00"), ONE, s(), prompt("ship it"));
+        first.hook_id = Some("h1".into());
+        let mut again = at(&on_day("09:00:01"), ONE, s(), prompt("ship it"));
+        again.hook_id = Some("h1".into());
+
+        let ledger = Ledger::fold(&[first, again], DAY);
+
+        assert_eq!(ledger.repeated, 1);
+        assert_eq!(ledger.records, 2, "two lines on disk");
     }
 
     #[test]

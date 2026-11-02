@@ -2,8 +2,9 @@
 
 The log is the source of truth. It is a directory of append-only JSONL
 segments under the data root, `log/segment-00000000.jsonl` and up, rolled at
-8 MiB. Everything else conbus keeps — the daemon's state, `cache/`, any index —
-is derived from it and can be rebuilt from it.
+8 MiB. The daemon's state, `cache/meta/` and any index are derived from it and
+can be rebuilt from it. `spool/` is the one thing that can hold a record the log
+does not have yet ([what is safe to delete](stability.md#what-counts-as-breaking)).
 
 ## A line
 
@@ -19,7 +20,7 @@ envelope comes first, then the event's own fields at the same level:
 | `vendor_turn_id` | string, optional | The vendor's turn correlator |
 | `vendor_agent_id` | string, optional | Set when a subagent wrote the record |
 | `hook_id` | string, optional | The id the hook minted, so a delivery retried through the spool is counted once |
-| `spooled_at` | string, optional | When the hook wrote it to the spool, while `ts` stays the write time |
+| `spooled_at` | string, optional | When it first failed to reach the log: the hook wrote it to the spool, or the recorder kept it for a log that refused it. `ts` stays the write time |
 | `harness` | string | `claude_code`, `codex`, `cursor`, `grok`, `opencode`, `agy`, `claude_chat` |
 | `harness_version` | string, optional | When the vendor exposes it to its hooks |
 | `vendor_session_id` | string, optional | The vendor's session id |
@@ -73,5 +74,7 @@ so no caller can put a withheld body on disk.
 Hooks reach the recorder over a Unix socket (`conbus.sock`, mode `0600`) as one
 JSON request per line. `PROTOCOL_VERSION` (`crates/conbus/src/wire.rs`) moves
 whenever the request's shape does. A recorder refuses a hook that speaks a
-newer protocol and says so ("Restart the daemon"); a hook that speaks an older
-one is served.
+newer protocol and says so ("Restart the daemon"), and that includes a request
+at its own version with an event kind it does not know. The hook keeps what was
+refused in `spool/`, where it waits up to seven days for a recorder that can read
+it. A hook that speaks an older protocol is served.

@@ -3,14 +3,25 @@
 #
 #   scripts/canary.sh preflight [--evidence DIR]
 #   scripts/canary.sh status
-#   scripts/canary.sh verdict [--since <ts>]
-#   scripts/canary.sh start --from <candidate-binary>
+#   scripts/canary.sh verdict [--since <ts>] [--idle <harness|day>[,...]]
+#   scripts/canary.sh start --from <candidate-binary> [--parity <binary>]
 #   scripts/canary.sh restart
 #   scripts/canary.sh rollback
 #
-# preflight, status and verdict are read-only (preflight also makes the
-# plist backup — a copy, never a change). start, restart and rollback swap
-# or reload the installed binary. Per the 1.0 plan, §7:
+#   verdict exits: 0 pass, 1 an item failed, 2 arguments refused, 3 the window is
+#   still open, 4 the window is over and an item other than operator-feel could not
+#   be judged. It names what is open, and that is neither a fail nor a pass.
+#   --idle is your answer to "was this harness or day idle, or not recorded?". The
+#   question names what to pass, and a PASS prints the answer.
+#   start exits 1 when it rolled back or found no candidate or install to swap, and
+#   2 when it refused before anything moved.
+#   start and rollback exit 3 when the rollback could not be verified.
+#   restart exits 1 when the daemon never served.
+#
+# status and verdict are read-only. preflight makes the plist backup, a copy; with
+# --from it also prebuilds the candidate's cache/ next to the live log, a rebuildable
+# sidecar, and runs the candidate's own daemon on a throwaway root. start, restart and
+# rollback swap or reload the installed binary. Per the 1.0 plan, §7:
 #   - the swap is real only when ALL of these hold: HOME is the passwd
 #     home, CONBUS_SKIP_LAUNCHCTL is unset, CONBUS_CANARY_REHEARSAL is
 #     unset. It then ends in `conbus install --apply` (bootout +
@@ -27,30 +38,50 @@
 #   - start runs preflight first and refuses before swapping when it
 #     fails. After the swap it requires, inside
 #     CONBUS_CANARY_SERVING_LIMIT seconds (default 30): a new daemon pid
-#     serving, a doctor with no DIFFERS against the candidate build,
-#     every hooks line `runs`, and zero drop reasons that were not there
-#     before — except the two a normal swap window produces (a protocol
-#     refusal while the old daemon still answers, or no listener
-#     mid-restart), which are counted into canary.json as
-#     swap_window_drops instead. Any other failure rolls back
-#     automatically and exits 1. The 5-second serving goal is a verdict
-#     criterion, not a rollback one — current measurements sit above it
-#     and would undo every cutover.
+#     serving, a doctor with no DIFFERS against the candidate build and a log
+#     that can take a record, every installed vendor's hooks line `runs` with no
+#     event missing (a vendor CLI too slow to say its version is a note, not a
+#     failure), a daemon that answers on its socket, and zero drop reasons that
+#     were not there before. Three kinds of line are excepted: the two reasons a
+#     normal swap window produces in its first 60 s (a protocol refusal while the
+#     old daemon still answers, or no listener mid-restart), counted into
+#     canary.json as swap_window_drops; lines that lost no record; and a tool event
+#     with no prompt, which the verdict judges against its rate. Any other failure
+#     rolls back automatically and exits 1. The
+#     5-second serving goal is a verdict criterion, not a rollback one —
+#     current measurements sit above it and would undo every cutover.
+#   - `hooks ... runs` is not a round trip: doctor starts the command with a
+#     marker that returns before the socket, and for Cursor and OpenCode only
+#     reads the registration. So preflight --from sends the candidate's own hook
+#     through its own daemon into a throwaway log, and after the swap the live
+#     daemon must answer on its socket. Neither writes to the real log. What no
+#     check here can prove is that a vendor fires its hook; the verdict's
+#     harness-activity judges that from the records that arrive.
 #   - state lives at <root>/canary.json: swap time, previous/candidate
 #     builds, candidate sha, swap-window drop count, and the planned
 #     restarts (each with its start->serving milliseconds and the number
 #     of drop lines added during it — not new-reason strings).
 #   - `restart` performs a planned restart (`install --apply`) and records
-#     its measurements. `verdict` bounds its window by the recorded swap
+#     its measurements, and exits 1 if the daemon never served. `verdict` bounds its window by the recorded swap
 #     time unless --since overrides it; its budgets come from
 #     CONBUS_CANARY_TAIL_MS / _USAGE_MS / _DOCTOR_MS / _SERVING_MS /
-#     _RSS_MB / _WINDOW_DAYS, defaulting to the plan's M3 targets.
+#     _RSS_MB / _WINDOW_DAYS, defaulting to the plan's M3 targets. `start` stores
+#     the RSS and doctor budgets, the serving limit and CONBUS_CANARY_DISK_WARN_OK
+#     in canary.json, and the verdict reads them back and prints them, so a later
+#     shell cannot forget them. The environment still wins, and says so.
+#   - `verdict` exits 0 on a completed pass, 1 when an item fails, 2 when it
+#     refuses its arguments, 3 while the 7-day window is still open, and 4
+#     when the window is over but an item other than operator-feel could not
+#     be judged. Exit 4 is neither a fail nor a pass; it names what is open.
+#     --idle is the operator's answer to the one question a log cannot settle,
+#     "was this harness or day idle, or not recorded?"; a PASS prints it.
 #   - preflight fails on doctor's `disk` warning unless
 #     CONBUS_CANARY_DISK_WARN_OK=1 downgrades it to WARN.
 #   - every rollback — the automatic one after a failed start and the
-#     `rollback` subcommand — is verified: the restored build must write a
-#     daemon.build stamp with a new pid and doctor must listen with no
-#     DIFFERS, else the script exits 3.
+#     `rollback` subcommand — is verified: the build the rollback copy says it
+#     is must write a daemon.build stamp with a new pid and doctor must listen
+#     with no DIFFERS, within the serving limit, else the script exits 3 and
+#     says which it was. An `install --apply` that failed says that.
 #   - every doctor call is capped at CONBUS_CANARY_DOCTOR_LIMIT seconds
 #     (default 120): an old build's vendor probes are unbounded, and a
 #     wedged one must fail the check it is in — not hang it. A cap hit in
@@ -61,6 +92,11 @@
 # over a binary a running daemon has mapped.
 set -euo pipefail
 
+# Under pipefail a reader that leaves early (`grep -q`, `head`) can cost its writer
+# a SIGPIPE, and the pipeline then reads as failed however the match came out: a
+# healthy daemon as "not answering", a swap rolled back. So grep -q reads a
+# here-string, and a first line comes from `sed -n '1p'`, which reads to the end.
+
 say() { printf 'canary: %s\n' "$*"; }
 die() { say "$*" >&2; exit 1; }
 refuse() { say "$*" >&2; exit 2; }
@@ -69,6 +105,8 @@ install_dir=$HOME/.local/bin
 daemon_label=sh.conbus.daemon
 bin=$install_dir/conbus
 rollback_bin=$install_dir/conbus.rollback
+# usage-parity's baseline, kept apart from the rollback copy: a rollback uses that up.
+parity_bin=$install_dir/conbus.parity
 new_bin=$install_dir/conbus.new
 
 # Every check must describe the install and data root the managed daemon
@@ -79,6 +117,14 @@ root=$HOME/.conbus
 stamp=$root/daemon.build
 daemon_log=$root/daemon.log
 drops_log=$root/drops.jsonl
+# A build that rotates its drop log renames a full drops.jsonl here and
+# starts fresh; the file sits beside the live one, never nested further.
+drops_rotated=$root/drops.1.jsonl
+# crates/conbus/src/drops.rs CAP_BYTES. A build that does not rotate (0.2.x,
+# rc.3) stops recording the moment its log reaches this size, so a file at
+# it is blind: every later drop was silently discarded and any "0 drops"
+# verdict on it has no basis.
+drops_cap_bytes=$((4 * 1024 * 1024))
 state_file=$root/canary.json
 
 serving_limit=${CONBUS_CANARY_SERVING_LIMIT:-30}
@@ -90,8 +136,21 @@ usage_ms_budget=${CONBUS_CANARY_USAGE_MS:-2000}
 doctor_ms_budget=${CONBUS_CANARY_DOCTOR_MS:-3000}
 serving_ms_budget=${CONBUS_CANARY_SERVING_MS:-5000}
 doctor_limit_s=${CONBUS_CANARY_DOCTOR_LIMIT:-120}
+noise_limit=${CONBUS_CANARY_NOISE_MAX:-2000}
+probe_s=${CONBUS_CANARY_PROBE_S:-5}
 
 is_uint() { case $1 in '' | *[!0-9]*) return 1 ;; *) return 0 ;; esac }
+# A whole number with no leading zero: `$((08))` ends the script under `set -e`.
+is_count() { is_uint "$1" && case $1 in 0?*) return 1 ;; *) return 0 ;; esac }
+
+# An ISO-8601 UTC timestamp with real milliseconds — `date` only writes a
+# literal .000, and drop lines carry true ms, so a same-second boundary
+# needs the fraction to order them.
+now_iso_ms() {
+    perl -MTime::HiRes=gettimeofday -MPOSIX=strftime -e \
+        '($s, $u) = gettimeofday;
+         printf "%s.%03dZ", strftime("%Y-%m-%dT%H:%M:%S", gmtime($s)), int($u / 1000)'
+}
 
 # doctor under a wall-clock cap — CONBUS_CANARY_DOCTOR_LIMIT seconds
 # (default 120). 0.2.x's vendor probes have no bound and a wedged probe has
@@ -105,8 +164,9 @@ run_doctor() {
     "$bin" doctor >"$df" 2>&1 &
     dpid=$!
     n=0
-    while kill -0 "$dpid" 2>/dev/null && [ $n -lt $((doctor_limit_s * 2)) ]; do
-        sleep 0.5
+    # A short tick: time-budget times this call, and a long one reads as doctor.
+    while kill -0 "$dpid" 2>/dev/null && [ $n -lt $((doctor_limit_s * 10)) ]; do
+        sleep 0.1
         n=$((n + 1))
     done
     if kill -0 "$dpid" 2>/dev/null; then
@@ -124,9 +184,13 @@ run_doctor() {
         rm -f "$df"
         return 142
     fi
-    wait "$dpid" 2>/dev/null || true
+    # The doctor's own status goes back to the caller: one that could not read
+    # the log exits non-zero after printing most of its lines.
+    doctor_status=0
+    wait "$dpid" 2>/dev/null || doctor_status=$?
     cat "$df"
     rm -f "$df"
+    return "$doctor_status"
 }
 
 # HOME resolves to this user's passwd home — independent of SKIP or
@@ -137,25 +201,40 @@ passwd_home() {
     env -u HOME bash -c 'cd ~ && pwd -P' 2>/dev/null
 }
 
+# The same directory by device and inode, not the same text. This volume is
+# case-insensitive and firmlinked, so /users/me and /System/Volumes/Data/Users/me
+# are the real home under other spellings. A HOME that links to the real root or
+# the real install is the real one as well.
 is_passwd_home() {
     local pw
     pw=$(passwd_home) || return 1
     [ -n "$pw" ] || return 1
-    [ "$(cd "$HOME" && pwd -P)" = "$(cd "$pw" && pwd -P)" ]
+    [ "$HOME" -ef "$pw" ] || [ "$root" -ef "$pw/.conbus" ] || [ "$install_dir" -ef "$pw/.local/bin" ]
+}
+
+# A stand-in, not a build. The seam below walks the real swap path, and `install
+# --apply` from a real binary takes the live recorder down whatever HOME says:
+# launchctl answers by uid.
+is_stand_in() { # is_stand_in <binary>
+    [ "$(LC_ALL=C head -c 2 "$1" 2>/dev/null)" = '#!' ]
 }
 
 # The real environment: HOME is this user's passwd home and nothing asked
 # that launchctl be skipped. CONBUS_CANARY_TEST_REAL_HOME is the
-# rehearsal's seam into the real code path: honoured only when it resolves
-# to the same throwaway HOME the script sees, which by construction is not
-# the passwd home. Naming the passwd home through it can never launder a
-# real swap.
+# rehearsal's seam into the real code path: honoured only when it is the same
+# throwaway HOME the script sees, which by construction is not the passwd home,
+# and when the binaries are stand-ins: the installed one, the candidate, and the
+# rollback copy, whose `install --apply` a rollback runs. Naming the passwd home
+# through it can never launder a real swap. Set at all counts as asked, empty too,
+# because that is how the binary reads it.
 is_real_env() {
-    [ -z "${CONBUS_SKIP_LAUNCHCTL:-}" ] || return 1
+    [ -z "${CONBUS_SKIP_LAUNCHCTL+set}" ] || return 1
     is_passwd_home && return 0
     [ -n "${CONBUS_CANARY_TEST_REAL_HOME:-}" ] || return 1
-    this_home=$(cd "$HOME" && pwd -P)
-    [ "$(cd "$CONBUS_CANARY_TEST_REAL_HOME" 2>/dev/null && pwd -P)" = "$this_home" ]
+    [ "$CONBUS_CANARY_TEST_REAL_HOME" -ef "$HOME" ] || return 1
+    is_stand_in "$bin" || return 1
+    [ ! -e "$rollback_bin" ] || is_stand_in "$rollback_bin" || return 1
+    [ -z "${from:-}" ] || is_stand_in "$from"
 }
 
 # True when `agy models` lists models. With no login it fails and opens nothing.
@@ -179,34 +258,31 @@ agy_signed_in() {
 # terminal, and doctor on a build older than conbus's own sign-in check still
 # runs it. That build may be the one installed or the one rolled back to, so
 # the check is made here too. A throwaway HOME has no login to ask about, and a
-# quota line is not what this script tests.
-if ! is_real_env || ! agy_signed_in; then
+# quota line is not what this script tests. A rehearsal never asks: under the real
+# HOME it is about to be refused, and a real vendor must not run before that.
+if [ -n "${CONBUS_CANARY_REHEARSAL:-}" ] || ! is_real_env || ! agy_signed_in; then
     export CONBUS_AGY_BIN=/usr/bin/false
 fi
 
 # --- blackout ---------------------------------------------------------------
 
-# Weekday spec like Mon, Mon-Fri, Sat,Sun — 0 if it parses.
+is_day() { case $1 in Mon | Tue | Wed | Thu | Fri | Sat | Sun) return 0 ;; *) return 1 ;; esac; }
+
+# Weekday spec like Mon, Mon-Fri, Sat,Sun — 0 if it parses, and nothing else does.
 is_day_spec() {
     case $1 in
-        Mon | Tue | Wed | Thu | Fri | Sat | Sun) return 0 ;;
+        *-*)
+            [ "$1" = "${1%%-*}-${1##*-}" ] && is_day "${1%%-*}" && is_day "${1##*-}"
+            ;;
+        *,*)
+            rest=$1,
+            while [ -n "$rest" ]; do
+                is_day "${rest%%,*}" || return 1
+                rest=${rest#*,}
+            done
+            ;;
+        *) is_day "$1" ;;
     esac
-    case $1 in
-        Mon- | Tue- | Wed- | Thu- | Fri- | Sat- | Sun- | \
-        *-Mon | *-Tue | *-Wed | *-Thu | *-Fri | *-Sat | *-Sun) : ;;
-        *) return 1 ;;
-    esac
-    rest=$1
-    while :; do
-        case $rest in
-            Mon | Tue | Wed | Thu | Fri | Sat | Sun) return 0 ;;
-            Mon-* | Tue-* | Wed-* | Thu-* | Fri-* | Sat-* | Sun-*)
-                rest=${rest#*-} ;;
-            Mon,* | Tue,* | Wed,* | Thu,* | Fri,* | Sat,* | Sun,*)
-                rest=${rest#*,} ;;
-            *) return 1 ;;
-        esac
-    done
 }
 
 # Map an English weekday name to date +%u (Mon=1 .. Sun=7).
@@ -289,7 +365,12 @@ blackout_active() {
             else range=$1 tz=$2
             fi
             ;;
-        3) days=$1 range=$2 tz=$3 ;;
+        3)
+            # A day part that is not a day must not read as "not today": that is a
+            # swap in the very hours the spec was written to protect.
+            is_day_spec "$1" || { BLACKOUT_REASON="unparseable"; return 0; }
+            days=$1 range=$2 tz=$3
+            ;;
         *) BLACKOUT_REASON="unparseable"; return 0 ;;
     esac
     if is_time_range "$range"; then
@@ -381,6 +462,25 @@ wait_for_serving() {
     return 1
 }
 
+# A binary as a person checks it against a release: its version and the start of its
+# sha256.
+describe_build() { # describe_build <binary>
+    db_version=$("$1" --version 2>/dev/null || true)
+    db_sha=$({ shasum -a 256 "$1" 2>/dev/null || true; } | awk '{ print substr($1, 1, 12) }')
+    printf '%s (sha256 %s)' "${db_version:-does not run}" "${db_sha:-unreadable}"
+}
+
+# The build a binary says it is, empty when it does not run.
+build_of() { # build_of <binary>
+    "$1" --version 2>/dev/null | sed -n 's/.*(\([0-9a-f]*\)).*/\1/p' || true
+}
+
+# Something accepts a connection on the socket. For waiting only: it says nothing about
+# whether the daemon behind it answers.
+socket_accepts() {
+    perl -MIO::Socket::UNIX -e 'exit(IO::Socket::UNIX->new(Type => SOCK_STREAM(), Peer => $ARGV[0]) ? 0 : 1)' "$root/conbus.sock"
+}
+
 # Wait for the stamp to name <build> with a pid that is not <not_pid> — the
 # proof a rollback actually booted. A restored 0.2.x stamp carries no
 # `serving` key, so unlike wait_for_serving this never asks for one.
@@ -404,77 +504,70 @@ wait_for_build() {
     return 1
 }
 
-# After a rollback the old build must come back: a stamp naming it with a
-# pid the candidate never had, then a doctor that is listening and agrees.
-# Verified prints and returns; anything else exits 3 — a rollback nobody
-# verified is worse news than the failure that caused it.
+# After a rollback the build that was restored must come back: a stamp naming it with
+# a pid the candidate never had, a socket, then a doctor that is listening and agrees.
+# Its first stamp comes before its socket, by 6 s on a real log, so one look at doctor
+# reads a rollback that worked as one that did not. Verified prints and returns;
+# anything else exits 3 and says which of these it was. <restored> is what the rollback
+# copy says it is: that can be older than the build being replaced.
 verify_rollback() {
-    prev_build=$1
+    restored=$1
     cand_pid=$2
     mode=$3
+    if [ -z "$restored" ]; then
+        say "ROLLBACK NOT VERIFIED — the rollback copy does not say which build it is; run 'canary.sh status'"
+        exit 3
+    fi
     if [ "$mode" = rehearsal ]; then
         # The reload is skipped under rehearsal; let the fake boot the old
         # build's daemon the way install --apply would have.
         run_doctor >/dev/null 2>&1 || true
     fi
-    rb_pid=$(wait_for_build "$prev_build" "$cand_pid") || {
-        say "ROLLBACK NOT VERIFIED — no $prev_build stamp inside ${serving_limit}s; run 'canary.sh status'"
+    rb_pid=$(wait_for_build "$restored" "$cand_pid") || {
+        say "ROLLBACK NOT VERIFIED — no $restored stamp inside ${serving_limit}s; run 'canary.sh status'"
         exit 3
     }
-    doctor_rc=0
-    doctor_out=$(run_doctor) || doctor_rc=$?
-    if [ "$doctor_rc" -eq 142 ]; then
-        say "ROLLBACK NOT VERIFIED — doctor did not answer inside ${doctor_limit_s}s; run 'canary.sh status'"
-        exit 3
-    fi
-    if echo "$doctor_out" | grep -q 'DIFFERS'; then
-        say "ROLLBACK NOT VERIFIED — doctor reports a different build; run 'canary.sh status'"
-        exit 3
-    fi
-    if ! echo "$doctor_out" | grep -q 'listening'; then
-        say "ROLLBACK NOT VERIFIED — the daemon is not listening; run 'canary.sh status'"
-        exit 3
-    fi
-    say "rollback verified: $prev_build pid $rb_pid listening"
+    n=0
+    while ! socket_accepts && [ "$n" -lt $((serving_limit * 2)) ]; do
+        sleep 0.5
+        n=$((n + 1))
+    done
+    rb_until=$(($(date +%s) + serving_limit))
+    while :; do
+        doctor_rc=0
+        doctor_out=$(run_doctor) || doctor_rc=$?
+        if [ "$doctor_rc" -eq 142 ]; then
+            say "ROLLBACK NOT VERIFIED — doctor did not answer inside ${doctor_limit_s}s; run 'canary.sh status'"
+            exit 3
+        fi
+        if grep -q 'DIFFERS' <<<"$doctor_out"; then
+            say "ROLLBACK NOT VERIFIED — doctor reports a different build; run 'canary.sh status'"
+            exit 3
+        fi
+        grep -q 'listening' <<<"$doctor_out" && break
+        if [ "$(date +%s)" -ge "$rb_until" ]; then
+            say "ROLLBACK NOT VERIFIED — $restored wrote a stamp and the daemon is not listening after ${serving_limit}s; run 'canary.sh status'"
+            exit 3
+        fi
+        sleep 1
+    done
+    say "rollback verified: $restored pid $rb_pid listening"
 }
 
-# Report the socket state and fail (1) only when a real reload did not come
-# up; in rehearsal, not-listening is expected.
-check_doctor() {
-    mode=$1
-    doctor_rc=0
-    doctor_out=$(run_doctor) || doctor_rc=$?
-    [ "$doctor_rc" -eq 142 ] &&
-        say "doctor: no answer inside ${doctor_limit_s}s (cap)"
-    echo "$doctor_out" | grep -E '^(socket|daemon|recorder|hardening)' || true
-    if echo "$doctor_out" | grep -q 'DIFFERS'; then
-        say "doctor: the answering daemon is a different build —"
-        say "  check \`canary.sh status\`, or roll back: canary.sh rollback"
-        return 1
+# The reload after a rollback. A failed one has nothing to verify: the old daemon may
+# never have stopped, and waiting for a stamp would only blame the wrong thing.
+rollback_reload() { # rollback_reload <mode>
+    if ! reregister_daemon "$1" && [ "$1" = real ]; then
+        say "ROLLBACK NOT VERIFIED — the binary is back, and 'conbus install --apply' failed, so what is running is not known; run 'canary.sh status'"
+        exit 3
     fi
-    if echo "$doctor_out" | grep -q 'listening'; then
-        say "doctor: socket listening"
-        return 0
-    fi
-    if [ "$mode" = real ]; then
-        say "doctor: the daemon is not answering after install --apply —"
-        say "  check \`canary.sh status\`, or roll back: canary.sh rollback"
-        return 1
-    fi
-    say "doctor: not answering — expected while the daemon is not restarted"
-    return 0
 }
 
 # --- canary.json ------------------------------------------------------------
 
 state_get() { # state_get <dotted key> — flat fields only
     [ -f "$state_file" ] || return 1
-    sed -n "s/.*\"$1\":\"\\([^\"]*\\)\".*/\\1/p" "$state_file" | head -1
-}
-
-state_restart_count() {
-    [ -f "$state_file" ] || { echo 0; return; }
-    { grep -o '"serving_ms"' "$state_file" || true; } | wc -l | tr -d ' '
+    sed -n "s/.*\"$1\":\"\\([^\"]*\\)\".*/\\1/p" "$state_file" | sed -n '1p'
 }
 
 state_restart_drop_total() {
@@ -483,72 +576,1154 @@ state_restart_drop_total() {
         awk '{ t += $1 } END { print t + 0 }'
 }
 
+# state_extra is what `start` measured before the swap, kept as it is on each write.
+state_extra=""
 state_write() { # state_write <swapped> <prev> <cand> <sha> <restarts-json-array> [rolled_back] [swap_window_drops]
     mkdir -p "$root"
     tmp=$state_file.tmp
-    printf '{"swapped":"%s","prev_build":"%s","candidate_build":"%s","candidate_sha256":"%s","restarts":%s%s%s}\n' \
+    printf '{"swapped":"%s","prev_build":"%s","candidate_build":"%s","candidate_sha256":"%s","restarts":%s%s%s%s}\n' \
         "$1" "$2" "$3" "$4" "$5" "${6:+,\"rolled_back\":\"$6\"}" \
-        "${7:+,\"swap_window_drops\":$7}" >"$tmp"
+        "${7:+,\"swap_window_drops\":$7}" "$state_extra" >"$tmp"
     mv -f "$tmp" "$state_file"
 }
 
-state_restarts_json() { # echoes the restarts array as stored, [] when absent
-    [ -f "$state_file" ] || { echo '[]'; return; }
-    sed -n 's/.*"restarts":\(\[.*\]\).*/\1/p' "$state_file" | head -1
-}
-
 state_add_restart() { # state_add_restart <ts> <serving_ms|-> <new_drops>
-    restarts=$(state_restarts_json)
-    entry=$(printf '{"ts":"%s","serving_ms":%s,"new_drops":%s}' "$1" "${2:--1}" "${3:-0}")
-    if [ "$restarts" = '[]' ]; then
-        new="[$entry]"
-    else
-        new="${restarts%\]},$entry]"
-    fi
-    state_write "$(state_get swapped)" "$(state_get prev_build)" \
-        "$(state_get candidate_build)" "$(state_get candidate_sha256)" "$new"
+    # The array and nothing else. Dropping rolled_back here would turn a rolled-back
+    # window back into a live one the moment anyone restarted.
+    CANARY_RESTART=$(printf '{"ts":"%s","serving_ms":%s,"new_drops":%s}' "$1" "${2:--1}" "${3:-0}") \
+        perl -pe 's/"restarts":\[\]/"restarts":[$ENV{CANARY_RESTART}]/ or s/"restarts":\[(.*)\]/"restarts":[$1,$ENV{CANARY_RESTART}]/' \
+        "$state_file" >"$state_file.tmp"
+    mv -f "$state_file.tmp" "$state_file"
 }
 
-# Spool files left after a rollback — the restored 0.2.x build does not
-# read a spool, so they sit until a newer daemon drains them. Reported,
-# never deleted here.
+# Spool files left after a rollback. A 0.2.x build does not read a spool, so there they
+# sit until a build that does. Reported, never deleted here, and never the reason a
+# rollback stops short of its verification.
 say_spool() {
+    if [ -d "$root/spool" ] && [ ! -r "$root/spool" ]; then
+        say "spool: $root/spool could not be read — whatever it holds is still there"
+        return 0
+    fi
     n=0
-    [ -d "$root/spool" ] && n=$(ls "$root/spool" 2>/dev/null | wc -l | tr -d ' ')
-    say "spool: $n file(s) — the old build does not drain them; they wait for the next daemon"
+    if [ -d "$root/spool" ]; then
+        n=$({ ls "$root/spool" 2>/dev/null || true; } | wc -l | tr -d ' ')
+    fi
+    say "spool: $n file(s), left in place — a build that reads the spool drains them; 0.2.x does not"
 }
 
-# The distinct drop reasons in drops.jsonl, one per line.
+# What a drop line means. The classes come from what the hook and the daemon
+# write (crates/conbus/src/hook/client.rs, daemon.rs, drops.rs) and from what
+# this log's real history shows each of them to be:
+#   lost        a record that did not land. A build that spools only writes these
+#               when the spool refused too. Fails at any count, known or not.
+#               Includes an orphaned prompt: real content with no conversation to
+#               go in, and `the recorder stopped with records it could not land`
+#               (#158), whose detail says how many.
+#   orphan      a tool event or permission ask whose session never got a prompt. Lost
+#               too, but at a known rate from before the swap (14 of 39 past windows
+#               have one), so it is judged on its own line against that rate.
+#   gap         the adapter has no mapping for an event (`no mapping`, `no
+#               adapter`), or a payload that does not parse as what it expects
+#               (`missing field ... at line N column M`): the vendor moved, and the
+#               prompt is gone. Fails at any count, named by event or by shape.
+#   ghost       the end of a session or a turn, or a notification, for a session
+#               with no binding. It carries no content of its own: 693 of the 729
+#               orphan lines in the three weeks before the swap, 8 of them within two
+#               minutes of a daemon start, and 350 of the 405 sessions behind those
+#               729 never reached the log.
+#   sessionless the payload named no session. The plan counts this as the vendor's,
+#               not a lost record.
+#   payload     `EOF while parsing`: the hook was given nothing, which is what one
+#               run by hand says. 64 lines in eight weeks, and nothing else in the
+#               real history ends in a line and a column. Since the hook names a
+#               stdin it could not read, an invalid byte no longer reads as this.
+#   held        `the log refused writes for a while` (#155): an outage's one line,
+#               written once a write worked, when every record waited and landed.
+#               Delayed, not lost, and counted on its own line because a person
+#               should know the disk refused writes. The same line with `and records
+#               may be lost` is lost.
+#   elided      `tool bodies elided, not sealed` (#158): the record landed, its
+#               tool body did not. Judged on its own, as a share of tool calls.
+#   other       none of the above: new since the swap fails, known needs a person.
+drop_awk_lib='
+function drop_parse(line) {
+    d_ts = ""; d_reason = ""; d_detail = ""
+    if (match(line, /"ts":"[^"]*"/)) d_ts = substr(line, RSTART + 6, RLENGTH - 7)
+    if (match(line, /"reason":"([^"\\]|\\.)*"/)) d_reason = substr(line, RSTART + 10, RLENGTH - 11)
+    if (match(line, /"detail":"([^"\\]|\\.)*"/)) d_detail = substr(line, RSTART + 10, RLENGTH - 11)
+}
+# One physical line can hold more than one record: a write cut short by a full disk,
+# then the next line glued on. A quote inside a JSON string is escaped, so `{"ts":"`
+# can only start a record, and each field can come first: older files, other writers.
+function drop_split(line,    rest, at) {
+    n_frag = 0
+    rest = line
+    while (match(substr(rest, 2), /\{"(ts|reason|detail)":"/)) {
+        at = RSTART + 1
+        frag[++n_frag] = substr(rest, 1, at - 1)
+        rest = substr(rest, at)
+    }
+    frag[++n_frag] = rest
+}
+function drop_whole(fragment) { return fragment ~ /\}[[:space:]]*$/ }
+function drop_event(detail,    event) {
+    event = detail
+    sub(/ for session .*/, "", event)
+    sub(/ as .*/, "", event)
+    return event
+}
+function starts(text, prefix) { return index(text, prefix) == 1 }
+function drop_class(r, d) {
+    if (r == "tool bodies elided, not sealed") return "elided"
+    if (r == "the log refused writes for a while") return "held"
+    if (starts(r, "the log refused writes for a while")) return "lost"
+    if (starts(r, "the recorder stopped with records it could not land")) return "lost"
+    if (starts(r, "no mapping for hook event") || starts(r, "no adapter for harness")) return "gap"
+    if (index(r, "names no session")) return "sessionless"
+    if (starts(r, "no conversation for this session") || starts(r, "spooled hook still has no conversation")) {
+        if (drop_event(d) ~ /^([Ss]ession_?[Ee]nd(ed)?|([Ss]ubagent)?[Ss]top|turn_ended|[Nn]otification|notified)$/)
+            return "ghost"
+        if (drop_event(d) ~ /^([Pp]re|[Pp]ost)[Tt]ool|^tool_|^[Pp]ermission/) return "orphan"
+        return "lost"
+    }
+    if (starts(r, "no daemon on ") || starts(r, "could not send the record:") ||
+        starts(r, "no reply from the daemon:") || starts(r, "unreadable reply ") ||
+        starts(r, "could not bound the daemon call:") || starts(r, "the daemon refused the record:") ||
+        starts(r, "spooled hook refused") || starts(r, "spool entry ") ||
+        starts(r, "no home directory to resolve") || starts(r, "the socket path ") ||
+        starts(r, "the hook payload could not be read"))
+        return "lost"
+    if (starts(r, "EOF while parsing")) return "payload"
+    if (r ~ / at line [0-9]+ column [0-9]+$/) return "gap"
+    return "other"
+}
+# The two reasons a normal swap window produces. Between the mv and the new
+# daemon serving, a firing hook either reaches the old daemon, which refuses a
+# protocol it does not speak and cannot be spooled past (an old stamp names no
+# retention), or finds nobody listening. A same-version refusal is not one.
+function drop_swap_reason(r,    old_v, new_v) {
+    if (starts(r, "no daemon on ")) return index(r, ": Connection refused") > 0
+    if (!match(r, /^the daemon refused the record: this daemon speaks protocol v[0-9]+; the hook speaks v[0-9]+/)) return 0
+    old_v = r; sub(/^.*speaks protocol v/, "", old_v); sub(/;.*/, "", old_v)
+    new_v = r; sub(/^.*the hook speaks v/, "", new_v); sub(/[^0-9].*/, "", new_v)
+    return old_v != new_v
+}
+function drop_gap_name(r,    rest, event, as) {
+    if (!starts(r, "no mapping") && !starts(r, "no adapter")) {
+        rest = r
+        sub(/ at line [0-9]+ column [0-9]+$/, "", rest)
+        return rest
+    }
+    rest = r
+    sub(/^[^"]*"/, "", rest)
+    event = rest
+    sub(/\\".*/, "", event)
+    if (starts(r, "no adapter")) return "harness " event
+    as = ""
+    if (match(rest, /\(as [a-z_]+/)) as = " as " substr(rest, RSTART + 4, RLENGTH - 4)
+    return event as
+}
+'
+
+# The distinct drop reasons across the live file and its rotated generation — a
+# flood that rotated the log mid-window put its reason in drops.1, and reading
+# drops.jsonl alone would miss it. Whole reasons, escaped quotes and all: stopping
+# at the first \" made every `no mapping for hook event \"X\"` one reason.
 drop_reasons() {
-    [ -f "$drops_log" ] || return 0
-    sed -n 's/.*"reason":"\([^"]*\)".*/\1/p' "$drops_log" | LC_ALL=C sort -u
+    for f in "$drops_rotated" "$drops_log"; do
+        # `continue`, not `&&`: a missing last file would end the loop non-zero
+        # and take the whole script down under pipefail, without a word.
+        [ -r "$f" ] || continue
+        LC_ALL=C awk "$drop_awk_lib"'{
+            drop_split($0)
+            for (f = 1; f <= n_frag; f++) { drop_parse(frag[f]); if (d_reason != "") print d_reason }
+        }' "$f"
+    done | LC_ALL=C sort -u
 }
 
-# Reasons in the second file/list that the first did not have.
-# new_drop_reasons <before-file> — prints nothing when there is no diff.
-new_drop_reasons() {
-    tmp=$(mktemp)
-    drop_reasons >"$tmp"
-    comm -13 "$1" "$tmp"
-    rm -f "$tmp"
+# "<class><tab><reason>" for each drop line later than <ts>, from both
+# generations: a rotation can rename the file mid-window, so "after this moment"
+# is a timestamp cut, not a line count. `swap` marks a reason a swap window makes,
+# no later than <swap end>: the same 60 s the verdict exempts. A restart has none.
+drop_classes_after() { # drop_classes_after <ts> [swap end]
+    dca_after=$1
+    dca_end=${2:-}
+    shift
+    [ $# -eq 0 ] || shift
+    if [ -r "$drops_rotated" ]; then set -- "$@" "$drops_rotated"; fi
+    if [ -r "$drops_log" ]; then set -- "$@" "$drops_log"; fi
+    [ $# -gt 0 ] || return 0
+    LC_ALL=C awk -v s="$dca_after" -v swap_end="$dca_end" "$drop_awk_lib"'
+        {
+            drop_split($0)
+            for (f = 1; f <= n_frag; f++) {
+                # A torn line is for the verdict: it says what it could read, and a
+                # guess at its class must not roll a swap back.
+                if (!drop_whole(frag[f])) continue
+                drop_parse(frag[f])
+                if (d_ts > s && d_reason != "")
+                    printf "%s\t%s\n", (drop_swap_reason(d_reason) && swap_end != "" && !(d_ts > swap_end) ? "swap" : drop_class(d_reason, d_detail)), d_reason
+            }
+        }' "$@"
 }
 
-# The drop reasons a normal swap window legitimately produces. Between the
-# mv and the new daemon serving, a firing hook either reaches the old
-# daemon — which answers a protocol refusal it cannot spool past, since an
-# old build's stamp names no retention — or finds nobody listening at all.
-# Both vanish when the new daemon is up; the boot's gap fill recovers some.
-# A same-version "refusal" or any other reason is not a swap artifact.
-expected_swap_reason() {
-    case $1 in
-        "the daemon refused the record: this daemon speaks protocol v"*"; the hook speaks v"*)
-            rest=${1#*"this daemon speaks protocol v"}
-            old_v=${rest%%;*}
-            new_v=${rest##*"the hook speaks v"}
-            new_v=${new_v%%.*}
-            is_uint "$old_v" && is_uint "$new_v" && [ "$old_v" != "$new_v" ]
-            ;;
-        "no daemon on "*": Connection refused"*) return 0 ;;
+# True when this binary renames a full drop log aside. It names that file, and a
+# build that does not rotate has no reason to.
+build_rotates() { # build_rotates <binary>
+    LC_ALL=C grep -aq 'drops\.1\.jsonl' "$1" 2>/dev/null
+}
+
+# True when drops.jsonl reached the cap under a build that does not rotate: it
+# stopped recording, and nothing after that point is observable. On a build that
+# rotates, a file at the cap only means the next drop renames it.
+drops_blind() { # drops_blind <binary that will be writing>
+    [ -r "$drops_log" ] || return 1
+    [ "$(wc -c <"$drops_log" | tr -d ' ')" -ge "$drops_cap_bytes" ] || return 1
+    ! build_rotates "$1"
+}
+
+# `<device>:<inode>:<size>:<sha256 of those bytes>`, empty when there is no such file.
+# The drop log only ever grows, so the bytes it held then are still its first bytes
+# now, whatever it has become. Size alone cannot see a file rewritten in place.
+file_identity() { # file_identity <file>
+    [ -f "$1" ] || return 0
+    if [ "$(uname -s)" = Darwin ]; then
+        fi_stat=$(stat -f '%d:%i:%z' "$1" 2>/dev/null || true)
+    else
+        fi_stat=$(stat -c '%d:%i:%s' "$1" 2>/dev/null || true)
+    fi
+    [ -n "$fi_stat" ] || return 0
+    printf '%s:%s\n' "$fi_stat" "$(file_prefix_sha "$1" "${fi_stat##*:}")"
+}
+
+file_prefix_sha() { # file_prefix_sha <file> <bytes>
+    { head -c "$2" "$1" 2>/dev/null || true; } | shasum -a 256 | awk '{ print $1 }'
+}
+
+# Is the drop log the file `start` saw? The real rotation renames it, inode kept, so
+# it is one of the two names. Sets df_fault for a file the recorder cannot write and
+# df_open for evidence that was taken away.
+drops_file_state() { # drops_file_state <1 when two rotations already explain it>
+    df_fault="" df_open=""
+    if [ -e "$drops_log" ] && { [ ! -f "$drops_log" ] || [ ! -w "$drops_log" ]; }; then
+        df_fault="the recorder cannot write $drops_log, so no later drop can land there"
+    elif [ ! -e "$drops_log" ] && [ ! -w "$root" ]; then
+        df_fault="the recorder cannot create $drops_log, so no later drop can land there"
+    fi
+    df_recorded=$(state_get drops_file || true)
+    if [ -z "$df_recorded" ]; then
+        df_open="canary.json has no record of the drop log, so nothing says this is the file 'canary.sh start' saw"
+        return 0
+    fi
+    [ "$1" != 1 ] || return 0
+    IFS=: read -r df_dev df_ino df_size df_sha <<<"$df_recorded"
+    for df_file in "$drops_log" "$drops_rotated"; do
+        df_now=$(file_identity "$df_file")
+        case $df_now in
+            "$df_dev:$df_ino:"*) ;;
+            *) continue ;;
+        esac
+        df_rest=${df_now#"$df_dev:$df_ino:"}
+        df_now_size=${df_rest%%:*}
+        if [ "$df_now_size" -lt "$df_size" ]; then
+            df_open="$df_file is $df_now_size byte(s), smaller than the $df_size it was at the swap: part of what it held is gone"
+        elif [ "$(file_prefix_sha "$df_file" "$df_size")" != "$df_sha" ]; then
+            df_open="the first $df_size byte(s) of $df_file are not what they were at the swap: it was rewritten"
+        fi
+        return 0
+    done
+    df_open="the drop log 'canary.sh start' saw is gone, moved aside or replaced, and no rotation explains it"
+}
+
+# The log's segments: an index each, oldest first. Nothing in conbus removes one.
+log_segments() {
+    [ -d "$root/log" ] || return 0
+    { ls "$root/log" 2>/dev/null || true; } | sed -n 's/^segment-\([0-9]*\)\.jsonl$/\1/p'
+}
+
+# The value of `<name> <value>` in rows an item built.
+row_value() { # row_value <rows> <name>
+    printf '%s\n' "$1" | sed -n "s/^$2 //p"
+}
+
+# One fact per line for verdict to judge: `<name> <number>`, and `item <class> <n>
+# <what>` for what a person needs to read. Every comparison is on the text in C
+# locale, so one invalid byte cannot lose a line.
+drop_table() { # drop_table <since> <end of the swap window> <file>...
+    dt_since=$1 dt_end=$2
+    shift 2
+    LC_ALL=C awk -v s="$dt_since" -v swap_end="$dt_end" -v rotated="$drops_rotated" "$drop_awk_lib"'
+        function one(fragment,    c, key, weight) {
+            drop_parse(fragment)
+            if (FILENAME == rotated && first_rotated == "" && d_ts != "") first_rotated = d_ts
+            if (!drop_whole(fragment) || d_ts == "" || d_reason == "") {
+                # Torn: nothing more can be read from it, and it can only be judged
+                # for where it fell. With no time of its own, the next line says.
+                if (d_ts == "") pending++
+                else if (d_ts > s) bad++
+                return
+            }
+            if (pending > 0) {
+                if (d_ts > s) bad += pending
+                pending = 0
+            }
+            if (d_ts > last) last = d_ts
+            if (!(d_ts > s)) {
+                if (!(d_reason in before)) { before[d_reason] = 1; baseline++ }
+                return
+            }
+            lines++
+            if (starts(d_reason, "the log refused writes for a while") && d_ts > last_outage) last_outage = d_ts
+            c = drop_class(d_reason, d_detail)
+            if (c == "lost" && drop_swap_reason(d_reason) && !(d_ts > swap_end)) { swap++; return }
+            if (c == "elided") {
+                if (d_detail ~ /^[0-9]+ tool event\(s\)$/) elided += d_detail + 0
+                else elided_bad++
+                return
+            }
+            if (c == "gap") key = drop_gap_name(d_reason)
+            else if (c == "ghost" || c == "sessionless" || c == "held" || c == "orphan") { key = d_detail; sub(/ \(fields:.*/, "", key); sub(/ for session .*/, "", key) }
+            else if (c == "lost" && index(d_detail, " for session ")) key = drop_event(d_detail) ": " d_reason
+            else if (c == "lost" && d_detail != "") key = d_reason " (" d_detail ")"
+            else key = d_reason
+            if (key == "") key = "(no detail)"
+            if (c == "other") {
+                other_key[key] = 1
+                n_other[key]++
+                return
+            }
+            # One line can stand for many records. Zero or no count still counts
+            # as one: the line says records were lost, so it fails either way.
+            weight = 1
+            if (c == "lost" && d_detail ~ /^[1-9][0-9]* record\(s\) lost$/) weight = d_detail + 0
+            if (c == "lost" && match(d_detail, /[1-9][0-9]* could not be kept/)) {
+                weight = substr(d_detail, RSTART, RLENGTH) + 0
+                not_kept += weight
+            }
+            total[c] += weight
+            n[c SUBSEP key]++
+        }
+        {
+            drop_split($0)
+            for (f = 1; f <= n_frag; f++) one(frag[f])
+        }
+        END {
+            bad += pending
+            for (key in other_key) {
+                c = (key in before) ? "known" : "new"
+                total[c] += n_other[key]
+                n[c SUBSEP key] = n_other[key]
+            }
+            printf "lines %d\nswap %d\nbad %d\nlast %s\nfirst_rotated %s\nelided %d\nelided_bad %d\nbaseline %d\nlast_outage %s\nnot_kept %d\n",
+                lines, swap, bad, last, first_rotated, elided, elided_bad, baseline, last_outage, not_kept
+            for (c in total) printf "total_%s %d\n", c, total[c]
+            for (entry in n) {
+                split(entry, part, SUBSEP)
+                printf "item %s %d× %s\n", part[1], n[entry], substr(part[2], 1, 150)
+            }
+        }' "$@"
+}
+
+# 3. Drops, judged by what each line means. Whether a reason's text is new says
+# nothing about whether a record was lost, and a week of no-daemon lines used to
+# pass because the words had been seen before.
+verdict_drops() {
+    dt_rows=""
+    dt_problem=""
+    set --
+    for f in "$drops_rotated" "$drops_log"; do
+        [ -f "$f" ] || continue
+        if [ -r "$f" ]; then
+            set -- "$@" "$f"
+        else
+            dt_problem="$dt_problem $f"
+        fi
+    done
+    dt_end=$(swap_window_end "${recorded_swap:-$since}")
+    if [ $# -gt 0 ]; then
+        dt_rc=0
+        dt_rows=$(drop_table "$since" "$dt_end" "$@") || dt_rc=$?
+        [ "$dt_rc" -eq 0 ] || dt_problem="$dt_problem (reading them exited $dt_rc)"
+    fi
+    restart_drops=$(state_restart_drop_total)
+    n_lost=$(row_value "$dt_rows" total_lost)
+    n_gap=$(row_value "$dt_rows" total_gap)
+    n_new=$(row_value "$dt_rows" total_new)
+    n_known=$(row_value "$dt_rows" total_known)
+    n_ghost=$(row_value "$dt_rows" total_ghost)
+    n_sessionless=$(row_value "$dt_rows" total_sessionless)
+    n_payload=$(row_value "$dt_rows" total_payload)
+    n_held=$(row_value "$dt_rows" total_held)
+    n_orphan=$(row_value "$dt_rows" total_orphan)
+    n_bad=$(row_value "$dt_rows" bad)
+    n_lines=$(row_value "$dt_rows" lines)
+    first_rotated=$(row_value "$dt_rows" first_rotated)
+    last_drop=$(row_value "$dt_rows" last)
+    elided_total=$(row_value "$dt_rows" elided)
+    elided_bad=$(row_value "$dt_rows" elided_bad)
+    dt_baseline=$(row_value "$dt_rows" baseline)
+    swap_exempted=$(row_value "$dt_rows" swap)
+    swap_exempted=${swap_exempted:-0}
+
+    # What cannot be read leaves the item open; what can be read still counts. A
+    # log that went blind on day 5 still shows what days 1 to 4 lost.
+    open=""
+    [ -z "$dt_problem" ] || open="$open; cannot read:$dt_problem"
+    if [ "${n_bad:-0}" -gt 0 ]; then
+        open="$open; ${n_bad} line(s) are torn, or have no readable time or reason: what each one said is gone"
+    fi
+    held_floor=""
+    if drops_blind "$bin"; then
+        held_floor="at least "
+        open="$open; $drops_log reached the cap on a build that does not rotate: nothing after ${last_drop:-its last line} was recorded"
+    fi
+    # The rotated generation keeps the file as it was, so its first line predates
+    # the swap unless a second rotation threw that part away.
+    discarded=0
+    if [ -n "$first_rotated" ] && [ "$first_rotated" \> "$since" ]; then
+        discarded=1
+        held_floor="at least "
+        open="$open; the oldest drop line left is at $first_rotated, after the swap: anything dropped before it was rotated away"
+    fi
+    drops_file_state "$discarded"
+    [ -z "$df_open" ] || open="$open; $df_open"
+    if [ "${n_known:-0}" -gt 0 ]; then
+        open="$open; ${n_known} line(s) with a known reason no rule covers need a person to say what they mean"
+    fi
+    for noisy in "ghost:$n_ghost" "sessionless:$n_sessionless" "payload:$n_payload"; do
+        if [ "${noisy#*:}" != "" ] && [ "${noisy#*:}" -gt "$noise_limit" ]; then
+            open="$open; ${noisy#*:} ${noisy%%:*} line(s) are over the limit of $noise_limit (CONBUS_CANARY_NOISE_MAX): too many to call background"
+        fi
+    done
+
+    # A reason never seen needs a baseline to call it new. With the baseline
+    # rotated away it is a question, not a fault.
+    n_unseen=${n_new:-0}
+    if [ "$n_unseen" -gt 0 ] && [ "${dt_baseline:-0}" -eq 0 ] && [ "$discarded" = 1 ]; then
+        open="$open; $n_unseen line(s) with a reason no rule covers, and the baseline that would say whether it is new was rotated away"
+        n_unseen=0
+    fi
+
+    faults=""
+    [ -z "$df_fault" ] || faults="$faults, $df_fault"
+    [ "${n_lost:-0}" -eq 0 ] || faults="$faults, ${n_lost} lost record(s)"
+    [ "${n_gap:-0}" -eq 0 ] || faults="$faults, ${n_gap} adapter gap(s)"
+    [ "$n_unseen" -eq 0 ] || faults="$faults, $n_unseen line(s) with a reason not seen before the swap"
+    [ "$restart_drops" -eq 0 ] || faults="$faults, $restart_drops drop(s) during planned restarts"
+
+    shown=$((${n_ghost:-0} + ${n_sessionless:-0} + ${n_payload:-0}))
+    tally="${n_lines:-0} line(s) since $since: $swap_exempted expected swap-window, $shown not lost, ${n_orphan:-0} on orphan-tools, $restart_drops on planned restarts"
+    if [ -n "$faults" ]; then
+        line FAIL drops "${faults#, } ($tally)${open:+$open}"
+    elif [ -n "$open" ]; then
+        line UNCHECKED drops "${open#; } ($tally)"
+    else
+        line PASS drops "no line says a record was lost ($tally)"
+    fi
+
+    # What was decided, so a person can argue with it.
+    group() { # group <class> <heading>
+        group_rows=$(row_value "$dt_rows" "item $1" | sort)
+        [ -n "$group_rows" ] || return 0
+        printf '  %s\n' "$2"
+        printf '%s\n' "$group_rows" | sed 's/^/    /'
+    }
+    group lost "lost records — fail at any count, known reason or not:"
+    group gap "adapter gaps — fail at any count; the vendor moved ahead of this build:"
+    group new "reasons not seen before the swap — fail:"
+    group known "known reasons no rule covers — not a pass until a person reads them:"
+    group ghost "end of a session or turn with no binding — not lost, shown only:"
+    group sessionless "payload named no session — the vendor's, not lost, shown only:"
+    group payload "payload the hook could not parse — cannot prove a loss, shown only:"
+    printf '  rule: a lost record or adapter gap fails at any count; a reason new since the swap fails; the three shown kinds stop a pass only above %s lines each; tool events with no prompt are judged on orphan-tools; the swap window exempts its two reasons for 60 s\n' "$noise_limit"
+    if [ -r "$daemon_log" ]; then
+        refused_hooks=$(awk -v s="$since" '$1 ~ /^[0-9]/ && $1 > s && /refusing a hook speaking protocol/ { n++ } END { print n + 0 }' "$daemon_log")
+        if [ "$refused_hooks" -gt 0 ]; then
+            printf '  note: daemon.log names %s refused hook(s) since the window began, and %s expected swap-window drop line(s) exist here; a refusal with no line was spooled, or its line never landed\n' "$refused_hooks" "$swap_exempted"
+        fi
+    fi
+}
+
+# Outages the log came back from. Nothing was lost, only delayed, so it is no drop;
+# it is on its own line because a person should know the disk refused writes.
+verdict_log_outages() {
+    if [ -n "$dt_problem" ]; then
+        line UNCHECKED log-outages "the drop log could not be read:$dt_problem"
+        return
+    fi
+    line PASS log-outages "${held_floor}${n_held:-0} time(s) the log refused writes since $since and every record waited and landed"
+    row_value "$dt_rows" "item held" | sort | sed 's/^/  /'
+}
+
+# Orphan tool lines a day on the 28 days before the swap, each line once, from every drop
+# log beside this one: the live file, its rotated generation, and what an operator
+# archived. A median, as for `repeated`: a mean let one flood day raise the bar for a
+# month. A day before the oldest line any of them reach is not a day with none, so it is
+# left out. Prints "<median a day> <days it covers> <lines on them>".
+orphan_baseline() { # orphan_baseline <swap time>
+    ob_days=$(perl -MTime::Local -MPOSIX=strftime -e '
+        my ($y, $m, $d) = $ARGV[0] =~ /^(\d+)-(\d+)-(\d+)/;
+        my $t = timegm(0, 0, 0, $d, $m - 1, $y);
+        print join(" ", map { strftime("%Y-%m-%d", gmtime($t - $_ * 86400)) } 1 .. 28)' "$1")
+    set --
+    for ob_file in "$root"/drops*.jsonl; do
+        if [ -f "$ob_file" ] && [ -r "$ob_file" ]; then set -- "$@" "$ob_file"; fi
+    done
+    [ $# -gt 0 ] || { echo "0 0 0"; return 0; }
+    LC_ALL=C awk -v days="$ob_days" "$drop_awk_lib"'
+        BEGIN { n_days = split(days, list, " "); for (i = 1; i <= n_days; i++) wanted[list[i]] = 1 }
+        seen[$0]++ { next }
+        {
+            drop_split($0)
+            for (f = 1; f <= n_frag; f++) {
+                if (!drop_whole(frag[f])) continue
+                drop_parse(frag[f])
+                if (d_ts == "" || d_reason == "") continue
+                if (oldest == "" || d_ts < oldest) oldest = d_ts
+                day = substr(d_ts, 1, 10)
+                if ((day in wanted) && drop_class(d_reason, d_detail) == "orphan") per_day[day]++
+            }
+        }
+        END {
+            k = 0; lines = 0
+            for (i = 1; i <= n_days; i++) {
+                if (oldest == "" || list[i] < substr(oldest, 1, 10)) continue
+                v[++k] = per_day[list[i]] + 0
+                lines += v[k]
+            }
+            for (i = 2; i <= k; i++) { x = v[i]; for (j = i - 1; j >= 1 && v[j] > x; j--) v[j + 1] = v[j]; v[j + 1] = x }
+            middle = 0
+            if (k) middle = k % 2 ? v[(k + 1) / 2] : (v[k / 2] + v[k / 2 + 1]) / 2
+            printf "%.1f %d %d\n", middle, k, lines
+        }' "$@"
+}
+
+# A tool event whose session never got a prompt is lost, and has been at a known rate
+# since long before this build, so a week is not failed for having one. It fails when
+# the rate is clearly above that: three times the median day of the 28 before the swap,
+# and never under 100 lines, so that a quiet month cannot make the next stray one a
+# fault. What that leaves: up to the limit, real tool events can go this way unfailed,
+# only shown.
+orphan_floor=100
+verdict_orphan_tools() {
+    if [ -n "$dt_problem" ]; then
+        line UNCHECKED orphan-tools "the drop log could not be read:$dt_problem"
+        return
+    fi
+    read -r vo_median vo_covered vo_base <<<"$(orphan_baseline "${recorded_swap:-$since}")"
+    read -r vo_limit vo_rate <<<"$(awk -v n="${n_orphan:-0}" -v median="$vo_median" \
+        -v from="$(ts_epoch "$since")" -v now="$(date +%s)" -v floor="$orphan_floor" '
+        BEGIN {
+            days = (now - from) / 86400
+            if (days < 1) days = 1
+            limit = 3 * median * days
+            if (limit < floor) limit = floor
+            printf "%d %.1f\n", limit + 0.999, n / days
+        }')"
+    vo_said="${held_floor}${n_orphan:-0} tool event(s) lost with no prompt from their session since $since, $vo_rate/day; a median $vo_median a day over the $vo_covered day(s) before the swap that the drop logs reach ($vo_base line(s))"
+    if [ "${n_orphan:-0}" -gt "$vo_limit" ]; then
+        line FAIL orphan-tools "$vo_said; over the limit of $vo_limit (3× that median, at least $orphan_floor)"
+    else
+        line PASS orphan-tools "$vo_said; fails over $vo_limit (3× that median, at least $orphan_floor)"
+    fi
+    row_value "$dt_rows" "item orphan" | sort | sed 's/^/  /'
+}
+
+# 4. Activity. Only what the log holds can be read here, so the questions are:
+# which days have no record at all, which harness used before the swap has none
+# since, and how much of what is here the recorder saw itself. A usage row has no
+# record total, only counts and `recovered`. Recovered turns carry no tool calls
+# and two or more records each, so a row with tool calls, or more counted than
+# recovered, holds something the recorder saw; on the real log every harness-day
+# from before the recorder existed reads as recovered-only by this test.
+verdict_activity() {
+    if [ -n "$window_problem" ]; then
+        line UNCHECKED harness-activity "$window_problem"
+        return
+    fi
+    va_closed=""
+    va_day=$since_day
+    va_guard=0
+    while [ "$va_day" \< "$today_utc" ] && [ "$va_guard" -lt 370 ]; do
+        va_closed="$va_closed $va_day"
+        va_day=$(next_day "$va_day") || break
+        va_guard=$((va_guard + 1))
+    done
+    # The two weeks before the swap decide who counts as "active before it". A
+    # harness last used in September is not news.
+    va_lookback=$(perl -MTime::Local -MPOSIX=strftime -e '
+        my ($y, $m, $d) = $ARGV[0] =~ /^(\d+)-(\d+)-(\d+)/;
+        print strftime("%Y-%m-%d", gmtime(timegm(0, 0, 0, $d, $m - 1, $y) - 14 * 86400))' "$since_day")
+    va_rows=$({
+        printf '%s\n' "$usage_json" | sed 's/^/B /'
+        printf '%s\n' "$window_json" | sed 's/^/W /'
+    } | LC_ALL=C awk -v closed="$va_closed" -v lb="$va_lookback" -v sd="$since_day" -v today="$today_utc" '
+        function num(key,    re) {
+            re = "\"" key "\":[0-9]+"
+            if (!match($0, re)) return 0
+            return substr($0, RSTART + length(key) + 3, RLENGTH - length(key) - 3) + 0
+        }
+        function str(key,    re) {
+            re = "\"" key "\":\"[^\"]*\""
+            if (!match($0, re)) return ""
+            return substr($0, RSTART + length(key) + 4, RLENGTH - length(key) - 5)
+        }
+        function saw_live(    counted, rec) {
+            rec = num("recovered")
+            counted = num("turns") + num("limit_stops") + num("account_stops") + num("vendor_errors") + \
+                num("request_faults") + num("other_stops") + num("user_stops") + num("subagents") + \
+                num("tool_calls") + num("tool_denials") + num("permission_asks") + num("briefings") + num("hops")
+            return rec == 0 || num("tool_calls") > 0 || counted > rec
+        }
+        {
+            d = str("day"); h = str("harness")
+            if (d == "" || h == "") next
+            if ($1 == "B") {
+                if (d >= lb && d <= sd && saw_live()) {
+                    active_before[h] = 1
+                    if (d < sd && !((h, d) in before_day)) { before_day[h, d] = 1; before_days[h]++ }
+                }
+                next
+            }
+            any_row = 1
+            day_seen[d] = 1
+            harness_seen[h] = 1
+            row_day[h, d] = 1
+            recovered[h] += num("recovered")
+            turns[h] += num("turns")
+            tools[h] += num("tool_calls")
+            if (saw_live()) {
+                day_live[d] = 1
+                if (!((h, d) in live_day)) { live_day[h, d] = 1; live_days[h]++ }
+            }
+        }
+        END {
+            n = split(closed, days, " ")
+            for (i = 1; i <= n; i++)
+                if (!(days[i] in day_seen)) empty = empty " " days[i]
+            for (d in day_seen)
+                if (!(d in day_live)) recovered_days = recovered_days " " d
+            # No hook, nothing to go silent: this one arrives only by export.
+            delete active_before["claude_chat"]
+            for (h in active_before)
+                if (!(h in harness_seen)) silent = silent " " h
+            for (h in harness_seen) {
+                if (live_days[h] == 0 && (h in active_before)) only_recovered = only_recovered " " h ":" recovered[h]
+                if (before_days[h] == 14) {
+                    missed = ""
+                    for (i = 1; i <= n; i++)
+                        if ((days[i] in day_seen) && !((h, days[i]) in live_day)) missed = missed "," days[i]
+                    if (missed != "") streak = streak " " h ":" substr(missed, 2)
+                }
+                # A hook that dies writes no drop line, and one missed day takes a
+                # harness out of the rule above. So: its last closed days, newest
+                # first, that it has no live row on. A day nobody has a row on is
+                # the empty-day question, and a live row today means it came back.
+                quiet = 0; filled = 0
+                if (!((h, today) in live_day)) {
+                    for (i = n; i >= 1; i--) {
+                        if (!(days[i] in day_seen)) continue
+                        if ((h, days[i]) in live_day) break
+                        quiet++
+                        if ((h, days[i]) in row_day) filled++
+                    }
+                }
+                if (before_days[h] >= 7 && quiet >= 3 && live_days[h] > 0) {
+                    if (filled > 0) faded_fill = faded_fill " " h ":" filled ":" quiet
+                    else if (before_days[h] < 14) faded = faded " " h ":" before_days[h] ":" quiet
+                }
+                printf "table %s: the recorder saw it on %d of %d day(s) (%d turn(s), %d tool call(s)); gap fill recovered %d record(s)\n",
+                    h, live_days[h], n + 1, turns[h], tools[h], recovered[h]
+            }
+            printf "any %d\nempty%s\nrecovered_days%s\nsilent%s\nonly_recovered%s\nstreak%s\nfaded%s\nfaded_fill%s\n",
+                any_row, empty, recovered_days, silent, only_recovered, streak, faded, faded_fill
+        }')
+
+    if [ "$(row_value "$va_rows" any)" != 1 ]; then
+        line UNCHECKED harness-activity \
+            "no record since $since — nothing recorded to judge, and no answer from a person changes that"
+        return
+    fi
+    va_faults="" va_open="" va_answered="" va_asked=""
+    for pair in $(row_value "$va_rows" only_recovered); do
+        va_faults="$va_faults; ${pair%%:*}: used since the swap, but only gap fill has it (${pair#*:} record(s)) — the recorder saw none of it"
+    done
+    for trio in $(row_value "$va_rows" faded_fill); do
+        va_rest=${trio#*:}
+        va_faults="$va_faults; ${trio%%:*}: gap fill has ${va_rest%%:*} of its last ${va_rest#*:} closed day(s), and the recorder saw none of them"
+    done
+    va_list=$(row_value "$va_rows" recovered_days)
+    if [ -n "$va_list" ]; then
+        va_faults="$va_faults; only gap fill has these day(s), the recorder saw nothing on them: $va_list"
+    fi
+    va_ask() { # va_ask <name> <question>; the answer from --idle, or an open item
+        if is_idle "$1"; then
+            va_answered="$va_answered $1"
+            operator_answers="$operator_answers $1"
+        else
+            va_open="$va_open; $2"
+            va_asked="$va_asked,$1"
+        fi
+    }
+    for va_item in $(row_value "$va_rows" empty); do
+        va_ask "$va_item" "no record at all on $va_item — idle, or the recorder down?"
+    done
+    for va_item in $(row_value "$va_rows" silent); do
+        va_ask "$va_item" "$va_item recorded in the two weeks before the swap and not since — not used, or not recorded?"
+    done
+    for pair in $(row_value "$va_rows" streak); do
+        va_ask "${pair%%:*}" "${pair%%:*} recorded on all 14 days before the swap and not on ${pair#*:} — not used, or not recorded?"
+    done
+    for trio in $(row_value "$va_rows" faded); do
+        va_rest=${trio#*:}
+        va_ask "${trio%%:*}" "${trio%%:*} recorded on ${va_rest%%:*} of the 14 days before the swap and not on its last ${va_rest#*:} closed day(s) — not used, or not recorded?"
+    done
+
+    va_answer=${va_answered:+; on the operator\'s word, idle:$va_answered}
+    if [ -n "$va_faults" ]; then
+        line FAIL harness-activity "${va_faults#; }${va_open}${va_answer}"
+    elif [ -n "$va_open" ]; then
+        line UNCHECKED harness-activity "${va_open#; } — if so, answer with --idle ${va_asked#,}${va_answer}"
+    else
+        line PASS harness-activity "every closed day has records and every harness active before the swap has some since${va_answer}"
+    fi
+    printf '%s\n' "$va_rows" | sed -n 's/^table /  /p' | sort
+}
+
+# Is what ran this window still what the window judges? Read back from the files
+# themselves: `start` stamps the candidate, and nothing after it checked.
+verdict_build() {
+    cand_build=$(state_get candidate_build || true)
+    cand_sha=$(state_get candidate_sha256 || true)
+    rolled=$(state_get rolled_back || true)
+    if [ -z "$cand_build" ]; then
+        line UNCHECKED build "canary.json names no candidate — nothing says which build this window judges"
+        return
+    fi
+    vb_faults="" vb_open=""
+    if [ -n "$rolled" ]; then
+        vb_faults="$vb_faults; rolled back at $rolled — this window no longer judges the candidate"
+    fi
+    vb_installed=$("$bin" --version 2>&1 | sed -n 's/.*(\([0-9a-f]*\)).*/\1/p' || true)
+    if [ "$vb_installed" != "$cand_build" ]; then
+        vb_faults="$vb_faults; the installed binary is build ${vb_installed:-unknown}, the candidate is $cand_build"
+    fi
+    vb_sha=$(shasum -a 256 "$bin" 2>/dev/null | awk '{ print $1 }' || true)
+    if [ -z "$cand_sha" ]; then
+        vb_open="canary.json names no candidate sha256"
+    elif [ "$vb_sha" != "$cand_sha" ]; then
+        vb_faults="$vb_faults; the installed binary's sha256 is not the candidate's"
+    fi
+    vb_running=$(sed -n 's/.*"build":"\([^"]*\)".*/\1/p' "$stamp" 2>/dev/null || true)
+    if [ "$vb_running" != "$cand_build" ]; then
+        vb_faults="$vb_faults; the daemon's stamp names build ${vb_running:-none}, the candidate is $cand_build"
+    fi
+    if [ -n "$doctor_failed" ]; then
+        vb_open="${vb_open:+$vb_open; }$doctor_failed"
+    else
+        vb_doctor=$(printf '%s\n' "$doctor_out" | grep -E 'DIFFERS|the stamp is stale|^recorder  starting' || true)
+        if [ -n "$vb_doctor" ]; then
+            vb_faults="$vb_faults; doctor says: $(printf '%s\n' "$vb_doctor" | sed -n '1p' | cut -c1-160)"
+        fi
+    fi
+    if [ -n "$vb_faults" ]; then
+        line FAIL build "${vb_faults#; }"
+    elif [ -n "$vb_open" ]; then
+        line UNCHECKED build "the binary and stamp name the candidate, and it could not be confirmed: $vb_open"
+    else
+        line PASS build "the installed binary and the running daemon are candidate $cand_build (sha256 agrees); never rolled back"
+    fi
+}
+
+# The lines doctor prints that mean a vendor's events will not reach the recorder.
+# `not installed here` is a vendor this machine does not have, not a broken hook.
+# `could not read which version` says the vendor's CLI missed doctor's 2 s, or is gone
+# with its directory left behind: nothing is known to be wrong, and a slow CLI must not
+# undo a healthy swap. A real mismatch has its own word.
+hook_problems() { # hook_problems <doctor output>
+    printf '%s\n' "$1" | awk '
+        /^hooks / && !/ runs / && !/ not installed here/ && !/could not read which version/ { print; next }
+        /^events / && /MISSING/ { print; next }
+        /^ +(NOT TRUSTED|MODIFIED)/ { print }'
+}
+
+verdict_hooks() {
+    if [ -n "$doctor_failed" ]; then
+        line UNCHECKED hooks "$doctor_failed"
+        return
+    fi
+    vh_bad=$(hook_problems "$doctor_out")
+    vh_runs=$(printf '%s\n' "$doctor_out" | grep -c '^hooks .* runs ' || true)
+    if [ -n "$vh_bad" ]; then
+        line FAIL hooks "$(printf '%s\n' "$vh_bad" | sed -n '1p' | sed -E 's/  +/ /g' | cut -c1-170)"
+        printf '%s\n' "$vh_bad" | sed -n '2,$p' | sed -E 's/  +/ /g; s/^ */  /' | cut -c1-170
+    elif [ "$vh_runs" -eq 0 ]; then
+        line UNCHECKED hooks "doctor names no hook that runs here — nothing is registered to record"
+    else
+        line PASS hooks "$vh_runs hook line(s) runs; what that proves: the command starts and answers, or for cursor and opencode that it is registered. harness-activity is the proof that vendors fire them"
+    fi
+    printf '%s\n' "$doctor_out" | sed -n 's/^hooks  *\(.*could not read which version.*\)$/\1/p' | sed -E 's/  +/ /g; s/^/  not judged: /' | cut -c1-170
+}
+
+# Ask the recorder something it must answer and will not record. A line that is
+# not a request comes back as `failed` from the loop that serves hooks: no record,
+# no drop line, no daemon.log line. Connecting proves only that the socket exists;
+# a daemon wedged in its accept loop still lets you connect. A busy daemon gets
+# three tries before it counts as not serving.
+probe_recorder() { # exits 0 answered, 1 connected and no answer, 2 nothing there
+    probe_try=0
+    while [ "$probe_try" -lt 3 ]; do
+        probe_rc=0
+        perl -MIO::Socket::UNIX -MIO::Select -e '
+            $SIG{PIPE} = "IGNORE";
+            my ($path, $limit) = @ARGV;
+            my $s = IO::Socket::UNIX->new(Type => SOCK_STREAM(), Peer => $path) or exit 2;
+            $s->autoflush(1);
+            print $s "{}\n";
+            IO::Select->new($s)->can_read($limit) or exit 1;
+            sysread($s, my $reply, 4096) or exit 1;
+            exit($reply =~ /"status"/ ? 0 : 1);' "$root/conbus.sock" "$probe_s" || probe_rc=$?
+        [ "$probe_rc" -eq 1 ] || return "$probe_rc"
+        probe_try=$((probe_try + 1))
+    done
+    return 1
+}
+
+# Doctor's `writable` line when the log cannot take a record right now: read-only,
+# or a recorder holding what a full disk refuses. Empty when it can.
+log_cannot_take() { # log_cannot_take <doctor output>
+    lc_line=$(printf '%s\n' "$1" | sed -n 's/^writable  *//p' | sed -n '1p')
+    case $lc_line in
+        NOT\ APPENDABLE* | REFUSING*) printf '%s\n' "$lc_line" ;;
+    esac
+}
+
+verdict_recorder() {
+    vr_faults=""
+    vr_rc=0
+    probe_recorder || vr_rc=$?
+    case $vr_rc in
+        0) ;;
+        2) vr_faults="$vr_faults; nothing answers at $root/conbus.sock" ;;
+        *) vr_faults="$vr_faults; something holds $root/conbus.sock and did not answer in three tries of ${probe_s}s" ;;
+    esac
+    # An idle daemon drains the spool every two seconds, so an old entry is a record
+    # that has not reached the log. Except what #157 holds on purpose: a tool event or a
+    # notification whose session has no conversation yet waits a day for its prompt, and
+    # gets the same ten minutes to go once its day is over. Its kind is in the entry, and
+    # a kind that cannot be read gets no such allowance.
+    vr_stale=0 vr_parked=0
+    if [ -d "$root/spool" ] && [ ! -r "$root/spool" ]; then
+        vr_faults="$vr_faults; $root/spool cannot be read"
+    elif [ -d "$root/spool" ]; then
+        vr_stale=$(find "$root/spool" -maxdepth 1 -name '*.json' -mmin +1450 | wc -l | tr -d ' ')
+        while IFS= read -r vr_entry; do
+            [ -n "$vr_entry" ] || continue
+            vr_kind=$(grep -ao '"event":"[a-z_]*"' "$vr_entry" 2>/dev/null | sed -n '1p' || true)
+            case $vr_kind in
+                '"event":"tool_requested"' | '"event":"tool_use"' | '"event":"tool_denied"' | \
+                    '"event":"tool_batch_ended"' | '"event":"permission_asked"' | '"event":"notified"')
+                    vr_parked=$((vr_parked + 1)) ;;
+                *) vr_stale=$((vr_stale + 1)) ;;
+            esac
+        done <<<"$(find "$root/spool" -maxdepth 1 -name '*.json' -mmin +10 ! -mmin +1450)"
+    fi
+    if [ "$vr_stale" -gt 0 ]; then
+        vr_faults="$vr_faults; $vr_stale spooled record(s) have not reached the log: older than 10 minutes, or 24 hours for a tool event or a notification"
+    fi
+    vr_write=$(log_cannot_take "$doctor_out")
+    if [ -n "$vr_write" ]; then
+        vr_faults="$vr_faults; it answers, and what it is told to record is not landing: $vr_write"
+    fi
+    if [ -n "$vr_faults" ]; then
+        line FAIL recorder-serving "${vr_faults#; }"
+    else
+        vr_waiting=""
+        if [ "$vr_parked" -gt 0 ]; then
+            vr_waiting="; $vr_parked tool event(s) or notification(s) waiting up to 24 hours for a prompt from their session"
+        fi
+        line PASS recorder-serving "the daemon answered a request on its socket, and nothing is stuck in the spool$vr_waiting"
+    fi
+}
+
+# Every boot of this machine this script can find, as epochs. macOS keeps only the
+# latest in kern.boottime, and the ones before it in `last reboot`, to the minute, in
+# local time, with no year. A window can hold several, so both. Linux has only the
+# latest here: an earlier reboot in the window still reads as a restart there.
+boot_epochs() {
+    if [ "$(uname -s)" = Darwin ]; then
+        { sysctl -n kern.boottime 2>/dev/null || true; } | sed -n 's/.*sec = \([0-9]*\),.*/\1/p'
+        { last reboot 2>/dev/null || true; } | perl -MPOSIX=mktime -ne '
+            my %month; @month{qw(Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec)} = (0 .. 11);
+            next unless /^reboot\b.*\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d+)\s+(\d\d):(\d\d)/;
+            my $year = (localtime)[5];
+            my $at = mktime(0, $4, $3, $2, $month{$1}, $year);
+            $at = mktime(0, $4, $3, $2, $month{$1}, $year - 1) if $at > time + 86400;
+            print "$at\n";'
+    else
+        perl -e 'open(my $f, "<", "/proc/uptime") or exit 0; my ($up) = split(" ", <$f>); printf "%d\n", time - $up'
+    fi
+}
+
+# Every start since the swap should be one the script knows about: the swap's own, a
+# planned restart's, or a reboot's. Paired by time, so a planned restart that never
+# served cannot cancel out a crash, and a log trimmed down to one line cannot read as
+# zero restarts. launchd starts the recorder at login, 177 to 224 s after each boot
+# measured here. A boot's first start line within boot_grace_s is its own, and a second
+# one in that boot is a crash; so is the first if it comes later than that.
+boot_grace_s=1800
+verdict_restarts() {
+    # One boot from each source is one boot: the minute in `last reboot` is at most a
+    # minute before the second in kern.boottime.
+    vs_boot_all=$(boot_epochs)
+    vs_boots=$(printf '%s\n' "$vs_boot_all" | sort -n | awk -v from="$(ts_epoch "$since")" '
+        $1 + 0 <= from + 0 { next }
+        n && $1 - last <= 120 { list[n] = $1; last = $1; next }
+        { list[++n] = $1; last = $1 }
+        END { for (i = 1; i <= n; i++) printf "%s ", list[i] }')
+    if [ ! -r "$daemon_log" ]; then
+        line UNCHECKED restarts "no readable $daemon_log"
+        return
+    fi
+    vs_lines=$(awk -v s="$since" '$1 ~ /^[0-9]/ && $1 > s && /conbus daemon: .*: socket .* log / { print $1 }' "$daemon_log")
+    if [ -z "$vs_lines" ]; then
+        # The swap itself boots once: a log that names no start since
+        # the swap was rotated or truncated underneath it — counting
+        # unplanned restarts against a window the log cannot see is
+        # checking nothing.
+        line UNCHECKED restarts \
+            "$daemon_log names no start since $since — the log does not reach back to the swap"
+        return
+    fi
+    vs_starts=""
+    for vs_ts in $vs_lines; do
+        vs_starts="$vs_starts $(ts_epoch "$vs_ts")"
+    done
+    vs_planned=""
+    for vs_row in $(grep -o '"ts":"[^"]*","serving_ms":-\{0,1\}[0-9]*' "$state_file" 2>/dev/null || true); do
+        vs_ts=${vs_row#*'"ts":"'}
+        vs_ts=${vs_ts%%'"'*}
+        vs_planned="$vs_planned $(ts_epoch "$vs_ts"):${vs_row##*:}:$vs_ts"
+    done
+    # `start` and `restart` each allow the serving limit for install --apply and
+    # again for the boot; a start line later than that is its own boot.
+    vs_rows=$(awk -v starts="$vs_starts" -v planned="$vs_planned" -v grace=$((serving_limit * 2 + 30)) \
+        -v swap="$(ts_epoch "${recorded_swap:-$since}")" -v exact="$([ "$since" = "$recorded_swap" ] && echo 1)" \
+        -v boots="$vs_boots" -v boot_grace="$boot_grace_s" '
+        function take(from,    i) {
+            for (i = 1; i <= n; i++)
+                if (!(i in used) && st[i] >= from && st[i] <= from + grace) { used[i] = 1; return 1 }
+            return 0
+        }
+        BEGIN {
+            n = split(starts, st, " ")
+            m = split(planned, pl, " ")
+            if (exact == 1) {
+                if (!take(swap)) printf "no_swap_boot 1\n"
+            } else used[1] = 1
+            for (j = 1; j <= m; j++) {
+                split(pl[j], part, ":")
+                # The stamp is the 3rd field onward: colons in the time split too.
+                when = pl[j]; sub(/^[^:]*:[^:]*:/, "", when)
+                got = take(part[1])
+                if (part[2] < 0) printf "never_served %s\n", when
+                else if (!got) printf "no_line %s\n", when
+            }
+            b = split(boots, boot, " ")
+            for (j = 1; j <= b; j++) {
+                for (i = 1; i <= n; i++) {
+                    # Up to a minute early, for what the reboot list rounds off. A start already
+                    # claimed that is earlier than the boot did not come from this boot.
+                    if (st[i] < boot[j] - 60 || ((i in used) && st[i] < boot[j])) continue
+                    if (st[i] <= boot[j] + boot_grace && !(i in used)) { used[i] = 1; rebooted++ }
+                    break
+                }
+            }
+            for (i = 1; i <= n; i++) if (!(i in used)) unplanned++
+            printf "seen %d\nplanned %d\nrebooted %d\nunplanned %d\n", n, m, rebooted, unplanned
+        }')
+    vs_seen=$(row_value "$vs_rows" seen)
+    vs_count=$(row_value "$vs_rows" planned)
+    vs_rebooted=$(row_value "$vs_rows" rebooted)
+    vs_unplanned=$(row_value "$vs_rows" unplanned)
+    vs_never=$(row_value "$vs_rows" never_served | tr '\n' ' ')
+    vs_noline=$(row_value "$vs_rows" no_line | tr '\n' ' ')
+    vs_newest=$(printf '%s\n' "$vs_lines" | sed -n '$p')
+    vs_stamped=$(sed -n 's/.*"started":"\([^"]*\)".*/\1/p' "$stamp" 2>/dev/null || true)
+
+    vs_grace="a start within $((serving_limit * 2 + 30))s of the swap or a planned restart counts as theirs"
+    vs_faults="" vs_open=""
+    if [ "$vs_unplanned" -gt 0 ]; then
+        vs_faults="$vs_faults; $vs_unplanned unplanned daemon start(s) since $since ($vs_seen seen: 1 swap + $vs_count planned + $vs_rebooted after a reboot); $vs_grace"
+    fi
+    if [ -n "$vs_never" ]; then
+        vs_faults="$vs_faults; a planned restart never served: $vs_never"
+    fi
+    if [ -n "$(row_value "$vs_rows" no_swap_boot)" ]; then
+        vs_open="$vs_open; the first start line since the swap is at ${vs_lines%%[[:space:]]*}, too late to be the swap's own boot — the log does not reach back to the swap"
+    fi
+    if [ -n "$vs_noline" ]; then
+        vs_open="$vs_open; no start line for the planned restart at: ${vs_noline}— the log was trimmed"
+    fi
+    if [ -n "$vs_stamped" ] && [ "$vs_stamped" \> "$vs_newest" ]; then
+        vs_open="$vs_open; the running daemon's stamp says it started at $vs_stamped, after the newest start line ($vs_newest) — the log was trimmed, or that boot never finished"
+    fi
+    if [ -n "$vs_faults" ]; then
+        line FAIL restarts "${vs_faults#; }${vs_open}"
+    elif [ -n "$vs_open" ]; then
+        line UNCHECKED restarts "${vs_open#; }"
+    else
+        line PASS restarts \
+            "0 unplanned daemon start(s) since $since ($vs_seen seen: 1 swap + $vs_count planned + $vs_rebooted after a reboot); $vs_grace"
+    fi
+}
+
+verdict_reboots() {
+    if [ -z "$vs_boot_all" ]; then
+        line UNCHECKED reboots "the OS boot time could not be read, so a start line cannot be told from a crash"
+        return
+    fi
+    vr_n=0
+    for _ in $vs_boots; do vr_n=$((vr_n + 1)); done
+    line PASS reboots "$vr_n reboot(s) in the window; a boot's first start within ${boot_grace_s}s is its own. Whether the recorder came back is what restarts, recorder-serving and rss-budget judge"
+}
+
+# Unreadable lines across the window, not the last boot. Each boot reports the whole
+# log, so the worst one counts, with doctor's read for what landed after it. A boot
+# that could not read the log prints a zero, so that case needs its own look.
+verdict_unreadable() {
+    vu_rows=""
+    if [ -r "$daemon_log" ]; then
+        vu_rows=$(awk -v s="$since" '
+            $1 ~ /^[0-9]/ && $1 > s {
+                if (/starting with no bindings/) failed++
+                if (match($0, /\([0-9]+ record\(s\), [0-9]+ unreadable\)/)) {
+                    split(substr($0, RSTART + 1, RLENGTH - 2), word, " ")
+                    boots++
+                    if (word[3] + 0 > worst + 0) worst = word[3]
+                    if (boots > 1 && word[1] + 0 < previous + 0) fell = previous " to " word[1]
+                    previous = word[1]
+                }
+            }
+            END { printf "boots %d\nworst %d\nfailed %d\nfell %s\n", boots, worst, failed, fell }' "$daemon_log")
+    fi
+    vu_boots=$(row_value "$vu_rows" boots)
+    vu_worst=$(row_value "$vu_rows" worst)
+    vu_failed=$(row_value "$vu_rows" failed)
+    vu_fell=$(row_value "$vu_rows" fell)
+    vu_now=$(printf '%s\n' "$doctor_out" | sed -n 's/^log.* \([0-9][0-9]*\) unreadable line(s)/\1/p' | sed -n '$p')
+
+    if [ "${vu_failed:-0}" -gt 0 ]; then
+        line FAIL unreadable "$vu_failed boot(s) since $since could not read the log and started with no bindings"
+    elif [ -n "$vu_fell" ]; then
+        line FAIL unreadable "the log's record count fell across a restart, from $vu_fell"
+    elif [ "${vu_worst:-0}" -gt 0 ] || [ "${vu_now:-0}" -gt 0 ]; then
+        line FAIL unreadable "unreadable line(s): worst boot since the swap ${vu_worst:-unknown}, doctor now ${vu_now:-unknown}"
+    elif [ -z "$vu_now" ]; then
+        line UNCHECKED unreadable "doctor named no count${doctor_failed:+ ($doctor_failed)}; ${vu_boots:-0} boot(s) since the swap reported 0, and they read the log earlier"
+    else
+        line PASS unreadable "0 unreadable line(s) across ${vu_boots:-0} boot(s) since the swap and in doctor's read now"
+    fi
+}
+
+# A segment gone since the swap is records gone with no drop line and no start line,
+# and the usage rows of both builds agree without them. Doctor's count just reads
+# lower. So what was there at the swap has to still be there, and what came after
+# has to have no hole in it.
+verdict_log_files() {
+    vl_record=$(state_get log_files || true)
+    if [ -z "$vl_record" ]; then
+        line UNCHECKED log-files "canary.json has no record of the log's segments, so nothing says one has not gone since the swap"
+        return
+    fi
+    if [ -d "$root/log" ] && [ ! -r "$root/log" ]; then
+        line UNCHECKED log-files "$root/log cannot be read"
+        return
+    fi
+    IFS=: read -r vl_count vl_first vl_last <<<"$vl_record"
+    vl_rows=$(log_segments | awk -v last="${vl_last:-0}" -v had="$vl_count" '
+        { i = $1 + 0; if (had + 0 > 0 && i <= last + 0) old++; else { new++; if (i > high) high = i } }
+        END { printf "old %d\nnew %d\nhigh %d\n", old, new, high }')
+    vl_old=$(row_value "$vl_rows" old)
+    vl_new=$(row_value "$vl_rows" new)
+    vl_high=$(row_value "$vl_rows" high)
+    vl_after=$((10#${vl_last:-0}))
+    [ "$vl_count" -gt 0 ] || vl_after=-1
+    vl_faults=""
+    if [ "$vl_old" -lt "$vl_count" ]; then
+        vl_faults="$vl_faults; $((vl_count - vl_old)) of the $vl_count segment(s) there at the swap are gone"
+    fi
+    if [ "$vl_new" -gt 0 ] && [ "$vl_new" -ne $((vl_high - vl_after)) ]; then
+        vl_faults="$vl_faults; $((vl_high - vl_after - vl_new)) segment(s) written since the swap are gone"
+    fi
+    if [ -n "$vl_faults" ]; then
+        line FAIL log-files "${vl_faults#; }"
+    else
+        line PASS log-files "the $vl_count segment(s) there at the swap are all there, and $vl_new since with no gap"
+    fi
+}
+
+# Space, and anything else the log refused. A full disk can take the record, the
+# spool entry and the drop line together, and daemon.log is the one trace left when
+# that write lands. A build that holds refused records (#155) says so at each end
+# instead, and its drop line covers an outage that ended; one that has not ended is
+# read here. Its daemon.log notes are throttled, so a recovery can have only the drop
+# line to say it: this reads after verdict_drops for that reason. Doctor's 10% warning
+# stays a note: this Mac lives under it.
+verdict_disk() {
+    vd_rows=""
+    if [ -r "$daemon_log" ]; then
+        vd_rows=$(awk -v s="$since" -v recovered="$(row_value "$dt_rows" last_outage)" '
+            $1 ~ /^[0-9]/ && $1 > s && /the log refused a write / {
+                refusing = $0
+                refusing_at = $1
+                sub(/^.*the log refused a write /, "", refusing)
+            }
+            $1 ~ /^[0-9]/ && $1 > s && /the log takes writes again/ { refusing = "" }
+            $1 ~ /^[0-9]/ && $1 > s && match($0, /[1-9][0-9]* could not be kept/) { not_kept += substr($0, RSTART, RLENGTH) }
+            END {
+                if (recovered > refusing_at) refusing = ""
+                printf "refusing %s\nnot_kept %d\n", refusing, not_kept
+            }' "$daemon_log")
+    fi
+    vd_refusing=$(row_value "$vd_rows" refusing | cut -c1-120)
+    vd_not_kept=$(row_value "$vd_rows" not_kept)
+    # Whichever log said it. A throttled note leaves only the drop line.
+    vd_lost_outage=$(row_value "$dt_rows" not_kept)
+    if [ "${vd_lost_outage:-0}" -gt "${vd_not_kept:-0}" ]; then
+        vd_not_kept=$vd_lost_outage
+    fi
+    vd_line=$(printf '%s\n' "$doctor_out" | sed -n 's/^disk  *//p' | sed -n '1p')
+    vd_write_bad=$(log_cannot_take "$doctor_out")
+    if [ "${vd_not_kept:-0}" -gt 0 ]; then
+        line FAIL disk "$vd_not_kept record(s) could not be kept since $since"
+    elif [ -n "$vd_refusing" ]; then
+        line FAIL disk "the log refused a write and daemon.log does not say it stopped: $vd_refusing"
+    elif [ -n "$vd_write_bad" ]; then
+        line FAIL disk "$vd_write_bad"
+    elif [ ! -r "$daemon_log" ] || [ -z "$vd_line" ]; then
+        line UNCHECKED disk "needs daemon.log and doctor's disk line${doctor_failed:+ ($doctor_failed)}"
+    else
+        line PASS disk "no refusal left open and no record it could not keep since $since, as far as a write to daemon.log or the drop log could say; now: $vd_line"
+    fi
+}
+
+# UTC ISO-8601 to epoch milliseconds, the fraction kept. Empty on failure.
+ts_ms() {
+    tm_epoch=$(ts_epoch "$1")
+    is_uint "$tm_epoch" || return 0
+    tm_frac=${1#*.}
+    tm_frac=${tm_frac%Z}
+    case $tm_frac in
+        [0-9][0-9][0-9]) ;;
+        *) tm_frac=000 ;;
+    esac
+    echo $((tm_epoch * 1000 + 10#$tm_frac))
+}
+
+is_idle() { # is_idle <harness or day>
+    case ",$idle," in
+        *,"$1",*) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -573,6 +1748,82 @@ ts_epoch() {
     else
         date -u -d "$iso" +%s 2>/dev/null || true
     fi
+}
+
+# Where the swap window ends: its two reasons are exempt for 60 s from the swap, at
+# `start` and at the verdict alike.
+swap_window_end() { # swap_window_end <swap time>
+    perl -MPOSIX=strftime -e 'print strftime("%Y-%m-%dT%H:%M:%S.000Z", gmtime($ARGV[0] + 60))' "$(ts_epoch "$1")"
+}
+
+# Does a record land through this binary? Its own hook, its own daemon, a log in a
+# throwaway root. No vendor can be found on this PATH, the empty root gives gap fill
+# nothing to read, and an unset retention never asks the Keychain. It proves the
+# binary's own path on this machine, not that a vendor calls it.
+candidate_round_trip() { # candidate_round_trip <binary>; says what happened, 0 if a record landed
+    rt_home=$(mktemp -d /tmp/canary-roundtrip.XXXXXX) || {
+        echo "could not make a throwaway root"
+        return 1
+    }
+    # Split on purpose, and no function around it: env execs the daemon, so `$!`
+    # is the daemon. Behind a function it would be a subshell, and the kill below
+    # would leave the daemon running on a root that is about to be removed.
+    rt_env="env -i HOME=$rt_home PATH=/usr/bin:/bin TMPDIR=/tmp CONBUS_SKIP_LAUNCHCTL=1 CONBUS_AGY_BIN=/usr/bin/false CONBUS_CODEX_BIN=/usr/bin/false"
+    $rt_env "$1" daemon >"$rt_home/daemon.out" 2>&1 &
+    rt_pid=$!
+    rt_said=""
+    rt_n=0
+    while ! grep -q '"serving"' "$rt_home/.conbus/daemon.build" 2>/dev/null; do
+        rt_n=$((rt_n + 1))
+        if ! kill -0 "$rt_pid" 2>/dev/null; then
+            rt_said="its daemon exited before serving an empty root"
+            break
+        fi
+        if [ "$rt_n" -gt $((serving_limit * 10)) ]; then
+            rt_said="its daemon did not serve an empty root inside ${serving_limit}s"
+            break
+        fi
+        sleep 0.1
+    done
+    if [ -z "$rt_said" ]; then
+        printf '{"session_id":"canary-round-trip","hook_event_name":"UserPromptSubmit","cwd":"%s","prompt":"canary round trip","prompt_id":"p1"}' "$rt_home" |
+            $rt_env "$1" hook --harness claude_code >/dev/null 2>&1 || rt_said="its hook exited non-zero"
+    fi
+    if [ -z "$rt_said" ]; then
+        # A stall makes the hook spool, and an idle daemon drains every 2 s, so a first
+        # look that finds nothing has not shown that nothing landed.
+        rt_n=0
+        while :; do
+            rt_records=$($rt_env "$1" log --json 2>/dev/null | wc -l | tr -d ' ' || true)
+            [ "${rt_records:-0}" -eq 0 ] && [ "$rt_n" -lt 10 ] || break
+            sleep 0.5
+            rt_n=$((rt_n + 1))
+        done
+        if [ "${rt_records:-0}" -gt 0 ]; then
+            rt_said="ok"
+        else
+            rt_said="its hook answered, and no record reached the log"
+        fi
+    fi
+    kill "$rt_pid" 2>/dev/null || true
+    rt_n=0
+    while kill -0 "$rt_pid" 2>/dev/null && [ "$rt_n" -lt 50 ]; do
+        sleep 0.1
+        rt_n=$((rt_n + 1))
+    done
+    if kill -0 "$rt_pid" 2>/dev/null; then
+        # Removing a root under a live daemon helps nobody; say where it is.
+        rt_said="$rt_said; its daemon outlived SIGTERM, $rt_home left in place"
+    else
+        wait "$rt_pid" 2>/dev/null || true
+        rm -rf "$rt_home"
+    fi
+    if [ "$rt_said" = ok ]; then
+        echo "a record reached a throwaway log through this binary's own hook and daemon"
+        return 0
+    fi
+    echo "$rt_said"
+    return 1
 }
 
 # --- subcommands ------------------------------------------------------------
@@ -626,8 +1877,8 @@ do_preflight() {
                 ;;
             *) check 0 disk "${disk_line:-no disk line}" ;;
         esac
-        if echo "$doctor_out" | grep -q 'DIFFERS'; then
-            check 1 daemon-build "$(echo "$doctor_out" | grep 'DIFFERS' | head -1)"
+        if grep -q 'DIFFERS' <<<"$doctor_out"; then
+            check 1 daemon-build "$(grep 'DIFFERS' <<<"$doctor_out" | sed -n '1p')"
         else
             check 0 daemon-build "no DIFFERS"
         fi
@@ -639,7 +1890,7 @@ do_preflight() {
     evidence_dir=${evidence:-./evidence}
     if [ -d "$evidence_dir" ]; then
         for i in 1 2 3 4 5; do
-            found=$(cd "$evidence_dir" && { ls "s$i"* "S$i"* 2>/dev/null || true; } | head -1)
+            found=$(cd "$evidence_dir" && { ls "s$i"* "S$i"* 2>/dev/null || true; } | sed -n '1p')
             if [ -n "$found" ]; then
                 check 0 "evidence-s$i" "$evidence_dir/$found"
             elif [ -n "$evidence" ]; then
@@ -654,13 +1905,34 @@ do_preflight() {
         check 2 evidence "no $evidence_dir — pass --evidence DIR when it lives elsewhere"
     fi
 
-    # The rollback copy: present already, or makeable from the install.
-    if [ -f "$rollback_bin" ]; then
-        check 0 rollback-copy "$rollback_bin"
-    elif [ -x "$bin" ]; then
-        check 0 rollback-copy "absent — will be made from $bin at start"
+    # A drop log at the cap on a build that does not rotate has been blind
+    # since it filled — swapping over it would carry the blind spot into
+    # the new window's verdict. Move it aside first.
+    if drops_blind "${from:-$bin}"; then
+        check 1 drops-cap \
+            "$drops_log is at the 4 MiB cap and blind — rotate it aside before a swap"
     else
-        check 1 rollback-copy "no $rollback_bin and no $bin to copy"
+        check 0 drops-cap "drops.jsonl below the cap"
+    fi
+
+    # Where a rollback goes: start copies the binary installed now to the rollback copy,
+    # replacing one left from an earlier window, so a failed swap returns to what ran
+    # before it. And what usage-parity compares against: what --parity names, or the
+    # build being replaced.
+    if [ -x "$bin" ]; then
+        rb_said="a rollback returns to $(describe_build "$bin"), the build installed now; start copies it to $rollback_bin"
+        if [ -f "$rollback_bin" ] && ! cmp -s "$bin" "$rollback_bin"; then
+            rb_said="$rb_said, replacing $(describe_build "$rollback_bin")"
+        fi
+        check 0 rollback-target "$rb_said"
+    else
+        check 1 rollback-target "no $bin to copy"
+    fi
+    parity_source=${parity_from:-$bin}
+    if [ -x "$parity_source" ] && [ -n "$("$parity_source" --version 2>/dev/null || true)" ]; then
+        check 0 parity-baseline "usage-parity compares against $(describe_build "$parity_source")${parity_from:+, named with --parity}"
+    else
+        check 1 parity-baseline "$parity_source does not run, so usage-parity would have nothing to compare against"
     fi
 
     # The launchd plist (or systemd unit on Linux), backed up beside
@@ -749,6 +2021,11 @@ do_preflight() {
         else
             check 1 cache "candidate log index failed: $index_out"
         fi
+        if rt_out=$(candidate_round_trip "$from"); then
+            check 0 round-trip "$rt_out"
+        else
+            check 1 round-trip "$rt_out"
+        fi
     else
         check 2 cache "no --from — the live cache is not prebuilt"
     fi
@@ -758,8 +2035,10 @@ do_preflight() {
 sub=${1:-}
 [ $# -ge 1 ] && shift
 from=""
+parity_from=""
 evidence=""
 since=""
+idle=""
 while [ $# -gt 0 ]; do
     case $1 in
         --live) refuse "--live is gone — a rehearsal is CONBUS_CANARY_REHEARSAL=1 under a throwaway HOME" ;;
@@ -778,13 +2057,37 @@ while [ $# -gt 0 ]; do
             since=$2
             shift
             ;;
+        --parity)
+            [ $# -ge 2 ] || refuse "--parity wants a binary"
+            parity_from=$2
+            shift
+            ;;
+        --idle)
+            [ $# -ge 2 ] || refuse "--idle wants a harness or a day"
+            idle="$idle,$2"
+            shift
+            ;;
         *) refuse "unknown argument: $1" ;;
     esac
     shift
 done
 
-is_uint "$doctor_limit_s" && [ "$doctor_limit_s" -ge 1 ] ||
-    refuse "CONBUS_CANARY_DOCTOR_LIMIT='$doctor_limit_s' is not a positive integer"
+# Every number from the environment, before any of them is used. Junk read as a
+# failed test, and a failed test reads as false: `[ 7d -lt 7 ]` let a day-old window
+# through, and a blank serving limit left the round trip's daemon running.
+want_positive() { # want_positive <variable> <value>
+    { is_count "$2" && [ "$2" -ge 1 ]; } || refuse "$1='$2' is not a positive integer"
+}
+want_positive CONBUS_CANARY_DOCTOR_LIMIT "$doctor_limit_s"
+want_positive CONBUS_CANARY_SERVING_LIMIT "$serving_limit"
+want_positive CONBUS_CANARY_RSS_MB "$rss_budget_mb"
+want_positive CONBUS_CANARY_WINDOW_DAYS "$window_days"
+want_positive CONBUS_CANARY_TAIL_MS "$tail_ms_budget"
+want_positive CONBUS_CANARY_USAGE_MS "$usage_ms_budget"
+want_positive CONBUS_CANARY_DOCTOR_MS "$doctor_ms_budget"
+want_positive CONBUS_CANARY_SERVING_MS "$serving_ms_budget"
+want_positive CONBUS_CANARY_PROBE_S "$probe_s"
+is_count "$noise_limit" || refuse "CONBUS_CANARY_NOISE_MAX='$noise_limit' is not a number"
 
 case $sub in
     preflight)
@@ -799,9 +2102,12 @@ case $sub in
             say "installed: no conbus at $bin"
         fi
         if [ -f "$rollback_bin" ]; then
-            say "rollback: $("$rollback_bin" --version 2>&1 || echo 'present, does not run')"
+            say "rollback: $(describe_build "$rollback_bin")"
         else
             say "rollback: none ($rollback_bin absent)"
+        fi
+        if [ -f "$parity_bin" ]; then
+            say "parity: $(describe_build "$parity_bin")"
         fi
         if [ -f "$stamp" ]; then
             say "daemon stamp: $(cat "$stamp")"
@@ -831,237 +2137,302 @@ case $sub in
         # The §7 pass criteria a machine can score, against the log since
         # the recorded swap. The default boundary is the swap time in
         # canary.json — restarts of the recorder itself do not move it, so
-        # an unplanned one is still counted. Exits 1 on a fail, 3 while the
-        # 7-day window is still open, 0 on a completed pass.
+        # an unplanned one is still counted.
+        #
+        # Exits 0 on a completed pass, 1 on a fail, 2 on arguments it refuses,
+        # 3 while the 7-day window is still open, 4 when the window is over and
+        # an item other than operator-feel could not be judged. Every read that
+        # can fail is taken with its status in hand, because `x=$(a | b)` under
+        # `set -e` ends the script on the spot and prints no summary at all.
+        # Bytes, not characters, for everything this reads: on macOS sed, cut and
+        # tr exit non-zero on one invalid byte under a UTF-8 locale, and `set -e`
+        # would end the verdict on the line a bad byte sits on.
+        export LC_ALL=C
+        for answer in $(printf '%s' "$idle" | tr ',' ' '); do
+            case $answer in
+                [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ;;
+                *[!a-z_]*) refuse "--idle '$answer' is not a harness or a YYYY-MM-DD day" ;;
+            esac
+        done
         fails=0
+        unchecked=""
         line() { # line <PASS|FAIL|UNCHECKED> <name> <detail>
             printf '%s %s — %s\n' "$1" "$2" "$3"
-            if [ "$1" = FAIL ]; then fails=$((fails + 1)); fi
+            case $1 in
+                FAIL) fails=$((fails + 1)) ;;
+                UNCHECKED)
+                    # The one question no tool can answer may stay open for a
+                    # pass. Anything else left open means nothing was proved.
+                    if [ "$2" != operator-feel ]; then
+                        unchecked="$unchecked$2 — $3"$'\n'
+                    fi
+                    ;;
+            esac
         }
 
+        # Every comparison below is on this text, so anything else is refused
+        # rather than compared: `yesterday` sorts after every timestamp.
+        case $since in
+            '') ;;
+            [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) since="$since"T00:00:00.000Z ;;
+            [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z)
+                since=${since%Z}.000Z
+                ;;
+            [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z) ;;
+            *) refuse "--since '$since' is not YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS[.mmm]Z" ;;
+        esac
+        if [ -n "$since" ] && ! is_uint "$(ts_epoch "$since")"; then
+            refuse "--since '$since' is not a date"
+        fi
+        if [ -f "$state_file" ] && [ ! -r "$state_file" ]; then
+            line UNCHECKED window "$state_file cannot be read — nothing says when the swap was"
+            say "verdict: UNCHECKED — no swap time to judge a window from; not a pass"
+            exit 4
+        fi
+        recorded_swap=$(state_get swapped || true)
+        if [ -n "$recorded_swap" ] && ! is_uint "$(ts_epoch "$recorded_swap")"; then
+            line UNCHECKED window "$state_file says the swap was '$recorded_swap', which is not a time"
+            say "verdict: UNCHECKED — no swap time to judge a window from; not a pass"
+            exit 4
+        fi
         if [ -z "$since" ]; then
-            since=$(state_get swapped || true)
+            since=$recorded_swap
         fi
         if [ -z "$since" ] && [ -f "$stamp" ]; then
-            since=$(sed -n 's/.*"started":"\([^"]*\)".*/\1/p' "$stamp")
+            since=$(sed -n 's/.*"started":"\([^"]*\)".*/\1/p' "$stamp" 2>/dev/null || true)
             say "note: no canary.json — bounding by the daemon's own start $since"
         fi
         [ -n "$since" ] ||
             die "no --since, no canary.json, no daemon.build stamp — nothing to bound the window with"
-        case $since in
-            [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) since="$since"T00:00:00.000Z ;;
-        esac
         since_day=${since:0:10}
+        today_utc=$(date -u +%Y-%m-%d)
+        operator_answers=""
         say "window: since $since"
+        read_budget() { # read_budget <state key> <environment variable> <value now>
+            budget_stored=$(state_get "$1" || true)
+            budget_value=$3
+            budget_from="default"
+            if [ -n "${!2:-}" ]; then
+                budget_from="from the environment"
+            elif [ -n "$budget_stored" ]; then
+                { is_count "$budget_stored" && [ "$budget_stored" -ge 1 ]; } ||
+                    refuse "canary.json $1='$budget_stored' is not a positive integer"
+                budget_value=$budget_stored
+                budget_from="stored at start"
+            fi
+        }
+        read_budget rss_mb CONBUS_CANARY_RSS_MB "$rss_budget_mb"
+        rss_budget_mb=$budget_value rss_from=$budget_from
+        read_budget doctor_ms CONBUS_CANARY_DOCTOR_MS "$doctor_ms_budget"
+        doctor_ms_budget=$budget_value doctor_from=$budget_from
+        read_budget serving_limit CONBUS_CANARY_SERVING_LIMIT "$serving_limit"
+        serving_limit=$budget_value
+        disk_accepted=$(state_get disk_warn_ok || true)
+        say "budgets: recorder RSS $rss_budget_mb MB ($rss_from), doctor $doctor_ms_budget ms ($doctor_from); disk warning accepted at start: $([ "$disk_accepted" = 1 ] && echo yes || echo no)"
 
         [ -x "$bin" ] || die "no installed conbus at $bin — verdict needs its reads"
 
-        # 1. Unplanned recorder restarts: daemon start lines after since,
-        #    minus the swap's own boot and each planned restart — each of
-        #    those is one `install --apply`, one boot.
-        starts=0
-        if [ -f "$daemon_log" ]; then
-            starts=$(awk -v s="$since" '
-                $1 > s && /conbus daemon: .*: socket .* log / { n++ }
-                END { print n + 0 }
-            ' "$daemon_log")
-        else
-            line UNCHECKED restarts "no $daemon_log"
+        # One doctor for every item that reads it. Each doctor starts Codex's
+        # app-server two or three times, so items do not get their own.
+        doctor_t0=$(perl -MTime::HiRes=time -e 'printf "%d", time()*1000')
+        doctor_rc=0
+        doctor_out=$(run_doctor 2>/dev/null) || doctor_rc=$?
+        doctor_first_ms=$(($(perl -MTime::HiRes=time -e 'printf "%d", time()*1000') - doctor_t0))
+        doctor_failed=""
+        if [ "$doctor_rc" -eq 142 ]; then
+            doctor_failed="doctor did not answer inside ${doctor_limit_s}s"
+        elif [ "$doctor_rc" -ne 0 ]; then
+            doctor_failed="doctor exited $doctor_rc"
+        elif ! grep -q '^socket' <<<"$doctor_out"; then
+            doctor_failed="doctor printed no socket line"
         fi
-        planned=$(state_restart_count)
-        unplanned=$((starts - 1 - planned))
-        [ "$unplanned" -lt 0 ] && unplanned=0
-        if [ -f "$daemon_log" ]; then
-            if [ "$unplanned" -eq 0 ]; then
-                line PASS restarts \
-                    "0 unplanned daemon start(s) since $since ($starts seen: 1 swap + $planned planned)"
+
+        verdict_build
+        verdict_hooks
+
+        verdict_recorder
+        verdict_restarts
+        verdict_reboots
+        verdict_unreadable
+        verdict_log_files
+
+        # A read that failed and a log with no rows are different facts, and
+        # neither is evidence of activity.
+        usage_err=$(mktemp "${TMPDIR:-/tmp}/canary-usage.XXXXXX")
+        usage_rc=0
+        usage_json=$("$bin" usage --json --since 1970-01-01 2>"$usage_err") || usage_rc=$?
+        usage_problem=""
+        if [ "$usage_rc" -ne 0 ]; then
+            usage_problem="usage --json failed (exit $usage_rc): $(sed -n '1p' "$usage_err" | cut -c1-160)"
+        elif [ -z "$usage_json" ]; then
+            usage_problem="usage --json gave no rows"
+        elif [ -s "$usage_err" ]; then
+            say "note: usage --json reported: $(sed -n '1p' "$usage_err" | cut -c1-160)"
+        fi
+        rm -f "$usage_err"
+        # The same read cut at the swap itself, because the swap day's rows hold
+        # whatever ran before it. A row without tool_calls is a count not read.
+        window_problem=$usage_problem
+        window_tool_calls=0
+        if [ -z "$window_problem" ]; then
+            window_rc=0
+            window_json=$("$bin" usage --json --since "$since" 2>/dev/null) || window_rc=$?
+            if [ "$window_rc" -ne 0 ]; then
+                window_problem="usage --json --since $since failed (exit $window_rc)"
             else
-                line FAIL restarts \
-                    "$unplanned unplanned daemon start(s) since $since ($starts seen: 1 swap + $planned planned)"
-            fi
-        fi
-
-        # 2. Unreadable log lines: the newest start line's report, else the
-        #    doctor's log line.
-        unreadable=""
-        if [ -f "$daemon_log" ]; then
-            unreadable=$(sed -n 's/.*(\([0-9][0-9]*\) record(s), \([0-9][0-9]*\) unreadable).*/\2/p' \
-                "$daemon_log" | tail -1)
-        fi
-        if [ -z "$unreadable" ]; then
-            unreadable=$(run_doctor 2>/dev/null |
-                sed -n 's/^log.* \([0-9][0-9]*\) unreadable line(s)/\1/p' | tail -1)
-        fi
-        case ${unreadable:-x} in
-            x) line UNCHECKED unreadable "no report line names a count" ;;
-            0) line PASS unreadable "0 unreadable line(s)" ;;
-            *) line FAIL unreadable "$unreadable unreadable line(s)" ;;
-        esac
-
-        # 3. New drop reasons since the swap (a known reason repeating is
-        #    not new), plus every planned restart's recorded new_drops.
-        #    A swap-window reason — the old daemon's protocol refusal or a
-        #    dropped connection mid-restart — is exempt only inside 60
-        #    seconds after the swap; the same reason later is a fault.
-        if [ -f "$drops_log" ]; then
-            new_reasons=$(awk -v s="$since" '
-                {
-                    ts = ""; r = ""
-                    if (match($0, /"ts":"[^"]*"/)) ts = substr($0, RSTART + 6, RLENGTH - 7)
-                    if (match($0, /"reason":"[^"]*"/)) r = substr($0, RSTART + 10, RLENGTH - 11)
-                    if (r == "") next
-                    if (ts > s) { after[r] = 1; n++ } else { before[r] = 1 }
-                }
-                END { print n + 0; for (r in after) if (!(r in before)) print r }
-            ' "$drops_log")
-            drop_count=$(echo "$new_reasons" | head -1)
-            new_reasons=$(echo "$new_reasons" | tail -n +2 | LC_ALL=C sort)
-            s_epoch=$(ts_epoch "$since")
-            swap_exempted=0
-            real_new=""
-            while IFS= read -r r; do
-                [ -z "$r" ] && continue
-                if expected_swap_reason "$r" && is_uint "${s_epoch:-}"; then
-                    late=0 n_here=0
-                    while IFS= read -r dl; do
-                        t=${dl#*'"ts":"'}; t=${t%%'"'*}
-                        [ "$t" \> "$since" ] || continue
-                        n_here=$((n_here + 1))
-                        e=$(ts_epoch "$t")
-                        if ! is_uint "${e:-}" || [ "$e" -gt $((s_epoch + 60)) ]; then
-                            late=1
-                        fi
-                    done <<< "$(grep -F "\"reason\":\"$r\"" "$drops_log" || true)"
-                    if [ "$late" = 1 ]; then
-                        real_new="$real_new ${r} (persisted >60s after the swap)"
-                    else
-                        swap_exempted=$((swap_exempted + n_here))
-                    fi
-                else
-                    real_new="$real_new $r"
+                window_tool_calls=$(echo "$window_json" | awk '
+                    NF == 0 { next }
+                    match($0, /"tool_calls":[0-9]+/) { total += substr($0, RSTART + 13, RLENGTH - 13); next }
+                    { missing++ }
+                    END { print (missing ? "missing" : total + 0) }')
+                if [ "$window_tool_calls" = missing ]; then
+                    window_tool_calls=0
+                    window_problem="usage rows name no tool_calls"
                 fi
-            done <<< "$new_reasons"
-            restart_drops=$(state_restart_drop_total)
-            if [ -z "$real_new" ] && [ "$restart_drops" -eq 0 ]; then
-                line PASS drops \
-                    "0 new drop reason(s) ($drop_count drop(s)${swap_exempted:+, $swap_exempted expected swap-window}, $restart_drops on planned restarts)"
-            elif [ -n "$real_new" ]; then
-                line FAIL drops \
-                    "new drop reason(s) since $since:$real_new"
-            else
-                line FAIL drops "$restart_drops drop(s) during planned restarts"
-            fi
-        else
-            restart_drops=$(state_restart_drop_total)
-            if [ "$restart_drops" -eq 0 ]; then
-                line PASS drops "no $drops_log — nothing dropped"
-            else
-                line FAIL drops "$restart_drops drop(s) during planned restarts"
             fi
         fi
 
-        # 4. Per-harness activity: usage --json rows give every (day,
-        #    harness) with records. A harness that misses a day some other
-        #    harness recorded on cannot be told idle from lost — UNCHECKED
-        #    with the gap named.
-        usage_json=$("$bin" usage --json --since 1970-01-01 2>/dev/null || true)
-        if [ -z "$usage_json" ]; then
-            line UNCHECKED harness-activity "usage --json gave no rows"
+        # 3. Drops, then what the same lines say about tool bodies. Both read the
+        #    usage rows taken above. 1% of very few is nothing: 12 of 112 is a restart on
+        #    a quiet day. So it takes a minimum, and on a quiet machine a body that is
+        #    elided every time still shows as most of them.
+        elided_min=100
+        elided_min_half=20
+        verdict_drops
+        verdict_log_outages
+        verdict_orphan_tools
+        verdict_disk
+
+        if [ -n "$window_problem" ]; then
+            line UNCHECKED tool-bodies \
+                "${elided_total:-0} tool event(s) elided, not sealed; no tool-call count to weigh them against: $window_problem"
+        elif [ "${elided_bad:-0}" -gt 0 ]; then
+            line UNCHECKED tool-bodies \
+                "$elided_bad elided line(s) do not read '<N> tool event(s)' — the count is not known"
+        elif [ $((${elided_total:-0} * 100)) -gt "$window_tool_calls" ] && {
+            [ "${elided_total:-0}" -ge "$elided_min" ] ||
+                { [ "${elided_total:-0}" -ge "$elided_min_half" ] && [ $((${elided_total:-0} * 2)) -gt "$window_tool_calls" ]; }
+        }; then
+            line FAIL tool-bodies \
+                "${elided_total:-0} tool event(s) elided, not sealed — more than 1% of $window_tool_calls tool call(s); a spool elides tens per restart, a Keychain that will not answer elides them all"
         else
-            activity=$(echo "$usage_json" | awk -v s="$since_day" '
-                {
-                    day = ""; h = ""
-                    if (match($0, /"day":"[^"]*"/)) day = substr($0, RSTART + 7, RLENGTH - 8)
-                    if (match($0, /"harness":"[^"]*"/)) h = substr($0, RSTART + 11, RLENGTH - 12)
-                    if (day == "" || h == "") next
-                    if (day >= s) {
-                        wh[h SUBSEP day] = 1; active[h] = 1; wdays[day] = 1
-                    } else {
-                        before[h] = 1
-                    }
-                }
-                END {
-                    nwdays = 0; for (d in wdays) nwdays++
-                    gaps = ""; silent = ""
-                    for (h in active) {
-                        have = 0
-                        for (d in wdays) if (wh[h, d]) have++
-                        if (have < nwdays) gaps = gaps " " h
-                    }
-                    for (h in before) if (!(h in active)) silent = silent " " h
-                    printf "gaps:%s\nsilent:%s\ndays:%d\n", gaps, silent, nwdays
-                }')
-            gaps=$(echo "$activity" | sed -n 's/^gaps: //p')
-            silent=$(echo "$activity" | sed -n 's/^silent: //p')
-            nwdays=$(echo "$activity" | sed -n 's/^days://p')
-            if [ -z "$gaps" ]; then
-                line PASS harness-activity \
-                    "every active harness recorded on all $nwdays active day(s)${silent:+; silent:$silent}"
-            else
-                line UNCHECKED harness-activity \
-                    "day-gap(s) on:$gaps — idle vs lost needs the operator${silent:+; silent:$silent}"
-            fi
+            line PASS tool-bodies \
+                "${elided_total:-0} tool event(s) elided, not sealed, of $window_tool_calls tool call(s) — fails over 1% from $elided_min of them, or over half from $elided_min_half"
         fi
+
+        verdict_activity
 
         # 5. twins and `repeated` growth vs the pre-swap baseline, same rows.
-        if [ -n "$usage_json" ]; then
-            rep_result=$(echo "$usage_json" | awk -v s="$since_day" '
+        if [ -z "$usage_problem" ]; then
+            # By day, as a median against the 28 days before the swap. A mean over all
+            # history made one month in September the baseline for ever, and a large
+            # regression passed under it. One bad day is a burst and stays a total:
+            # days of 102, 22 and 17 sit among medians of 0 on the real log.
+            rep_result=$(echo "$usage_json" | awk -v s="$since_day" -v lb="$(perl -MTime::Local -MPOSIX=strftime -e '
+                my ($y, $m, $d) = $ARGV[0] =~ /^(\d+)-(\d+)-(\d+)/;
+                print strftime("%Y-%m-%d", gmtime(timegm(0, 0, 0, $d, $m - 1, $y) - 28 * 86400))' "$since_day")" '
+                function median(by,    v, n, i, j, x, d) {
+                    n = 0
+                    for (d in by) v[++n] = by[d]
+                    if (!n) return 0
+                    for (i = 2; i <= n; i++) { x = v[i]; for (j = i - 1; j >= 1 && v[j] > x; j--) v[j + 1] = v[j]; v[j + 1] = x }
+                    return n % 2 ? v[(n + 1) / 2] : (v[n / 2] + v[n / 2 + 1]) / 2
+                }
                 {
                     day = ""
                     if (match($0, /"day":"[^"]*"/)) day = substr($0, RSTART + 7, RLENGTH - 8)
                     if (match($0, /"repeated":[0-9]+/)) rep = substr($0, RSTART + 11, RLENGTH - 11) + 0
                     else rep = 0
-                    if (day >= s) { wr += rep; wd[day] = 1 } else { br += rep; bd[day] = 1 }
+                    if (day >= s) { wr += rep; wd[day] += rep }
+                    else if (day >= lb) { br += rep; bd[day] += rep }
                 }
                 END {
+                    wm = median(wd); bm = median(bd)
                     wdays = 0; for (d in wd) wdays++
-                    bdays = 0; for (d in bd) bdays++
-                    wrate = wdays ? wr / wdays : 0
-                    brate = bdays ? br / bdays : 0
-                    printf "%s %.4f %.4f %d %d", (wrate <= brate ? "PASS" : "FAIL"), wrate, brate, wr, br
+                    printf "%s %s %s %d %d %d", (wdays ? (wm <= bm + 2 ? "PASS" : "FAIL") : "UNCHECKED"), wm, bm, wr, br, wdays
                 }')
             set -- $rep_result
-            line "$1" twins-repeated \
-                "repeated/day $2 since vs $3 before ($4 vs $5 total)"
+            if [ "$1" = UNCHECKED ]; then
+                line UNCHECKED twins-repeated \
+                    "usage --json has no rows since $since_day — nothing to compare"
+            else
+                line "$1" twins-repeated \
+                    "repeated per day, median $2 since vs $3 in the 28 days before ($4 vs $5 total); fails when the median rises by more than 2, so one burst does not"
+            fi
         else
-            line UNCHECKED twins-repeated "usage --json gave no rows"
+            line UNCHECKED twins-repeated "$usage_problem"
         fi
 
-        # 6. usage-parity: every closed UTC day in the window, the rollback
-        #    binary's usage --json --day D against the candidate's, with
-        #    the documented tokens_* keys stripped.
-        today_utc=$(date -u +%Y-%m-%d)
-        if [ ! -x "$rollback_bin" ]; then
-            line FAIL usage-parity "no $rollback_bin — the 0.2.8 side of the parity is missing"
+        # 6. usage-parity: every closed UTC day in the window, the baseline's
+        #    usage --json --day D against the candidate's, with the documented
+        #    tokens_* keys stripped. The baseline is the copy start made of what
+        #    --parity named, or of the build it replaced. A window started before
+        #    that copy existed compares against the rollback copy, as it did.
+        parity_against=$parity_bin
+        [ -x "$parity_against" ] || parity_against=$rollback_bin
+        if [ ! -x "$parity_against" ]; then
+            line FAIL usage-parity "no $parity_bin and no $rollback_bin — nothing to compare the candidate's usage with"
         else
             strip='s/"tokens_[a-z_]*":[0-9]*,?//g; s/,\}/}/g; s/,]/]/g'
             parity_bad=""
+            parity_unread=""
+            parity_empty=""
+            parity_seen=0
             d=$since_day
             guard=0
             while [ "$d" \< "$today_utc" ] && [ "$guard" -lt 370 ]; do
-                old=$("$rollback_bin" usage --json --day "$d" 2>/dev/null | sed -E "$strip" || true)
-                new=$("$bin" usage --json --day "$d" 2>/dev/null | sed -E "$strip" || true)
-                if [ "$old" != "$new" ]; then
-                    parity_bad="$parity_bad $d"
+                old_rc=0 new_rc=0
+                old=$("$parity_against" usage --json --day "$d" 2>/dev/null) || old_rc=$?
+                new=$("$bin" usage --json --day "$d" 2>/dev/null) || new_rc=$?
+                if [ "$old_rc" -ne 0 ] || [ "$new_rc" -ne 0 ]; then
+                    # A side that failed compared nothing, whichever way the
+                    # text happens to come out.
+                    parity_unread="$parity_unread $d"
+                else
+                    old=$(echo "$old" | sed -E "$strip")
+                    new=$(echo "$new" | sed -E "$strip")
+                    if [ "$old" != "$new" ]; then
+                        parity_bad="$parity_bad $d"
+                    elif [ -z "$old" ]; then
+                        parity_empty="$parity_empty $d"
+                    else
+                        parity_seen=$((parity_seen + 1))
+                    fi
                 fi
-                d=$(next_day "$d")
+                d=$(next_day "$d") || break
                 guard=$((guard + 1))
             done
-            if [ -z "$parity_bad" ]; then
-                line PASS usage-parity "closed days agree (tokens_* stripped)"
-            else
+            if [ -n "$parity_bad" ]; then
                 line FAIL usage-parity "usage differs on:$parity_bad"
+            elif [ -n "$parity_unread" ]; then
+                line UNCHECKED usage-parity "a side could not read:$parity_unread"
+            elif [ "$parity_seen" -eq 0 ]; then
+                # Two binaries that both answer nothing "agree" on every
+                # day: a parity of emptiness proves nothing.
+                line UNCHECKED usage-parity \
+                    "no closed day produced rows on either side — nothing was compared"
+            else
+                line PASS usage-parity \
+                    "$parity_seen closed day(s) with rows agree with $(describe_build "$parity_against"), $(basename "$parity_against") (tokens_* stripped)${parity_empty:+; empty on both sides, so not compared:$parity_empty}"
             fi
         fi
 
         # 7. rss-budget + M3 time budgets: the running recorder's RSS and
         #    three re-measured reads against the plan's targets.
         rss_kb=""
+        rss_who=""
         if [ -f "$stamp" ]; then
-            pid=$(sed -n 's/.*"pid":\([0-9]*\).*/\1/p' "$stamp")
-            [ -n "$pid" ] && rss_kb=$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ')
+            pid=$(sed -n 's/.*"pid":\([0-9]*\).*/\1/p' "$stamp" 2>/dev/null || true)
+            # `ps` exits 1 for a dead pid, which is the case this item is for.
+            if [ -n "$pid" ]; then
+                rss_kb=$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ' || true)
+                rss_who=$(ps -o command= -p "$pid" 2>/dev/null || true)
+            fi
         fi
-        if is_uint "${rss_kb:-}"; then
+        # A reused pid has a size too. Only a conbus daemon's counts.
+        if [ -n "$rss_who" ] && case $rss_who in *conbus*daemon*) false ;; *) true ;; esac; then
+            line FAIL rss-budget "pid $pid in the stamp is not a conbus daemon: $(echo "$rss_who" | cut -c1-60)"
+        elif is_uint "${rss_kb:-}"; then
             rss_mb=$((rss_kb / 1024))
             if [ "$rss_mb" -le "$rss_budget_mb" ]; then
                 line PASS rss-budget "recorder RSS ${rss_mb} MB ≤ ${rss_budget_mb} MB"
@@ -1072,37 +2443,73 @@ case $sub in
             line FAIL rss-budget "no running recorder pid — the daemon itself is not up"
         fi
 
-        measure() { # measure <cmd...> — echoes wall-clock milliseconds
+        measure() { # measure <cmd...> — echoes "<wall-clock ms> <exit status>"
             start_ms=$(perl -MTime::HiRes=time -e 'printf "%d", time()*1000')
-            "$@" >/dev/null 2>&1 || true
+            measured_rc=0
+            "$@" >/dev/null 2>&1 || measured_rc=$?
             end_ms=$(perl -MTime::HiRes=time -e 'printf "%d", time()*1000')
-            echo $((end_ms - start_ms))
+            echo "$((end_ms - start_ms)) $measured_rc"
         }
-        t_tail=$(measure "$bin" log --tail 1)
-        t_usage=$(measure "$bin" usage --days 7)
-        t_doctor=$(measure run_doctor)
+        # One slow read under load is the machine, not the build, and a doctor
+        # re-read starts its vendor probes again. So a read that makes its budget
+        # is read once; one that does not gets two more, and the median judges.
+        # A wedge still trips it, a spike does not.
+        judge_read() { # judge_read <budget ms> <first ms> <first status> <cmd...> — echoes "<ms> <exit status>"
+            judge_budget=$1 judge_ms=$2 judge_rc=$3
+            shift 3
+            if [ "$judge_ms" = - ]; then
+                read -r judge_ms judge_rc <<<"$(measure "$@")"
+            fi
+            if [ "$judge_rc" -eq 0 ] && [ "$judge_ms" -gt "$judge_budget" ]; then
+                judge_again=$(for _ in 1 2; do measure "$@"; done)
+                judge_ms=$(printf '%s\n%s\n' "$judge_ms" "$judge_again" | awk '{ print $1 }' | sort -n | sed -n '2p')
+                judge_rc=$(printf '%s\n' "$judge_again" | awk '$2 != 0 { rc = $2 } END { print rc + 0 }')
+            fi
+            echo "$judge_ms $judge_rc"
+        }
+        read -r t_tail rc_tail <<<"$(judge_read "$tail_ms_budget" - - "$bin" log --tail 1)"
+        read -r t_usage rc_usage <<<"$(judge_read "$usage_ms_budget" - - "$bin" usage --days 7)"
+        read -r t_doctor rc_doctor <<<"$(judge_read "$doctor_ms_budget" "$doctor_first_ms" "$doctor_rc" run_doctor)"
+        tb_failed=""
+        [ "$rc_tail" -eq 0 ] || tb_failed="$tb_failed log --tail(exit $rc_tail)"
+        [ "$rc_usage" -eq 0 ] || tb_failed="$tb_failed usage(exit $rc_usage)"
+        # 142 is run_doctor's cap: a doctor that never answered is over budget,
+        # which the times below already say. Any other status failed fast.
+        case $rc_doctor in
+            0 | 142) ;;
+            *) tb_failed="$tb_failed doctor(exit $rc_doctor)" ;;
+        esac
         tb_bad=""
         [ "$t_tail" -gt "$tail_ms_budget" ] && tb_bad="$tb_bad tail(${t_tail}>${tail_ms_budget})"
         [ "$t_usage" -gt "$usage_ms_budget" ] && tb_bad="$tb_bad usage(${t_usage}>${usage_ms_budget})"
         [ "$t_doctor" -gt "$doctor_ms_budget" ] && tb_bad="$tb_bad doctor(${t_doctor}>${doctor_ms_budget})"
-        if [ -z "$tb_bad" ]; then
+        # A cap lower than the budget must not turn a doctor that never answered
+        # into one that answered in time.
+        [ "$rc_doctor" -eq 142 ] && tb_bad="$tb_bad doctor(no answer inside ${doctor_limit_s}s)"
+        if [ -n "$tb_failed" ]; then
+            # A read that fails fast beats any budget and proves none of them.
+            line UNCHECKED time-budget "a failing read cannot be timed:$tb_failed"
+        elif [ -z "$tb_bad" ]; then
             line PASS time-budget \
                 "log --tail 1 ${t_tail}ms≤${tail_ms_budget} usage --days 7 ${t_usage}ms≤${usage_ms_budget} doctor ${t_doctor}ms≤${doctor_ms_budget}"
         else
+            load_now=$(LC_ALL=C uptime | sed -E 's/.*load averages?: *//' || true)
             line FAIL time-budget \
-                "over budget on:$tb_bad"
+                "over budget on:$tb_bad (median of 3; load $load_now — re-run when the machine is quiet to tell the build from the load)"
         fi
 
         # 8. Serving ≤ 5 s on the newest recorded boot — the goal §7 moved
         #    here from the rollback checks.
         if [ -f "$stamp" ]; then
-            started=$(sed -n 's/.*"started":"\([^"]*\)".*/\1/p' "$stamp")
-            serving=$(sed -n 's/.*"serving":"\([^"]*\)".*/\1/p' "$stamp")
-            e0=$(ts_epoch "$started") e1=$(ts_epoch "$serving")
+            started=$(sed -n 's/.*"started":"\([^"]*\)".*/\1/p' "$stamp" 2>/dev/null || true)
+            serving=$(sed -n 's/.*"serving":"\([^"]*\)".*/\1/p' "$stamp" 2>/dev/null || true)
+            e0=$(ts_ms "$started") e1=$(ts_ms "$serving")
             if is_uint "${e0:-}" && is_uint "${e1:-}"; then
-                serving_ms=$(( (e1 - e0) * 1000 ))
+                serving_ms=$((e1 - e0))
+                # Shown, not judged: one reading under load cannot be taken again.
+                recorded_servings=$(grep -o '"serving_ms":-\{0,1\}[0-9]*' "$state_file" 2>/dev/null | cut -d: -f2 | tr '\n' ' ' || true)
                 if [ "$serving_ms" -le "$serving_ms_budget" ]; then
-                    line PASS serving-budget "start->serving ${serving_ms} ms ≤ ${serving_ms_budget}"
+                    line PASS serving-budget "start->serving ${serving_ms} ms ≤ ${serving_ms_budget}${recorded_servings:+; planned restarts recorded: ${recorded_servings}ms}"
                 else
                     line FAIL serving-budget "start->serving ${serving_ms} ms > ${serving_ms_budget}"
                 fi
@@ -1113,11 +2520,15 @@ case $sub in
             line UNCHECKED serving-budget "no daemon.build stamp"
         fi
 
-        # 9. Policy decisions: the file absent means none can be made.
+        # 9. Policy decisions: the file absent means none can be made. A
+        #    file that cannot be a policy decides nothing — zero counted
+        #    denials would read as a pass over a guard that never ran.
         if [ ! -f "$root/policy.json" ]; then
             line PASS policy "no policy.json — 0 decisions possible"
-        elif [ -z "$usage_json" ]; then
-            line UNCHECKED policy "policy.json present but usage --json gave no rows"
+        elif ! "$bin" policy check >/dev/null 2>&1; then
+            line FAIL policy "policy.json cannot be a policy — it decides nothing"
+        elif [ -n "$usage_problem" ]; then
+            line UNCHECKED policy "policy.json present but $usage_problem"
         else
             denials=$(echo "$usage_json" | awk -v s="$since_day" '
                 match($0, /"day":"[^"]*"/) { day = substr($0, RSTART + 7, RLENGTH - 8) }
@@ -1142,19 +2553,41 @@ case $sub in
 
         line UNCHECKED operator-feel "only the operator can answer this one"
 
-        # The window is open for CONBUS_CANARY_WINDOW_DAYS (default 7).
-        # A fail inside it still exits 1 — 3 only means "not done yet".
-        swapped_epoch=$(ts_epoch "$since")
-        if [ "$fails" -gt 0 ]; then
-            say "verdict: FAIL ($fails failing item(s))"
-            exit 1
-        elif is_uint "${swapped_epoch:-}" &&
-            [ "$swapped_epoch" -gt 0 ] &&
-            [ $((($(date +%s) - swapped_epoch) / 86400)) -lt "$window_days" ]; then
-            say "verdict: window incomplete ($(( ($(date +%s) - swapped_epoch) / 86400 ))/${window_days} days) — not a pass yet"
-            exit 3
+        # The window is open for CONBUS_CANARY_WINDOW_DAYS (default 7), counted
+        # from the recorded swap. --since moves what the items read, never the
+        # clock: an older date cannot complete a window that is still running,
+        # and a look at part of a window is not that window's verdict.
+        if [ -n "$recorded_swap" ] && [ "$since" != "$recorded_swap" ]; then
+            line UNCHECKED window \
+                "--since $since is not the recorded swap $recorded_swap — a look at part of the window, not its verdict"
+        elif [ -z "$recorded_swap" ]; then
+            line UNCHECKED window \
+                "no recorded swap — nothing says $since is where a $window_days-day window began"
         fi
-        say "verdict: PASS"
+        window_epoch=$(ts_epoch "${recorded_swap:-$since}")
+        unchecked_names=$(printf '%s' "$unchecked" | sed 's/ — .*//' | tr '\n' ' ')
+        # A fail inside the window still exits 1 — 3 only means "not done yet".
+        if [ "$fails" -gt 0 ]; then
+            say "verdict: FAIL ($fails failing item(s))${unchecked_names:+; also not judged: $unchecked_names}"
+            exit 1
+        elif ! is_uint "${window_epoch:-}"; then
+            say "verdict: UNCHECKED — '${recorded_swap:-$since}' cannot be read as a time; not a pass"
+            exit 4
+        elif [ $((($(date +%s) - window_epoch) / 86400)) -lt "$window_days" ]; then
+            say "verdict: window incomplete ($(( ($(date +%s) - window_epoch) / 86400 ))/${window_days} days) — not a pass yet${unchecked_names:+; also not judged so far: $unchecked_names}"
+            exit 3
+        elif [ -n "$unchecked" ]; then
+            say "verdict: UNCHECKED — not a pass; these could not be judged:"
+            printf '%s' "$unchecked" | sed 's/^/canary:   /'
+            exit 4
+        fi
+        window_said=""
+        [ "$window_days" -eq 7 ] || window_said="on a ${window_days}-day window, not the plan's 7; "
+        if [ -n "$operator_answers" ]; then
+            say "verdict: PASS — ${window_said}on the operator's word that these were idle:$operator_answers; operator-feel is still yours to answer"
+        else
+            say "verdict: PASS — ${window_said}every item judged; operator-feel is still yours to answer"
+        fi
         exit 0
         ;;
 
@@ -1166,8 +2599,7 @@ case $sub in
         if [ -f "$stamp" ]; then
             old_stamp_pid=$(sed -n 's/.*"pid":\([0-9]*\).*/\1/p' "$stamp")
         fi
-        before_lines=0
-        [ -f "$drops_log" ] && before_lines=$(wc -l <"$drops_log" | tr -d ' ')
+        before_ts=$(now_iso_ms)
         ts=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
         if [ "$mode" = rehearsal ]; then
             say "rehearsal: 'conbus install --apply' skipped (it would hit launchctl)"
@@ -1179,34 +2611,39 @@ case $sub in
             die "conbus install --apply failed — restart not recorded; check 'canary.sh status'"
         fi
         serving_ms=-1
+        served=0
         if wait_for_serving "$old_stamp_pid"; then
+            served=1
             started=$(sed -n 's/.*"started":"\([^"]*\)".*/\1/p' "$stamp")
             serving=$(sed -n 's/.*"serving":"\([^"]*\)".*/\1/p' "$stamp")
-            e0=$(ts_epoch "$started") e1=$(ts_epoch "$serving")
+            e0=$(ts_ms "$started") e1=$(ts_ms "$serving")
             if is_uint "${e0:-}" && is_uint "${e1:-}"; then
-                serving_ms=$(( (e1 - e0) * 1000 ))
+                serving_ms=$((e1 - e0))
             fi
         else
             say "restart: no new serving stamp inside ${serving_limit}s — check 'canary.sh status'"
         fi
-        # new_drops is the number of drop lines the restart added — the
-        # plan's "유실 0", not a new-reason count. A sessionless refusal is
-        # the vendor's payload, not a lost record: excluded, shown aside.
-        new_drops=0 sessionless=0
-        if [ -f "$drops_log" ]; then
-            while IFS= read -r l; do
-                [ -z "$l" ] && continue
-                case $l in
-                    *'"reason":"the hook payload names no session'*)
-                        sessionless=$((sessionless + 1)) ;;
-                    *) new_drops=$((new_drops + 1)) ;;
-                esac
-            done <<< "$(tail -n "+$((before_lines + 1))" "$drops_log" 2>/dev/null || true)"
-        fi
+        # new_drops is the number of drop lines the restart added that lost a
+        # record — the plan's "유실 0", not a new-reason count. A sessionless
+        # refusal is the vendor's payload, the end of a session the log never
+        # had loses nothing, and an elided tool body is a record that landed:
+        # excluded, shown aside. A timestamp cut: a rotation can rename the file
+        # mid-restart, so line numbers no longer mark "since".
+        new_drops=0 sessionless=0 not_lost=0
+        while IFS=$'\t' read -r cls _; do
+            case $cls in
+                '') ;;
+                sessionless) sessionless=$((sessionless + 1)) ;;
+                ghost | payload | elided | held) not_lost=$((not_lost + 1)) ;;
+                *) new_drops=$((new_drops + 1)) ;;
+            esac
+        done <<<"$(drop_classes_after "$before_ts")"
         state_add_restart "$ts" "$serving_ms" "$new_drops"
         extra=""
         [ "$sessionless" -gt 0 ] && extra=" ($sessionless sessionless refusal(s) not counted)"
+        [ "$not_lost" -gt 0 ] && extra="$extra ($not_lost line(s) that lost no record not counted)"
         say "recorded planned restart at $ts: serving ${serving_ms} ms, $new_drops drop(s)$extra"
+        [ "$served" = 1 ] || die "restart: the daemon never served"
         ;;
 
     start)
@@ -1244,16 +2681,42 @@ case $sub in
         fi
         before_drops=$(mktemp)
         drop_reasons >"$before_drops"
-        before_lines=0
-        [ -f "$drops_log" ] && before_lines=$(wc -l <"$drops_log" | tr -d ' ')
+        # Which file this window's drops land in, so the verdict can tell if it was
+        # taken away. One that does not exist yet could vanish unseen, so it does now.
+        (umask 077; : >>"$drops_log") 2>/dev/null || true
+        state_extra=",\"drops_file\":\"$(file_identity "$drops_log")\",\"log_files\":\"$(log_segments | awk 'NR == 1 { first = $1 } { last = $1; n++ } END { printf "%d:%s:%s", n, first, last }')\""
+        # The budgets this window runs on stay with it. A verdict a week later comes
+        # from another shell, and a forgotten RSS budget has failed a healthy week twice.
+        disk_ok=""
+        disk_said=no
+        if [ "${CONBUS_CANARY_DISK_WARN_OK:-}" = 1 ]; then
+            disk_ok=1
+            disk_said=yes
+        fi
+        state_extra="$state_extra,\"rss_mb\":\"$rss_budget_mb\",\"doctor_ms\":\"$doctor_ms_budget\",\"disk_warn_ok\":\"$disk_ok\",\"serving_limit\":\"$serving_limit\""
+        say "budgets stored: recorder RSS $rss_budget_mb MB, doctor $doctor_ms_budget ms, serving limit $serving_limit s, disk warning accepted: $disk_said"
+        # A rotation can rename drops.jsonl mid-swap, so "drops since now"
+        # is a timestamp cut across both generations, not a line offset.
+        before_ts=$(now_iso_ms)
+
+        # usage-parity's baseline: what --parity names, or the build being replaced.
+        # Copied first, so --parity can name the rollback copy refreshed next.
+        cp -p "${parity_from:-$bin}" "$parity_bin.new"
+        mv -f "$parity_bin.new" "$parity_bin"
+        say "usage-parity compares against $(describe_build "$parity_bin")"
+        # Where a rollback goes: the build installed right now. A copy left from an
+        # earlier window would send a failed swap back to it, releases behind.
+        rb_replaced=""
+        if [ -f "$rollback_bin" ] && ! cmp -s "$bin" "$rollback_bin"; then
+            rb_replaced=$(describe_build "$rollback_bin")
+        fi
+        cp -p "$bin" "$rollback_bin.new"
+        mv -f "$rollback_bin.new" "$rollback_bin"
+        say "a rollback returns to $(describe_build "$rollback_bin")${rb_replaced:+; it replaced $rb_replaced}"
 
         # Stage the candidate beside the target first, then swap names.
         cp "$from" "$new_bin"
         chmod 755 "$new_bin"
-        if [ ! -f "$rollback_bin" ]; then
-            cp -p "$bin" "$rollback_bin"
-            say "kept the current binary at $rollback_bin"
-        fi
         mv -f "$new_bin" "$bin"
         say "swapped $bin: $old_version -> $cand_version ($mode)"
 
@@ -1276,28 +2739,43 @@ case $sub in
             doctor_out=$(run_doctor) || doctor_rc=$?
             if [ "$doctor_rc" -eq 142 ]; then
                 fail_reason="doctor did not answer inside ${doctor_limit_s}s"
-            elif echo "$doctor_out" | grep -q 'DIFFERS'; then
+            elif grep -q 'DIFFERS' <<<"$doctor_out"; then
                 fail_reason="the answering daemon is a different build than $cand_build"
-            elif ! echo "$doctor_out" | grep -q 'listening'; then
+            elif ! grep -q 'listening' <<<"$doctor_out"; then
                 fail_reason="the daemon is not answering after the swap"
-            elif echo "$doctor_out" | grep '^hooks' | grep -qv ' runs '; then
-                bad_hooks=$(echo "$doctor_out" | grep '^hooks' | grep -v ' runs ' | head -1)
-                fail_reason="a hook is not 'runs': ${bad_hooks#hooks     }"
+            elif [ -n "$(log_cannot_take "$doctor_out")" ]; then
+                fail_reason="the log cannot take a record: $(log_cannot_take "$doctor_out")"
+            else
+                # A vendor this machine does not have has no hook to run, and
+                # trust is a person's act, told below rather than rolled back.
+                bad_hooks=$(hook_problems "$doctor_out" | awk '!/^ +(NOT TRUSTED|MODIFIED)/' | sed -n '1p')
+                if [ -n "$bad_hooks" ]; then
+                    fail_reason="a hook is not 'runs': ${bad_hooks#hooks     }"
+                elif ! grep -q '^hooks .* runs ' <<<"$doctor_out"; then
+                    fail_reason="no hook runs here"
+                elif ! probe_recorder; then
+                    fail_reason="the daemon did not answer a request on its socket"
+                fi
             fi
         fi
 
         swap_window_drops=0
-        if [ -z "$fail_reason" ] && [ -f "$drops_log" ]; then
-            while IFS= read -r l; do
-                [ -z "$l" ] && continue
-                r=${l#*'"reason":"'}; r=${r%%'"'*}
-                if expected_swap_reason "$r"; then
-                    swap_window_drops=$((swap_window_drops + 1))
-                elif ! grep -qxF "$r" "$before_drops"; then
-                    fail_reason="new drop reason(s) since the swap: $r"
-                    break
-                fi
-            done <<< "$(tail -n "+$((before_lines + 1))" "$drops_log" 2>/dev/null || true)"
+        if [ -z "$fail_reason" ]; then
+            while IFS=$'\t' read -r cls r; do
+                case $cls in
+                    '') ;;
+                    swap) swap_window_drops=$((swap_window_drops + 1)) ;;
+                    # A spool drained at the first boot writes these; none is a
+                    # lost record, and none should undo a healthy swap.
+                    ghost | sessionless | payload | elided | held | orphan) ;;
+                    *)
+                        if ! LC_ALL=C grep -qxF "$r" "$before_drops"; then
+                            fail_reason="new drop reason(s) since the swap: $r"
+                            break
+                        fi
+                        ;;
+                esac
+            done <<<"$(drop_classes_after "$before_ts" "$(swap_window_end "$swapped_ts")")"
         fi
         if [ "$swap_window_drops" -gt 0 ]; then
             say "start: $swap_window_drops swap-window drop(s) — the old daemon" \
@@ -1311,15 +2789,16 @@ case $sub in
             if [ -f "$stamp" ]; then
                 cand_pid=$(sed -n 's/.*"pid":\([0-9]*\).*/\1/p' "$stamp")
             fi
+            restored_build=$(build_of "$rollback_bin")
             mv -f "$rollback_bin" "$bin"
-            reregister_daemon "$mode" || true
             # The rollback happened whether or not it boots — record it
             # before verification, which exits 3 when it cannot confirm.
             state_write "$swapped_ts" "$prev_build" "$cand_build" "$cand_sha" '[]' \
                 "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
             say "rolled back $bin to $("$bin" --version 2>&1 || echo unknown)"
             say_spool
-            verify_rollback "$prev_build" "$cand_pid" "$mode"
+            rollback_reload "$mode"
+            verify_rollback "$restored_build" "$cand_pid" "$mode"
             die "start failed: $fail_reason (rolled back automatically)"
         fi
 
@@ -1328,7 +2807,13 @@ case $sub in
                 "" "$swap_window_drops"
         fi
 
-        say "start: serving, matching build, hooks runs, no new drops — canary is live"
+        # Trust is a person's act inside Codex, so it cannot undo a swap. verdict
+        # fails it if it is still so a week later.
+        if grep -qE '^ +(NOT TRUSTED|MODIFIED)' <<<"$doctor_out"; then
+            say "start: Codex will not spawn some hooks until you approve them inside Codex; run 'conbus doctor' to see which"
+        fi
+        say "start: serving, matching build, hooks registered and starting, daemon answering, no new drops — canary is live"
+        say "start: not proved here: that a vendor fires its hooks. preflight sent the candidate's own hook through its own daemon into a throwaway log; harness-activity in 'canary.sh verdict' judges the real records"
         ;;
 
     rollback)
@@ -1341,16 +2826,15 @@ case $sub in
         fi
         cand_pid=$old_stamp_pid
         mv -f "$rollback_bin" "$bin"
-        restored_version=$("$bin" --version 2>&1 || echo unknown)
-        say "rolled back $bin to $restored_version ($mode)"
-        prev_build=$(echo "$restored_version" | sed -n 's/.*(\([0-9a-f]*\)).*/\1/p')
-        reregister_daemon "$mode" || true
-        verify_rollback "$prev_build" "$cand_pid" "$mode"
+        restored_build=$(build_of "$bin")
+        say "rolled back $bin to $("$bin" --version 2>&1 || echo unknown) ($mode)"
+        rollback_reload "$mode"
+        verify_rollback "$restored_build" "$cand_pid" "$mode"
         say_spool
         ;;
 
     "" | -h | --help | help)
-        sed -n '3,10p' "$0"
+        sed -n '3,20p' "$0" | sed 's/^# \{0,1\}//'
         ;;
     *)
         refuse "unknown subcommand: $sub (preflight|status|verdict|start|restart|rollback)"

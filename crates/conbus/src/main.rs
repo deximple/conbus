@@ -5,7 +5,9 @@ mod note;
 
 mod appserver;
 mod arena;
+mod auth;
 mod backfill;
+mod backup;
 mod build_info;
 mod cli;
 mod code;
@@ -45,9 +47,50 @@ use conbus_core::retention::Retention;
 
 use cli::Command;
 
+/// `println!` panics when it cannot write, and `conbus log | head -1` is ordinary
+/// use. A reader that went away ends a command the way SIGPIPE ends any other
+/// Unix tool. SIGPIPE itself stays ignored, because a write to a socket or to a
+/// vendor process that has gone has to come back as an error, not end this one.
+///
+/// A hook exits zero whatever it could not print: it answers a turn, and its
+/// record has already gone where it was going.
+fn leave_quietly_when_the_output_is_gone(is_hook: bool) {
+    let report = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic| {
+        let text = panic.payload_as_str().unwrap_or_default();
+        if text.starts_with("failed printing to std") {
+            if is_hook {
+                std::process::exit(0);
+            }
+            if text.contains("Broken pipe") {
+                std::process::exit(128 + libc::SIGPIPE);
+            }
+        }
+        report(panic);
+    }));
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match cli::parse(&args, std::env::var("CONBUS_HARNESS").ok()) {
+    let command = cli::parse(&args, std::env::var("CONBUS_HARNESS").ok());
+    leave_quietly_when_the_output_is_gone(matches!(command, Command::Hook { .. }));
+    // `backfill --apply` and its kin write the log themselves, so they hold the
+    // recorder's claim until they are done, or refuse before writing anything.
+    let _claim = match &command {
+        Command::Backfill { apply: true, .. } => match Paths::resolve() {
+            Ok(paths) => match daemon::claim_for_a_fill(&paths) {
+                Ok(claim) => claim,
+                Err(err) => {
+                    eprintln!("conbus: {err}");
+                    return ExitCode::FAILURE;
+                }
+            },
+            // `run` says this one.
+            Err(_) => None,
+        },
+        _ => None,
+    };
+    match command {
         // A hook must never fail the turn it is attached to, so every failure
         // below leaves on stderr and exits zero.
         Command::Hook {
@@ -99,28 +142,35 @@ fn main() -> ExitCode {
             // explicit "carry on" costs nothing and cannot be mistaken for an
             // empty context block.
             let mut payload = String::new();
-            let _ = std::io::stdin().read_to_string(&mut payload);
+            let unread = std::io::stdin().read_to_string(&mut payload).err();
             let paths = Paths::resolve().ok();
             // The local policy decides from the payload alone, before and
             // independent of the daemon round trip: a down or slow recorder
             // must not lift a deny, so the same decision is the reply
             // whichever way the record lands.
             let decision = policy::decide(paths.as_ref(), &harness, &payload);
-            let reply =
-                match hook::client::run_in(paths.as_ref(), &harness, &mut payload.as_bytes()) {
-                    Ok(reply) => decision.unwrap_or(reply),
-                    Err(err) => {
-                        // Durable, because the vendor swallows stderr; throttled,
-                        // because a stopped daemon would otherwise write one of
-                        // these per hook per turn straight into the transcript.
-                        if drops::record(&err) {
-                            eprintln!("conbus hook: record dropped: {err}");
-                        }
-                        decision.unwrap_or_else(|| {
-                            hook::client::failure_reply(&harness, &payload).to_string()
-                        })
+            // A stdin that could not be read is said as that. Left to the parser,
+            // an invalid byte reads as an empty payload, which is what a hook run
+            // by hand looks like, and a prompt is gone with nothing to tell them
+            // apart.
+            let outcome = match unread {
+                Some(err) => hook::client::payload_unread(&harness, &err),
+                None => hook::client::run_in(paths.as_ref(), &harness, &mut payload.as_bytes()),
+            };
+            let reply = match outcome {
+                Ok(reply) => decision.unwrap_or(reply),
+                Err(err) => {
+                    // Durable, because the vendor swallows stderr; throttled,
+                    // because a stopped daemon would otherwise write one of
+                    // these per hook per turn straight into the transcript.
+                    if drops::record(&err) {
+                        eprintln!("conbus hook: record dropped: {err}");
                     }
-                };
+                    decision.unwrap_or_else(|| {
+                        hook::client::failure_reply(&harness, &payload).to_string()
+                    })
+                }
+            };
             // One JSON object and nothing else. The vendor's parser runs
             // `JSON.parse` on the whole of stdout, so a stray line anywhere
             // turns a reply into plain text — which on `UserPromptSubmit` is
@@ -132,7 +182,7 @@ fn main() -> ExitCode {
             run(|paths| daemon::serve(paths, Retention::from_env()))
         }
         Command::Daemon { prepare: true } => {
-            run(|paths| daemon::prepare(paths, Retention::from_env()))
+            run(|paths| daemon::prepare_command(paths, Retention::from_env()))
         }
         Command::Log { json, filter } => run(|paths| report::log(paths, json, &filter)),
         Command::LogIndex => run(report::log_index),
@@ -170,17 +220,26 @@ fn main() -> ExitCode {
         Command::Backfill {
             apply,
             gaps,
+            include_older_lines,
             chat_export,
         } => run(|paths| {
-            if let Some(export) = chat_export {
+            if include_older_lines && !gaps {
+                Err(std::io::Error::other(
+                    "--include-older-lines goes with --gaps",
+                ))
+            } else if let Some(export) = chat_export {
                 backfill::run_chat_export(paths, &export, apply)
             } else if gaps {
-                backfill::run_gaps(paths, apply)
+                backfill::run_gaps(paths, apply, include_older_lines)
             } else {
                 backfill::run(paths, apply)
             }
         }),
+        Command::Backup { to, verify } => run(|paths| backup::run(paths, &to, verify)),
         Command::Doctor => run(report::doctor),
+        Command::Auth { url, html, open } => {
+            run(|paths| auth::run(paths, url.as_deref(), html, open))
+        }
         Command::Status => run(report::status),
         Command::Quota => run(quota::run),
         Command::Policy { test } => run(|paths| match test {

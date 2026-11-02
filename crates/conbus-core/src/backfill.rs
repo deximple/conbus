@@ -13,7 +13,7 @@
 //! record is a weaker fact than a mirrored one and a reader that cannot tell
 //! them apart will over-trust the log.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -29,7 +29,8 @@ pub const CLAUDE_TRANSCRIPT: &str = "claude_transcript";
 /// What one transcript yielded.
 #[derive(Debug, Default)]
 pub struct Recovered {
-    /// The vendor's session id, from the lines themselves.
+    /// The vendor's session id: the file's name for a transcript, the thread's
+    /// own id for a Codex thread.
     pub vendor_session_id: Option<String>,
     /// The checkout the conversation happened in, from the lines themselves.
     pub workspace: Option<String>,
@@ -67,6 +68,16 @@ struct Line {
     prompt_source: Option<String>,
     #[serde(rename = "isSidechain", default)]
     is_sidechain: Option<bool>,
+    #[serde(rename = "isMeta", default)]
+    is_meta: Option<bool>,
+    #[serde(rename = "isCompactSummary", default)]
+    is_compact_summary: Option<bool>,
+    #[serde(rename = "isVisibleInTranscriptOnly", default)]
+    is_visible_in_transcript_only: Option<bool>,
+    #[serde(rename = "queueTranscriptOnly", default)]
+    queue_transcript_only: Option<bool>,
+    #[serde(rename = "toolEndsTurn", default)]
+    tool_ends_turn: Option<bool>,
     #[serde(default)]
     cwd: Option<String>,
     #[serde(default)]
@@ -79,6 +90,134 @@ struct Line {
 struct Message {
     #[serde(default)]
     content: Option<serde_json::Value>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    stop_reason: Option<String>,
+}
+
+/// What the model's last line said about whether it had stopped.
+///
+/// Measured on real transcripts: the model's lines carry `stop_reason` on all
+/// but 89 of 242,992, and every line of a tool call says `tool_use`. It is the
+/// only thing in a transcript that tells a finished turn from one still running
+/// or cut off, which matters because an ending cannot be taken back.
+///
+/// One thing overrides it. A turn can end on the model's tool call, and the result
+/// line says so with `toolEndsTurn`: all 313 real turns that end that way have a
+/// live `Stop`. Without the flag a last `tool_use` stays unfinished, because of the
+/// 403 real turns that end so, 286 have no live `Stop` at all.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ModelStop {
+    /// It finished what it had to say.
+    Stopped,
+    /// It had not finished: it was on a tool call, or something cut it short.
+    /// Live, `max_tokens` reaches the recorder as `StopFailure`, not `Complete`.
+    Working,
+    /// The line does not say. Builds that wrote no `stop_reason`, or a line
+    /// caught before the vendor knew.
+    Unsaid,
+}
+
+impl ModelStop {
+    fn of(stop_reason: Option<&str>) -> Self {
+        match stop_reason {
+            Some("end_turn") => ModelStop::Stopped,
+            Some(_) => ModelStop::Working,
+            None => ModelStop::Unsaid,
+        }
+    }
+}
+
+/// The model the vendor names on an assistant line it wrote itself: an API
+/// error, a usage limit, "No response requested." Live, a failure reaches the
+/// recorder as `StopFailure`, not as a reply.
+const VENDOR_WROTE_THIS: &str = "<synthetic>";
+
+/// What a `user` line with text is, in the terms of the live path: whether the
+/// prompt hook would have fired for it.
+///
+/// The vendor's flags decide before the words do, because the words mislead.
+/// Against the live log, joined by `promptId` over 2,094 transcripts: 186
+/// prompts that open on `<system-reminder>` and 1,399 `<task-notification>`
+/// lines fired the hook with the same text, and 522 `isMeta` lines did too.
+/// What those meta lines have, and the 5 that did not fire have not, is a
+/// `promptSource`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum UserLine {
+    /// A prompt: a turn starts here.
+    Prompt,
+    /// Only a turn if the model goes on to answer it. A typed slash command
+    /// looks the same whether the model will run it or the vendor will answer
+    /// it locally, and an image with no words has nothing to go on at all.
+    Tentative,
+    /// The person stopped the turn in progress.
+    Interrupt,
+    /// A local command's output: the command before it never reached the model.
+    LocalOutput,
+    /// Written for the vendor's own use, and not a turn or the end of one.
+    Bookkeeping(&'static str),
+}
+
+fn read_user_line(line: &Line, text: &str) -> UserLine {
+    let set = |flag: Option<bool>| flag == Some(true);
+    if set(line.is_compact_summary) || set(line.is_visible_in_transcript_only) {
+        return UserLine::Bookkeeping("compaction summary");
+    }
+    if set(line.queue_transcript_only) {
+        return UserLine::Bookkeeping("transcript-only line");
+    }
+    if line.prompt_source.is_some() {
+        return UserLine::Prompt;
+    }
+    if set(line.is_meta) {
+        return UserLine::Bookkeeping("meta line");
+    }
+    let head = text.trim_start();
+    if head.is_empty() {
+        UserLine::Tentative
+    } else if head.starts_with("[Request interrupted") {
+        UserLine::Interrupt
+    } else if head.starts_with("<local-command-") {
+        UserLine::LocalOutput
+    } else if head.starts_with("<command-name>") || head.starts_with("<command-message>") {
+        UserLine::Tentative
+    } else {
+        UserLine::Prompt
+    }
+}
+
+/// Whether a message's content holds an image, for a prompt that has no words.
+fn holds_image(content: &serde_json::Value) -> bool {
+    content.as_array().is_some_and(|blocks| {
+        blocks
+            .iter()
+            .any(|block| block.get("type").and_then(|t| t.as_str()) == Some("image"))
+    })
+}
+
+/// Start the turn a prompt line opens, closing the one before it.
+fn open_turn(
+    out: &mut Recovered,
+    bus_id: BusId,
+    open: &mut Option<OpenTurn>,
+    opened: &mut HashMap<String, String>,
+    entry: Entry,
+) {
+    close(out, bus_id, open.take(), ClosedBy::NextPrompt);
+    if let (Some(id), Event::TurnStarted { prompt, .. }) = (&entry.vendor_turn_id, &entry.event) {
+        let words = match prompt {
+            Body::Kept { text } | Body::Clipped { text, .. } => text.clone(),
+            Body::Elided { .. } | Body::Sealed { .. } => String::new(),
+        };
+        opened.insert(id.as_str().to_string(), words);
+    }
+    out.entries.push(entry);
+    *open = Some(OpenTurn {
+        last_reply: None,
+        stop: ModelStop::Unsaid,
+        tool_ended: None,
+    });
 }
 
 /// A turn that has started and not yet been closed by the next prompt.
@@ -89,6 +228,21 @@ struct OpenTurn {
     /// vendor upgrade mid-conversation is ordinary, and the ending belongs to
     /// the build that wrote it, not to the one that read the prompt.
     last_reply: Option<(Option<Timestamp>, String, Source)>,
+    /// What the turn's last line said about the model. A Chat export holds
+    /// finished messages only, so its turns are always stopped.
+    stop: ModelStop,
+    /// The result line that said a tool ended the turn: when, its stamp and its id. A
+    /// turn can end that way with no text at all, and 11 of the 313 real ones do.
+    tool_ended: Option<(Option<Timestamp>, Source, Option<VendorTurnId>)>,
+}
+
+/// What closed a turn, which is what an unsaid stop is read against.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ClosedBy {
+    /// The next prompt: the turn is over, however it went.
+    NextPrompt,
+    /// The end of the file: the turn may still be running.
+    EndOfFile,
 }
 
 /// The text a message carries, ignoring everything that is not text.
@@ -118,9 +272,65 @@ fn text_of(content: &serde_json::Value) -> Option<String> {
 /// That is an assumption rather than a fact — assistant lines carry no
 /// `promptId`, unlike user lines, so there is nothing to join on. It held in
 /// every transcript sampled.
-pub fn parse_claude_transcript(text: &str, bus_id: BusId) -> Recovered {
-    let mut out = Recovered::default();
+///
+/// `session` is the id the file is named for, and only its own lines are read.
+/// A transcript can open on another session's lines: a Claude Desktop
+/// continuation starts with its parent's history, stamped with the parent's
+/// `sessionId` (14 of 2,392 real files, 21,920 such `user` lines, always before
+/// the file's own first line). Those turns belong to the parent's conversation
+/// and are already in the parent's own file.
+pub fn parse_claude_transcript(text: &str, session: &str, bus_id: BusId) -> Recovered {
+    parse_claude_transcript_born(text, session, bus_id, None)
+}
+
+/// How a line older than its own transcript is counted as not read.
+pub const OLDER_THAN_ITS_FILE: &str = "line older than its file";
+
+/// How long before a transcript was created one of its own lines can be stamped.
+///
+/// The vendor stamps a line when it happens and can hold a new session's first
+/// lines before the file exists. On real transcripts that is usually under 11 s, but this
+/// is not a bound: two real sessions fired their hook at a first line stamped 677 s and
+/// 286,937 s before their file was created. No margin separates those from a copy, so a
+/// turn like them with its hook lost is set aside like one, and only
+/// `backfill --gaps --include-older-lines` fills it.
+pub const OWN_LINE_MARGIN_SECS: i64 = 60;
+
+/// As [`parse_claude_transcript`], for a file whose creation time is known: a line
+/// stamped well before the file existed was not written to it, it was copied in.
+///
+/// A fork opens on its parent's lines, and they say so nowhere. Their keys are the
+/// same, older builds rewrote their `sessionId` to the fork's and kept their
+/// `promptId`, and newer ones rewrite the `promptId` to the fork's first. What they
+/// keep is their stamp: on all 67,769 lines real files share, the same in both. So
+/// the file's birth is what tells: of those lines 67,689 are over this margin older
+/// than the later file, and none of the 39,756 in the earlier one is.
+///
+/// Only a fill may use this. A file moved by `cp`, `rsync -a` or across volumes has a
+/// new birth and almost every line older than it, which costs a fill the turns of that
+/// file it has not got, until a person asks for them with `--include-older-lines`, and
+/// would cost `backfill --apply` the whole file.
+pub fn parse_claude_transcript_born(
+    text: &str,
+    session: &str,
+    bus_id: BusId,
+    born: Option<Timestamp>,
+) -> Recovered {
+    let mut out = Recovered {
+        vendor_session_id: Some(session.to_string()),
+        ..Recovered::default()
+    };
     let mut open: Option<OpenTurn> = None;
+    // A prompt that is a turn only if the model answers it.
+    let mut tentative: Option<Entry> = None;
+    // The vendor numbers its turns: every line of one carries the same
+    // `promptId`, so a skill's body or a second block of one prompt starts
+    // nothing. Each id opened, with the words it opened on.
+    let mut opened: HashMap<String, String> = HashMap::new();
+    // Ids with two prompt lines in different words. A fork's copied lines carry the id
+    // of the fork's first prompt, so which of them is that prompt cannot be told, and
+    // the other words are another conversation's. Neither goes in the log.
+    let mut contested: HashSet<String> = HashSet::new();
     let mut harness_version: Option<String> = None;
 
     for raw in text.lines() {
@@ -135,8 +345,20 @@ pub fn parse_claude_transcript(text: &str, bus_id: BusId) -> Recovered {
             out.skip("sidechain");
             continue;
         }
-        if out.vendor_session_id.is_none() {
-            out.vendor_session_id.clone_from(&line.session_id);
+        if line.session_id.as_deref().is_some_and(|id| id != session) {
+            out.skip("line of another session");
+            continue;
+        }
+        let at = line
+            .timestamp
+            .as_deref()
+            .and_then(|text| text.parse::<Timestamp>().ok());
+        if born
+            .zip(at)
+            .is_some_and(|(born, at)| born.seconds_since(at) > OWN_LINE_MARGIN_SECS)
+        {
+            out.skip(OLDER_THAN_ITS_FILE);
+            continue;
         }
         // Kept as the last one seen rather than the first: a transcript's
         // opening lines are bookkeeping that carries no `cwd`, and a session
@@ -147,10 +369,6 @@ pub fn parse_claude_transcript(text: &str, bus_id: BusId) -> Recovered {
         if let Some(entrypoint) = &line.entrypoint {
             out.entrypoint = Some(Entrypoint::new(entrypoint.clone()));
         }
-        let at = line
-            .timestamp
-            .as_deref()
-            .and_then(|text| text.parse::<Timestamp>().ok());
         let source = Source {
             harness: Harness::new(Harness::CLAUDE_CODE),
             // The transcript carries the vendor version on every message line,
@@ -169,17 +387,54 @@ pub fn parse_claude_transcript(text: &str, bus_id: BusId) -> Recovered {
 
         match kind {
             "user" => {
-                let Some(text) = line
-                    .message
-                    .as_ref()
-                    .and_then(|m| m.content.as_ref())
-                    .and_then(text_of)
-                else {
+                if line.tool_ends_turn == Some(true)
+                    && let Some(turn) = open.as_mut()
+                {
+                    turn.stop = ModelStop::Stopped;
+                    turn.tool_ended = Some((
+                        at,
+                        source.clone(),
+                        line.prompt_id.clone().map(VendorTurnId::new),
+                    ));
+                }
+                let content = line.message.as_ref().and_then(|m| m.content.as_ref());
+                let Some(text) = content.and_then(text_of).or_else(|| {
+                    // No words, and still somebody's prompt: the hook sees it
+                    // with an empty one.
+                    content.filter(|c| holds_image(c)).map(|_| String::new())
+                }) else {
                     out.skip("user line with no text");
                     continue;
                 };
-                close(&mut out, bus_id, open.take());
-                out.entries.push(Entry {
+                let kind = read_user_line(&line, &text);
+                match kind {
+                    UserLine::Bookkeeping(why) => {
+                        out.skip(why);
+                        continue;
+                    }
+                    // The vendor fires no `Stop` for an interrupt, so the
+                    // recorder writes no ending for it, and neither does this.
+                    UserLine::Interrupt => {
+                        open = None;
+                        tentative = None;
+                        out.skip("interrupt line");
+                        continue;
+                    }
+                    UserLine::LocalOutput => {
+                        tentative = None;
+                        out.skip("local command output");
+                        continue;
+                    }
+                    UserLine::Prompt | UserLine::Tentative => {}
+                }
+                if let Some(words) = line.prompt_id.as_ref().and_then(|id| opened.get(id)) {
+                    if kind == UserLine::Prompt && *words != text {
+                        contested.extend(line.prompt_id.clone());
+                    }
+                    out.skip("another line of an open turn");
+                    continue;
+                }
+                let entry = Entry {
                     bus_id,
                     observed_at: at,
                     source: source.clone(),
@@ -191,16 +446,27 @@ pub fn parse_claude_transcript(text: &str, bus_id: BusId) -> Recovered {
                         author: line.prompt_source.clone().map(Author::new),
                         prompt: Body::kept(text),
                     },
-                });
-                open = Some(OpenTurn { last_reply: None });
+                };
+                if kind == UserLine::Tentative {
+                    tentative = Some(entry);
+                    continue;
+                }
+                tentative = None;
+                open_turn(&mut out, bus_id, &mut open, &mut opened, entry);
             }
             "assistant" => {
-                let Some(text) = line
-                    .message
-                    .as_ref()
-                    .and_then(|m| m.content.as_ref())
-                    .and_then(text_of)
-                else {
+                let message = line.message.as_ref();
+                if message.and_then(|m| m.model.as_deref()) == Some(VENDOR_WROTE_THIS) {
+                    out.skip("assistant line the vendor wrote");
+                    continue;
+                }
+                if let Some(entry) = tentative.take() {
+                    open_turn(&mut out, bus_id, &mut open, &mut opened, entry);
+                }
+                if let Some(turn) = open.as_mut() {
+                    turn.stop = ModelStop::of(message.and_then(|m| m.stop_reason.as_deref()));
+                }
+                let Some(text) = message.and_then(|m| m.content.as_ref()).and_then(text_of) else {
                     out.skip("assistant line with no text");
                     continue;
                 };
@@ -212,9 +478,33 @@ pub fn parse_claude_transcript(text: &str, bus_id: BusId) -> Recovered {
             other => out.skip(other),
         }
     }
-    close(&mut out, bus_id, open.take());
+    close(&mut out, bus_id, open.take(), ClosedBy::EndOfFile);
+    leave_out_turns(&mut out, &contested);
     prepend_session_candidate(&mut out, bus_id, harness_version);
     out
+}
+
+/// Take these turns out whole, the prompt and what follows it.
+fn leave_out_turns(out: &mut Recovered, turns: &HashSet<String>) {
+    if turns.is_empty() {
+        return;
+    }
+    let mut keep = true;
+    let entries = std::mem::take(&mut out.entries);
+    for entry in entries {
+        if matches!(entry.event, Event::TurnStarted { .. }) {
+            keep = entry
+                .vendor_turn_id
+                .as_ref()
+                .is_none_or(|id| !turns.contains(id.as_str()));
+            if !keep {
+                out.skip("prompt id with different prompts");
+            }
+        }
+        if keep {
+            out.entries.push(entry);
+        }
+    }
 }
 
 /// Put a session record at the head of a recovered conversation.
@@ -273,6 +563,9 @@ pub const CODEX_THREAD: &str = "codex_thread";
 /// back to 0.107.0 on the same machine, so the version skew the plan feared
 /// belongs to rollout files, not to this surface. Read tolerantly, like the
 /// transcript parser: what it does not understand is counted, not fatal.
+///
+/// `turns` are oldest first: see [`oldest_first`]. A reply is paired with the prompt
+/// before it, so this order is what makes the pairing true.
 pub fn parse_codex_thread(thread: &serde_json::Value, turns: &[serde_json::Value]) -> Recovered {
     let mut out = Recovered::default();
     let Some(bus_id) = thread
@@ -309,7 +602,23 @@ pub fn parse_codex_thread(thread: &serde_json::Value, turns: &[serde_json::Value
     // prompt turn and reply-only turns (590 of 1,070 turns in the 60 most
     // recent threads on 2026-09-03 carried nothing but replies).
     let mut open: Option<OpenCodexTurn> = None;
+    let thread_minted = thread
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .and_then(minted_ms);
     for turn in turns {
+        // A fork lists its parent's turns as its own, and they are the parent's.
+        let turn_minted = turn
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .and_then(minted_ms);
+        if thread_minted
+            .zip(turn_minted)
+            .is_some_and(|(thread, turn)| turn < thread)
+        {
+            out.skip("turn older than its thread");
+            continue;
+        }
         let items: Vec<&serde_json::Value> = turn
             .get("items")
             .and_then(serde_json::Value::as_array)
@@ -408,6 +717,37 @@ pub fn parse_codex_thread(thread: &serde_json::Value, turns: &[serde_json::Value
     out
 }
 
+/// Put a thread's turns in the order they happened, whatever order they came in.
+///
+/// The server is asked for this, but it has only been seen on its schema, and a build
+/// older than that field would ignore it. Read newest first, a running prompt takes an
+/// older turn's reply and its `completed` for good. By when a turn started, then by its
+/// id where a UUIDv7 can say. Any other id says nothing about time, so those turns stay
+/// in the order they came. A turn that does not say when it started goes last.
+///
+/// Measured against the order 280 real threads' 2,792 turns appear in their rollouts:
+/// listed as the server listed them by default, 2,510 neighbours are out of order, and
+/// reversed, 2. So the default really is newest first. This leaves 16 out of order
+/// whichever way they arrive.
+pub fn oldest_first(turns: &mut [serde_json::Value]) {
+    turns.sort_by_cached_key(|turn| {
+        let started = match turn.get("startedAt") {
+            Some(serde_json::Value::Number(n)) => n.as_i64(),
+            Some(serde_json::Value::String(s)) => s.parse().ok(),
+            _ => None,
+        };
+        let id = turn.get("id").and_then(serde_json::Value::as_str);
+        let minted = id.filter(|id| minted_ms(id).is_some()).map(str::to_string);
+        (started.is_none(), started, minted)
+    });
+}
+
+/// When a UUIDv7 says it was minted, in milliseconds. Any other id says nothing.
+fn minted_ms(id: &str) -> Option<u64> {
+    let id = uuid::Uuid::try_parse(id).ok()?;
+    (id.get_version_num() == 7).then(|| (id.as_u128() >> 80) as u64)
+}
+
 /// A Codex prompt that has not yet been ended by the next prompt.
 struct OpenCodexTurn {
     vendor_turn_id: Option<VendorTurnId>,
@@ -460,15 +800,52 @@ fn unix_seconds(value: Option<&serde_json::Value>) -> Option<Timestamp> {
     Timestamp::from_unix_seconds(seconds)
 }
 
-/// End a turn with the last reply it received. A prompt that was never answered
-/// simply has no ending in the transcript, which is the truth about it.
-fn close(out: &mut Recovered, bus_id: BusId, open: Option<OpenTurn>) {
+/// End a turn with the last reply it received, if the turn is known to be over.
+///
+/// A prompt that was never answered simply has no ending in the transcript,
+/// which is the truth about it. Neither has a turn the model had not stopped when
+/// the source ran out or the next prompt came: its last text is partial, and
+/// `Complete` would say otherwise for good. A turn still running gets its ending
+/// from `Stop`.
+fn close(out: &mut Recovered, bus_id: BusId, open: Option<OpenTurn>, closed_by: ClosedBy) {
     let Some(OpenTurn {
-        last_reply: Some((at, text, source)),
+        last_reply,
+        stop,
+        tool_ended,
     }) = open
     else {
         return;
     };
+    let Some((at, text, source)) = last_reply else {
+        // No text to end on, and the vendor says a tool ended it, so it ends with no words
+        // rather than reading as still running for ever.
+        if let (ModelStop::Stopped, Some((at, source, vendor_turn_id))) = (stop, tool_ended) {
+            out.entries.push(Entry {
+                bus_id,
+                observed_at: at,
+                source,
+                vendor_turn_id,
+                vendor_agent_id: None,
+                hook_id: None,
+                spooled_at: None,
+                event: Event::TurnEnded {
+                    state: TurnState::Complete,
+                    assistant_message: None,
+                    tokens: None,
+                },
+            });
+        }
+        return;
+    };
+    let over = match stop {
+        ModelStop::Stopped => true,
+        ModelStop::Working => false,
+        ModelStop::Unsaid => closed_by == ClosedBy::NextPrompt,
+    };
+    if !over {
+        out.skip("reply of a turn not known to have ended");
+        return;
+    }
     out.entries.push(Entry {
         bus_id,
         observed_at: at,
@@ -580,7 +957,7 @@ fn parse_chat_conversation(conversation: &Value) -> Recovered {
                     out.skip("human message with no text");
                     continue;
                 };
-                close(&mut out, bus_id, open.take());
+                close(&mut out, bus_id, open.take(), ClosedBy::NextPrompt);
                 out.entries.push(Entry {
                     bus_id,
                     observed_at: at,
@@ -597,7 +974,11 @@ fn parse_chat_conversation(conversation: &Value) -> Recovered {
                         prompt: Body::kept(text.to_string()),
                     },
                 });
-                open = Some(OpenTurn { last_reply: None });
+                open = Some(OpenTurn {
+                    last_reply: None,
+                    stop: ModelStop::Stopped,
+                    tool_ended: None,
+                });
             }
             "assistant" => {
                 let Some(text) = text else {
@@ -616,7 +997,7 @@ fn parse_chat_conversation(conversation: &Value) -> Recovered {
             }),
         }
     }
-    close(&mut out, bus_id, open.take());
+    close(&mut out, bus_id, open.take(), ClosedBy::EndOfFile);
     if !out.entries.is_empty() {
         let observed_at = out.entries[0].observed_at;
         out.entries.insert(
@@ -651,11 +1032,11 @@ mod tests {
 {"type":"assistant","sessionId":"S1","timestamp":"2026-07-28T15:36:56.388Z","version":"2.1.229","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Read","input":{}}]}}
 {"type":"assistant","sessionId":"S1","timestamp":"2026-07-28T15:37:00.000Z","version":"2.1.229","message":{"role":"assistant","content":[{"type":"text","text":"the answer"}]}}
 {"type":"user","sessionId":"S1","timestamp":"2026-07-28T15:38:00.000Z","version":"2.1.229","promptId":"P2","promptSource":"sdk","message":{"role":"user","content":[{"type":"text","text":"second question"}]}}
-{"type":"assistant","sessionId":"S1","timestamp":"2026-07-28T15:38:10.000Z","version":"2.1.247","message":{"role":"assistant","content":[{"type":"text","text":"and the second answer"}]}}
+{"type":"assistant","sessionId":"S1","timestamp":"2026-07-28T15:38:10.000Z","version":"2.1.247","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"and the second answer"}]}}
 "#;
 
     fn parsed() -> Recovered {
-        parse_claude_transcript(TRANSCRIPT, BusId::mint())
+        parse_claude_transcript(TRANSCRIPT, "S1", BusId::mint())
     }
 
     /// The turn records, without the session record that now heads a recovered
@@ -807,6 +1188,7 @@ mod tests {
         // whole deferral design exists to avoid.
         let out = parse_claude_transcript(
             r#"{"type":"queue-operation","sessionId":"S9","cwd":"/tmp"}"#,
+            "S9",
             BusId::mint(),
         );
 
@@ -860,7 +1242,7 @@ mod tests {
             "{not json at all",
         );
 
-        let out = parse_claude_transcript(&damaged, BusId::mint());
+        let out = parse_claude_transcript(&damaged, "S1", BusId::mint());
 
         assert_eq!(turns(&out).len(), 4, "the conversation must survive");
         assert_eq!(out.skipped.get("unreadable json"), Some(&1));
@@ -873,10 +1255,678 @@ mod tests {
             r#"{"type":"user","sessionId":"S1","isSidechain":true,"timestamp":"2026-07-28T15:39:00.000Z","promptId":"P9","message":{"role":"user","content":"a subagent prompt"}}"#
         );
 
-        let out = parse_claude_transcript(&with_sidechain, BusId::mint());
+        let out = parse_claude_transcript(&with_sidechain, "S1", BusId::mint());
 
         assert_eq!(turns(&out).len(), 4);
         assert_eq!(out.skipped.get("sidechain"), Some(&1));
+    }
+
+    /// A continuation: the parent's lines first, under the parent's id.
+    const FORK: &str = r#"
+{"type":"user","sessionId":"PARENT","timestamp":"2026-10-01T00:00:00.000Z","version":"2.1.200","cwd":"/parent/checkout","entrypoint":"claude-desktop","promptId":"P0","message":{"role":"user","content":"the parent's prompt"}}
+{"type":"assistant","sessionId":"PARENT","timestamp":"2026-10-01T00:00:01.000Z","version":"2.1.200","message":{"role":"assistant","content":[{"type":"text","text":"the parent's reply"}]}}
+{"type":"user","sessionId":"CHILD","timestamp":"2026-11-01T00:00:00.000Z","version":"2.1.316","cwd":"/child/checkout","entrypoint":"cli","promptId":"C0","message":{"role":"user","content":"the fork's prompt"}}
+"#;
+
+    #[test]
+    fn lines_of_another_session_do_not_become_this_sessions_turns() {
+        let out = parse_claude_transcript(FORK, "CHILD", BusId::mint());
+
+        assert_eq!(out.vendor_session_id.as_deref(), Some("CHILD"));
+        let started: Vec<&Entry> = turns(&out)
+            .into_iter()
+            .filter(|e| matches!(e.event, Event::TurnStarted { .. }))
+            .collect();
+        assert_eq!(started.len(), 1);
+        assert_eq!(
+            started[0].vendor_turn_id.as_ref().map(VendorTurnId::as_str),
+            Some("C0")
+        );
+        assert_eq!(out.skipped.get("line of another session"), Some(&2));
+    }
+
+    #[test]
+    fn a_forks_records_name_the_fork_and_nothing_of_the_parent() {
+        // A parent's stamp under the fork would bind the parent's session to
+        // the fork on the next restore, and its old time would move the fork's
+        // last activity backwards.
+        let out = parse_claude_transcript(FORK, "CHILD", BusId::mint());
+
+        assert!(out.entries.iter().all(|entry| {
+            entry.source.vendor_session_id.as_deref() == Some("CHILD")
+                && entry.source.workspace.as_deref() == Some("/child/checkout")
+                && entry.source.harness_version.as_deref() == Some("2.1.316")
+                && entry.observed_at.map(|t| t.to_string()).as_deref()
+                    == Some("2026-11-01T00:00:00.000Z")
+        }));
+        assert_eq!(out.entrypoint.as_ref().map(Entrypoint::as_str), Some("cli"));
+    }
+
+    /// A fork as older builds wrote it: the parent's lines under the fork's own id,
+    /// with their old stamps and their old prompt ids.
+    const FORK_UNDER_ITS_OWN_ID: &str = r#"
+{"type":"user","sessionId":"CHILD","timestamp":"2026-10-01T00:00:00.000Z","version":"2.1.200","cwd":"/parent/checkout","entrypoint":"claude-desktop","promptId":"P0","message":{"role":"user","content":"the parent's prompt"}}
+{"type":"assistant","sessionId":"CHILD","timestamp":"2026-10-01T00:00:01.000Z","version":"2.1.200","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"the parent's reply"}]}}
+{"type":"user","sessionId":"CHILD","timestamp":"2026-11-01T00:00:00.000Z","version":"2.1.316","cwd":"/child/checkout","entrypoint":"cli","promptId":"C0","message":{"role":"user","content":"the fork's prompt"}}
+{"type":"assistant","sessionId":"CHILD","timestamp":"2026-11-01T00:00:05.000Z","version":"2.1.316","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"the fork's reply"}]}}
+"#;
+
+    fn stamped(text: &str) -> Timestamp {
+        text.parse().expect("a time")
+    }
+
+    #[test]
+    fn a_line_older_than_its_file_is_a_copy_and_not_a_turn() {
+        let out = parse_claude_transcript_born(
+            FORK_UNDER_ITS_OWN_ID,
+            "CHILD",
+            BusId::mint(),
+            Some(stamped("2026-11-01T00:00:00.100Z")),
+        );
+
+        assert_eq!(prompts(&out), vec!["the fork's prompt"]);
+        assert_eq!(endings(&out), vec!["the fork's reply"]);
+        assert_eq!(out.skipped.get("line older than its file"), Some(&2));
+        assert!(out.entries.iter().all(|entry| {
+            entry.source.workspace.as_deref() == Some("/child/checkout")
+                && entry.source.harness_version.as_deref() == Some("2.1.316")
+        }));
+    }
+
+    #[test]
+    fn a_line_inside_the_margin_of_its_files_birth_is_its_own() {
+        // The vendor holds a new session's first lines for a while before the file
+        // exists, so the file's own first turn is older than the file.
+        let out = parse_claude_transcript_born(
+            FORK_UNDER_ITS_OWN_ID,
+            "CHILD",
+            BusId::mint(),
+            Some(stamped("2026-11-01T00:01:00.000Z")),
+        );
+
+        assert_eq!(prompts(&out), vec!["the fork's prompt"]);
+    }
+
+    #[test]
+    fn a_file_whose_creation_is_not_known_keeps_all_its_lines() {
+        let out = parse_claude_transcript_born(FORK_UNDER_ITS_OWN_ID, "CHILD", BusId::mint(), None);
+
+        assert_eq!(
+            prompts(&out),
+            vec!["the parent's prompt", "the fork's prompt"]
+        );
+    }
+
+    #[test]
+    fn a_file_holding_only_another_sessions_lines_recovers_nothing() {
+        let out = parse_claude_transcript(FORK, "SOMEONE-ELSE", BusId::mint());
+
+        assert!(out.entries.is_empty());
+        assert_eq!(out.skipped.get("line of another session"), Some(&3));
+    }
+
+    /// The prompts a parse started, as their text.
+    fn prompts(out: &Recovered) -> Vec<String> {
+        out.entries
+            .iter()
+            .filter_map(|entry| match &entry.event {
+                Event::TurnStarted { prompt, .. } => match prompt {
+                    Body::Kept { text } => Some(text.clone()),
+                    other => panic!("{other:?}"),
+                },
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The endings a parse wrote, as their text.
+    fn endings(out: &Recovered) -> Vec<String> {
+        out.entries
+            .iter()
+            .filter_map(|entry| match &entry.event {
+                Event::TurnEnded {
+                    assistant_message: Some(Body::Kept { text }),
+                    ..
+                } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A `user` line: `extra` is the flags, in the shapes real transcripts use.
+    fn user(extra: &str, id: &str, text: &str) -> String {
+        format!(
+            r#"{{"type":"user","sessionId":"S1","timestamp":"2026-11-01T00:00:00.000Z","promptId":"{id}",{extra}"message":{{"role":"user","content":{}}}}}"#,
+            serde_json::json!(text)
+        )
+    }
+
+    fn assistant(text: &str) -> String {
+        format!(
+            r#"{{"type":"assistant","sessionId":"S1","timestamp":"2026-11-01T00:00:01.000Z","message":{{"role":"assistant","model":"m","stop_reason":"end_turn","content":[{{"type":"text","text":{}}}]}}}}"#,
+            serde_json::json!(text)
+        )
+    }
+
+    fn parse(lines: &[String]) -> Recovered {
+        parse_claude_transcript(&lines.join("\n"), "S1", BusId::mint())
+    }
+
+    #[test]
+    fn lines_the_vendor_marks_as_not_a_prompt_do_not_become_turns() {
+        let out = parse(&[
+            user("", "P1", "a real prompt"),
+            user(
+                r#""isMeta":true,"#,
+                "P2",
+                "Base directory for this skill: /x",
+            ),
+            user(
+                r#""isCompactSummary":true,"isVisibleInTranscriptOnly":true,"#,
+                "P3",
+                "This session is being continued from a previous conversation",
+            ),
+            user("", "P4", "[Request interrupted by user]"),
+            user(
+                r#""promptSource":"system","queueTranscriptOnly":true,"#,
+                "P5",
+                "<task-notification>not sent to the model</task-notification>",
+            ),
+        ]);
+
+        assert_eq!(prompts(&out), vec!["a real prompt"]);
+    }
+
+    #[test]
+    fn a_skill_body_does_not_end_the_turn_it_belongs_to() {
+        let out = parse(&[
+            user(r#""promptSource":"sdk","#, "P1", "use the skill"),
+            user(
+                r#""isMeta":true,"#,
+                "P1",
+                "Base directory for this skill: /x",
+            ),
+            assistant("the answer"),
+        ]);
+
+        assert_eq!(prompts(&out), vec!["use the skill"]);
+        assert_eq!(endings(&out), vec!["the answer"]);
+    }
+
+    #[test]
+    fn a_compaction_inside_a_turn_does_not_end_it() {
+        let out = parse(&[
+            user(r#""promptSource":"sdk","#, "P1", "a long job"),
+            user(
+                r#""isCompactSummary":true,"isVisibleInTranscriptOnly":true,"#,
+                "P1",
+                "This session is being continued from a previous conversation",
+            ),
+            assistant("done after the compaction"),
+        ]);
+
+        assert_eq!(prompts(&out), vec!["a long job"]);
+        assert_eq!(endings(&out), vec!["done after the compaction"]);
+    }
+
+    #[test]
+    fn a_local_command_is_not_a_turn() {
+        // `/model` and friends: the caveat, the command, its output. The model
+        // never hears of it.
+        let out = parse(&[
+            user(
+                r#""isMeta":true,"#,
+                "P1",
+                "<local-command-caveat>Caveat</local-command-caveat>",
+            ),
+            user("", "P1", "<command-name>/model</command-name>"),
+            user(
+                "",
+                "P1",
+                "<local-command-stdout>Set model</local-command-stdout>",
+            ),
+        ]);
+
+        assert!(out.entries.is_empty(), "{:?}", out.entries);
+    }
+
+    #[test]
+    fn a_local_command_with_no_output_is_not_a_turn_either() {
+        let out = parse(&[user("", "P1", "<command-name>/exit</command-name>")]);
+
+        assert!(out.entries.is_empty(), "{:?}", out.entries);
+    }
+
+    #[test]
+    fn a_prompt_behind_a_local_command_on_the_same_id_is_the_turn() {
+        let out = parse(&[
+            user(
+                r#""isMeta":true,"#,
+                "P1",
+                "<local-command-caveat>Caveat</local-command-caveat>",
+            ),
+            user("", "P1", "<command-name>/model</command-name>"),
+            user(
+                "",
+                "P1",
+                "<local-command-stdout>Set model</local-command-stdout>",
+            ),
+            user(r#""promptSource":"sdk","#, "P1", "the real prompt"),
+            assistant("the answer"),
+        ]);
+
+        assert_eq!(prompts(&out), vec!["the real prompt"]);
+        assert_eq!(endings(&out), vec!["the answer"]);
+    }
+
+    #[test]
+    fn a_slash_command_the_model_answers_is_a_turn() {
+        // Typed by a person, and the hook fires for it. It carries no
+        // `promptSource`, and only the model answering tells it from `/model`.
+        let out = parse(&[
+            user(
+                "",
+                "P1",
+                "<command-message>go</command-message>\n<command-name>/go</command-name>",
+            ),
+            user(r#""isMeta":true,"#, "P1", "the command's expanded body"),
+            assistant("went"),
+        ]);
+
+        assert_eq!(out.entries.len(), 3, "session, prompt, ending");
+        assert_eq!(
+            prompts(&out),
+            vec!["<command-message>go</command-message>\n<command-name>/go</command-name>"]
+        );
+        assert_eq!(endings(&out), vec!["went"]);
+    }
+
+    #[test]
+    fn a_turn_before_a_slash_command_keeps_its_own_ending() {
+        let out = parse(&[
+            user("", "P1", "first"),
+            assistant("first answer"),
+            user("", "P2", "<command-name>/go</command-name>"),
+            assistant("went"),
+        ]);
+
+        assert_eq!(prompts(&out).len(), 2);
+        assert_eq!(endings(&out), vec!["first answer", "went"]);
+    }
+
+    #[test]
+    fn a_prompt_of_nothing_but_an_image_is_a_turn_with_no_words() {
+        // The hook sees it with an empty prompt. The `[Image…]` marker after it
+        // is the vendor's note about the image, marked meta.
+        let image = r#"{"type":"user","sessionId":"S1","timestamp":"2026-11-01T00:00:00.000Z","promptId":"P1","promptSource":"sdk","message":{"role":"user","content":[{"type":"image","source":{"type":"base64","data":"AA=="}}]}}"#;
+        let out = parse(&[
+            image.to_string(),
+            user(r#""isMeta":true,"#, "P1", "[Image: source: /tmp/a.png]"),
+            assistant("a cat"),
+        ]);
+
+        assert_eq!(prompts(&out), vec![""]);
+        assert_eq!(endings(&out), vec!["a cat"]);
+    }
+
+    #[test]
+    fn a_meta_line_the_vendor_submitted_as_a_prompt_is_a_turn() {
+        // Measured against the live log: `isMeta` with a `promptSource` is a
+        // prompt the system or a peer sent. 522 of these fired the prompt hook,
+        // and 5 meta lines without one did not.
+        let out = parse(&[
+            user(
+                r#""isMeta":true,"promptSource":"system","#,
+                "P1",
+                "scheduled wake-up",
+            ),
+            assistant("woke"),
+        ]);
+
+        assert_eq!(prompts(&out), vec!["scheduled wake-up"]);
+        assert_eq!(endings(&out), vec!["woke"]);
+    }
+
+    #[test]
+    fn a_prompt_that_opens_on_a_system_reminder_is_still_a_prompt() {
+        // SDK front ends put context in front of what the person typed. The
+        // hook records the same text, so the tag says nothing about who wrote
+        // the rest.
+        let text = "<system-reminder>context</system-reminder>\nthe person's words";
+        let out = parse(&[
+            user(r#""promptSource":"sdk","#, "P1", text),
+            assistant("ok"),
+        ]);
+
+        assert_eq!(prompts(&out), vec![text]);
+    }
+
+    #[test]
+    fn words_a_person_typed_are_a_prompt_whatever_they_look_like() {
+        let out = parse(&[user(
+            r#""promptSource":"typed","#,
+            "P1",
+            "[Request interrupted by user] is what it printed, why?",
+        )]);
+
+        assert_eq!(out.entries.len(), 2, "{:?}", out.entries);
+    }
+
+    #[test]
+    fn a_turn_the_person_interrupted_has_no_ending_as_on_the_live_path() {
+        // The vendor fires no `Stop` for an interrupt, so the recorder writes
+        // no ending, and neither may a recovery.
+        let out = parse(&[
+            user("", "P1", "start something"),
+            assistant("working on it"),
+            user("", "P1", "[Request interrupted by user]"),
+            user("", "P2", "do this instead"),
+            assistant("done"),
+        ]);
+
+        assert_eq!(prompts(&out), vec!["start something", "do this instead"]);
+        assert_eq!(endings(&out), vec!["done"]);
+    }
+
+    #[test]
+    fn one_prompt_id_in_the_same_words_opens_one_turn() {
+        // 22 of the 36 real ids with several prompt lines are this: one line, twice.
+        let out = parse(&[
+            user(r#""promptSource":"sdk","#, "P1", "the prompt"),
+            assistant("part one"),
+            user(r#""promptSource":"sdk","#, "P1", "the prompt"),
+            assistant("part two"),
+        ]);
+
+        assert_eq!(prompts(&out), vec!["the prompt"]);
+        assert_eq!(endings(&out), vec!["part two"]);
+        assert_eq!(out.skipped.get("prompt id with different prompts"), None);
+    }
+
+    #[test]
+    fn one_prompt_id_in_different_words_is_left_out_whole() {
+        // A fork's copied lines carry the id of the fork's first prompt. Which line is
+        // that prompt cannot be told, and the first is another conversation's words.
+        let out = parse(&[
+            user(r#""promptSource":"sdk","#, "P0", "before"),
+            assistant("the answer before"),
+            user(r#""promptSource":"sdk","#, "P1", "the parent's words"),
+            assistant("the parent's reply"),
+            user(r#""promptSource":"sdk","#, "P1", "the fork's first prompt"),
+            assistant("the fork's first reply"),
+            user(r#""promptSource":"sdk","#, "P2", "after"),
+            assistant("the answer after"),
+        ]);
+
+        assert_eq!(prompts(&out), vec!["before", "after"]);
+        assert_eq!(endings(&out), vec!["the answer before", "the answer after"]);
+        assert_eq!(
+            out.skipped.get("prompt id with different prompts"),
+            Some(&1)
+        );
+    }
+
+    #[test]
+    fn a_command_line_on_an_open_id_does_not_contest_its_prompt() {
+        // Not a prompt until the model answers it, and this id is already open.
+        let out = parse(&[
+            user(r#""promptSource":"sdk","#, "P1", "the prompt"),
+            user("", "P1", "<command-name>/model</command-name>"),
+            assistant("the answer"),
+        ]);
+
+        assert_eq!(prompts(&out), vec!["the prompt"]);
+        assert_eq!(endings(&out), vec!["the answer"]);
+    }
+
+    #[test]
+    fn the_vendors_own_message_is_not_the_models_reply() {
+        // An API error or a usage limit is written as an assistant line by the
+        // vendor itself. Live, `StopFailure` reports it; `Complete` would say
+        // the opposite.
+        let synthetic = r#"{"type":"assistant","sessionId":"S1","timestamp":"2026-11-01T00:00:01.000Z","isApiErrorMessage":true,"message":{"role":"assistant","model":"<synthetic>","stop_reason":"stop_sequence","content":[{"type":"text","text":"API Error: overloaded"}]}}"#;
+        let out = parse(&[user("", "P1", "a prompt"), synthetic.to_string()]);
+
+        assert_eq!(prompts(&out), vec!["a prompt"]);
+        assert_eq!(endings(&out), Vec::<String>::new());
+    }
+
+    /// An assistant line that says why the model stopped, if it does.
+    fn said(text: &str, stop_reason: serde_json::Value) -> String {
+        serde_json::json!({
+            "type": "assistant", "sessionId": "S1", "timestamp": "2026-11-01T00:00:01.000Z",
+            "message": {"role": "assistant", "model": "m", "stop_reason": stop_reason,
+                        "content": [{"type": "text", "text": text}]}
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn a_last_turn_the_model_has_not_stopped_has_no_ending() {
+        // Read while it runs, the text so far is not how the turn ended: 321 of
+        // 1,954 real last turns stop on a tool call. `Stop` writes the ending
+        // when there is one.
+        for stop_reason in [
+            serde_json::json!("tool_use"),
+            serde_json::Value::Null,
+            serde_json::json!("pause_turn"),
+        ] {
+            let out = parse(&[
+                user("", "P1", "a prompt"),
+                said("let me look at that first", stop_reason.clone()),
+            ]);
+
+            assert_eq!(prompts(&out).len(), 1);
+            assert_eq!(endings(&out), Vec::<String>::new(), "{stop_reason}");
+            assert_eq!(
+                out.skipped.get("reply of a turn not known to have ended"),
+                Some(&1)
+            );
+        }
+    }
+
+    #[test]
+    fn a_last_turn_the_model_finished_has_its_ending() {
+        let out = parse(&[
+            user("", "P1", "a prompt"),
+            said("the answer", serde_json::json!("end_turn")),
+        ]);
+
+        assert_eq!(endings(&out), vec!["the answer"]);
+    }
+
+    #[test]
+    fn a_turn_cut_short_is_not_recovered_as_complete() {
+        // `max_tokens` reaches the live path as `StopFailure`, which is not
+        // `Complete`, and the text is truncated. The others do not say it finished
+        // either, and a missing ending can be filled by a hook where a false one
+        // cannot be taken back.
+        for stop_reason in ["max_tokens", "refusal", "stop_sequence"] {
+            let out = parse(&[
+                user("", "P1", "a prompt"),
+                said("the answer so far", serde_json::json!(stop_reason)),
+                user("", "P2", "another prompt"),
+            ]);
+
+            assert_eq!(endings(&out), Vec::<String>::new(), "{stop_reason}");
+        }
+    }
+
+    #[test]
+    fn the_last_line_of_a_turn_says_whether_it_stopped() {
+        // A tool call after the text keeps the turn running, and the model's
+        // next stop ends it even when that line has no text of its own.
+        let tool_call = r#"{"type":"assistant","sessionId":"S1","timestamp":"2026-11-01T00:00:02.000Z","message":{"role":"assistant","model":"m","stop_reason":"tool_use","content":[{"type":"tool_use","id":"t1","name":"Read","input":{}}]}}"#;
+        let stopped_without_text = r#"{"type":"assistant","sessionId":"S1","timestamp":"2026-11-01T00:00:03.000Z","message":{"role":"assistant","model":"m","stop_reason":"end_turn","content":[{"type":"thinking","thinking":"done"}]}}"#;
+
+        let running = parse(&[
+            user("", "P1", "a prompt"),
+            said("the answer", serde_json::json!("end_turn")),
+            tool_call.to_string(),
+        ]);
+        assert_eq!(endings(&running), Vec::<String>::new());
+
+        let finished = parse(&[
+            user("", "P1", "a prompt"),
+            said("the answer", serde_json::json!("tool_use")),
+            stopped_without_text.to_string(),
+        ]);
+        assert_eq!(endings(&finished), vec!["the answer"]);
+    }
+
+    /// The result line of a tool call, with the vendor's flag or without it.
+    fn tool_result(flag: Option<bool>) -> String {
+        let mut line = serde_json::json!({
+            "type": "user", "sessionId": "S1", "timestamp": "2026-11-01T00:00:02.000Z",
+            "promptId": "P1", "toolUseResult": "ok",
+            "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]}
+        });
+        if let Some(flag) = flag {
+            line["toolEndsTurn"] = serde_json::json!(flag);
+        }
+        line.to_string()
+    }
+
+    #[test]
+    fn a_turn_the_vendor_says_a_tool_ended_has_an_ending() {
+        let out = parse(&[
+            user("", "P1", "a prompt"),
+            said("the closing words", serde_json::json!("tool_use")),
+            tool_result(Some(true)),
+        ]);
+
+        assert_eq!(endings(&out), vec!["the closing words"]);
+    }
+
+    /// A tool call with no text, as 11 of the 313 real flagged turns are.
+    fn said_nothing_but_a_tool_call() -> String {
+        r#"{"type":"assistant","sessionId":"S1","timestamp":"2026-11-01T00:00:01.000Z","message":{"role":"assistant","model":"m","stop_reason":"tool_use","content":[{"type":"tool_use","id":"t1","name":"StructuredOutput","input":{}}]}}"#.to_string()
+    }
+
+    fn the_ending_of(out: &Recovered) -> Option<&Entry> {
+        out.entries
+            .iter()
+            .find(|entry| matches!(entry.event, Event::TurnEnded { .. }))
+    }
+
+    #[test]
+    fn a_turn_a_tool_ended_with_no_text_ends_with_no_words() {
+        let out = parse(&[
+            user("", "P1", "a prompt"),
+            said_nothing_but_a_tool_call(),
+            tool_result(Some(true)),
+        ]);
+
+        let ending = the_ending_of(&out).expect("an ending");
+        assert!(matches!(
+            ending.event,
+            Event::TurnEnded {
+                state: TurnState::Complete,
+                assistant_message: None,
+                ..
+            }
+        ));
+        assert_eq!(
+            ending.vendor_turn_id.as_ref().map(VendorTurnId::as_str),
+            Some("P1")
+        );
+    }
+
+    #[test]
+    fn a_turn_with_no_text_and_no_flag_still_has_no_ending() {
+        for flag in [None, Some(false)] {
+            let out = parse(&[
+                user("", "P1", "a prompt"),
+                said_nothing_but_a_tool_call(),
+                tool_result(flag),
+            ]);
+
+            assert!(the_ending_of(&out).is_none(), "{flag:?}");
+        }
+    }
+
+    #[test]
+    fn the_model_going_on_with_no_text_after_a_flag_keeps_the_turn_open() {
+        let out = parse(&[
+            user("", "P1", "a prompt"),
+            said_nothing_but_a_tool_call(),
+            tool_result(Some(true)),
+            said_nothing_but_a_tool_call(),
+        ]);
+
+        assert!(the_ending_of(&out).is_none());
+    }
+
+    #[test]
+    fn a_tool_result_without_the_flag_does_not_end_the_turn() {
+        // Of the real turns that end on a tool call with no flag, most never got a
+        // `Stop`. A false `Complete` cannot be taken back.
+        for flag in [None, Some(false)] {
+            let out = parse(&[
+                user("", "P1", "a prompt"),
+                said("working on it", serde_json::json!("tool_use")),
+                tool_result(flag),
+            ]);
+
+            assert_eq!(endings(&out), Vec::<String>::new(), "{flag:?}");
+        }
+    }
+
+    #[test]
+    fn the_model_going_on_after_a_flagged_result_keeps_the_turn_open() {
+        let out = parse(&[
+            user("", "P1", "a prompt"),
+            said("first", serde_json::json!("tool_use")),
+            tool_result(Some(true)),
+            said("still going", serde_json::json!("tool_use")),
+        ]);
+
+        assert_eq!(endings(&out), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_turn_cut_off_on_a_tool_call_gets_no_ending_from_the_next_prompt() {
+        let out = parse(&[
+            user("", "P1", "a prompt"),
+            said("working on it", serde_json::json!("tool_use")),
+            user("", "P2", "another prompt"),
+            said("the answer", serde_json::json!("end_turn")),
+        ]);
+
+        assert_eq!(prompts(&out).len(), 2);
+        assert_eq!(endings(&out), vec!["the answer"]);
+    }
+
+    #[test]
+    fn a_transcript_that_never_says_why_is_ended_only_by_the_next_prompt() {
+        // Lines from a build that wrote no `stop_reason`: the next prompt shows
+        // the turn is over, and nothing shows how the last one went.
+        let reply = |text: &str| {
+            format!(
+                r#"{{"type":"assistant","sessionId":"S1","timestamp":"2026-11-01T00:00:01.000Z","message":{{"role":"assistant","content":[{{"type":"text","text":"{text}"}}]}}}}"#
+            )
+        };
+        let out = parse(&[
+            user("", "P1", "first"),
+            reply("first answer"),
+            user("", "P2", "second"),
+            reply("second answer"),
+        ]);
+
+        assert_eq!(endings(&out), vec!["first answer"]);
+    }
+
+    #[test]
+    fn a_line_that_names_no_session_is_read_as_the_files_own() {
+        // Nothing says it belongs elsewhere, and bookkeeping lines of this
+        // shape are common.
+        let out = parse_claude_transcript(
+            r#"{"type":"user","timestamp":"2026-11-01T00:00:00.000Z","promptId":"P1","message":{"role":"user","content":"a prompt"}}"#,
+            "S1",
+            BusId::mint(),
+        );
+
+        assert_eq!(turns(&out).len(), 1);
     }
 }
 
@@ -998,6 +2048,162 @@ mod codex_tests {
             out.entries[1].observed_at.map(|t| t.to_string()).as_deref(),
             Some("2026-09-02T17:06:36.000Z")
         );
+    }
+
+    #[test]
+    fn a_turn_older_than_its_thread_is_the_parent_a_fork_inherited() {
+        // A forked thread lists its parent's turns as its own, under the parent's
+        // turn ids. Both ids are UUIDv7, so they say when they were minted: on real
+        // rollouts all 280 inherited turns are older than their fork, and none of
+        // 2,356 turns a thread ran itself is older than it.
+        let inherited = serde_json::json!({
+            "id": "01a06316-03db-7000-8000-000000000001",
+            "items": [
+                {"type": "userMessage", "id": "u0", "content": [{"type": "text", "text": "the parent's prompt"}]},
+                {"type": "agentMessage", "id": "a0", "text": "the parent's reply", "phase": "final_answer"}
+            ],
+            "status": "completed", "startedAt": 1788368700, "completedAt": 1788368701
+        });
+        let mut listed = vec![inherited];
+        listed.extend(turns());
+
+        let out = parse_codex_thread(&thread(), &listed);
+
+        let prompts: Vec<&Entry> = out
+            .entries
+            .iter()
+            .filter(|e| matches!(e.event, Event::TurnStarted { .. }))
+            .collect();
+        assert_eq!(prompts.len(), 2, "the thread's own two: {prompts:?}");
+        assert!(prompts.iter().all(|e| {
+            e.vendor_turn_id.as_ref().map(VendorTurnId::as_str)
+                != Some("01a06316-03db-7000-8000-000000000001")
+        }));
+        assert_eq!(out.skipped.get("turn older than its thread"), Some(&1));
+    }
+
+    #[test]
+    fn a_turn_whose_id_says_nothing_about_time_is_kept() {
+        // Legacy history can number turns any way it likes.
+        let mut turn = turns().remove(0);
+        turn["id"] = serde_json::json!("legacy-1");
+
+        let out = parse_codex_thread(&thread(), &[turn]);
+
+        assert_eq!(out.skipped.get("turn older than its thread"), None);
+        assert!(
+            out.entries
+                .iter()
+                .any(|e| matches!(e.event, Event::TurnStarted { .. }))
+        );
+    }
+
+    #[test]
+    fn a_turn_minted_in_the_same_millisecond_as_its_thread_is_its_own() {
+        // A thread's first turn can be minted in the millisecond the thread was.
+        let mut turn = turns().remove(0);
+        turn["id"] = serde_json::json!("01a06316-03dc-7fff-8000-000000000009");
+
+        let out = parse_codex_thread(&thread(), &[turn]);
+
+        assert_eq!(out.skipped.get("turn older than its thread"), None);
+        assert!(
+            out.entries
+                .iter()
+                .any(|e| matches!(e.event, Event::TurnStarted { .. }))
+        );
+    }
+
+    #[test]
+    fn only_a_uuid_v7_says_when_it_was_minted() {
+        // Read as a time, this v4 id's first bits are older than any thread.
+        let mut turn = turns().remove(0);
+        turn["id"] = serde_json::json!("00000000-0000-4000-8000-000000000001");
+
+        let out = parse_codex_thread(&thread(), &[turn.clone()]);
+
+        assert_eq!(out.skipped.get("turn older than its thread"), None);
+
+        // And a thread with such an id says nothing about the turns it lists.
+        let mut old_style = thread();
+        old_style["id"] = serde_json::json!("ffffffff-ffff-4fff-8fff-ffffffffffff");
+        turn["id"] = serde_json::json!("01a06316-3a98-7022-b592-f9e9ac2305b5");
+
+        let out = parse_codex_thread(&old_style, &[turn]);
+
+        assert_eq!(out.skipped.get("turn older than its thread"), None);
+    }
+
+    fn ids_of(turns: &[serde_json::Value]) -> Vec<&str> {
+        turns
+            .iter()
+            .map(|turn| turn["id"].as_str().expect("an id"))
+            .collect()
+    }
+
+    #[test]
+    fn turns_are_put_oldest_first_by_when_they_started() {
+        let mut turns = vec![
+            serde_json::json!({"id": "c", "startedAt": 300}),
+            serde_json::json!({"id": "b", "startedAt": "200"}),
+            serde_json::json!({"id": "a", "startedAt": 100}),
+        ];
+
+        oldest_first(&mut turns);
+
+        assert_eq!(ids_of(&turns), ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn turns_that_started_in_one_second_go_by_a_uuid_v7s_time() {
+        // Real threads hold 45 such groups, 1,210 turns, and all of them are UUIDv7.
+        let (early, late) = (
+            "01a06316-3a98-7022-b592-f9e9ac2305b5",
+            "01a06316-3a99-7000-8000-000000000001",
+        );
+        let mut turns = vec![
+            serde_json::json!({"id": late, "startedAt": 100}),
+            serde_json::json!({"id": early, "startedAt": 100}),
+        ];
+
+        oldest_first(&mut turns);
+
+        assert_eq!(ids_of(&turns), [early, late]);
+    }
+
+    #[test]
+    fn an_id_that_says_nothing_about_time_leaves_a_tie_as_it_came() {
+        // A v4 id's order is noise: going by it would pair replies with the wrong prompt.
+        let mut turns = vec![
+            serde_json::json!({"id": "ffffffff-0000-4000-8000-000000000001", "startedAt": 100}),
+            serde_json::json!({"id": "00000000-0000-4000-8000-000000000002", "startedAt": 100}),
+            serde_json::json!({"id": "legacy-1"}),
+            serde_json::json!({"id": "legacy-0"}),
+        ];
+
+        oldest_first(&mut turns);
+
+        assert_eq!(
+            ids_of(&turns),
+            [
+                "ffffffff-0000-4000-8000-000000000001",
+                "00000000-0000-4000-8000-000000000002",
+                "legacy-1",
+                "legacy-0",
+            ],
+        );
+    }
+
+    #[test]
+    fn a_turn_that_does_not_say_when_it_started_goes_last() {
+        let mut turns = vec![
+            serde_json::json!({"id": "running", "startedAt": null}),
+            serde_json::json!({"id": "older", "startedAt": 100}),
+        ];
+
+        oldest_first(&mut turns);
+
+        assert_eq!(ids_of(&turns), ["older", "running"]);
     }
 
     #[test]

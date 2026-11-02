@@ -35,6 +35,62 @@ fn run_hook(home: &Path, payload: &str) -> (i32, String) {
     )
 }
 
+/// A hook whose stdin holds a byte that is not UTF-8.
+fn run_hook_on_an_invalid_byte(home: &Path, internal: bool) -> std::process::Output {
+    let mut command = Command::new(bin());
+    command
+        .arg("hook")
+        .arg("--harness")
+        .arg("claude_code")
+        .env("CONBUS_HOME", home)
+        .env("CONBUS_SKIP_LAUNCHCTL", "1")
+        .env_remove("CONBUS_INTERNAL_SESSION")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    if internal {
+        command.env("CONBUS_INTERNAL_SESSION", "1");
+    }
+    let mut child = command.spawn().expect("spawn hook");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(b"{\"session_id\":\"s\",\"hook_event_name\":\"UserPromptSubmit\",\"prompt\":\"p \xff\"}")
+        .expect("write");
+    child.wait_with_output().expect("wait")
+}
+
+#[test]
+fn a_payload_with_an_invalid_byte_is_a_named_drop_and_still_answers() {
+    // `read_to_string` refuses the whole stdin over one bad byte. Ignored, that read
+    // as an empty payload, and `EOF while parsing` is what a hook run by hand says.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out = run_hook_on_an_invalid_byte(dir.path(), false);
+
+    assert_eq!(out.status.code(), Some(0), "a hook always exits 0");
+    let reply: serde_json::Value = serde_json::from_slice(&out.stdout).expect("one JSON reply");
+    assert!(reply.is_object(), "{reply}");
+    let drops = std::fs::read_to_string(dir.path().join("drops.jsonl")).expect("a drop line");
+    let line: serde_json::Value = serde_json::from_str(drops.trim()).expect("one line");
+    assert_eq!(line["reason"], "the hook payload could not be read");
+    assert!(
+        !drops.contains("EOF while parsing"),
+        "the read error must not turn into a parse error: {drops}"
+    );
+}
+
+#[test]
+fn a_session_this_tool_started_drops_nothing_over_an_invalid_byte() {
+    // Its hooks are answered silently before anything is read into the log, so an
+    // unreadable one is no loss to report either.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out = run_hook_on_an_invalid_byte(dir.path(), true);
+
+    assert_eq!(out.status.code(), Some(0));
+    assert!(!dir.path().join("drops.jsonl").exists());
+}
+
 fn prompt(text: &str) -> String {
     serde_json::json!({
         "session_id": "s-spool",
@@ -353,6 +409,7 @@ fn a_thousand_hooks_survive_a_daemon_restart() {
         "every hook's id must reach the log exactly once ({dup_hook_ids} re-deliveries)"
     );
     assert_eq!(markers.len() as u64, HOOKS, "every storm event was written");
+    assert_eq!(dup_hook_ids, 0, "a hook id reached the log twice");
 }
 
 fn wait_for_socket(home: &Path) {

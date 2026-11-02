@@ -5,9 +5,9 @@
 # skipped), and CONBUS_CANARY_TEST_REAL_HOME=<the same throwaway HOME>
 # which walks the real code path — the fake's `install --apply` answers
 # for the reload. Nothing here can touch the real ~/.local/bin or
-# ~/.conbus — every swapping invocation uses a mktemp HOME, and the one
-# guard test that points HOME at the passwd home must be refused before
-# anything moves.
+# ~/.conbus — every swapping invocation uses a mktemp HOME, and the guard
+# tests that point HOME at the passwd home pass `--from /nonexistent`, so
+# even a broken guard dies before anything moves.
 #
 #   scripts/canary-rehearsal.sh
 set -euo pipefail
@@ -16,13 +16,75 @@ here=$(cd "$(dirname "$0")" && pwd)
 canary=$here/canary.sh
 
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/canary-rehearsal.XXXXXX")
-trap 'rm -rf "$tmp"' EXIT
+recorder_pid=""
+cleanup() {
+    if [ -n "$recorder_pid" ]; then
+        kill "$recorder_pid" 2>/dev/null || true
+        wait "$recorder_pid" 2>/dev/null || true
+    fi
+    rm -rf "$tmp"
+}
+trap cleanup EXIT
+
+# The OS boot times a verdict compares start lines with. No window here has a reboot
+# unless a scenario says so, and nothing here asks the real machine.
+mkdir -p "$tmp/boot"
+cat >"$tmp/boot/sysctl" <<EOF
+#!/bin/sh
+[ -f "$tmp/boot/unreadable" ] && exit 1
+printf '{ sec = %s, usec = 846817 } Sat Oct 31 23:04:19 2026\n' "\$(cat "$tmp/boot/boottime")"
+EOF
+cat >"$tmp/boot/last" <<EOF
+#!/bin/sh
+cat "$tmp/boot/reboots" 2>/dev/null
+echo
+echo "wtmp begins Wed Oct 15 14:44"
+EOF
+chmod 755 "$tmp/boot/sysctl" "$tmp/boot/last"
+echo 1577836800 >"$tmp/boot/boottime"
+PATH="$tmp/boot:$PATH"
+export PATH
+boot_at() { # boot_at <iso>: the boot kern.boottime knows, and only that one
+    rm -f "$tmp/boot/unreadable" "$tmp/boot/reboots"
+    perl -MTime::Local -e 'my ($y, $mo, $d, $h, $mi, $s) = $ARGV[0] =~ /^(\d+)-(\d+)-(\d+)T(\d+):(\d+):(\d+)/; print timegm($s, $mi, $h, $d, $mo - 1, $y), "\n"' "$1" >"$tmp/boot/boottime"
+}
+boot_at_none() { rm -f "$tmp/boot/unreadable" "$tmp/boot/reboots"; echo 1577836800 >"$tmp/boot/boottime"; }
+boot_unreadable() { touch "$tmp/boot/unreadable"; rm -f "$tmp/boot/reboots"; }
+reboot_listed() { # reboot_listed <seconds ago>: a line in `last reboot`, to the minute, in local time
+    LC_ALL=C date -r "$(($(date +%s) - $1))" "+reboot time                                %a %b %e %H:%M" >>"$tmp/boot/reboots"
+}
 
 home=$tmp/home
 install_dir=$home/.local/bin
 rollback_bin=$install_dir/conbus.rollback
+parity_copy=$install_dir/conbus.parity
 mkdir -p "$install_dir" "$tmp/stage" "$home/.conbus" \
     "$home/Library/LaunchAgents" "$tmp/evidence"
+
+DAY=86400
+
+iso_ago() { # iso_ago <seconds> — a UTC stamp in the shape the logs use
+    perl -MPOSIX=strftime -e 'print strftime("%Y-%m-%dT%H:%M:%S.000Z", gmtime(time - $ARGV[0]))' "$1"
+}
+
+iso_after() { # iso_after <iso> <seconds> — seconds may be negative
+    perl -MTime::Local -MPOSIX=strftime -e '
+        my ($y, $mo, $d, $h, $mi, $s) = $ARGV[0] =~ /^(\d+)-(\d+)-(\d+)T(\d+):(\d+):(\d+)/;
+        print strftime("%Y-%m-%dT%H:%M:%S.000Z", gmtime(timegm($s, $mi, $h, $d, $mo - 1, $y) + $ARGV[1]))' "$1" "$2"
+}
+
+# A row per harness per day, from <first> through today. Relative to today, so
+# no scenario runs out of rows the way fixed dates eventually would.
+usage_rows() { # usage_rows <first-iso> <harness>...
+    perl -MTime::Local -MPOSIX=strftime -e '
+        my ($y, $mo, $d) = shift(@ARGV) =~ /^(\d+)-(\d+)-(\d+)/;
+        my $today = strftime("%Y-%m-%d", gmtime(time));
+        for (my $t = timegm(0, 0, 0, $d, $mo - 1, $y); ; $t += 86400) {
+            my $day = strftime("%Y-%m-%d", gmtime($t));
+            last if $day gt $today;
+            print qq({"day":"$day","harness":"$_","turns":3,"tool_calls":40,"tool_denials":0,"repeated":0,"recovered":0,"tokens_input":1}\n) for @ARGV;
+        }' "$@"
+}
 
 # A fake conbus. $2 picks the doctor persona the scenario needs:
 #   silent    — socket not answering (the daemon is down or absent)
@@ -39,6 +101,37 @@ mkdir -p "$install_dir" "$tmp/stage" "$home/.conbus" \
 #   stuckboot — doctor stamps the daemon build, then never answers: the
 #               rollback-verify path can pass the stamp check and still
 #               hang on the agreeing-doctor check
+#   chatty    — like live, with far more output after the socket line than a pipe
+#               holds, so a reader that leaves at its first match costs the
+#               writer a SIGPIPE every time instead of once in a while
+#   novendor  — hooks run, and one vendor is simply not on this machine
+#   norecord  — its hook answers and no record lands
+#   tornlive  — doctor counts an unreadable line the last boot never saw
+#   nocount   — doctor fails before its log count, as with an unreadable segment
+#   readonly  — doctor says the log cannot be appended to
+#   slowvendor — a vendor CLI missed doctor's 2 s, so its version is not known
+#   slowonly  — the same, and no hook line that runs
+#   mismatch  — a plugin written for a major this vendor does not load
+#   orphans   — its `install --apply` writes a tool event that has no conversation
+#   coldboot  — its first stamp comes before its socket, as a real daemon's does
+#   stampnolisten — a stamp, and never a socket
+#   stampdiffers — a stamp, and a doctor saying another build answers
+#   noinstall — its `install --apply` fails
+#   swaplate  — its `install --apply` writes a swap reason dated past the 60 s
+#   slowlog   — its first read of the log finds nothing, as a hook that spooled would
+#   refusing  — doctor says the recorder is holding what the log refuses, right now
+#   lowdisk   — doctor's 10% warning, which this Mac is always under
+#   eventgap  — hooks run, but a registered hook misses events
+#   untrusted — Codex will not spawn the hooks until a person approves them
+#   nohooks   — no vendor installed here, so nothing registered
+#   rotating  — like live, and it names drops.1.jsonl the way a build that
+#               rotates its drop log does
+#   lostlines — its `install --apply` writes the two lines that lost records
+#   elided    — its `install --apply` writes `tool bodies elided, not sealed` and
+#               `the log refused writes for a while`, like a spool drained at boot
+#   flap      — doctor sleeps on its first call, then answers fast: a
+#               single-shot time budget flakes where a median does not
+#   polfail   — `policy check` exits 1: a file that cannot be a policy
 write_fake() {
     tag=$1
     persona=${2:-silent}
@@ -54,31 +147,101 @@ write_fake() {
         hookfail) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "hooks     codex        MISSING — /h hooks.json has no conbus entry"' ;;
         dropper) doctor='echo "{\"ts\":\"2030-01-01T00:00:00.000Z\",\"reason\":\"post-swap fault\"}" >> "$HOME/.conbus/drops.jsonl"; echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "hooks     claude_code  runs — x"' ;;
         swapdrop) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "hooks     claude_code  runs — x"'
-            install_body='touch "$HOME/.install-called"; printf "{\"ts\":\"%s\",\"reason\":\"the daemon refused the record: this daemon speaks protocol v5; the hook speaks v6. Restart the daemon.\"}\n" "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)" >> "$HOME/.conbus/drops.jsonl"' ;;
+            install_body='touch "$HOME/.install-called"; printf "{\"ts\":\"%s\",\"reason\":\"the daemon refused the record: this daemon speaks protocol v5; the hook speaks v6. Restart the daemon.\"}\n" "$(perl -MTime::HiRes=gettimeofday -MPOSIX=strftime -e "(\$s,\$u)=gettimeofday; printf \"%s.%03dZ\", strftime(\"%Y-%m-%dT%H:%M:%S\", gmtime(\$s)), int(\$u/1000)")" >> "$HOME/.conbus/drops.jsonl"' ;;
         sessions) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "hooks     claude_code  runs — x"'
-            install_body='touch "$HOME/.install-called"; printf "{\"ts\":\"%s\",\"reason\":\"the hook payload names no session; an empty id would merge unrelated sessions into one conversation\"}\n" "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)" >> "$HOME/.conbus/drops.jsonl"' ;;
+            install_body='touch "$HOME/.install-called"; printf "{\"ts\":\"%s\",\"reason\":\"the hook payload names no session; an empty id would merge unrelated sessions into one conversation\"}\n" "$(perl -MTime::HiRes=gettimeofday -MPOSIX=strftime -e "(\$s,\$u)=gettimeofday; printf \"%s.%03dZ\", strftime(\"%Y-%m-%dT%H:%M:%S\", gmtime(\$s)), int(\$u/1000)")" >> "$HOME/.conbus/drops.jsonl"' ;;
+        novendor) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "hooks     claude_code  runs — x"; echo "hooks     codex        not installed here"' ;;
+        norecord) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "hooks     claude_code  runs — x"' ;;
+        tornlive) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "disk      log 1.0 MB — 1.0 GB free of 2.0 GB (50.0%)"; echo "log       5 record(s), 1 conversation(s), 1 unreadable line(s)"; echo "hooks     claude_code  runs — x"' ;;
+        nocount) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "disk      log 1.0 MB — 1.0 GB free of 2.0 GB (50.0%)"; echo "hooks     claude_code  runs — x"; exit 1' ;;
+        readonly) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "writable  NOT APPENDABLE: Read-only file system — records will be refused"; echo "disk      log 1.0 MB — 1.0 GB free of 2.0 GB (50.0%)"; echo "log       5 record(s), 1 conversation(s), 0 unreadable line(s)"; echo "hooks     claude_code  runs — x"' ;;
+        refusing) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "writable  REFUSING since 2026-11-01T00:00:00.000Z — 20 record(s) in memory only, lost if the recorder stops; free space, do not restart it"; echo "disk      log 1.0 MB — 0.0 GB free of 2.0 GB (0.0%) — WARNING: under 10% free"; echo "log       5 record(s), 1 conversation(s), 0 unreadable line(s)"; echo "hooks     claude_code  runs — x"' ;;
+        slowvendor) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "disk      log 1.0 MB — 1.0 GB free of 2.0 GB (50.0%)"; echo "log       5 record(s), 1 conversation(s), 0 unreadable line(s)"; echo "hooks     claude_code  runs — x"; echo "hooks     opencode     could not read which version this is (opencode did not answer within 2s), so whether x loads is not known"' ;;
+        slowonly) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "log       5 record(s), 1 conversation(s), 0 unreadable line(s)"; echo "hooks     opencode     could not read which version this is (opencode did not answer within 2s), so whether x loads is not known"' ;;
+        mismatch) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "log       5 record(s), 1 conversation(s), 0 unreadable line(s)"; echo "hooks     claude_code  runs — x"; echo "hooks     opencode     MISMATCH — x is written for OpenCode 1.x, which this OpenCode does not load; run \`conbus install --apply\`"' ;;
+        coldboot) doctor='printf "{\"build\":\"'"$tag"'\",\"pid\":$$,\"started\":\"2026-11-01T10:00:00.000Z\"}\n" > "$HOME/.conbus/daemon.build"; n=$(cat "$HOME/.cold" 2>/dev/null || echo 0); echo $((n + 1)) > "$HOME/.cold"; if [ "$n" -lt 2 ]; then echo "socket    $HOME/.conbus/conbus.sock — not answering"; else echo "socket    $HOME/.conbus/conbus.sock — listening"; fi; echo "log       5 record(s), 1 conversation(s), 0 unreadable line(s)"; echo "hooks     claude_code  runs — x"' ;;
+        stampnolisten) doctor='printf "{\"build\":\"'"$tag"'\",\"pid\":$$,\"started\":\"2026-11-01T10:00:00.000Z\"}\n" > "$HOME/.conbus/daemon.build"; echo "socket    $HOME/.conbus/conbus.sock — not answering"' ;;
+        stampdiffers) doctor='printf "{\"build\":\"'"$tag"'\",\"pid\":$$,\"started\":\"2026-11-01T10:00:00.000Z\"}\n" > "$HOME/.conbus/daemon.build"; echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build aaaa pid 9999 since 2026-11-01T10:00:00.000Z — DIFFERS from this binary ('"$tag"'); restart the daemon"' ;;
+        noinstall) doctor='echo "socket    $HOME/.conbus/conbus.sock — not answering"'
+            install_body='exit 1' ;;
+        slowlog) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "hooks     claude_code  runs — x"' ;;
+        lowdisk) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "disk      log 1.0 MB — 100.0 GB free of 2000.0 GB (5.0%) — WARNING: under 10% free"; echo "log       5 record(s), 1 conversation(s), 0 unreadable line(s)"; echo "hooks     claude_code  runs — x"' ;;
+        eventgap) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "log       5 record(s), 1 conversation(s), 0 unreadable line(s)"; echo "hooks     claude_code  runs — x"; echo "events    claude_code  MISSING Stop, SessionEnd — run \`conbus install --apply\`"' ;;
+        untrusted) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "log       5 record(s), 1 conversation(s), 0 unreadable line(s)"; echo "hooks     codex        runs — x"; echo "codex     2 of 2 hook(s) Codex will not spawn:"; echo "          NOT TRUSTED: PreToolUse, PostToolUse"' ;;
+        nohooks) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "log       5 record(s), 1 conversation(s), 0 unreadable line(s)"; echo "hooks     cursor       not installed here"' ;;
+        rotating) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "disk      log 1.0 MB — 1.0 GB free of 2.0 GB (50.0%)"; echo "log       5 record(s), 1 conversation(s), 0 unreadable line(s)"; echo "hooks     claude_code  runs — x"' ;;
+        elided) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "hooks     claude_code  runs — x"'
+            install_body='touch "$HOME/.install-called"; now=$(perl -MTime::HiRes=gettimeofday -MPOSIX=strftime -e "(\$s,\$u)=gettimeofday; printf \"%s.%03dZ\", strftime(\"%Y-%m-%dT%H:%M:%S\", gmtime(\$s)), int(\$u/1000)"); printf "{\"ts\":\"%s\",\"reason\":\"tool bodies elided, not sealed\",\"detail\":\"7 tool event(s)\"}\n{\"ts\":\"%s\",\"reason\":\"the log refused writes for a while\",\"detail\":\"7 record(s) waited and landed, 0 could not be kept, since 2026-11-01T00:00:00.000Z: No space left on device (os error 28)\"}\n" "$now" "$now" >> "$HOME/.conbus/drops.jsonl"' ;;
+        lostlines) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "hooks     claude_code  runs — x"'
+            install_body='touch "$HOME/.install-called"; now=$(perl -MTime::HiRes=gettimeofday -MPOSIX=strftime -e "(\$s,\$u)=gettimeofday; printf \"%s.%03dZ\", strftime(\"%Y-%m-%dT%H:%M:%S\", gmtime(\$s)), int(\$u/1000)"); printf "{\"ts\":\"%s\",\"reason\":\"the recorder stopped with records it could not land\",\"detail\":\"2 record(s) lost\"}\n{\"ts\":\"%s\",\"reason\":\"the log refused writes for a while and records may be lost\",\"detail\":\"3 record(s) waited and landed, 1 could not be kept, since 2026-11-01T00:00:00.000Z: No space left on device (os error 28)\"}\n" "$now" "$now" >> "$HOME/.conbus/drops.jsonl"' ;;
+        orphans) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "hooks     claude_code  runs — x"'
+            install_body='touch "$HOME/.install-called"; printf "{\"ts\":\"%s\",\"reason\":\"no conversation for this session; the daemon has no binding for it (no prompt from this session has reached it)\",\"detail\":\"PreToolUse for session 01a06306\"}\n" "$(perl -MTime::HiRes=gettimeofday -MPOSIX=strftime -e "(\$s,\$u)=gettimeofday; printf \"%s.%03dZ\", strftime(\"%Y-%m-%dT%H:%M:%S\", gmtime(\$s)), int(\$u/1000)")" >> "$HOME/.conbus/drops.jsonl"' ;;
+        swaplate) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "hooks     claude_code  runs — x"'
+            install_body='touch "$HOME/.install-called"; printf "{\"ts\":\"%s\",\"reason\":\"the daemon refused the record: this daemon speaks protocol v5; the hook speaks v6. Restart the daemon.\"}\n" "$(perl -MPOSIX=strftime -e "print strftime(\"%Y-%m-%dT%H:%M:%S.000Z\", gmtime(time + 90))")" >> "$HOME/.conbus/drops.jsonl"' ;;
         knowndrop) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "hooks     claude_code  runs — x"'
-            install_body='touch "$HOME/.install-called"; printf "{\"ts\":\"%s\",\"reason\":\"socket closed early\"}\n" "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)" >> "$HOME/.conbus/drops.jsonl"' ;;
+            install_body='touch "$HOME/.install-called"; printf "{\"ts\":\"%s\",\"reason\":\"socket closed early\"}\n" "$(perl -MTime::HiRes=gettimeofday -MPOSIX=strftime -e "(\$s,\$u)=gettimeofday; printf \"%s.%03dZ\", strftime(\"%Y-%m-%dT%H:%M:%S\", gmtime(\$s)), int(\$u/1000)")" >> "$HOME/.conbus/drops.jsonl"' ;;
         notokens) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "hooks     claude_code  runs — x"' ;;
         stuck) doctor='sleep 3600' ;;
         stuckboot) doctor='printf "{\"build\":\"'"$tag"'\",\"pid\":$$,\"started\":\"2026-11-01T10:00:00.000Z\",\"serving\":\"2026-11-01T10:00:04.000Z\"}\n" > "$HOME/.conbus/daemon.build"; sleep 3600' ;;
+        chatty) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "disk      log 1.0 MB — 1.0 GB free of 2.0 GB (50.0%)"; echo "hooks     claude_code  runs — x"; perl -e "print qq(note\n) x 60000"' ;;
+        flap) doctor='n=$(cat "$HOME/.flap" 2>/dev/null || echo 0); echo $((n + 1)) > "$HOME/.flap"; [ "$n" = 0 ] && sleep 3; echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "disk      log 1.0 MB — 1.0 GB free of 2.0 GB (50.0%)"; echo "log       5 record(s), 1 conversation(s), 0 unreadable line(s)"; echo "hooks     claude_code  runs — x"' ;;
     esac
-    usage_rows='        echo "{\"day\":\"2026-10-30\",\"harness\":\"claude_code\",\"tool_denials\":0,\"repeated\":0,\"tokens_input\":1}"
-        echo "{\"day\":\"2026-10-31\",\"harness\":\"codex\",\"tool_denials\":0,\"repeated\":0,\"tokens_output\":2}"
-        echo "{\"day\":\"2026-11-01\",\"harness\":\"codex\",\"tool_denials\":0,\"repeated\":0,\"tokens_output\":3}"'
-    [ "$persona" = notokens ] && usage_rows='        echo "{\"day\":\"2026-10-30\",\"harness\":\"claude_code\",\"tool_denials\":0,\"repeated\":0}"
-        echo "{\"day\":\"2026-10-31\",\"harness\":\"codex\",\"tool_denials\":0,\"repeated\":0}"
-        echo "{\"day\":\"2026-11-01\",\"harness\":\"codex\",\"tool_denials\":0,\"repeated\":0}"'
+    policy_body=':'
+    [ "$persona" = polfail ] && policy_body='exit 1'
+    # Both binaries read the rows a scenario wrote to $HOME/.usage-rows, as two
+    # builds read one log; the older one without the tokens_* keys. .usage-fail
+    # fails every read, .usage-fail-day only that day's.
+    hook_body='{ cat; echo; } >>"$HOME/.conbus/fake-records"; echo "{}"'
+    [ "$persona" = norecord ] && hook_body='cat >/dev/null; echo "{}"'
+    log_json='cat "$HOME/.conbus/fake-records" 2>/dev/null'
+    if [ "$persona" = slowlog ]; then
+        log_json='if [ -f "$HOME/.read-once" ]; then cat "$HOME/.conbus/fake-records" 2>/dev/null; else touch "$HOME/.read-once"; fi'
+    fi
+    usage_filter=cat
+    if [ "$persona" = notokens ]; then
+        usage_filter="sed -E 's/\"tokens_[a-z_]*\":[0-9]*,?//g; s/,}/}/g'"
+    fi
+    rotates_note=""
+    [ "$persona" = rotating ] && rotates_note="# renames a full log to drops.1.jsonl"
     cat >"$path" <<EOF
 #!/bin/sh
+$rotates_note
 case "\$1" in doctor|quota|status) echo "\${CONBUS_AGY_BIN:-unset}" >>"$tmp/agy-bin.seen" ;; esac
 case "\$1" in
     --version) echo "conbus 0.0.0-$tag ($tag)" ;;
     doctor) $doctor ;;
-    log) echo "cache     0 closed segment(s): 0 built, 0 already valid" ;;
-    usage)
-$usage_rows
+    log)
+        case "\$2" in
+            --json) $log_json ;;
+            *) echo "cache     0 closed segment(s): 0 built, 0 already valid" ;;
+        esac
         ;;
+    daemon)
+        mkdir -p "\$HOME/.conbus"
+        printf '{"build":"$tag","pid":%s,"started":"2026-11-01T10:00:00.000Z","serving":"2026-11-01T10:00:02.000Z"}\\n' "\$\$" >"\$HOME/.conbus/daemon.build"
+        echo "\$\$ \$HOME" >>"$tmp/round-trip-daemons"
+        exec sleep 300
+        ;;
+    hook) $hook_body ;;
+    usage)
+        [ -f "\$HOME/.usage-fail" ] && { echo "a segment could not be read" >&2; exit 1; }
+        case "\$2 \$3" in
+            "--json --day")
+                [ "\$4" = "\$(cat "\$HOME/.usage-fail-day" 2>/dev/null)" ] &&
+                    { echo "a segment could not be read" >&2; exit 1; }
+                grep "\"day\":\"\$4\"" "\$HOME/.usage-rows" 2>/dev/null | $usage_filter
+                ;;
+            "--json --since")
+                case "\$4" in
+                    *T*) [ -f "\$HOME/.usage-window" ] && { cat "\$HOME/.usage-window"; exit 0; } ;;
+                esac
+                awk -v s="\${4%%T*}" 'match(\$0, /"day":"[^"]*"/) && substr(\$0, RSTART + 7, 10) >= s' \
+                    "\$HOME/.usage-rows" 2>/dev/null | $usage_filter
+                ;;
+        esac
+        exit 0
+        ;;
+    policy) $policy_body ;;
     install) $install_body ;;
     *) echo "fake-$tag: \$*" ;;
 esac
@@ -133,14 +296,32 @@ EOF
 touch "$home/Library/LaunchAgents/sh.conbus.daemon.plist"
 for i in 1 2 3 4 5; do touch "$tmp/evidence/s$i.txt"; done
 
+# Every run here is under a HOME this script made. Checked where the run starts, not
+# only once: a failed setup or a subshell must never carry on with another HOME.
+home_is_throwaway() {
+    case $home in
+        "$tmp"/*) ;;
+        *)
+            echo "rehearsal: FAIL: HOME '$home' is not this rehearsal's own" >&2
+            exit 1
+            ;;
+    esac
+}
+
+# The read budgets are wide here: a scenario is not about this machine's load
+# unless it sets one itself.
 run() {
+    home_is_throwaway
     env -u CONBUS_HOME -u XDG_STATE_HOME \
         HOME="$home" CONBUS_SKIP_LAUNCHCTL=1 CONBUS_CANARY_REHEARSAL=1 \
+        CONBUS_CANARY_TAIL_MS=${TAIL_MS:-20000} CONBUS_CANARY_USAGE_MS=${USAGE_MS:-20000} \
+        CONBUS_CANARY_DOCTOR_MS=${DOCTOR_MS:-20000} \
         CONBUS_CANARY_SERVING_LIMIT=${SERVING_LIMIT:-30} \
         bash "$canary" "$@"
 }
 
 run_norehearsal() {
+    home_is_throwaway
     env -u CONBUS_HOME -u XDG_STATE_HOME \
         HOME="$home" CONBUS_SKIP_LAUNCHCTL=1 \
         CONBUS_CANARY_SERVING_LIMIT=${SERVING_LIMIT:-30} \
@@ -151,6 +332,7 @@ run_norehearsal() {
 # walks the real code path — swap runs, the fake's `install --apply`
 # answers for the reload. No SKIP, no REHEARSAL.
 run_real() {
+    home_is_throwaway
     env -u CONBUS_HOME -u XDG_STATE_HOME -u CONBUS_SKIP_LAUNCHCTL \
         -u CONBUS_CANARY_REHEARSAL \
         HOME="$home" CONBUS_CANARY_TEST_REAL_HOME="$home" \
@@ -179,8 +361,17 @@ expect_absent() {
 }
 
 expect_grep() { # expect_grep <pattern> <file> <what>
-    if ! grep -q "$1" "$2"; then
+    if ! LC_ALL=C grep -aq "$1" "$2"; then
         echo "rehearsal: FAIL: $3 — no '$1' in $2:" >&2
+        cat "$2" >&2
+        exit 1
+    fi
+    echo "rehearsal: ok: $3"
+}
+
+expect_no_grep() { # expect_no_grep <pattern> <file> <what>
+    if grep -q "$1" "$2"; then
+        echo "rehearsal: FAIL: $3 — '$1' in $2:" >&2
         cat "$2" >&2
         exit 1
     fi
@@ -222,6 +413,38 @@ daemon_boot() { # daemon_boot <build> <pid>
 }
 
 say() { printf 'rehearsal: %s\n' "$*"; }
+
+# A stand-in for the running recorder, named so `ps` shows `conbus daemon` the way
+# the real one reads, answering a line that is not a request the way the real one
+# does. <socket>.silent makes it hold connections and never reply: a wedged daemon.
+# <socket>.garbage makes it reply with something that is not the protocol.
+mkdir -p "$tmp/recorder"
+cat >"$tmp/recorder/conbus" <<'EOF'
+#!/usr/bin/perl
+use IO::Socket::UNIX;
+my $path = $ARGV[1];
+unlink $path;
+my $server = IO::Socket::UNIX->new(Type => SOCK_STREAM(), Local => $path, Listen => 16) or die "bind: $!";
+$SIG{PIPE} = "IGNORE";
+while (my $client = $server->accept) {
+    if (-e "$path.silent") { push @held, $client; next; }
+    $client->autoflush(1);
+    my $line = <$client>;
+    print $client (-e "$path.garbage" ? "hello\n" : qq({"status":"failed","error":"unreadable request"}\n));
+    close $client;
+}
+EOF
+chmod 755 "$tmp/recorder/conbus"
+start_recorder() {
+    "$tmp/recorder/conbus" daemon "$home/.conbus/conbus.sock" &
+    recorder_pid=$!
+    n=0
+    while [ ! -S "$home/.conbus/conbus.sock" ] && [ "$n" -lt 100 ]; do
+        sleep 0.05
+        n=$((n + 1))
+    done
+}
+start_recorder
 
 # --- read-only and preflight -------------------------------------------------
 
@@ -312,36 +535,112 @@ code=0
 run start --live --from "$tmp/stage/conbus-good" >/dev/null 2>&1 || code=$?
 expect 2 "$code" "--live is refused (exit 2)"
 
-# A rehearsal under the real passwd HOME is refused BEFORE anything moves —
-# this is the guard that makes a stray REHEARSAL flag safe. The refusal must
-# come before preflight or the file swap, and the live binary must not move.
-# Resolve the passwd home the same way canary.sh does — `cd ~` with HOME
-# unset answers from getpwuid; plain `cd` needs HOME itself.
+# The guards themselves. Nothing here may move, so nothing is handed to move: with `--from /nonexistent`, a broken
+# guard dies right after it, before preflight, any doctor or the swap, and fails the expectation on its exit code.
 real_home=$(env -u HOME bash -c 'cd ~ && pwd -P' 2>/dev/null)
-live_bin=$real_home/.local/bin/conbus
-live_sha=""
-[ -f "$live_bin" ] && live_sha=$(shasum -a 256 "$live_bin" | awk '{print $1}')
+guard_witness=$tmp/witness
+mkdir -p "$guard_witness"
+for witness in agy launchctl; do
+    printf '#!/bin/sh\necho %s >>"%s/witness.calls"\nexit 1\n' "$witness" "$tmp" >"$guard_witness/$witness"
+    chmod 755 "$guard_witness/$witness"
+done
+real_home_state() { # everything a broken guard would have touched, read only
+    for f in .local/bin/conbus .local/bin/conbus.rollback .conbus/canary.json; do
+        if [ -f "$real_home/$f" ]; then shasum -a 256 "$real_home/$f"; else echo "absent $f"; fi
+    done
+    for f in .local/bin/conbus.new .conbus/fake-records; do
+        if [ -e "$real_home/$f" ]; then echo "present $f"; fi
+    done
+    ls -lT "$real_home/Library/LaunchAgents/sh.conbus.daemon.plist.bak" 2>/dev/null || true
+}
+guard_refuses() { # guard_refuses <what> <HOME spelling> [env...]
+    guard_what=$1 guard_home=$2
+    shift 2
+    guard_before=$(real_home_state)
+    : >"$tmp/witness.calls"
+    code=0
+    env -u CONBUS_HOME -u XDG_STATE_HOME -u CONBUS_AGY_BIN -u CONBUS_SKIP_LAUNCHCTL \
+        HOME="$guard_home" CONBUS_CANARY_REHEARSAL=1 PATH="$guard_witness:$PATH" "$@" \
+        bash "$canary" start --from /nonexistent >"$tmp/guard.out" 2>&1 || code=$?
+    expect 2 "$code" "$guard_what: refused (exit 2)"
+    expect_grep 'CONBUS_CANARY_REHEARSAL is set under the real HOME' "$tmp/guard.out" "$guard_what: by the guard, not by something later"
+    expect 0 "$(wc -l <"$tmp/witness.calls" | tr -d ' ')" "$guard_what: no vendor and no launchctl ran before the refusal"
+    expect "$guard_before" "$(real_home_state)" "$guard_what: nothing under the real HOME moved"
+}
+guard_refuses "REHEARSAL under the real HOME" "$real_home"
+guard_refuses "REHEARSAL + SKIP under the real HOME" "$real_home" CONBUS_SKIP_LAUNCHCTL=1
+# The same home under other spellings: this volume is case-insensitive and firmlinked, and a string compare reads
+# these as somewhere else. Only where they really are the same directory.
+guard_upper=$(printf '%s' "$real_home" | tr '[:lower:]' '[:upper:]')
+if [ "$guard_upper" -ef "$real_home" ]; then
+    guard_refuses "the real HOME in other case" "$guard_upper"
+fi
+guard_firmlink=/System/Volumes/Data$real_home
+if [ "$guard_firmlink" -ef "$real_home" ]; then
+    guard_refuses "the real HOME through its firmlink" "$guard_firmlink"
+fi
+# A throwaway HOME whose root or install is the real one is the real one.
+guard_links=$tmp/guard-links
+mkdir -p "$guard_links/.local"
+if [ -d "$real_home/.conbus" ]; then
+    ln -s "$real_home/.conbus" "$guard_links/.conbus"
+    guard_refuses "a HOME whose .conbus is the real one" "$guard_links"
+    rm -f "$guard_links/.conbus"
+fi
+if [ -d "$real_home/.local/bin" ]; then
+    ln -s "$real_home/.local/bin" "$guard_links/.local/bin"
+    guard_refuses "a HOME whose install is the real one" "$guard_links"
+    rm -f "$guard_links/.local/bin"
+fi
+
+# An empty CONBUS_SKIP_LAUNCHCTL is set as far as the binary goes, so the script must not call that the real path.
 code=0
-env -u CONBUS_HOME -u XDG_STATE_HOME HOME="$real_home" CONBUS_CANARY_REHEARSAL=1 \
-    bash "$canary" start --from "$tmp/stage/conbus-good" >"$tmp/realhome.out" 2>&1 || code=$?
-if [ "${code:-0}" != 2 ]; then
-    say "diagnostic: real_home='$real_home' pw='$(env -u HOME bash -c 'cd ~ && pwd -P' 2>/dev/null)'"
-    sed 's/^/  canary: /' "$tmp/realhome.out" | head -8
-fi
-expect 2 "$code" "REHEARSAL under the real HOME refuses (exit 2)"
-if [ -n "$live_sha" ]; then
-    expect "$live_sha" "$(shasum -a 256 "$live_bin" | awk '{print $1}')" \
-        "the live binary is untouched"
-fi
+env -u CONBUS_HOME -u XDG_STATE_HOME -u CONBUS_CANARY_REHEARSAL HOME="$home" CONBUS_SKIP_LAUNCHCTL= \
+    CONBUS_CANARY_TEST_REAL_HOME="$home" bash "$canary" start --from "$tmp/stage/conbus-good" >"$tmp/guard-empty.out" 2>&1 || code=$?
+expect 2 "$code" "an empty CONBUS_SKIP_LAUNCHCTL is no real path"
+expect_grep "the real swap needs the real HOME" "$tmp/guard-empty.out" "by the guard, before preflight"
+
+# The seam walks the real swap path, whose `install --apply` from a real binary would take the live recorder down
+# whatever HOME says: launchctl answers by uid. So it is for stand-ins only. Both sides refuse before anything moves.
+native=$tmp/stage/conbus-native
+cp /usr/bin/true "$native"
+installed_before=$(shasum -a 256 "$install_dir/conbus" | awk '{ print $1 }')
 code=0
-env -u CONBUS_HOME -u XDG_STATE_HOME HOME="$real_home" \
-    CONBUS_CANARY_REHEARSAL=1 CONBUS_SKIP_LAUNCHCTL=1 \
-    bash "$canary" start --from "$tmp/stage/conbus-good" >/dev/null 2>&1 || code=$?
-expect 2 "$code" "REHEARSAL + SKIP under the real HOME still refuses (exit 2)"
-if [ -n "$live_sha" ]; then
-    expect "$live_sha" "$(shasum -a 256 "$live_bin" | awk '{print $1}')" \
-        "no half deploy — the binary is still untouched"
-fi
+env -u CONBUS_HOME -u XDG_STATE_HOME -u CONBUS_SKIP_LAUNCHCTL -u CONBUS_CANARY_REHEARSAL HOME="$home" \
+    CONBUS_CANARY_TEST_REAL_HOME="$home" CONBUS_AGY_BIN="$tmp/agy-no-login" \
+    bash "$canary" start --from "$native" >"$tmp/guard-native-from.out" 2>&1 || code=$?
+expect 2 "$code" "the seam refuses a candidate that is a real binary"
+expect_grep "the real swap needs the real HOME" "$tmp/guard-native-from.out" "by the guard, before preflight"
+expect "$installed_before" "$(shasum -a 256 "$install_dir/conbus" | awk '{ print $1 }')" "and nothing moved"
+stand_in_copy=$tmp/stand-in-copy
+cp -p "$install_dir/conbus" "$stand_in_copy"
+cp /usr/bin/true "$install_dir/conbus"
+code=0
+env -u CONBUS_HOME -u XDG_STATE_HOME -u CONBUS_SKIP_LAUNCHCTL -u CONBUS_CANARY_REHEARSAL HOME="$home" \
+    CONBUS_CANARY_TEST_REAL_HOME="$home" CONBUS_AGY_BIN="$tmp/agy-no-login" \
+    bash "$canary" start --from "$tmp/stage/conbus-good" >"$tmp/guard-native-bin.out" 2>&1 || code=$?
+expect 2 "$code" "the seam refuses an installed binary that is a real one"
+expect_grep "the real swap needs the real HOME" "$tmp/guard-native-bin.out" "by the guard, before preflight"
+cp -p "$stand_in_copy" "$install_dir/conbus"
+
+# The seam walks the real rollback path too: a real binary as the rollback copy would get `install --apply` with
+# launchctl live. So the rollback copy has to be a stand-in as well, and it is refused by the guard, not later.
+write_fake 01d old "$install_dir/conbus"
+cp -p "$install_dir/conbus" "$tmp/stand-in-copy2"; cp /usr/bin/true "$rollback_bin"
+code=0
+env -u CONBUS_HOME -u XDG_STATE_HOME -u CONBUS_SKIP_LAUNCHCTL -u CONBUS_CANARY_REHEARSAL HOME="$home" \
+    CONBUS_CANARY_TEST_REAL_HOME="$home" CONBUS_AGY_BIN="$tmp/agy-no-login" CONBUS_CANARY_SERVING_LIMIT=1 \
+    bash "$canary" rollback >"$tmp/guard-native-rollback.out" 2>&1 || code=$?
+expect 2 "$code" "the seam refuses a rollback copy that is a real binary"
+expect_grep "the real swap needs the real HOME" "$tmp/guard-native-rollback.out" "before anything moves"
+expect "conbus 0.0.0-01d (01d)" "$("$install_dir/conbus" --version)" "and the installed binary is where it was"
+code=0
+env -u CONBUS_HOME -u XDG_STATE_HOME -u CONBUS_SKIP_LAUNCHCTL -u CONBUS_CANARY_REHEARSAL HOME="$home" \
+    CONBUS_CANARY_TEST_REAL_HOME="$home" CONBUS_AGY_BIN="$tmp/agy-no-login" CONBUS_CANARY_SERVING_LIMIT=1 \
+    bash "$canary" start --from "$tmp/stage/conbus-good" >"$tmp/guard-native-rollback-start.out" 2>&1 || code=$?
+expect 2 "$code" "and a start with one there, though start would replace it"
+expect_grep "the real swap needs the real HOME" "$tmp/guard-native-rollback-start.out" "by the guard too"
+cp -p "$tmp/stand-in-copy2" "$install_dir/conbus"; write_fake 01d old "$rollback_bin"
 
 # The test seam only accepts a throwaway HOME that names itself.
 code=0
@@ -426,7 +725,10 @@ expect "$mf_expect" "$code" "'Mon-Fri HH:MM-HH:MM Asia/Seoul' parses and applies
 # --- the healthy start -------------------------------------------------------
 
 # A good candidate: serving stamp appears, doctor agrees, hooks run, no
-# new drops — the swap stays.
+# new drops — the swap stays. Over the "0.2.8" again: the blackout scenarios above
+# left a swapped install, and start keeps whatever it replaces.
+write_fake 01d old "$install_dir/conbus"
+rm -f "$home/.conbus/canary.json"
 daemon_boot beef 4243
 code=0
 run start --from "$tmp/stage/conbus-good" >"$tmp/start.out" 2>&1 || code=$?
@@ -438,6 +740,131 @@ expect_absent "$install_dir/conbus.new" "write-beside temp is renamed, not left"
 expect_absent "$home/.install-called" "rehearsal never invoked install --apply"
 expect_file "$home/.conbus/canary.json" "canary.json records the window"
 expect_grep '"candidate_build":"beef"' "$home/.conbus/canary.json" "canary.json names the candidate build"
+
+# A healthy doctor with a lot to say. `echo "$out" | grep -q listening` leaves at the
+# first match, echo takes a SIGPIPE, pipefail fails the pipeline, and a daemon that
+# said `listening` was rolled back as not answering. Seen once in about fifteen
+# runs with ordinary output; with this much it happens every time.
+write_fake beef chatty "$tmp/stage/conbus-chatty"
+write_fake 01d old "$install_dir/conbus"
+rm -f "$rollback_bin" "$home/.conbus/canary.json"
+daemon_boot beef 4249
+code=0
+run start --from "$tmp/stage/conbus-chatty" >"$tmp/start-chatty.out" 2>&1 || code=$?
+if [ "$code" != 0 ]; then tail -8 "$tmp/start-chatty.out" >&2; fi
+expect 0 "$code" "a doctor with a lot to say does not roll a healthy swap back"
+# Preflight tells the operator to rotate a capped log aside, so no drops.jsonl
+# at all is a normal way to arrive here. It used to end start with exit 1 and
+# not a word, on the last `[ -f ]` of a loop under pipefail.
+write_fake 01d old "$install_dir/conbus"
+rm -f "$rollback_bin" "$home/.conbus/canary.json" "$home/.conbus/drops.jsonl" "$home/.conbus/drops.1.jsonl"
+daemon_boot beef 4250
+code=0
+run start --from "$tmp/stage/conbus-good" >"$tmp/start-nodrops.out" 2>&1 || code=$?
+if [ "$code" != 0 ]; then cat "$tmp/start-nodrops.out" >&2; fi
+expect 0 "$code" "start proceeds with no drop log"
+expect_grep "canary is live" "$tmp/start-nodrops.out" "and reaches its live marker"
+cat >"$home/.conbus/drops.jsonl" <<'EOF'
+{"ts":"2026-10-30T09:00:00.000Z","reason":"socket closed early"}
+EOF
+
+# --- what start proves --------------------------------------------------------
+
+# preflight proves a record can land through the candidate, under its own root.
+expect_grep '^PASS round-trip.*throwaway log' "$tmp/start.out" "preflight sends the candidate's hook through its own daemon"
+expect_absent "$home/.conbus/fake-records" "and nothing of it reaches this root"
+expect_file "$tmp/round-trip-daemons" "the candidate's daemon ran"
+still_running=0
+roots_left=0
+while read -r daemon_pid daemon_root; do
+    if kill -0 "$daemon_pid" 2>/dev/null; then
+        still_running=$((still_running + 1))
+        kill "$daemon_pid" 2>/dev/null || true
+    fi
+    if [ -e "$daemon_root" ]; then roots_left=$((roots_left + 1)); fi
+done <"$tmp/round-trip-daemons"
+expect 0 "$still_running" "and is stopped, not left running on a removed root"
+expect 0 "$roots_left" "and its throwaway root is gone"
+expect_grep 'not proved here: that a vendor fires its hooks' "$tmp/start.out" "start says what it did not prove"
+# A candidate whose hook answers and records nothing is refused before it swaps:
+# `hooks runs` would never have seen it.
+write_fake beef norecord "$tmp/stage/conbus-norecord"
+write_fake 01d old "$install_dir/conbus"
+code=0
+run start --from "$tmp/stage/conbus-norecord" >"$tmp/start-norecord.out" 2>&1 || code=$?
+expect 2 "$code" "a candidate that lands no record is refused"
+expect_grep '^FAIL round-trip.*no record reached the log' "$tmp/start-norecord.out" "it is the named failure"
+expect "conbus 0.0.0-01d (01d)" "$("$install_dir/conbus" --version)" "and nothing moved"
+
+# After the swap the new daemon has to answer. Doctor's `listening` only connects.
+touch "$home/.conbus/conbus.sock.silent"
+rm -f "$rollback_bin" "$home/.conbus/canary.json"
+daemon_boot beef 4252
+code=0
+CONBUS_CANARY_PROBE_S=1 SERVING_LIMIT=5 run start --from "$tmp/stage/conbus-good" >"$tmp/start-wedged.out" 2>&1 || code=$?
+rm -f "$home/.conbus/conbus.sock.silent"
+expect 1 "$code" "a daemon that listens and never answers rolls back"
+expect_grep 'did not answer a request on its socket' "$tmp/start-wedged.out" "the reason says so"
+expect "conbus 0.0.0-01d (01d)" "$("$install_dir/conbus" --version)" "the old build is back"
+
+# A registered hook missing events: the same gate as one that does not run.
+write_fake beef eventgap "$tmp/stage/conbus-eventgap"
+write_fake 01d old "$install_dir/conbus"
+rm -f "$home/.conbus/canary.json"
+daemon_boot beef 4253
+code=0
+SERVING_LIMIT=5 run start --from "$tmp/stage/conbus-eventgap" >"$tmp/start-eventgap.out" 2>&1 || code=$?
+expect 1 "$code" "a hook missing events rolls back"
+expect_grep "a hook is not 'runs'.*MISSING Stop" "$tmp/start-eventgap.out" "the events are named"
+
+# A vendor this machine does not have has no hook to run. It is no reason to roll
+# back, and neither is it proof of anything if no hook runs at all.
+write_fake beef novendor "$tmp/stage/conbus-novendor"
+write_fake 01d old "$install_dir/conbus"
+rm -f "$home/.conbus/canary.json"
+daemon_boot beef 4255
+code=0
+run start --from "$tmp/stage/conbus-novendor" >"$tmp/start-novendor.out" 2>&1 || code=$?
+if [ "$code" != 0 ]; then tail -6 "$tmp/start-novendor.out" >&2; fi
+expect 0 "$code" "a vendor not installed here does not roll back"
+write_fake beef nohooks "$tmp/stage/conbus-nohooks"
+write_fake 01d old "$install_dir/conbus"
+rm -f "$rollback_bin" "$home/.conbus/canary.json"
+daemon_boot beef 4256
+code=0
+SERVING_LIMIT=5 run start --from "$tmp/stage/conbus-nohooks" >"$tmp/start-nohooks.out" 2>&1 || code=$?
+expect 1 "$code" "no hook running at all rolls back"
+expect_grep 'no hook runs here' "$tmp/start-nohooks.out" "the reason says so"
+
+# A log that cannot take a record is not live, whatever else looks healthy.
+write_fake beef readonly "$tmp/stage/conbus-readonly"
+write_fake 01d old "$install_dir/conbus"
+rm -f "$rollback_bin" "$home/.conbus/canary.json"
+daemon_boot beef 4280
+code=0
+SERVING_LIMIT=5 run start --from "$tmp/stage/conbus-readonly" >"$tmp/start-readonly.out" 2>&1 || code=$?
+expect 1 "$code" "start does not call a log that cannot be appended to live"
+expect_grep 'the log cannot take a record: NOT APPENDABLE' "$tmp/start-readonly.out" "the reason is doctor's"
+expect_no_grep 'canary is live' "$tmp/start-readonly.out" "and nothing says live"
+expect "conbus 0.0.0-01d (01d)" "$("$install_dir/conbus" --version)" "the old build is back"
+write_fake beef refusing "$tmp/stage/conbus-refusing"
+write_fake 01d old "$install_dir/conbus"
+rm -f "$rollback_bin" "$home/.conbus/canary.json"
+daemon_boot beef 4281
+code=0
+SERVING_LIMIT=5 run start --from "$tmp/stage/conbus-refusing" >"$tmp/start-refusing.out" 2>&1 || code=$?
+expect 1 "$code" "nor one refusing writes"
+expect_grep 'the log cannot take a record: REFUSING' "$tmp/start-refusing.out" "and says so"
+
+# Codex's trust is a person's act, so it warns and does not undo a healthy swap.
+write_fake beef untrusted "$tmp/stage/conbus-untrusted"
+write_fake 01d old "$install_dir/conbus"
+rm -f "$home/.conbus/canary.json"
+daemon_boot beef 4254
+code=0
+run start --from "$tmp/stage/conbus-untrusted" >"$tmp/start-untrusted.out" 2>&1 || code=$?
+expect 0 "$code" "a hook waiting on a person's trust does not roll back"
+expect_grep 'until you approve them inside Codex' "$tmp/start-untrusted.out" "and the person is told"
 
 # --- the real path through the test seam -------------------------------------
 
@@ -467,6 +894,22 @@ expect 0 "${code:-0}" "a swap-window protocol refusal does not roll back"
 expect_grep "swap-window drop" "$tmp/start-swapdrop.out" "the expected drop is announced"
 expect_grep '"swap_window_drops":1' "$home/.conbus/canary.json" \
     "canary.json records swap_window_drops"
+
+# A spool drained at the first boot elides its tool bodies, and an outage the daemon
+# outlasted says so once writes work again. The records landed; neither line may
+# undo a healthy swap.
+write_fake beef elided "$tmp/stage/conbus-elided"
+write_fake 01d old "$install_dir/conbus"
+rm -f "$rollback_bin" "$home/.install-called" "$home/.conbus/canary.json"
+cat >"$home/.conbus/drops.jsonl" <<'EOF'
+{"ts":"2026-10-30T09:00:00.000Z","reason":"socket closed early"}
+EOF
+daemon_boot beef 4251
+code=0
+run_real start --from "$tmp/stage/conbus-elided" >"$tmp/start-elided.out" 2>&1 || code=$?
+if [ "$code" != 0 ]; then cat "$tmp/start-elided.out" >&2; fi
+expect 0 "$code" "lines that lost no record do not roll a swap back"
+expect "conbus 0.0.0-beef (beef)" "$("$install_dir/conbus" --version)" "the candidate stays"
 
 # A drop reason that is NOT a swap artifact still rolls back under the
 # real path — the tolerance is narrow by design.
@@ -538,8 +981,7 @@ expect_grep "rollback verified" "$tmp/drop.out" "the old build came back and is 
 # (b) a post-swap failure whose rollback never comes back: the restored
 # binary cannot boot a daemon, so the stamp keeps the candidate's pid and
 # build. exit 3, not the ordinary 1.
-write_fake 01d silent "$rollback_bin"
-restore_candidate
+write_fake 01d silent "$install_dir/conbus"
 code=0
 SERVING_LIMIT=1 run start --from "$tmp/stage/conbus-dropper" >"$tmp/norb.out" 2>&1 || code=$?
 expect 3 "$code" "unverified rollback -> start exits 3"
@@ -579,49 +1021,98 @@ expect_grep "rollback verified" "$tmp/stuck.out" "the old build came back and is
 
 # The same wedge on the rollback path: the rehearsal kick writes the old
 # build's stamp before the doctor hangs, so the stamp check passes and the
-# verifying call is the one that hits the cap -> ROLLBACK NOT VERIFIED.
-cat >"$home/.conbus/drops.jsonl" <<'EOF'
-{"ts":"2026-10-30T09:00:00.000Z","reason":"socket closed early"}
-EOF
+# verifying call is the one that hits the cap -> ROLLBACK NOT VERIFIED. Through
+# `rollback`: a copy whose doctor wedges would fail start's preflight first.
 write_fake 01d stuckboot "$rollback_bin"
 restore_candidate
-daemon_boot beef 4404
+write_stamp beef 4404
 code=0
-CONBUS_CANARY_DOCTOR_LIMIT=2 SERVING_LIMIT=2 run start \
-    --from "$tmp/stage/conbus-dropper" >"$tmp/stuckrb.out" 2>&1 || code=$?
+CONBUS_CANARY_DOCTOR_LIMIT=2 SERVING_LIMIT=2 run rollback >"$tmp/stuckrb.out" 2>&1 || code=$?
 expect 3 "$code" "a capped rollback-verify doctor -> exit 3"
 expect_grep "ROLLBACK NOT VERIFIED" "$tmp/stuckrb.out" "the cap-hit verification says NOT VERIFIED"
 rm -f "$rollback_bin"
 
 # --- restart + verdict -------------------------------------------------------
 
+# What `start` records about the drop log, measured the same way.
+drops_identity() {
+    if [ "$(uname -s)" = Darwin ]; then
+        di_stat=$(stat -f '%d:%i:%z' "$home/.conbus/drops.jsonl")
+    else
+        di_stat=$(stat -c '%d:%i:%s' "$home/.conbus/drops.jsonl")
+    fi
+    printf '%s:%s' "$di_stat" "$(shasum -a 256 "$home/.conbus/drops.jsonl" | awk '{ print $1 }')"
+}
+
+# A complete, healthy window: everything verdict reads, dated around <swapped>
+# (default 7 days and an hour ago, so the window is over). A scenario then
+# breaks the one thing it is about.
+verdict_fixture() { # verdict_fixture [swapped-iso] [restarts-json]
+    fx_swapped=${1:-$(iso_ago $((7 * DAY + 3600)))}
+    fx_restarts=${2:-[]}
+    # A boot job left from a start scenario would write its stamp over this one,
+    # and only under load, when it is still waiting for its turn.
+    if [ -n "${boot_job:-}" ]; then
+        kill "$boot_job" 2>/dev/null || true
+        wait "$boot_job" 2>/dev/null || true
+        boot_job=""
+    fi
+    rm -f "$home/.conbus/drops.1.jsonl" "$home/.conbus/sync.json" \
+        "$home/.conbus/policy.json" "$home/.usage-fail" "$home/.usage-fail-day" "$home/.usage-window" \
+        "$home/.conbus/conbus.sock.silent"
+    rm -rf "$home/.conbus/spool"
+    write_fake beef live "$install_dir/conbus"
+    write_fake 01d notokens "$rollback_bin"
+    write_fake 01d notokens "$parity_copy"
+    printf '%s conbus daemon: beef: socket /x/sock log /x/log (10 record(s), 0 unreadable)\n' \
+        "$(iso_after "$fx_swapped" 4)" >"$home/.conbus/daemon.log"
+    printf '{"build":"beef","pid":%s,"started":"%s","serving":"%s","core_dumps_disabled":true,"memory_locked":true}\n' \
+        "$recorder_pid" "$(iso_after "$fx_swapped" 1)" "$(iso_after "$fx_swapped" 4)" >"$home/.conbus/daemon.build"
+    rm -f "$home/.conbus/drops.jsonl"
+    printf '{"ts":"%s","reason":"socket closed early"}\n' \
+        "$(iso_after "$fx_swapped" -$((5 * DAY)))" >"$home/.conbus/drops.jsonl"
+    rm -rf "$home/.conbus/log"
+    mkdir -p "$home/.conbus/log"
+    touch "$home/.conbus/log/segment-00000000.jsonl" "$home/.conbus/log/segment-00000001.jsonl"
+    printf '{"swapped":"%s","prev_build":"01d","candidate_build":"beef","candidate_sha256":"%s","restarts":%s,"drops_file":"%s","log_files":"2:00000000:00000001"}\n' \
+        "$fx_swapped" "$(shasum -a 256 "$install_dir/conbus" | awk '{ print $1 }')" "$fx_restarts" "$(drops_identity)" \
+        >"$home/.conbus/canary.json"
+    usage_rows "$(iso_after "$fx_swapped" -$((14 * DAY)))" claude_code codex >"$home/.usage-rows"
+}
+
+state_with() { # state_with <flat key> <value>: canary.json with that field changed
+    sed -E "s#\"$1\":\"[^\"]*\"#\"$1\":\"$2\"#" "$home/.conbus/canary.json" >"$home/.conbus/canary.json.new"
+    mv -f "$home/.conbus/canary.json.new" "$home/.conbus/canary.json"
+}
+
+# The candidate again under another persona, with the recorded hash kept true.
+install_persona() { # install_persona <persona>
+    write_fake beef "$1" "$install_dir/conbus"
+    sed -E "s/\"candidate_sha256\":\"[^\"]*\"/\"candidate_sha256\":\"$(shasum -a 256 "$install_dir/conbus" | awk '{ print $1 }')\"/" \
+        "$home/.conbus/canary.json" >"$home/.conbus/canary.json.new"
+    mv -f "$home/.conbus/canary.json.new" "$home/.conbus/canary.json"
+}
+
 # Planned restarts are recorded; unplanned ones are counted by verdict.
 # Scenario: swap happened >7 days ago, two planned restarts, one crash.
-cat >"$home/.conbus/canary.json" <<'EOF'
-{"swapped":"2026-10-20T00:00:00.000Z","prev_build":"01d","candidate_build":"beef","candidate_sha256":"x","restarts":[{"ts":"2026-10-21T00:00:00.000Z","serving_ms":4000,"new_drops":0},{"ts":"2026-10-26T00:00:00.000Z","serving_ms":4100,"new_drops":0}]}
+swapped=$(iso_ago $((9 * DAY)))
+restart_1=$(iso_after "$swapped" "$DAY")
+restart_2=$(iso_after "$swapped" $((6 * DAY)))
+verdict_fixture "$swapped" "[{\"ts\":\"$restart_1\",\"serving_ms\":4000,\"new_drops\":0},{\"ts\":\"$restart_2\",\"serving_ms\":4100,\"new_drops\":0}]"
+cat >>"$home/.conbus/daemon.log" <<EOF
+$(iso_after "$restart_1" 4) conbus daemon: beef: socket /x/sock log /x/log (10 record(s), 0 unreadable)
+$(iso_after "$restart_2" 4) conbus daemon: beef: socket /x/sock log /x/log (10 record(s), 0 unreadable)
 EOF
-cat >"$home/.conbus/daemon.log" <<'EOF'
-2026-10-20T00:00:05.000Z conbus daemon: beef: socket /x/sock log /x/log (10 record(s), 0 unreadable)
-2026-10-21T00:00:04.000Z conbus daemon: beef: socket /x/sock log /x/log (10 record(s), 0 unreadable)
-2026-10-26T00:00:04.000Z conbus daemon: beef: socket /x/sock log /x/log (10 record(s), 0 unreadable)
-EOF
-cat >"$home/.conbus/drops.jsonl" <<'EOF'
-{"ts":"2026-10-15T09:00:00.000Z","reason":"socket closed early"}
-{"ts":"2026-10-30T09:00:00.000Z","reason":"socket closed early"}
-EOF
-cat >"$home/.conbus/daemon.build" <<EOF
-{"build":"beef","pid":$$,"started":"2026-10-26T00:00:00.000Z","serving":"2026-10-26T00:00:04.000Z"}
-EOF
-restore_candidate
+planned_log=$(cat "$home/.conbus/daemon.log")
 # A rollback binary that answers usage identically minus the tokens_*
 # keys — parity only passes when the sed strip actually removes them.
-write_fake 01d notokens "$rollback_bin"
 # verdict: 3 starts - 1 swap - 2 planned = 0 unplanned, closed days agree.
 code=0
 run verdict >"$tmp/verdict.out" 2>&1 || code=$?
+if [ "$code" != 0 ]; then cat "$tmp/verdict.out" >&2; fi
 expect 0 "$code" "verdict exits 0 on a completed clean window"
-for name in restarts unreadable drops harness-activity twins-repeated usage-parity \
-    rss-budget time-budget serving-budget policy sync operator-feel; do
+for name in build hooks recorder-serving restarts reboots unreadable log-files disk drops log-outages orphan-tools tool-bodies harness-activity twins-repeated \
+    usage-parity rss-budget time-budget serving-budget policy sync operator-feel; do
     grep -qE "^(PASS|FAIL|UNCHECKED) $name " "$tmp/verdict.out"
     expect 0 $? "verdict prints a $name line"
 done
@@ -631,19 +1122,20 @@ expect_grep '^PASS rss-budget' "$tmp/verdict.out" "rss-budget measured against C
 expect_grep '^PASS time-budget' "$tmp/verdict.out" "time budgets are measured"
 expect_grep '^PASS serving-budget' "$tmp/verdict.out" "serving <= 5 s is a verdict line"
 expect_grep '^UNCHECKED operator-feel' "$tmp/verdict.out" "only operator-feel stays UNCHECKED"
+expect_grep 'verdict: PASS' "$tmp/verdict.out" "a clean window says PASS"
+expect_grep 'operator-feel is still yours' "$tmp/verdict.out" "and says what a PASS leaves open"
 
 # A crash after the swap is still visible — the window does not move.
-cat >>"$home/.conbus/daemon.log" <<'EOF'
-2026-10-28T03:00:04.000Z conbus daemon: beef: socket /x/sock log /x/log (10 record(s), 0 unreadable)
-EOF
+printf '%s conbus daemon: beef: socket /x/sock log /x/log (10 record(s), 0 unreadable)\n' \
+    "$(iso_after "$swapped" $((8 * DAY)))" >>"$home/.conbus/daemon.log"
 code=0
 run verdict >"$tmp/verdict-crash.out" 2>&1 || code=$?
 expect 1 "$code" "a crash after the swap fails the verdict"
 expect_grep '^FAIL restarts' "$tmp/verdict-crash.out" "the crash is counted as unplanned"
-sed -i '' '$d' "$home/.conbus/daemon.log"
+printf '%s\n' "$planned_log" >"$home/.conbus/daemon.log"
 
 # A parity mismatch fails.
-cat >"$rollback_bin" <<'EOF'
+cat >"$parity_copy" <<'EOF'
 #!/bin/sh
 case "$1" in
     --version) echo "conbus 0.0.0-01d (01d)" ;;
@@ -651,56 +1143,28 @@ case "$1" in
     *) echo old ;;
 esac
 EOF
-chmod 755 "$rollback_bin"
+chmod 755 "$parity_copy"
 code=0
 run verdict >"$tmp/verdict-parity.out" 2>&1 || code=$?
 expect 1 "$code" "a usage parity mismatch fails"
 expect_grep '^FAIL usage-parity' "$tmp/verdict-parity.out" "the mismatch day is named FAIL"
-write_fake 01d notokens "$rollback_bin"
-
-# A verdict fixture builder: <swapped-iso> — everything verdict needs except
-# the drops and canary.json the scenario then writes itself.
-verdict_fixture() {
-    cat >"$home/.conbus/daemon.log" <<EOF
-$(date -u +%Y-%m-%dT%H:%M:%S.000Z) conbus daemon: beef: socket /x/sock log /x/log (10 record(s), 0 unreadable)
-EOF
-    printf '{"build":"beef","pid":%s,"started":"%s","serving":"%s","core_dumps_disabled":true,"memory_locked":true}\n' \
-        "$$" "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)" "$(date -u +%Y-%m-%dT%H:%M:%S.002Z)" >"$home/.conbus/daemon.build"
-    write_fake beef live "$install_dir/conbus"
-    write_fake 01d notokens "$rollback_bin"
-    cat >"$home/.conbus/drops.jsonl" <<'EOF'
-{"ts":"2026-10-15T09:00:00.000Z","reason":"socket closed early"}
-EOF
-}
+write_fake 01d notokens "$parity_copy"
 
 # F1 verdict side: a swap-window reason is exempt only inside 60s after the
 # swap. swapped=now-30s + a refusal at +20s -> exempt (exit 3, window open);
 # the same reason at +90s -> FAIL drops.
-swapped_now=$(date -u -v-30S +%Y-%m-%dT%H:%M:%S.000Z 2>/dev/null || date -u -d '30 seconds ago' +%Y-%m-%dT%H:%M:%S.000Z)
-drop_in=$(date -u -v-10S +%Y-%m-%dT%H:%M:%S.000Z 2>/dev/null || date -u -d '10 seconds ago' +%Y-%m-%dT%H:%M:%S.000Z)
-verdict_fixture
-cat >"$home/.conbus/canary.json" <<EOF
-{"swapped":"$swapped_now","prev_build":"01d","candidate_build":"beef","candidate_sha256":"x","restarts":[]}
-EOF
-cat >"$home/.conbus/drops.jsonl" <<EOF
-{"ts":"2026-10-15T09:00:00.000Z","reason":"socket closed early"}
-{"ts":"$drop_in","reason":"the daemon refused the record: this daemon speaks protocol v5; the hook speaks v6. Restart the daemon."}
-EOF
+verdict_fixture "$(iso_ago 30)"
+printf '{"ts":"%s","reason":"the daemon refused the record: this daemon speaks protocol v5; the hook speaks v6. Restart the daemon."}\n' \
+    "$(iso_ago 10)" >>"$home/.conbus/drops.jsonl"
 code=0
 run verdict >"$tmp/verdict-swap60.out" 2>&1 || code=$?
 expect 3 "$code" "a swap-window refusal inside 60s is exempt (window still open)"
 expect_grep 'expected swap-window' "$tmp/verdict-swap60.out" "the exempted count is shown"
 # Same refusal >60s after the swap: keep the window open (swapped ~2min
 # ago) with the drop at swapped+90s — past the exemption.
-swapped_old=$(date -u -v-120S +%Y-%m-%dT%H:%M:%S.000Z 2>/dev/null || date -u -d '120 seconds ago' +%Y-%m-%dT%H:%M:%S.000Z)
-drop_late=$(date -u -v-30S +%Y-%m-%dT%H:%M:%S.000Z 2>/dev/null || date -u -d '30 seconds ago' +%Y-%m-%dT%H:%M:%S.000Z)
-cat >"$home/.conbus/canary.json" <<EOF
-{"swapped":"$swapped_old","prev_build":"01d","candidate_build":"beef","candidate_sha256":"x","restarts":[]}
-EOF
-cat >"$home/.conbus/drops.jsonl" <<EOF
-{"ts":"2026-10-15T09:00:00.000Z","reason":"socket closed early"}
-{"ts":"$drop_late","reason":"the daemon refused the record: this daemon speaks protocol v5; the hook speaks v6. Restart the daemon."}
-EOF
+verdict_fixture "$(iso_ago 120)"
+printf '{"ts":"%s","reason":"the daemon refused the record: this daemon speaks protocol v5; the hook speaks v6. Restart the daemon."}\n' \
+    "$(iso_ago 30)" >>"$home/.conbus/drops.jsonl"
 code=0
 run verdict >"$tmp/verdict-swap90.out" 2>&1 || code=$?
 expect 1 "$code" "the same refusal >60s after the swap FAILS"
@@ -708,51 +1172,1440 @@ expect_grep '^FAIL drops' "$tmp/verdict-swap90.out" "the persisting refusal is n
 
 # F4 — the window boundary in UTC: swapped 6d23h ago is still open (exit 3),
 # 7d1h ago is complete (exit 0).
-past=$(date -u -v-6d -v-23H +%Y-%m-%dT%H:%M:%S.000Z 2>/dev/null || date -u -d '6 days ago 23 hours ago' +%Y-%m-%dT%H:%M:%S.000Z)
-verdict_fixture
-cat >"$home/.conbus/canary.json" <<EOF
-{"swapped":"$past","prev_build":"01d","candidate_build":"beef","candidate_sha256":"x","restarts":[]}
-EOF
+verdict_fixture "$(iso_ago $((6 * DAY + 23 * 3600)))"
 code=0
 run verdict >"$tmp/verdict-6d.out" 2>&1 || code=$?
 expect 3 "$code" "a 6d23h window is still incomplete (exit 3)"
-past=$(date -u -v-7d -v-1H +%Y-%m-%dT%H:%M:%S.000Z 2>/dev/null || date -u -d '7 days ago 1 hour ago' +%Y-%m-%dT%H:%M:%S.000Z)
-cat >"$home/.conbus/canary.json" <<EOF
-{"swapped":"$past","prev_build":"01d","candidate_build":"beef","candidate_sha256":"x","restarts":[]}
-EOF
+verdict_fixture
 code=0
 run verdict >"$tmp/verdict-7d.out" 2>&1 || code=$?
 expect 0 "$code" "a 7d1h window completes (exit 0)"
 
 # C6 — verdict budgets honor CONBUS_CANARY_* overrides.
-past=$(date -u -v-7d -v-1H +%Y-%m-%dT%H:%M:%S.000Z 2>/dev/null || date -u -d '7 days ago 1 hour ago' +%Y-%m-%dT%H:%M:%S.000Z)
 verdict_fixture
-cat >"$home/.conbus/canary.json" <<EOF
-{"swapped":"$past","prev_build":"01d","candidate_build":"beef","candidate_sha256":"x","restarts":[]}
-EOF
 code=0
-env -u CONBUS_HOME -u XDG_STATE_HOME HOME="$home" CONBUS_SKIP_LAUNCHCTL=1 \
-    CONBUS_CANARY_REHEARSAL=1 CONBUS_CANARY_DOCTOR_MS=1 \
-    bash "$canary" verdict >"$tmp/verdict-budget.out" 2>&1 || code=$?
+DOCTOR_MS=1 run verdict >"$tmp/verdict-budget.out" 2>&1 || code=$?
 expect 1 "$code" "a doctor over its env budget fails the verdict"
-expect_grep 'doctor' "$tmp/verdict-budget.out" "the over-budget item is named"
+expect_grep '^FAIL time-budget.*doctor' "$tmp/verdict-budget.out" "the over-budget item is named"
+expect_grep '^FAIL time-budget.*load ' "$tmp/verdict-budget.out" "with the load it was measured under"
+code=0
+TAIL_MS=1 run verdict >"$tmp/verdict-budget-tail.out" 2>&1 || code=$?
+expect 1 "$code" "a read slow every time still fails, whichever read it is"
+expect_grep '^FAIL time-budget.*tail' "$tmp/verdict-budget-tail.out" "the slow read is named"
 
 # A planned restart's drop delta fails the same way a new reason does.
-cat >"$home/.conbus/canary.json" <<'EOF'
-{"swapped":"2026-10-20T00:00:00.000Z","prev_build":"01d","candidate_build":"beef","candidate_sha256":"x","restarts":[{"ts":"2026-10-21T00:00:00.000Z","serving_ms":4000,"new_drops":1}]}
-EOF
+verdict_fixture "" "[{\"ts\":\"$(iso_ago $((5 * DAY)))\",\"serving_ms\":4000,\"new_drops\":1}]"
+printf '%s conbus daemon: beef: socket /x/sock log /x/log (10 record(s), 0 unreadable)\n' \
+    "$(iso_ago $((5 * DAY - 4)))" >>"$home/.conbus/daemon.log"
 code=0
 run verdict >"$tmp/verdict-rdrop.out" 2>&1 || code=$?
 expect 1 "$code" "a drop during a planned restart fails"
 expect_grep '^FAIL drops' "$tmp/verdict-rdrop.out" "the planned-restart drop is named FAIL"
 
+# A drop log at the 4 MiB cap went blind — every later drop was silently
+# discarded, so drops can never be PASS on it. The live log did exactly
+# this for seven days in October; preflight must refuse a swap over it too.
+verdict_fixture
+# perl, not `yes | head` — head exits mid-stream and yes dies on SIGPIPE,
+# which set -o pipefail turns into a rehearsal failure that is not the
+# scenario's.
+perl -e 'print "{\"ts\":\"2026-10-10T09:00:00.000Z\",\"reason\":\"old flood\"}\n" x 80000' \
+    >"$home/.conbus/drops.jsonl"
+code=0
+run verdict >"$tmp/verdict-capped.out" 2>&1 || code=$?
+expect 4 "$code" "a capped drop log leaves the verdict unchecked, not passed"
+expect_grep '^UNCHECKED drops' "$tmp/verdict-capped.out" \
+    "a drops.jsonl at the cap cannot pass drops"
+expect_grep 'verdict: UNCHECKED' "$tmp/verdict-capped.out" "the outcome is named"
+expect_grep 'canary:   drops — ' "$tmp/verdict-capped.out" "with the reason, not only the item"
+expect_no_grep 'verdict: PASS' "$tmp/verdict-capped.out" "an unchecked drops line cannot read as a pass"
+if grep -q '^PASS drops' "$tmp/verdict-capped.out"; then
+    echo "rehearsal: FAIL: a capped drops.jsonl passed drops" >&2
+    exit 1
+fi
+code=0
+run preflight >"$tmp/preflight-capped.out" 2>&1 || code=$?
+expect 1 "$code" "preflight refuses a swap over a blind drop log"
+expect_grep '^FAIL drops-cap' "$tmp/preflight-capped.out" \
+    "the capped drops.jsonl is the named failure"
+
+# A rotated log still sees both sides: the new reason lives only in the
+# generation that was renamed away — a flood mid-window rotates the file
+# and the fresh drops.jsonl holds nothing new. Reading drops.jsonl alone
+# misses it.
+verdict_fixture
+cat "$home/.conbus/drops.jsonl" >"$home/.conbus/drops.1.jsonl"
+printf '{"ts":"%s","reason":"a fault after the rotation"}\n' "$(iso_ago 3600)" >>"$home/.conbus/drops.1.jsonl"
+code=0
+run verdict >"$tmp/verdict-rotated.out" 2>&1 || code=$?
+expect 1 "$code" "a new drop reason in the rotated generation is caught"
+expect_grep 'a fault after the rotation' "$tmp/verdict-rotated.out" \
+    "the post-rotation reason is named"
+rm -f "$home/.conbus/drops.1.jsonl"
+
+# --- what a drop line means ---------------------------------------------------
+
+# The real writer's field order: ts, reason, detail. Reversed, a torn line never tore
+# where a real one does, and a test of it proved nothing about the real file.
+drop_line() { # drop_line <seconds ago> <reason, JSON-escaped> [detail]
+    if [ -n "${3:-}" ]; then
+        printf '{"ts":"%s","reason":"%s","detail":"%s"}\n' "$(iso_ago "$1")" "$2" "$3"
+    else
+        printf '{"ts":"%s","reason":"%s"}\n' "$(iso_ago "$1")" "$2"
+    fi >>"$home/.conbus/drops.jsonl"
+}
+
+# A lost record fails whether or not its words have been seen before. The swap
+# window aside, a week of these used to read `0 new drop reason(s)`.
+for lost_reason in \
+    'no daemon on /x/sock: Connection refused (os error 61)' \
+    'no reply from the daemon: Resource temporarily unavailable (os error 35)' \
+    'could not send the record: Broken pipe (os error 32)' \
+    'could not bound the daemon call: Invalid argument (os error 22)' \
+    'unreadable reply \"\": EOF while parsing a value at line 1 column 0' \
+    'the daemon refused the record: 2 record(s) written, 1 lost: No space left on device (os error 28)' \
+    'spooled hook refused: 1 record(s) written, 1 lost: No space left on device (os error 28)'; do
+    verdict_fixture
+    drop_line $((8 * DAY)) "$lost_reason"
+    drop_line 3600 "$lost_reason"
+    code=0
+    run verdict >"$tmp/verdict-lost.out" 2>&1 || code=$?
+    expect 1 "$code" "a known reason that lost a record fails: ${lost_reason%%:*}"
+    expect_grep '^FAIL drops — 1 lost record' "$tmp/verdict-lost.out" "and is counted as lost"
+    expect_grep 'fail at any count' "$tmp/verdict-lost.out" "and the rule is printed beside it"
+done
+
+# The swap window keeps its exemption for its two reasons, known or not, and
+# only for 60 seconds.
+verdict_fixture "$(iso_ago 120)"
+drop_line $((3 * DAY)) 'no daemon on /x/sock: Connection refused (os error 61)'
+drop_line 100 'no daemon on /x/sock: Connection refused (os error 61)'
+code=0
+run verdict >"$tmp/verdict-swap-nd.out" 2>&1 || code=$?
+expect 3 "$code" "a no-daemon line inside 60 s of the swap is exempt"
+expect_grep '^PASS drops.*1 expected swap-window' "$tmp/verdict-swap-nd.out" "and counted"
+drop_line 30 'no daemon on /x/sock: Connection refused (os error 61)'
+code=0
+run verdict >"$tmp/verdict-swap-nd90.out" 2>&1 || code=$?
+expect 1 "$code" "the same known reason 90 s after the swap fails"
+
+# Every event name a vendor renames into is its own gap. The reason's escaped
+# quote used to end the parse, so all of them read as one known prefix.
+verdict_fixture
+drop_line $((8 * DAY)) 'no mapping for hook event \"KnownOld\" (as claude_code, fields: cwd,hook_event_name)'
+drop_line 3600 'no mapping for hook event \"StopV2\" (as claude_code, fields: cwd,hook_event_name)'
+code=0
+run verdict >"$tmp/verdict-renamed.out" 2>&1 || code=$?
+expect 1 "$code" "a renamed event fails"
+expect_grep 'StopV2 as claude_code' "$tmp/verdict-renamed.out" "the new event and harness are named"
+verdict_fixture
+drop_line $((8 * DAY)) 'no mapping for hook event \"KnownOld\" (as claude_code, fields: cwd,hook_event_name)'
+drop_line 3600 'no mapping for hook event \"KnownOld\" (as claude_code, fields: cwd,hook_event_name)'
+code=0
+run verdict >"$tmp/verdict-renamed-known.out" 2>&1 || code=$?
+expect 1 "$code" "an event already unmapped before the swap still lost its record"
+
+# Sessions the log never had: their end is not a lost record, whatever its
+# spelling. These are most of the real orphan lines, and one would have rolled a
+# swap back or failed a week. A tool event in one is real content, and fails.
+verdict_fixture
+for ghost in 'SessionEnd for session 01a06300' 'sessionEnd for session 01a06301' 'Stop for session 01a06302'; do
+    drop_line 3600 'no conversation for this session; the daemon has no binding for it (no prompt from this session has reached it)' "$ghost"
+done
+drop_line 3600 'spooled hook still has no conversation (orphan)' 'session_ended for session 01a06303'
+code=0
+run verdict >"$tmp/verdict-ghost.out" 2>&1 || code=$?
+expect 0 "$code" "the end of a session the log never had is not a loss"
+expect_grep '^PASS drops.*4 not lost' "$tmp/verdict-ghost.out" "and it is shown, not dropped from view"
+expect_grep '1× session_ended' "$tmp/verdict-ghost.out" "by event"
+expect_grep '^  rule: a lost record or adapter gap fails at any count' "$tmp/verdict-ghost.out" "and the standard is printed for a person to argue with"
+expect_no_grep '01a0630' "$tmp/verdict-ghost.out" "without a session id"
+verdict_fixture
+drop_line 3600 'spooled hook still has no conversation (orphan)' 'turn_started for session 01a06304'
+code=0
+run verdict >"$tmp/verdict-orphan.out" 2>&1 || code=$?
+expect 1 "$code" "a prompt with no conversation is a lost record"
+expect_grep '^FAIL drops — 1 lost record' "$tmp/verdict-orphan.out" "and is counted as one"
+expect_grep '1× turn_started: spooled hook' "$tmp/verdict-orphan.out" "by event"
+expect_no_grep '01a0630' "$tmp/verdict-orphan.out" "without a session id"
+
+# A payload that names no session is the vendor's, per the plan: shown, and it
+# stops a pass only as a flood. Same for an empty payload.
+verdict_fixture
+drop_line 3600 'the hook payload names no session; an empty id would merge unrelated sessions into one conversation' 'preToolUse as cursor (fields: cwd,tool_name)'
+drop_line 3600 'EOF while parsing a value at line 1 column 0'
+code=0
+run verdict >"$tmp/verdict-sessionless.out" 2>&1 || code=$?
+expect 0 "$code" "a sessionless line or an unparseable payload alone does not fail"
+expect_grep '1× preToolUse as cursor' "$tmp/verdict-sessionless.out" "the sessionless line is shown"
+expect_no_grep 'fields: cwd' "$tmp/verdict-sessionless.out" "without its field list"
+for _ in 1 2 3; do
+    drop_line 3600 'the hook payload names no session; an empty id would merge unrelated sessions into one conversation' 'preToolUse as cursor (fields: cwd,tool_name)'
+done
+code=0
+CONBUS_CANARY_NOISE_MAX=3 run verdict >"$tmp/verdict-flood.out" 2>&1 || code=$?
+expect 4 "$code" "a flood of sessionless lines is not a pass"
+expect_grep '^UNCHECKED drops.*over the limit of 3' "$tmp/verdict-flood.out" "the limit it crossed is named"
+expect_grep 'canary:   drops — ' "$tmp/verdict-flood.out" "and listed as what is open"
+code=0
+CONBUS_CANARY_NOISE_MAX=lots run verdict >/dev/null 2>&1 || code=$?
+expect 2 "$code" "a limit that is not a number is refused"
+
+# A full disk that the daemon outlasted (#155). Every record waited and landed, so
+# that line is no loss. The same outage with records it could not keep is one.
+verdict_fixture
+drop_line 3600 'the log refused writes for a while' '3 record(s) waited and landed, 0 could not be kept, since 2026-11-01T00:00:00.000Z: No space left on device (os error 28)'
+code=0
+run verdict >"$tmp/verdict-held.out" 2>&1 || code=$?
+expect 0 "$code" "an outage in which every record landed is not a loss"
+expect_grep '^PASS drops — no line says a record was lost (1 line(s) since' "$tmp/verdict-held.out" "drops passes: it is not a drop"
+expect_no_grep 'not seen before\|no rule covers need' "$tmp/verdict-held.out" "and not a new reason"
+expect_grep '^PASS log-outages — 1 time(s) the log refused writes' "$tmp/verdict-held.out" "the outage has its own line"
+expect_grep '^  1× 3 record(s) waited and landed' "$tmp/verdict-held.out" "with what it said"
+drop_line 1800 'the log refused writes for a while' '1 record(s) waited and landed, 0 could not be kept, since 2026-11-01T01:00:00.000Z: No space left on device (os error 28)'
+code=0
+run verdict >"$tmp/verdict-held-two.out" 2>&1 || code=$?
+expect 0 "$code" "two outages are still no loss"
+expect_grep '^PASS log-outages — 2 time(s)' "$tmp/verdict-held-two.out" "they are counted"
+expect_grep '^PASS log-outages — 0 time(s)' "$tmp/verdict.out" "and a window with none says so"
+verdict_fixture
+drop_line 3600 'the log refused writes for a while and records may be lost' '3 record(s) waited and landed, 2 could not be kept, since 2026-11-01T00:00:00.000Z: No space left on device (os error 28)'
+code=0
+run verdict >"$tmp/verdict-held-lost.out" 2>&1 || code=$?
+expect 1 "$code" "an outage that could not keep its records fails"
+expect_grep '^FAIL drops — 2 lost record' "$tmp/verdict-held-lost.out" "as the records it says it lost"
+expect_grep '^PASS log-outages — 0 time(s)' "$tmp/verdict-held-lost.out" "and is no outage that lost nothing"
+# Inside the swap window it is no less lost, and known words do not excuse it.
+verdict_fixture "$(iso_ago 120)"
+drop_line $((3 * DAY)) 'the log refused writes for a while and records may be lost' 'seen before the swap'
+drop_line 100 'the log refused writes for a while and records may be lost' '3 record(s) waited and landed, 2 could not be kept, since 2026-11-01T00:00:00.000Z: No space left on device (os error 28)'
+code=0
+run verdict >"$tmp/verdict-held-lost-swap.out" 2>&1 || code=$?
+expect 1 "$code" "records may be lost has no exemption, not even in the swap window"
+
+# The recorder went down holding records it could not land (#158). The count in
+# its detail is how many, and whether its words are known changes nothing.
+verdict_fixture
+drop_line 3600 'the recorder stopped with records it could not land' '3 record(s) lost'
+code=0
+run verdict >"$tmp/verdict-stopped-lost.out" 2>&1 || code=$?
+expect 1 "$code" "a recorder that stopped with records it could not land fails"
+expect_grep '^FAIL drops — 3 lost record' "$tmp/verdict-stopped-lost.out" "and the line counts what it stands for"
+expect_grep 'the recorder stopped with records it could not land (3 record(s) lost)' "$tmp/verdict-stopped-lost.out" "with its detail"
+verdict_fixture
+drop_line $((8 * DAY)) 'the recorder stopped with records it could not land' '1 record(s) lost'
+drop_line 3600 'the recorder stopped with records it could not land' '2 record(s) lost'
+code=0
+run verdict >"$tmp/verdict-stopped-known.out" 2>&1 || code=$?
+expect 1 "$code" "seen before the swap, it still fails: not a question for a person"
+expect_grep '^FAIL drops — 2 lost record' "$tmp/verdict-stopped-known.out" "only the window's lines are counted"
+verdict_fixture "$(iso_ago 120)"
+drop_line 100 'the recorder stopped with records it could not land' '1 record(s) lost'
+code=0
+run verdict >"$tmp/verdict-stopped-swap.out" 2>&1 || code=$?
+expect 1 "$code" "it has no swap-window exemption"
+verdict_fixture
+drop_line 3600 'the recorder stopped with records it could not land' '0 record(s) lost'
+code=0
+run verdict >"$tmp/verdict-stopped-zero.out" 2>&1 || code=$?
+expect 1 "$code" "a count of zero does not clear the line"
+
+# A vendor renaming or retyping a field reaches the hook as a parse error with a line and a column. These are what a
+# real hook writes for it, and the prompts are gone. Only an empty payload is what a hook run by hand says.
+verdict_fixture; drop_line 3600 'missing field `session_id` at line 1 column 66'
+code=0; run verdict >"$tmp/verdict-renamed-field.out" 2>&1 || code=$?
+expect 1 "$code" "a payload missing a field is the vendor moving, not noise (P1)"
+expect_grep '^FAIL drops — 1 adapter gap' "$tmp/verdict-renamed-field.out" "and is counted as an adapter gap"
+expect_grep 'missing field `session_id`$' "$tmp/verdict-renamed-field.out" "named without its column, so a hundred lines are one row"
+verdict_fixture; drop_line 3600 'invalid type: map, expected a string at line 1 column 14'
+code=0; run verdict >"$tmp/verdict-retyped-field.out" 2>&1 || code=$?
+expect 1 "$code" "a retyped field is the vendor moving, not noise (P1b)"
+verdict_fixture; drop_line 3600 'invalid type: string \"x\", expected a map at line 1 column 14'
+code=0; run verdict >"$tmp/verdict-retyped-quoted.out" 2>&1 || code=$?
+expect 1 "$code" "one with a quoted value too"
+expect_grep 'invalid type: string' "$tmp/verdict-retyped-quoted.out" "named whole, not cut at its quote"
+verdict_fixture; drop_line 3600 'EOF while parsing a value at line 1 column 0'
+code=0; run verdict >"$tmp/verdict-eof.out" 2>&1 || code=$?
+expect 0 "$code" "an empty payload stays shown only"
+# An invalid byte used to read as the empty payload above, with the prompt gone.
+verdict_fixture; drop_line 3600 'the hook payload could not be read' 'stream did not contain valid UTF-8'
+code=0; run verdict >"$tmp/verdict-unread-payload.out" 2>&1 || code=$?
+expect 1 "$code" "a payload that could not be read is a lost record"
+expect_grep '^FAIL drops — 1 lost record' "$tmp/verdict-unread-payload.out" "and counted as one"
+# Seen before the swap is no excuse, and a parse error at the swap is a new reason to start.
+verdict_fixture
+drop_line $((8 * DAY)) 'missing field `session_id` at line 1 column 66'
+drop_line 3600 'missing field `session_id` at line 1 column 66'
+code=0; run verdict >"$tmp/verdict-renamed-known.out" 2>&1 || code=$?
+expect 1 "$code" "a gap seen before the swap still fails"
+
+# The same words, seen before and covered by no rule, need a person.
+verdict_fixture
+drop_line $((8 * DAY)) 'a reason no rule covers'
+drop_line 3600 'a reason no rule covers'
+code=0
+run verdict >"$tmp/verdict-known.out" 2>&1 || code=$?
+expect 4 "$code" "a known reason no rule covers is not a pass"
+expect_grep '^UNCHECKED drops.*no rule covers' "$tmp/verdict-known.out" "and says why"
+
+# A line that cannot be read is not a line without a problem, and one bad byte
+# must not cost the read of the line it sits on.
+verdict_fixture
+printf '{"ts":"%s","reason":"no daem' "$(iso_ago 3600)" >>"$home/.conbus/drops.jsonl"
+code=0
+run verdict >"$tmp/verdict-torn.out" 2>&1 || code=$?
+expect 4 "$code" "a torn drop line is not a pass"
+expect_grep '^UNCHECKED drops.*no readable time or reason' "$tmp/verdict-torn.out" "the torn line is counted"
+verdict_fixture
+printf '{"ts":"%s","reason":"no daemon on /x/\377/sock: Connection refused (os error 61)"}\n' "$(iso_ago 3600)" \
+    >>"$home/.conbus/drops.jsonl"
+code=0
+LC_ALL=en_US.UTF-8 run verdict >"$tmp/verdict-badbyte.out" 2>&1 || code=$?
+expect 1 "$code" "an invalid byte does not hide the lost record on its line"
+expect_grep '^FAIL drops — 1 lost record' "$tmp/verdict-badbyte.out" "the line is counted, under a UTF-8 locale too"
+expect_grep 'verdict: FAIL' "$tmp/verdict-badbyte.out" "and the verdict reaches its summary"
+
+# A torn line as the real writer leaves it: ts first, no newline, and the next line glued on. It must not swallow what
+# comes next, whichever class it was torn from and whichever side of the swap it fell on.
+verdict_fixture
+printf '{"ts":"%s","reason":"no conversation for this session; the daemon has no binding for it (no prompt from this session has reached it)","detail":"Stop for session gl' "$(iso_ago 7200)" >>"$home/.conbus/drops.jsonl"
+drop_line 3600 'no mapping for hook event \"BrandNew\" (as claude_code, fields: cwd)'
+code=0; run verdict >"$tmp/verdict-glued.out" 2>&1 || code=$?
+expect 1 "$code" "a new fault glued to a torn ghost line still fails (P2)"
+expect_grep '1× BrandNew as claude_code' "$tmp/verdict-glued.out" "and is named"
+verdict_fixture
+printf '{"ts":"%s","reason":"no daem' "$(iso_ago $((8 * DAY)))" >>"$home/.conbus/drops.jsonl"
+drop_line 3600 'BrandNewVendorEvent'
+code=0; run verdict >"$tmp/verdict-glued-before.out" 2>&1 || code=$?
+expect 1 "$code" "a new fault glued to a pre-swap torn line still fails (P2b)"
+expect_grep 'BrandNewVendorEvent' "$tmp/verdict-glued-before.out" "and is named"
+verdict_fixture
+printf '{"ts":"%s","reason":"the hook payload names no session; an empty id would merge unrelated sessions into one conversation","detail":"preTool' "$(iso_ago 7200)" >>"$home/.conbus/drops.jsonl"
+drop_line 3600 'no daemon on /x/sock: Connection refused (os error 61)'
+code=0; run verdict >"$tmp/verdict-glued-detail.out" 2>&1 || code=$?
+expect 1 "$code" "a tear inside a shown class's detail swallows nothing"
+expect_grep '^FAIL drops — 1 lost record' "$tmp/verdict-glued-detail.out" "the next line is counted"
+# A tear before the swap, with nothing glued to it, costs nothing. One in the window leaves the item open.
+verdict_fixture
+printf '{"ts":"%s","reason":"no daem\n' "$(iso_ago $((8 * DAY)))" >>"$home/.conbus/drops.jsonl"
+code=0; run verdict >"$tmp/verdict-torn-before.out" 2>&1 || code=$?
+expect 0 "$code" "a line torn before the swap says nothing about the window"
+verdict_fixture
+printf '{"ts":"%s","reason":"no conversation for this session; the daemon has no binding for it (no prompt from this session has reached it)","detail":"Stop for sess\n' "$(iso_ago 3600)" >>"$home/.conbus/drops.jsonl"
+code=0; run verdict >"$tmp/verdict-torn-detail.out" 2>&1 || code=$?
+expect 4 "$code" "one torn in the window leaves drops open, whatever it was"
+# Torn inside its time, it is placed by the line after it.
+verdict_fixture
+printf '{"ts":"2026-1' >>"$home/.conbus/drops.jsonl"
+drop_line $((8 * DAY)) 'EOF while parsing a value at line 1 column 0'
+code=0; run verdict >"$tmp/verdict-torn-ts-before.out" 2>&1 || code=$?
+expect 0 "$code" "a tear with no time, before a pre-swap line, is before the swap"
+verdict_fixture
+printf '{"ts":"2026-1' >>"$home/.conbus/drops.jsonl"
+drop_line 3600 'EOF while parsing a value at line 1 column 0'
+code=0; run verdict >"$tmp/verdict-torn-ts-after.out" 2>&1 || code=$?
+expect 4 "$code" "before a line in the window, it is in the window"
+# Two whole records on one line are two records.
+verdict_fixture
+printf '{"ts":"%s","reason":"EOF while parsing a value at line 1 column 0"}{"ts":"%s","reason":"no daemon on /x/sock: Connection refused (os error 61)"}\n' \
+    "$(iso_ago 7200)" "$(iso_ago 3600)" >>"$home/.conbus/drops.jsonl"
+code=0; run verdict >"$tmp/verdict-glued-whole.out" 2>&1 || code=$?
+expect 1 "$code" "two whole records on one line are both read"
+expect_grep '(2 line(s) since' "$tmp/verdict-glued-whole.out" "and both counted"
+# An escaped quote in a real reason is not the start of a record.
+verdict_fixture
+drop_line 3600 'unreadable reply \"{\"ts\":\"x\"}\": EOF while parsing a value at line 1 column 0'
+code=0; run verdict >"$tmp/verdict-escaped.out" 2>&1 || code=$?
+expect 1 "$code" "JSON quoted inside a reason is not a second record"
+expect_grep '^FAIL drops — 1 lost record' "$tmp/verdict-escaped.out" "it stays one lost record"
+
+# A capped log still shows what it recorded before it filled. A new reason on
+# day 2 plus a cap on day 5 used to read as a pass, and main said FAIL.
+fill_to_cap() { # fill_to_cap <ts> — plain perl: `yes | head` dies on SIGPIPE under pipefail
+    perl -e '
+        my ($file, $ts) = @ARGV;
+        my $line = "{\"ts\":\"$ts\",\"reason\":\"the hook payload names no session; an empty id would merge unrelated sessions into one conversation\"}\n";
+        my $n = int((4 * 1024 * 1024 - (-s $file)) / length($line)) + 1;
+        open(my $fh, ">>", $file) or die; print $fh $line x $n; close $fh;' "$home/.conbus/drops.jsonl" "$1"
+}
+verdict_fixture
+drop_line 3600 'a brand new fault after the swap'
+fill_to_cap "$(iso_ago 1800)"
+code=0
+run verdict >"$tmp/verdict-capped-new.out" 2>&1 || code=$?
+expect 1 "$code" "a capped log does not hide a new reason written before the cap"
+expect_grep 'a brand new fault after the swap' "$tmp/verdict-capped-new.out" "the reason is named"
+verdict_fixture "" "[{\"ts\":\"$(iso_ago $((5 * DAY)))\",\"serving_ms\":4000,\"new_drops\":7}]"
+printf '%s conbus daemon: beef: socket /x/sock log /x/log (10 record(s), 0 unreadable)\n' \
+    "$(iso_ago $((5 * DAY - 4)))" >>"$home/.conbus/daemon.log"
+fill_to_cap "$(iso_ago 1800)"
+code=0
+run verdict >"$tmp/verdict-capped-restart.out" 2>&1 || code=$?
+expect 1 "$code" "a capped log does not hide drops on a planned restart"
+expect_grep '^FAIL drops.*7 drop(s) during planned restarts' "$tmp/verdict-capped-restart.out" "they are named"
+verdict_fixture
+fill_to_cap "$(iso_ago $((30 * DAY)))"
+code=0
+run verdict >"$tmp/verdict-capped-blind.out" 2>&1 || code=$?
+expect 4 "$code" "a capped log with nothing to show is still not a pass"
+expect_grep '^UNCHECKED drops.*does not rotate: nothing after' "$tmp/verdict-capped-blind.out" \
+    "it says when the log went blind"
+
+# The same file under a build that rotates is not blind: the next drop renames it.
+write_fake beef rotating "$tmp/stage/conbus-rotating"
+verdict_fixture
+install_persona rotating
+fill_to_cap "$(iso_ago $((30 * DAY)))"
+code=0
+run verdict >"$tmp/verdict-capped-rotating.out" 2>&1 || code=$?
+expect 0 "$code" "a full log on a build that rotates is not blind"
+expect_grep '^PASS drops' "$tmp/verdict-capped-rotating.out" "and drops can pass on it"
+write_fake beef live "$install_dir/conbus"
+code=0
+run preflight --from "$tmp/stage/conbus-rotating" >"$tmp/preflight-rotating.out" 2>&1 || code=$?
+expect_grep '^PASS drops-cap' "$tmp/preflight-rotating.out" "preflight lets a rotating candidate swap over it"
+
+# Just rotated, no live file yet: the new reason is only in drops.1.
+verdict_fixture
+mv "$home/.conbus/drops.jsonl" "$home/.conbus/drops.1.jsonl"
+printf '{"ts":"%s","reason":"a fault in the old generation"}\n' "$(iso_ago 3600)" >>"$home/.conbus/drops.1.jsonl"
+code=0
+run verdict >"$tmp/verdict-rotated-only.out" 2>&1 || code=$?
+expect 1 "$code" "a new reason only in drops.1 fails with no live file"
+expect_grep 'a fault in the old generation' "$tmp/verdict-rotated-only.out" "the reason is named"
+
+# One rotation keeps the baseline, and a clean window still passes across it.
+verdict_fixture
+mv "$home/.conbus/drops.jsonl" "$home/.conbus/drops.1.jsonl"
+drop_line 3600 'spooled hook still has no conversation (orphan)' 'session_ended for session 01a06305'
+code=0
+run verdict >"$tmp/verdict-one-rotation.out" 2>&1 || code=$?
+expect 0 "$code" "one rotation loses nothing"
+
+# The drop log taken away. A lost-record line sits in the window, then the file goes: removed, reseeded, emptied or
+# replaced. Reading what is left finds nothing wrong, so `start` records which file it was and what it held.
+verdict_fixture; drop_line 3600 'no daemon on /x/sock: Connection refused (os error 61)'
+rm -f "$home/.conbus/drops.jsonl"
+code=0; run verdict >"$tmp/verdict-dropsgone.out" 2>&1 || code=$?
+expect 4 "$code" "a drop log removed after the swap leaves drops open (P4)"
+expect_grep '^UNCHECKED drops.*is gone' "$tmp/verdict-dropsgone.out" "and says so"
+verdict_fixture; drop_line 3600 'no daemon on /x/sock: Connection refused (os error 61)'
+printf '{"ts":"2026-09-01T00:00:00.000Z","reason":"no daemon on /x/sock: Connection refused (os error 61)"}\n' >"$home/.conbus/drops.jsonl"
+code=0; run verdict >"$tmp/verdict-dropsreseeded.out" 2>&1 || code=$?
+expect 4 "$code" "a drop log reseeded after the swap leaves drops open (P4b)"
+expect_grep '^UNCHECKED drops.*rewritten' "$tmp/verdict-dropsreseeded.out" "and says so"
+verdict_fixture; drop_line 3600 'no daemon on /x/sock: Connection refused (os error 61)'
+: >"$home/.conbus/drops.jsonl"
+code=0; run verdict >"$tmp/verdict-dropsemptied.out" 2>&1 || code=$?
+expect 4 "$code" "a drop log emptied after the swap leaves drops open"
+expect_grep '^UNCHECKED drops.*smaller' "$tmp/verdict-dropsemptied.out" "and says so"
+verdict_fixture
+cat "$home/.conbus/drops.jsonl" >"$home/.conbus/drops.copy"
+mv "$home/.conbus/drops.jsonl" "$home/.conbus/drops.aside"
+mv "$home/.conbus/drops.copy" "$home/.conbus/drops.jsonl"
+code=0; run verdict >"$tmp/verdict-dropsother.out" 2>&1 || code=$?
+expect 4 "$code" "another file in its place, same bytes, leaves drops open"
+rm -f "$home/.conbus/drops.aside"
+# A file the recorder cannot write will hold no drop at all from now on.
+if [ "$(id -u)" != 0 ]; then
+    verdict_fixture
+    chmod 444 "$home/.conbus/drops.jsonl"
+    code=0; run verdict >"$tmp/verdict-dropsro.out" 2>&1 || code=$?
+    chmod 600 "$home/.conbus/drops.jsonl"
+    expect 1 "$code" "a drop log the recorder cannot write fails"
+    expect_grep '^FAIL drops.*cannot write' "$tmp/verdict-dropsro.out" "and says so"
+fi
+verdict_fixture
+rm -f "$home/.conbus/drops.jsonl"
+mkdir "$home/.conbus/drops.jsonl"
+code=0; run verdict >"$tmp/verdict-dropsdir.out" 2>&1 || code=$?
+rmdir "$home/.conbus/drops.jsonl"
+expect 1 "$code" "a directory in its place fails"
+# A window start did not record: nothing says this is the file.
+verdict_fixture
+sed -E 's/,"drops_file":"[^"]*"//' "$home/.conbus/canary.json" >"$home/.conbus/canary.json.new"
+mv -f "$home/.conbus/canary.json.new" "$home/.conbus/canary.json"
+code=0; run verdict >"$tmp/verdict-dropsnorecord.out" 2>&1 || code=$?
+expect 4 "$code" "a window that recorded no drop log cannot pass drops"
+expect_grep '^UNCHECKED drops.*no record of the drop log' "$tmp/verdict-dropsnorecord.out" "and says why"
+# The real rotation renames the file, inode kept, and a line grew it first. That is no fault.
+verdict_fixture
+drop_line 3600 'EOF while parsing a value at line 1 column 0'
+mv "$home/.conbus/drops.jsonl" "$home/.conbus/drops.1.jsonl"
+drop_line 1800 'EOF while parsing a value at line 1 column 0'
+code=0; run verdict >"$tmp/verdict-dropsrotated.out" 2>&1 || code=$?
+expect 0 "$code" "a real rotation is not flagged"
+verdict_fixture
+mv "$home/.conbus/drops.jsonl" "$home/.conbus/drops.1.jsonl"
+code=0; run verdict >"$tmp/verdict-dropsrotated-nolive.out" 2>&1 || code=$?
+expect 0 "$code" "nor one with no new line yet"
+# start records it, and creates the file when there is none, so a removal later can be seen.
+write_fake 01d old "$install_dir/conbus"
+rm -f "$rollback_bin" "$home/.conbus/canary.json" "$home/.conbus/drops.jsonl" "$home/.conbus/drops.1.jsonl"
+daemon_boot beef 4270
+code=0; run start --from "$tmp/stage/conbus-good" >"$tmp/start-dropsfile.out" 2>&1 || code=$?
+expect 0 "$code" "start with no drop log"
+expect_grep '"drops_file":"[0-9]*:[0-9]*:0:' "$home/.conbus/canary.json" "records one it made, empty"
+expect_file "$home/.conbus/drops.jsonl" "and it exists"
+# restart keeps it.
+code=0; run restart >/dev/null 2>&1 || code=$?
+expect_grep '"drops_file":"' "$home/.conbus/canary.json" "and restart keeps it"
+expect_grep '"restarts":\[{' "$home/.conbus/canary.json" "beside the restart it adds"
+code=0; run restart >/dev/null 2>&1 || code=$?
+expect 2 "$(grep -o '"serving_ms"' "$home/.conbus/canary.json" | wc -l | tr -d ' ')" "and a second one is appended"
+
+# Two rotations threw the baseline and part of the window away. Known kinds are
+# still known, which ends the false FAIL, and the hole in the evidence is named.
+verdict_fixture
+printf '{"ts":"%s","reason":"the hook payload names no session; an empty id would merge unrelated sessions into one conversation"}\n' \
+    "$(iso_ago $((3 * DAY)))" >"$home/.conbus/drops.1.jsonl"
+rm -f "$home/.conbus/drops.jsonl"
+drop_line 3600 'the hook payload names no session; an empty id would merge unrelated sessions into one conversation'
+code=0
+run verdict >"$tmp/verdict-two-rotations.out" 2>&1 || code=$?
+expect 4 "$code" "two rotations leave a hole, not a pass and not a fail"
+expect_grep '^UNCHECKED drops.*anything dropped before it was rotated away' "$tmp/verdict-two-rotations.out" "the hole is named"
+expect_no_grep '^FAIL drops' "$tmp/verdict-two-rotations.out" "a known kind does not read as new"
+expect_grep '^PASS log-outages — at least 0 time(s)' "$tmp/verdict-two-rotations.out" "and a count over a hole says it is a floor"
+printf '{"ts":"%s","reason":"a reason no rule covers"}\n' "$(iso_ago $((3 * DAY)))" >"$home/.conbus/drops.1.jsonl"
+code=0
+run verdict >"$tmp/verdict-two-rotations-other.out" 2>&1 || code=$?
+expect 4 "$code" "with the baseline gone, an unknown reason is a question"
+expect_grep 'the baseline that would say whether it is new was rotated away' "$tmp/verdict-two-rotations-other.out" "and the missing baseline is said"
+
+# tool bodies elided (#158): the record landed, so it is no drop and no new
+# reason. Its count is judged alone, against the tool calls in the window.
+elided_line() { # elided_line <N>
+    drop_line 3600 'tool bodies elided, not sealed' "$1 tool event(s)"
+}
+verdict_fixture
+elided_line 3
+elided_line 2
+code=0
+run verdict >"$tmp/verdict-elided-low.out" 2>&1 || code=$?
+expect 0 "$code" "elided bodies below 1% of tool calls pass"
+expect_grep '^PASS tool-bodies — 5 tool event(s)' "$tmp/verdict-elided-low.out" "their sum is on its own line"
+expect_grep '^PASS drops — no line says a record was lost' "$tmp/verdict-elided-low.out" "and the line is not a drop"
+expect_no_grep 'new drop\|not seen before' "$tmp/verdict-elided-low.out" "and not a new reason"
+verdict_fixture
+elided_line 100000
+code=0
+run verdict >"$tmp/verdict-elided-high.out" 2>&1 || code=$?
+expect 1 "$code" "elided bodies above 1% of tool calls fail"
+expect_grep '^FAIL tool-bodies — 100000 tool event(s)' "$tmp/verdict-elided-high.out" "the item that failed says so"
+expect_grep '^PASS drops' "$tmp/verdict-elided-high.out" "and it is tool-bodies that fails, not drops"
+# Both generations count, and a count that cannot be read cannot pass.
+verdict_fixture
+cat "$home/.conbus/drops.jsonl" >"$home/.conbus/drops.1.jsonl"
+printf '{"ts":"%s","reason":"tool bodies elided, not sealed","detail":"4 tool event(s)"}\n' "$(iso_ago 3600)" >>"$home/.conbus/drops.1.jsonl"
+elided_line 2
+code=0
+run verdict >"$tmp/verdict-elided-both.out" 2>&1 || code=$?
+expect_grep '^PASS tool-bodies — 6 tool event' "$tmp/verdict-elided-both.out" "the sum spans both generations"
+verdict_fixture
+elided_line 3
+touch "$home/.usage-fail"
+code=0
+run verdict >"$tmp/verdict-elided-nousage.out" 2>&1 || code=$?
+rm -f "$home/.usage-fail"
+expect 4 "$code" "no tool-call count is not a pass"
+expect_grep '^UNCHECKED tool-bodies — 3 tool event' "$tmp/verdict-elided-nousage.out" "tool-bodies says why"
+# A row that names no tool_calls is a count not read, not a count of zero.
+verdict_fixture
+sed -E 's/"tool_calls":[0-9]+,//' "$home/.usage-rows" >"$home/.usage-rows.new"
+mv -f "$home/.usage-rows.new" "$home/.usage-rows"
+code=0
+run verdict >"$tmp/verdict-elided-nocount.out" 2>&1 || code=$?
+expect 4 "$code" "usage rows with no tool_calls are not a pass"
+expect_grep '^UNCHECKED tool-bodies.*name no tool_calls' "$tmp/verdict-elided-nocount.out" "and tool-bodies says why"
+verdict_fixture
+drop_line 3600 'tool bodies elided, not sealed' 'many'
+code=0
+run verdict >"$tmp/verdict-elided-garbled.out" 2>&1 || code=$?
+expect 4 "$code" "a detail that does not carry a count is not a pass"
+expect_grep '^UNCHECKED tool-bodies' "$tmp/verdict-elided-garbled.out" "and says the count is not known"
+
+# 1% of very few is nothing: 12 of 112 failed a week over a dozen elided bodies. It takes a minimum, and a Keychain that
+# will not answer still shows, as most of what was there.
+elided_of() { # elided_of <tool calls in the window> <elided>
+    verdict_fixture
+    sed -E 's/"tool_calls":[0-9]+/"tool_calls":0/' "$home/.usage-rows" >"$home/.usage-rows.new"
+    printf '{"day":"%s","harness":"codex","turns":3,"tool_calls":%s,"tool_denials":0,"repeated":0,"recovered":0,"tokens_input":1}\n' \
+        "$(iso_ago $((2 * DAY)) | cut -c1-10)" "$1" >>"$home/.usage-rows.new"
+    mv -f "$home/.usage-rows.new" "$home/.usage-rows"
+    elided_line "$2"
+}
+elided_of 112 12
+code=0; run verdict >"$tmp/verdict-elided-few.out" 2>&1 || code=$?
+expect 0 "$code" "12 of 112 is not worth failing a week"
+expect_grep '^PASS tool-bodies — 12 tool event(s)' "$tmp/verdict-elided-few.out" "it is shown"
+elided_of 5000 99
+code=0; run verdict >"$tmp/verdict-elided-99.out" 2>&1 || code=$?
+expect_grep '^PASS tool-bodies — 99 tool event' "$tmp/verdict-elided-99.out" "over 1% and under the minimum of 100 passes"
+elided_of 5000 100
+code=0; run verdict >"$tmp/verdict-elided-100.out" 2>&1 || code=$?
+expect_grep '^FAIL tool-bodies — 100 tool event' "$tmp/verdict-elided-100.out" "over 1% at the minimum fails"
+elided_of 10000 100
+code=0; run verdict >"$tmp/verdict-elided-1pct.out" 2>&1 || code=$?
+expect_grep '^PASS tool-bodies — 100 tool event' "$tmp/verdict-elided-1pct.out" "exactly 1% is within the limit"
+elided_of 10000 101
+code=0; run verdict >"$tmp/verdict-elided-over.out" 2>&1 || code=$?
+expect_grep '^FAIL tool-bodies — 101 tool event' "$tmp/verdict-elided-over.out" "more than 1% is not"
+elided_of 39 20
+code=0; run verdict >"$tmp/verdict-elided-half.out" 2>&1 || code=$?
+expect_grep '^FAIL tool-bodies — 20 tool event' "$tmp/verdict-elided-half.out" "over half of a quiet week fails: a Keychain that will not answer"
+elided_of 20 19
+code=0; run verdict >"$tmp/verdict-elided-19.out" 2>&1 || code=$?
+expect_grep '^PASS tool-bodies — 19 tool event' "$tmp/verdict-elided-19.out" "and under 20 of them says nothing yet"
+# The count that matters is the window's. A busy month before the swap must not dilute a week in which most were elided.
+verdict_fixture
+awk -v s="$(iso_after "$fx_swapped" 0 | cut -c1-10)" 'match($0, /"day":"[^"]*"/) && substr($0, RSTART + 7, 10) >= s' \
+    "$home/.usage-rows" | sed -E 's/"tool_calls":[0-9]+/"tool_calls":0/' >"$home/.usage-window"
+printf '{"day":"%s","harness":"codex","turns":3,"tool_calls":100,"tool_denials":0,"repeated":0,"recovered":0}\n' \
+    "$(iso_ago $((2 * DAY)) | cut -c1-10)" >>"$home/.usage-window"
+elided_line 60
+code=0; run verdict >"$tmp/verdict-elided-window.out" 2>&1 || code=$?
+expect_grep '^FAIL tool-bodies — 60 tool event.*of 100 tool call' "$tmp/verdict-elided-window.out" "the limit is on the tool calls since the swap"
+rm -f "$home/.usage-window"
+
+# --- activity -----------------------------------------------------------------
+
+day_ago() { iso_ago $(($1 * DAY)) | cut -c1-10; }
+usage_row() { # usage_row <day> <harness> [turns] [tool_calls] [recovered]
+    printf '{"day":"%s","harness":"%s","turns":%s,"tool_calls":%s,"tool_denials":0,"repeated":0,"recovered":%s}\n' \
+        "$1" "$2" "${3:-3}" "${4:-40}" "${5:-0}"
+}
+keep_rows_except() { # keep_rows_except <grep -E pattern on the raw row>
+    grep -Ev "$1" "$home/.usage-rows" >"$home/.usage-rows.new" || true
+    mv -f "$home/.usage-rows.new" "$home/.usage-rows"
+}
+
+# A day with no record at all is visible, whichever day it is. The recorder
+# stopping on day 2 used to score "all 2 active days".
+verdict_fixture
+empty_day=$(day_ago 3)
+keep_rows_except "\"day\":\"$empty_day\""
+code=0
+run verdict >"$tmp/verdict-emptyday.out" 2>&1 || code=$?
+expect 4 "$code" "a closed day with no record at all is not a pass"
+expect_grep "^UNCHECKED harness-activity.*no record at all on $empty_day" "$tmp/verdict-emptyday.out" "the day is named"
+# The operator can answer that one, and the pass says it rests on the answer.
+code=0
+run verdict --idle "$empty_day" >"$tmp/verdict-emptyday-idle.out" 2>&1 || code=$?
+expect 0 "$code" "the operator can answer that the day was idle"
+expect_grep "^PASS harness-activity.*on the operator's word, idle: $empty_day" "$tmp/verdict-emptyday-idle.out" "the item names the answer"
+expect_grep "verdict: PASS — on the operator's word that these were idle: $empty_day" "$tmp/verdict-emptyday-idle.out" "and so does the outcome"
+code=0
+run verdict --idle 'cursor;rm' >/dev/null 2>&1 || code=$?
+expect 2 "$code" "--idle takes only a harness or a day"
+# Today is not over, so no row for it yet is no question.
+verdict_fixture
+keep_rows_except "\"day\":\"$(day_ago 0)\""
+code=0
+run verdict >"$tmp/verdict-notoday.out" 2>&1 || code=$?
+expect 0 "$code" "today having no row yet is not an empty day"
+
+# Rows on the first two days only: what a recorder that stopped looks like.
+verdict_fixture
+for gone in 1 2 3 4 5 6 0; do keep_rows_except "\"day\":\"$(day_ago "$gone")\""; done
+code=0
+run verdict >"$tmp/verdict-stopped.out" 2>&1 || code=$?
+expect 4 "$code" "a recorder that stopped on day 2 is not a pass"
+expect_grep "no record at all on $(day_ago 1)" "$tmp/verdict-stopped.out" "the silent days are named"
+
+# Nothing at all since the swap: no answer from a person turns that into evidence.
+verdict_fixture
+awk -v s="$(iso_after "$fx_swapped" 0 | cut -c1-10)" 'match($0, /"day":"[^"]*"/) && substr($0, RSTART + 7, 10) < s' \
+    "$home/.usage-rows" >"$home/.usage-rows.new"
+mv -f "$home/.usage-rows.new" "$home/.usage-rows"
+code=0
+run verdict --idle claude_code,codex >"$tmp/verdict-nothing.out" 2>&1 || code=$?
+expect 4 "$code" "no record since the swap cannot be answered away"
+expect_grep '^UNCHECKED harness-activity — no record since' "$tmp/verdict-nothing.out" "and it says so"
+
+# A harness used before the swap and silent since cannot sit on a PASS line.
+verdict_fixture
+usage_row "$(day_ago 10)" cursor >>"$home/.usage-rows"
+code=0
+run verdict >"$tmp/verdict-silent.out" 2>&1 || code=$?
+expect 4 "$code" "a harness silent since the swap is not a pass"
+expect_grep '^UNCHECKED harness-activity.*cursor recorded in the two weeks before the swap' "$tmp/verdict-silent.out" "it is named as a question"
+code=0
+run verdict --idle cursor >"$tmp/verdict-silent-idle.out" 2>&1 || code=$?
+expect 0 "$code" "the operator can answer that it was not used"
+expect_grep "idle: cursor" "$tmp/verdict-silent-idle.out" "and the answer is printed"
+# Last used a month ago is not news.
+verdict_fixture
+usage_row "$(day_ago 40)" cursor >>"$home/.usage-rows"
+code=0
+run verdict >"$tmp/verdict-silent-old.out" 2>&1 || code=$?
+expect 0 "$code" "a harness last used long before the swap is not asked about"
+
+# The swap day's rows hold whatever ran before the swap. Only the read cut at
+# the swap itself says whether a harness has run since.
+verdict_fixture
+grep -v '"harness":"grok"' "$home/.usage-rows" >"$home/.usage-window"
+usage_row "$(iso_after "$fx_swapped" 0 | cut -c1-10)" grok >>"$home/.usage-rows"
+code=0
+run verdict >"$tmp/verdict-swapday.out" 2>&1 || code=$?
+expect 4 "$code" "a harness whose only rows predate the swap on the swap day is silent"
+expect_grep 'grok recorded in the two weeks before the swap' "$tmp/verdict-swapday.out" "and named"
+
+# A harness that recorded every day for two weeks and then misses a day is a
+# question. One that comes and goes is not: on the real log that is most weeks.
+verdict_fixture
+keep_rows_except "\"day\":\"$(day_ago 3)\",\"harness\":\"codex\""
+code=0
+run verdict >"$tmp/verdict-streak.out" 2>&1 || code=$?
+expect 4 "$code" "an every-day harness missing a closed day is not a pass"
+expect_grep "codex recorded on all 14 days before the swap and not on $(day_ago 3)" "$tmp/verdict-streak.out" "it is named"
+code=0
+run verdict --idle codex >/dev/null 2>&1 || code=$?
+expect 0 "$code" "and the operator can answer it"
+verdict_fixture
+for gone in 11 12 13; do keep_rows_except "\"day\":\"$(day_ago "$gone")\",\"harness\":\"codex\""; done
+keep_rows_except "\"day\":\"$(day_ago 3)\",\"harness\":\"codex\""
+code=0
+run verdict >"$tmp/verdict-comesgoes.out" 2>&1 || code=$?
+expect 0 "$code" "a harness that comes and goes may miss a day"
+expect_grep '^  codex: the recorder saw it on' "$tmp/verdict-comesgoes.out" "its days are still shown"
+
+# Records gap fill recovered are not records the recorder saw. A week of nothing
+# but recovered rows used to read "all 8 active days".
+verdict_fixture
+awk -v s="$(iso_after "$fx_swapped" 0 | cut -c1-10)" 'match($0, /"day":"[^"]*"/) && substr($0, RSTART + 7, 10) >= s' \
+    "$home/.usage-rows" |
+    sed -E 's/"harness":"claude_code","turns":3,"tool_calls":40,"tool_denials":0,"repeated":0,"recovered":0/"harness":"claude_code","turns":3,"tool_calls":0,"tool_denials":0,"repeated":0,"recovered":9/' \
+        >"$home/.usage-window"
+code=0
+run verdict >"$tmp/verdict-recovered.out" 2>&1 || code=$?
+expect 1 "$code" "a harness only gap fill has is a fail"
+expect_grep '^FAIL harness-activity.*claude_code: used since the swap, but only gap fill has it' "$tmp/verdict-recovered.out" "it is named"
+code=0
+run verdict --idle claude_code >"$tmp/verdict-recovered-idle.out" 2>&1 || code=$?
+expect 1 "$code" "its transcripts prove it was used, so no answer clears it"
+expect_grep '^  claude_code: the recorder saw it on 0 of' "$tmp/verdict-recovered.out" "seen and recovered are shown apart"
+
+# A whole day only gap fill has: the recorder saw nothing while work went on.
+verdict_fixture
+outage=$(day_ago 3)
+sed -E "/\"day\":\"$outage\"/s/\"tool_calls\":40,\"tool_denials\":0,\"repeated\":0,\"recovered\":0/\"tool_calls\":0,\"tool_denials\":0,\"repeated\":0,\"recovered\":9/" \
+    "$home/.usage-rows" >"$home/.usage-rows.new"
+mv -f "$home/.usage-rows.new" "$home/.usage-rows"
+code=0
+run verdict >"$tmp/verdict-outageday.out" 2>&1 || code=$?
+expect 1 "$code" "a day only gap fill has is a fail"
+expect_grep "^FAIL harness-activity.*the recorder saw nothing on them: *$outage" "$tmp/verdict-outageday.out" "the day is named"
+
+# A harness whose hook dies mid-window writes no drop line, so the rows are all there is. It was used on most days
+# before the swap and has gone quiet for the end of the window: not used, or not recorded?
+verdict_fixture
+for gone in 11 12 13; do keep_rows_except "\"day\":\"$(day_ago "$gone")\",\"harness\":\"codex\""; done
+for d in 0 1 2 3 4 5; do keep_rows_except "\"day\":\"$(day_ago $d)\",\"harness\":\"codex\""; done
+code=0; run verdict >"$tmp/verdict-diedmid.out" 2>&1 || code=$?
+expect 4 "$code" "a harness silent for its last days is a question (P5)"
+expect_grep "codex recorded on .* of the 14 days before the swap and not on its last 5 closed day(s)" "$tmp/verdict-diedmid.out" "it says what it saw"
+expect_grep 'answer with --idle codex' "$tmp/verdict-diedmid.out" "and the answer to give"
+code=0; run verdict --idle codex >"$tmp/verdict-diedmid-idle.out" 2>&1 || code=$?
+expect 0 "$code" "the operator can answer it"
+expect_grep "idle: codex" "$tmp/verdict-diedmid-idle.out" "and the pass says it rests on that"
+# The same, with gap fill on those days: its transcripts prove it was used.
+verdict_fixture
+for gone in 11 12 13; do keep_rows_except "\"day\":\"$(day_ago "$gone")\",\"harness\":\"codex\""; done
+for d in 0 1 2 3 4 5; do sed -E "/\"day\":\"$(day_ago $d)\",\"harness\":\"codex\"/s/\"tool_calls\":40,\"tool_denials\":0,\"repeated\":0,\"recovered\":0/\"tool_calls\":0,\"tool_denials\":0,\"repeated\":0,\"recovered\":9/" "$home/.usage-rows" >"$home/.usage-rows.new"; mv -f "$home/.usage-rows.new" "$home/.usage-rows"; done
+code=0; run verdict >"$tmp/verdict-diedmid-gap.out" 2>&1 || code=$?
+expect 1 "$code" "a harness only gap fill has on its last days fails (P5b)"
+expect_grep '^FAIL harness-activity.*codex: gap fill has 5 of its last 5 closed day(s), and the recorder saw none of them' "$tmp/verdict-diedmid-gap.out" "it is named"
+code=0; run verdict --idle codex >/dev/null 2>&1 || code=$?
+expect 1 "$code" "and no answer clears it"
+# Not every harness: one used on under half the days before the swap may stop.
+verdict_fixture
+for gone in 9 11 12 13 14 15 16 17 18 19 20; do keep_rows_except "\"day\":\"$(day_ago "$gone")\",\"harness\":\"codex\""; done
+for d in 0 1 2 3 4 5; do keep_rows_except "\"day\":\"$(day_ago $d)\",\"harness\":\"codex\""; done
+code=0; run verdict >"$tmp/verdict-rare.out" 2>&1 || code=$?
+expect 0 "$code" "a harness used on under half the days before the swap may stop"
+# Quiet for two days is not three.
+verdict_fixture
+for gone in 11 12 13; do keep_rows_except "\"day\":\"$(day_ago "$gone")\",\"harness\":\"codex\""; done
+for d in 0 1 2; do keep_rows_except "\"day\":\"$(day_ago $d)\",\"harness\":\"codex\""; done
+code=0; run verdict >"$tmp/verdict-twodays.out" 2>&1 || code=$?
+expect 0 "$code" "two quiet days are not three"
+verdict_fixture
+for gone in 11 12 13; do keep_rows_except "\"day\":\"$(day_ago "$gone")\",\"harness\":\"codex\""; done
+for d in 0 1 2 3; do keep_rows_except "\"day\":\"$(day_ago $d)\",\"harness\":\"codex\""; done
+code=0; run verdict >"$tmp/verdict-threedays.out" 2>&1 || code=$?
+expect 4 "$code" "three are"
+# A row today means it came back. Today is not over, so no row today says nothing.
+verdict_fixture
+for gone in 11 12 13; do keep_rows_except "\"day\":\"$(day_ago "$gone")\",\"harness\":\"codex\""; done
+for d in 1 2 3 4 5; do keep_rows_except "\"day\":\"$(day_ago $d)\",\"harness\":\"codex\""; done
+code=0; run verdict >"$tmp/verdict-backtoday.out" 2>&1 || code=$?
+expect 0 "$code" "a harness with a row today came back"
+
+# A harness that only ever arrives by export or gap fill is not a dead hook.
+verdict_fixture
+usage_row "$(day_ago 2)" claude_chat 3 0 9 >>"$home/.usage-rows"
+code=0
+run verdict >"$tmp/verdict-chat.out" 2>&1 || code=$?
+expect 0 "$code" "a harness never seen live before the swap can be recovered-only"
+expect_grep '^  claude_chat: the recorder saw it on 0 of' "$tmp/verdict-chat.out" "and is shown as what it is"
+
+# The audit's combined case: 6,000 drops of known reasons, records on two days
+# of eight, and silent harnesses. All of it together used to end in `verdict: PASS`.
+combined_fixture() {
+    verdict_fixture
+    keep_next=$(iso_after "$fx_swapped" "$DAY" | cut -c1-10)
+    awk -v b="$keep_next" 'match($0, /"day":"[^"]*"/) && substr($0, RSTART + 7, 10) <= b' \
+        "$home/.usage-rows" >"$home/.usage-rows.new"
+    mv -f "$home/.usage-rows.new" "$home/.usage-rows"
+    for silent_harness in cursor grok; do
+        usage_row "$(iso_after "$fx_swapped" -$((3 * DAY)) | cut -c1-10)" "$silent_harness" >>"$home/.usage-rows"
+    done
+    drop_line $((9 * DAY)) "$1"
+    perl -e 'my ($r, $t) = @ARGV; print "{\"ts\":\"$t\",\"reason\":\"$r\"}\n" x 6000' "$1" "$(iso_ago 3600)" >>"$home/.conbus/drops.jsonl"
+}
+combined_fixture 'no daemon on /x/sock: Connection refused (os error 61)'
+code=0
+run verdict >"$tmp/verdict-combined.out" 2>&1 || code=$?
+expect 1 "$code" "the audit's combined case fails"
+expect_grep '^FAIL drops — 6000 lost' "$tmp/verdict-combined.out" "on its 6,000 lost records"
+expect_grep '^UNCHECKED harness-activity.*no record at all on' "$tmp/verdict-combined.out" "its empty days are named"
+expect_grep 'cursor recorded in the two weeks before the swap' "$tmp/verdict-combined.out" "its silent harnesses are named"
+expect_no_grep 'verdict: PASS' "$tmp/verdict-combined.out" "and nothing about it reads as a pass"
+combined_fixture 'the hook payload names no session; an empty id would merge unrelated sessions into one conversation'
+code=0
+run verdict >"$tmp/verdict-combined-noise.out" 2>&1 || code=$?
+expect 4 "$code" "the same case with only vendor noise is still not a pass"
+expect_grep '^UNCHECKED drops.*over the limit' "$tmp/verdict-combined-noise.out" "its flood is named"
+
+# C0 — verdict items that could pass over a blind input say UNCHECKED.
+# A daemon.log whose every start line predates the swap cannot prove
+# anything about restarts inside the window.
+verdict_fixture
+printf '%s conbus daemon: 01d: socket /x/sock log /x/log (10 record(s), 0 unreadable)\n' \
+    "$(iso_ago $((30 * DAY)))" >"$home/.conbus/daemon.log"
+code=0
+run verdict >"$tmp/verdict-nostarts.out" 2>&1 || code=$?
+expect 4 "$code" "an unchecked restarts line is not a pass"
+expect_grep '^UNCHECKED restarts' "$tmp/verdict-nostarts.out" \
+    "a log that does not reach the swap cannot pass restarts"
+if grep -q '^PASS restarts' "$tmp/verdict-nostarts.out"; then
+    echo "rehearsal: FAIL: a pre-swap-only daemon.log passed restarts" >&2
+    exit 1
+fi
+
+# A parity of emptiness: both binaries answering nothing "agree" on every
+# closed day — that proved nothing. Rows with no day inside the window
+# leave twins nothing to compare either.
+verdict_fixture
+: >"$home/.usage-rows"
+code=0
+run verdict >"$tmp/verdict-blind.out" 2>&1 || code=$?
+expect 4 "$code" "unchecked parity and twins are not a pass"
+expect_grep '^UNCHECKED usage-parity' "$tmp/verdict-blind.out" \
+    "two empties do not pass parity"
+expect_grep '^UNCHECKED twins-repeated' "$tmp/verdict-blind.out" \
+    "no in-window rows do not pass twins-repeated"
+
+# Rows that all predate the swap are not "every harness on all 0 days".
+verdict_fixture
+awk -v s="$(iso_ago $((8 * DAY)))" 'match($0, /"day":"[^"]*"/) && substr($0, RSTART + 7, 10) < substr(s, 1, 10)' \
+    "$home/.usage-rows" >"$home/.usage-rows.old"
+mv -f "$home/.usage-rows.old" "$home/.usage-rows"
+code=0
+run verdict >"$tmp/verdict-norows.out" 2>&1 || code=$?
+expect 4 "$code" "no record since the swap is not a pass"
+expect_grep '^UNCHECKED harness-activity' "$tmp/verdict-norows.out" \
+    "zero days in the window cannot pass harness-activity"
+
+# One side of the parity failing on one day compared nothing that day; the
+# text of two failures must not count as agreement.
+verdict_fixture
+iso_ago $((3 * DAY)) | cut -c1-10 >"$home/.usage-fail-day"
+code=0
+run verdict >"$tmp/verdict-parityfail.out" 2>&1 || code=$?
+expect 4 "$code" "a parity read that failed on one day is not a pass"
+expect_grep "^UNCHECKED usage-parity.*$(cat "$home/.usage-fail-day")" "$tmp/verdict-parityfail.out" \
+    "the day that could not be read is named"
+rm -f "$home/.usage-fail-day"
+
+# A log that cannot be read: usage fails and every item built on it says so.
+# Timing a read that fails fast proves no budget either. That was a PASS.
+verdict_fixture
+touch "$home/.usage-fail"
+code=0
+run verdict >"$tmp/verdict-usagefail.out" 2>&1 || code=$?
+expect 4 "$code" "a usage read that fails is not a pass"
+expect_grep '^UNCHECKED harness-activity.*a segment could not be read' "$tmp/verdict-usagefail.out" \
+    "the failing read is named, with what it said"
+expect_grep '^UNCHECKED twins-repeated' "$tmp/verdict-usagefail.out" "twins needs that read"
+expect_grep '^UNCHECKED usage-parity' "$tmp/verdict-usagefail.out" "parity needs that read"
+expect_grep '^UNCHECKED time-budget' "$tmp/verdict-usagefail.out" "a failing read cannot be timed"
+rm -f "$home/.usage-fail"
+
+# Each file the verdict reads, unreadable: the verdict still finishes with a
+# summary, never dies mid-way, and never passes. Skipped as root, who reads all.
+if [ "$(id -u)" != 0 ]; then
+    for unreadable_input in daemon.log daemon.build drops.jsonl canary.json; do
+        verdict_fixture
+        chmod 000 "$home/.conbus/$unreadable_input"
+        code=0
+        run verdict >"$tmp/verdict-chmod.out" 2>&1 || code=$?
+        chmod 600 "$home/.conbus/$unreadable_input"
+        case $code in
+            1 | 4) echo "rehearsal: ok: an unreadable $unreadable_input is not a pass (exit $code)" ;;
+            *)
+                echo "rehearsal: FAIL: an unreadable $unreadable_input gave exit $code" >&2
+                cat "$tmp/verdict-chmod.out" >&2
+                exit 1
+                ;;
+        esac
+        expect_grep 'verdict: ' "$tmp/verdict-chmod.out" \
+            "an unreadable $unreadable_input still reaches a summary"
+    done
+fi
+
+if [ "$(id -u)" != 0 ]; then
+    verdict_fixture
+    chmod 000 "$home/.conbus/canary.json"
+    code=0
+    run verdict >"$tmp/verdict-chmod-state.out" 2>&1 || code=$?
+    chmod 600 "$home/.conbus/canary.json"
+    expect 4 "$code" "an unreadable canary.json ends in exit 4"
+    expect_grep 'canary.json cannot be read' "$tmp/verdict-chmod-state.out" "and says so, not that no swap was recorded"
+fi
+
+if [ "$(id -u)" != 0 ]; then
+    verdict_fixture
+    chmod 000 "$home/.conbus/drops.jsonl"
+    code=0
+    run verdict >"$tmp/verdict-chmod-outages.out" 2>&1 || code=$?
+    chmod 600 "$home/.conbus/drops.jsonl"
+    expect_grep '^UNCHECKED log-outages.*could not be read' "$tmp/verdict-chmod-outages.out" "an unreadable drop log cannot report outages"
+fi
+
+# A dead recorder pid is this item's whole point, and `ps` failing inside a
+# pipeline under `set -e` used to end the script before the line printed.
+verdict_fixture
+sleep 0 &
+dead_pid=$!
+wait "$dead_pid"
+printf '{"build":"beef","pid":%s,"started":"%s","serving":"%s"}\n' "$dead_pid" \
+    "$(iso_ago $((7 * DAY)))" "$(iso_ago $((7 * DAY - 2)))" >"$home/.conbus/daemon.build"
+code=0
+run verdict >"$tmp/verdict-deadpid.out" 2>&1 || code=$?
+expect 1 "$code" "a dead recorder pid fails the verdict"
+expect_grep '^FAIL rss-budget' "$tmp/verdict-deadpid.out" "the dead recorder is named"
+expect_grep 'verdict: FAIL' "$tmp/verdict-deadpid.out" "and the summary still prints"
+
+# C1 — verdict paths the bash -x trace showed the rehearsal never reached
+# (evidence/c1-unrun-lines.md). A day-only --since bounds the window at
+# UTC midnight of that day; it is a look at the window, never its verdict.
+past=$(iso_ago $((7 * DAY + 3600)))
+verdict_fixture "$past"
+code=0
+run verdict --since "${past:0:10}" >"$tmp/verdict-since.out" 2>&1 || code=$?
+expect 4 "$code" "--since other than the swap is a look, not a verdict"
+expect_grep "since ${past:0:10}T00:00:00.000Z" "$tmp/verdict-since.out" \
+    "the day-only --since becomes a UTC midnight boundary"
+expect_grep '^UNCHECKED window' "$tmp/verdict-since.out" "the override is named"
+code=0
+run verdict --since "$past" >"$tmp/verdict-since-same.out" 2>&1 || code=$?
+expect 0 "$code" "--since naming the recorded swap is the verdict itself"
+
+# --since cannot complete a window: the clock runs from the recorded swap.
+verdict_fixture "$(iso_ago $((2 * DAY)))"
+code=0
+run verdict --since "$(iso_ago $((3 * DAY)))" >"$tmp/verdict-since-old.out" 2>&1 || code=$?
+expect 3 "$code" "an old --since does not complete a window that is still open"
+expect_grep 'window incomplete (2/7' "$tmp/verdict-since-old.out" "counted from the swap, not from --since"
+# And a boundary that is not a time is refused rather than compared: as text,
+# `yesterday` sorts after every timestamp, so nothing was ever "after" it.
+code=0
+run verdict --since yesterday >"$tmp/verdict-since-word.out" 2>&1 || code=$?
+expect 2 "$code" "--since yesterday is refused"
+code=0
+run verdict --since 2026-13-45 >/dev/null 2>&1 || code=$?
+expect 2 "$code" "--since that is shaped like a date and is not one is refused"
+# `date` would read this one with a warning, and it sorts wrongly against the logs.
+code=0
+run verdict --since 2026-10-01T00:00:00+09:00 >/dev/null 2>&1 || code=$?
+expect 2 "$code" "--since with an offset is refused: every stamp here is UTC text"
+
+# No recorded swap: nothing says a window began, whatever the stamp says.
+verdict_fixture
+rm -f "$home/.conbus/canary.json"
+code=0
+run verdict --since "$past" >"$tmp/verdict-nostate.out" 2>&1 || code=$?
+expect 4 "$code" "no canary.json cannot end in a pass"
+expect_grep '^UNCHECKED window.*no recorded swap' "$tmp/verdict-nostate.out" "the missing swap is named"
+# A swap time that is not a time ends the verdict, it does not skip the check.
+printf '{"swapped":"soon","prev_build":"01d","candidate_build":"beef","candidate_sha256":"x","restarts":[]}\n' \
+    >"$home/.conbus/canary.json"
+code=0
+run verdict >"$tmp/verdict-badswap.out" 2>&1 || code=$?
+expect 4 "$code" "a swap time that is not a time cannot end in a pass"
+expect_grep '^UNCHECKED window' "$tmp/verdict-badswap.out" "the bad swap time is named"
+
+# Parity has no baseline at all when both copies are gone — that is a FAIL, not an
+# agreement of empties.
+verdict_fixture
+rm -f "$rollback_bin" "$parity_copy"
+code=0
+run verdict >"$tmp/verdict-noroll.out" 2>&1 || code=$?
+expect 1 "$code" "a missing parity baseline fails the parity check"
+expect_grep '^FAIL usage-parity' "$tmp/verdict-noroll.out" \
+    "the missing baseline is named"
+
+# A daemon.log without the "(N record(s), N unreadable)" parenthetical
+# falls back to the doctor's own log line for the unreadable count.
+verdict_fixture
+printf '%s conbus daemon: beef: socket /x/sock log /x/log\n' \
+    "$(iso_after "$fx_swapped" 4)" >"$home/.conbus/daemon.log"
+code=0
+run verdict >"$tmp/verdict-unread.out" 2>&1 || code=$?
+expect 0 "$code" "the doctor-fallback unreadable count completes the window"
+expect_grep '^PASS unreadable' "$tmp/verdict-unread.out" \
+    "the unreadable count falls back to the doctor's log line"
+
+# A joined machine's sync POSTs are operator-visible, not a silent pass.
+verdict_fixture
+touch "$home/.conbus/sync.json"
+code=0
+run verdict >"$tmp/verdict-sync.out" 2>&1 || code=$?
+expect 4 "$code" "an unchecked sync line is not a pass"
+expect_grep '^UNCHECKED sync' "$tmp/verdict-sync.out" \
+    "a joined machine's POSTs need counting"
+rm -f "$home/.conbus/sync.json"
+
+# A policy file that cannot be a policy decides nothing: zero counted
+# denials over it is not a pass.
+verdict_fixture
+install_persona polfail
+echo 'this is not a policy' >"$home/.conbus/policy.json"
+code=0
+run verdict >"$tmp/verdict-polfail.out" 2>&1 || code=$?
+expect 1 "$code" "a policy file that cannot decide fails the verdict"
+expect_grep '^FAIL policy' "$tmp/verdict-polfail.out" \
+    "the unparseable policy is the named failure"
+rm -f "$home/.conbus/policy.json"
+
+# time-budget: one slow doctor is a spike, not a wedge. It gets two more reads
+# and the median judges, so the verdict passes and doctor ran 3x.
+verdict_fixture
+install_persona flap
+rm -f "$home/.flap"
+code=0
+DOCTOR_MS=2000 run verdict >"$tmp/verdict-median.out" 2>&1 || code=$?
+expect 0 "$code" "one slow doctor out of three does not fail the verdict"
+expect_grep '^PASS time-budget' "$tmp/verdict-median.out" \
+    "the median of three passes the time budget"
+expect 3 "$(cat "$home/.flap")" "doctor was measured three times"
+# A doctor that makes its budget is not read again: each read starts vendors.
+code=0
+DOCTOR_MS=2000 run verdict >"$tmp/verdict-oneread.out" 2>&1 || code=$?
+expect 0 "$code" "a fast doctor passes on its first read"
+expect 4 "$(cat "$home/.flap")" "and is read only once"
+
+# --- the build and the hooks ---------------------------------------------------
+
+# The canary was rolled back, and a verdict that reads only the swap time would
+# go on judging the build that replaced it.
+verdict_fixture
+sed -E 's/,"restarts":\[\]/,"restarts":[],"rolled_back":"2026-11-01T01:00:00.000Z"/' \
+    "$home/.conbus/canary.json" >"$home/.conbus/canary.json.new"
+mv -f "$home/.conbus/canary.json.new" "$home/.conbus/canary.json"
+code=0
+run verdict >"$tmp/verdict-rolledback.out" 2>&1 || code=$?
+expect 1 "$code" "a window that was rolled back cannot pass"
+expect_grep '^FAIL build.*rolled back at 2026-11-01' "$tmp/verdict-rolledback.out" "it says so"
+
+# Installed: another build, then the same version with other bytes.
+verdict_fixture
+write_fake aaaa live "$install_dir/conbus"
+code=0
+run verdict >"$tmp/verdict-otherbuild.out" 2>&1 || code=$?
+expect 1 "$code" "an installed binary that is not the candidate fails"
+expect_grep '^FAIL build.*installed binary is build aaaa' "$tmp/verdict-otherbuild.out" "the build is named"
+verdict_fixture
+printf '# touched\n' >>"$install_dir/conbus"
+code=0
+run verdict >"$tmp/verdict-otherbytes.out" 2>&1 || code=$?
+expect 1 "$code" "the candidate's version with other bytes fails"
+expect_grep "^FAIL build.*sha256 is not the candidate" "$tmp/verdict-otherbytes.out" "the hash is named"
+
+# Running: a stamp from another build, and doctor saying the same.
+verdict_fixture
+printf '{"build":"aaaa","pid":%s,"started":"%s","serving":"%s"}\n' "$recorder_pid" \
+    "$(iso_after "$fx_swapped" 1)" "$(iso_after "$fx_swapped" 4)" >"$home/.conbus/daemon.build"
+code=0
+run verdict >"$tmp/verdict-otherstamp.out" 2>&1 || code=$?
+expect 1 "$code" "a daemon stamped with another build fails"
+expect_grep "^FAIL build.*stamp names build aaaa" "$tmp/verdict-otherstamp.out" "the running build is named"
+verdict_fixture
+install_persona differs
+code=0
+run verdict >"$tmp/verdict-differs.out" 2>&1 || code=$?
+expect 1 "$code" "doctor's DIFFERS fails"
+expect_grep "^FAIL build.*DIFFERS" "$tmp/verdict-differs.out" "doctor's line is quoted"
+verdict_fixture
+printf '{"swapped":"%s","restarts":[]}\n' "$fx_swapped" >"$home/.conbus/canary.json"
+code=0
+run verdict >"$tmp/verdict-nocandidate.out" 2>&1 || code=$?
+expect 4 "$code" "a window that names no candidate cannot pass"
+expect_grep "^UNCHECKED build" "$tmp/verdict-nocandidate.out" "and build says so"
+
+verdict_fixture
+sed -E 's/"candidate_sha256":"[^"]*",//' "$home/.conbus/canary.json" >"$home/.conbus/canary.json.new"
+mv -f "$home/.conbus/canary.json.new" "$home/.conbus/canary.json"
+code=0
+run verdict >"$tmp/verdict-nosha.out" 2>&1 || code=$?
+expect 4 "$code" "a window with no recorded hash cannot pass"
+expect_grep "^UNCHECKED build.*no candidate sha256" "$tmp/verdict-nosha.out" "and build says so"
+
+# Hooks: broken, missing an event, or waiting on a person's trust in Codex.
+verdict_fixture
+install_persona hookfail
+code=0
+run verdict >"$tmp/verdict-hookfail.out" 2>&1 || code=$?
+expect 1 "$code" "a hook that stopped running fails"
+expect_grep "^FAIL hooks.*codex MISSING" "$tmp/verdict-hookfail.out" "the hook is named"
+verdict_fixture
+install_persona eventgap
+code=0
+run verdict >"$tmp/verdict-eventgap.out" 2>&1 || code=$?
+expect 1 "$code" "a registered hook missing an event fails"
+expect_grep "^FAIL hooks.*MISSING Stop" "$tmp/verdict-eventgap.out" "the event is named"
+verdict_fixture
+install_persona untrusted
+code=0
+run verdict >"$tmp/verdict-untrusted.out" 2>&1 || code=$?
+expect 1 "$code" "a hook Codex will not spawn fails"
+expect_grep "^FAIL hooks.*NOT TRUSTED" "$tmp/verdict-untrusted.out" "the trust state is quoted"
+verdict_fixture
+install_persona nohooks
+code=0
+run verdict >"$tmp/verdict-nohooks.out" 2>&1 || code=$?
+expect 4 "$code" "no hook registered at all is not a pass"
+expect_grep "^UNCHECKED hooks" "$tmp/verdict-nohooks.out" "and hooks says so"
+# Doctor never answers: every item that reads it stays open, and the time budget
+# is what fails. The verdict still reaches its summary.
+verdict_fixture
+install_persona stuck
+code=0
+CONBUS_CANARY_DOCTOR_LIMIT=1 run verdict >"$tmp/verdict-stuck.out" 2>&1 || code=$?
+expect 1 "$code" "a wedged doctor fails the time budget"
+expect_grep "^UNCHECKED hooks.*did not answer" "$tmp/verdict-stuck.out" "hooks cannot be judged without it"
+expect_grep "^UNCHECKED build.*could not be confirmed: doctor did not answer" "$tmp/verdict-stuck.out" "nor can the running build"
+expect_grep "verdict: FAIL" "$tmp/verdict-stuck.out" "and the summary still prints"
+
+# --- the recorder ---------------------------------------------------------------
+
+# Listening is not serving. A daemon wedged in its accept loop still lets you
+# connect, and doctor says `listening`.
+verdict_fixture
+touch "$home/.conbus/conbus.sock.silent"
+code=0
+CONBUS_CANARY_PROBE_S=1 run verdict >"$tmp/verdict-wedged.out" 2>&1 || code=$?
+rm -f "$home/.conbus/conbus.sock.silent"
+expect 1 "$code" "a recorder that holds connections and never answers fails"
+expect_grep '^FAIL recorder-serving.*did not answer' "$tmp/verdict-wedged.out" "it is named"
+expect_grep '^PASS rss-budget' "$tmp/verdict-wedged.out" "though its process looks healthy"
+
+# The socket gone, and a stand-in that answers nothing a client can use.
+verdict_fixture
+mv "$home/.conbus/conbus.sock" "$home/.conbus/conbus.sock.moved"
+code=0
+run verdict >"$tmp/verdict-nosock.out" 2>&1 || code=$?
+mv "$home/.conbus/conbus.sock.moved" "$home/.conbus/conbus.sock"
+expect 1 "$code" "no socket fails"
+expect_grep '^FAIL recorder-serving.*nothing answers' "$tmp/verdict-nosock.out" "and says so"
+
+# A spooled record old enough that a serving daemon should have drained it.
+spool_entry() { # spool_entry <name> <event kind> [touch -A offset]; a real entry but for its session
+    mkdir -p "$home/.conbus/spool"
+    printf '{"pv":6,"harness":"claude_code","vendor_session_id":"s","workspace":"/tmp/w","hid":"01a19a1e-0cce-75c2-aad8-43ea57dadd25","spooled":"2026-11-02T02:37:03.055Z","event":{"event":"%s"}}' "$2" \
+        >"$home/.conbus/spool/$1.json"
+    if [ -n "${3:-}" ]; then touch -A "$3" "$home/.conbus/spool/$1.json"; fi
+}
+verdict_fixture
+spool_entry old-entry turn_started
+touch -t 202001010000 "$home/.conbus/spool/old-entry.json"
+code=0
+run verdict >"$tmp/verdict-spool.out" 2>&1 || code=$?
+expect 1 "$code" "a record stuck in the spool fails"
+expect_grep '^FAIL recorder-serving.*1 spooled record' "$tmp/verdict-spool.out" "it is counted"
+verdict_fixture
+spool_entry in-transit turn_started
+code=0
+run verdict >"$tmp/verdict-spool-fresh.out" 2>&1 || code=$?
+expect 0 "$code" "a record just spooled is in transit, not stuck"
+
+# A spool that cannot be read holds what the log may be missing.
+if [ "$(id -u)" != 0 ]; then
+    verdict_fixture
+    mkdir -p "$home/.conbus/spool"
+    chmod 000 "$home/.conbus/spool"
+    code=0
+    run verdict >"$tmp/verdict-spool-chmod.out" 2>&1 || code=$?
+    chmod 700 "$home/.conbus/spool"
+    expect 1 "$code" "a spool that cannot be read fails"
+    expect_grep '^FAIL recorder-serving.*spool cannot be read' "$tmp/verdict-spool-chmod.out" "and says so"
+    expect_grep 'verdict: FAIL' "$tmp/verdict-spool-chmod.out" "and the summary still prints"
+fi
+
+# A pid that is alive and is not the recorder. A `sleep` passed as one.
+verdict_fixture
+printf '{"build":"beef","pid":%s,"started":"%s","serving":"%s"}\n' "$$" \
+    "$(iso_after "$fx_swapped" 1)" "$(iso_after "$fx_swapped" 4)" >"$home/.conbus/daemon.build"
+code=0
+run verdict >"$tmp/verdict-notrecorder.out" 2>&1 || code=$?
+expect 1 "$code" "a stamped pid that is not a conbus daemon fails"
+expect_grep '^FAIL rss-budget.*not a conbus daemon' "$tmp/verdict-notrecorder.out" "and says what it is"
+
+# Unreadable lines count across the window, not only at the last boot.
+verdict_fixture
+printf '%s conbus daemon: beef: socket /x/sock log /x/log (10 record(s), 3 unreadable)\n%s conbus daemon: beef: socket /x/sock log /x/log (12 record(s), 0 unreadable)\n' \
+    "$(iso_after "$fx_swapped" 4)" "$(iso_after "$fx_swapped" $((2 * DAY)))" >"$home/.conbus/daemon.log"
+sed -E 's/,"restarts":\[\]/,"restarts":[{"ts":"'"$(iso_after "$fx_swapped" $((2 * DAY - 4)))"'","serving_ms":4000,"new_drops":0}]/' \
+    "$home/.conbus/canary.json" >"$home/.conbus/canary.json.new"
+mv -f "$home/.conbus/canary.json.new" "$home/.conbus/canary.json"
+printf '{"build":"beef","pid":%s,"started":"%s","serving":"%s"}\n' "$recorder_pid" \
+    "$(iso_after "$fx_swapped" $((2 * DAY - 2)))" "$(iso_after "$fx_swapped" $((2 * DAY)))" >"$home/.conbus/daemon.build"
+code=0
+run verdict >"$tmp/verdict-unread-boot.out" 2>&1 || code=$?
+expect 1 "$code" "an earlier boot's unreadable lines still count"
+expect_grep '^FAIL unreadable.*worst boot since the swap 3' "$tmp/verdict-unread-boot.out" "the worst boot is named"
+# A line torn after the last boot: only doctor can see it.
+verdict_fixture
+install_persona tornlive
+code=0
+run verdict >"$tmp/verdict-unread-now.out" 2>&1 || code=$?
+expect 1 "$code" "a line torn after the last boot counts"
+expect_grep '^FAIL unreadable.*doctor now 1' "$tmp/verdict-unread-now.out" "doctor's count is named"
+# Doctor could not read the log at all: a boot's old zero proves nothing now.
+verdict_fixture
+install_persona nocount
+code=0
+run verdict >"$tmp/verdict-unread-nocount.out" 2>&1 || code=$?
+expect 4 "$code" "doctor unable to count is not a pass"
+expect_grep '^UNCHECKED unreadable' "$tmp/verdict-unread-nocount.out" "and unreadable stays open"
+# A boot that could not read the log prints `0 record(s), 0 unreadable`.
+verdict_fixture
+printf '%s conbus daemon: could not read /x/log (Permission denied); starting with no bindings, so a session that outlived the last daemon will get a second bus_id\n' \
+    "$(iso_after "$fx_swapped" 3)" >>"$home/.conbus/daemon.log"
+code=0
+run verdict >"$tmp/verdict-restore.out" 2>&1 || code=$?
+expect 1 "$code" "a boot that could not read the log fails"
+expect_grep '^FAIL unreadable.*started with no bindings' "$tmp/verdict-restore.out" "it is named"
+verdict_fixture "" "[{\"ts\":\"$(iso_ago $((5 * DAY)))\",\"serving_ms\":4000,\"new_drops\":0}]"
+printf '%s conbus daemon: beef: socket /x/sock log /x/log (0 record(s), 0 unreadable)\n' \
+    "$(iso_ago $((5 * DAY - 4)))" >>"$home/.conbus/daemon.log"
+code=0
+run verdict >"$tmp/verdict-fell.out" 2>&1 || code=$?
+expect 1 "$code" "a record count that falls across a restart fails"
+expect_grep '^FAIL unreadable.*from 10 to 0' "$tmp/verdict-fell.out" "the fall is named"
+
+# A reboot makes launchd start the recorder, and that start line is nobody's plan and nobody's crash.
+reboot_fixture() { # reboot_fixture <start line, seconds after the boot> <boot, seconds ago>
+    verdict_fixture
+    boot_at "$(iso_ago "$2")"
+    printf '%s conbus daemon: beef: socket /x/sock log /x/log (10 record(s), 0 unreadable)\n' \
+        "$(iso_ago $(($2 - $1)))" >>"$home/.conbus/daemon.log"
+}
+reboot_fixture 200 $((3 * DAY))
+code=0; run verdict >"$tmp/verdict-reboot.out" 2>&1 || code=$?
+expect 0 "$code" "a start shortly after a reboot is not an unplanned restart"
+expect_grep '^PASS restarts' "$tmp/verdict-reboot.out" "restarts passes"
+expect_grep '^PASS reboots — 1 reboot(s) in the window' "$tmp/verdict-reboot.out" "and the reboot has its own line"
+boot_at_none
+verdict_fixture
+code=0; run verdict >"$tmp/verdict-noreboot.out" 2>&1 || code=$?
+expect_grep '^PASS reboots — 0 reboot(s) in the window' "$tmp/verdict-noreboot.out" "a window with none says so"
+# kern.boottime has only the latest. An earlier one comes from `last reboot`, to the minute and in local time.
+verdict_fixture
+boot_at "$(iso_ago $((2 * DAY)))"
+reboot_listed $((5 * DAY))
+for reboot_ago in $((5 * DAY - 200)) $((2 * DAY - 180)); do
+    printf '%s conbus daemon: beef: socket /x/sock log /x/log (10 record(s), 0 unreadable)\n' "$(iso_ago "$reboot_ago")" >>"$home/.conbus/daemon.log"
+done
+code=0; run verdict >"$tmp/verdict-reboot-two.out" 2>&1 || code=$?
+expect 0 "$code" "two reboots in a window, one of them only in last reboot"
+expect_grep '^PASS reboots — 2 reboot(s) in the window' "$tmp/verdict-reboot-two.out" "both are counted"
+# The latest boot in both sources is one boot.
+verdict_fixture
+boot_at "$(iso_ago $((2 * DAY)))"
+reboot_listed $((2 * DAY))
+printf '%s conbus daemon: beef: socket /x/sock log /x/log (10 record(s), 0 unreadable)\n' "$(iso_ago $((2 * DAY - 180)))" >>"$home/.conbus/daemon.log"
+code=0; run verdict >"$tmp/verdict-reboot-same.out" 2>&1 || code=$?
+expect 0 "$code" "the same boot from both sources"
+expect_grep '^PASS reboots — 1 reboot(s) in the window' "$tmp/verdict-reboot-same.out" "counts once"
+# A crash relaunch is still a fail: with no boot near it, and as a second start after one.
+verdict_fixture
+boot_at "$(iso_ago $((3 * DAY)))"
+printf '%s conbus daemon: beef: socket /x/sock log /x/log (10 record(s), 0 unreadable)\n%s conbus daemon: beef: socket /x/sock log /x/log (10 record(s), 0 unreadable)\n' \
+    "$(iso_ago $((3 * DAY - 200)))" "$(iso_ago $((3 * DAY - 400)))" >>"$home/.conbus/daemon.log"
+code=0; run verdict >"$tmp/verdict-reboot-crash.out" 2>&1 || code=$?
+expect 1 "$code" "a second start in the same boot is a crash"
+expect_grep '^FAIL restarts — 1 unplanned' "$tmp/verdict-reboot-crash.out" "and is counted"
+verdict_fixture
+boot_at "$(iso_ago $((3 * DAY)))"
+printf '%s conbus daemon: beef: socket /x/sock log /x/log (10 record(s), 0 unreadable)\n' "$(iso_ago $((DAY)))" >>"$home/.conbus/daemon.log"
+code=0; run verdict >"$tmp/verdict-reboot-late.out" 2>&1 || code=$?
+expect 1 "$code" "a start long after the boot is not the boot's"
+expect_grep '^FAIL restarts — 1 unplanned' "$tmp/verdict-reboot-late.out" "and is counted"
+# A boot before the swap explains no start after it.
+verdict_fixture "$(iso_ago $((7 * DAY + 3600)))"
+boot_at "$(iso_ago $((7 * DAY + 3700)))"
+printf '%s conbus daemon: beef: socket /x/sock log /x/log (10 record(s), 0 unreadable)\n' "$(iso_ago $((7 * DAY + 3000)))" >>"$home/.conbus/daemon.log"
+code=0; run verdict >"$tmp/verdict-reboot-before.out" 2>&1 || code=$?
+expect 1 "$code" "a boot before the swap explains no start after it"
+# A recorder that did not come back. The start line is what a reboot would have left, so with none:
+verdict_fixture
+boot_at "$(iso_ago $((2 * DAY)))"
+sleep 0 &
+gone_pid=$!
+wait "$gone_pid"
+printf '{"build":"beef","pid":%s,"started":"%s","serving":"%s"}\n' "$gone_pid" "$(iso_after "$fx_swapped" 1)" "$(iso_after "$fx_swapped" 4)" >"$home/.conbus/daemon.build"
+mv "$home/.conbus/conbus.sock" "$home/.conbus/conbus.sock.moved"
+code=0; run verdict >"$tmp/verdict-reboot-noreturn.out" 2>&1 || code=$?
+mv "$home/.conbus/conbus.sock.moved" "$home/.conbus/conbus.sock"
+expect 1 "$code" "a recorder that never came back after a reboot fails"
+expect_grep '^FAIL recorder-serving.*nothing answers' "$tmp/verdict-reboot-noreturn.out" "on recorder-serving"
+expect_grep '^FAIL rss-budget.*not up' "$tmp/verdict-reboot-noreturn.out" "and on rss-budget"
+expect_grep '^PASS reboots — 1 reboot(s) in the window' "$tmp/verdict-reboot-noreturn.out" "and the reboot is named"
+# Up again with no start line since the boot: the stamp says so, and its boot is not accounted for.
+verdict_fixture
+boot_at "$(iso_ago $((2 * DAY)))"
+printf '{"build":"beef","pid":%s,"started":"%s","serving":"%s"}\n' "$recorder_pid" "$(iso_ago $((2 * DAY - 100)))" "$(iso_ago $((2 * DAY - 98)))" >"$home/.conbus/daemon.build"
+code=0; run verdict >"$tmp/verdict-reboot-noline.out" 2>&1 || code=$?
+expect 4 "$code" "a boot with no start line leaves restarts open"
+expect_grep '^UNCHECKED restarts.*stamp says it started' "$tmp/verdict-reboot-noline.out" "and says so"
+# A boot time that cannot be read cannot excuse anything.
+verdict_fixture
+boot_unreadable
+code=0; run verdict >"$tmp/verdict-reboot-unread.out" 2>&1 || code=$?
+expect 4 "$code" "an OS boot time that cannot be read leaves it open"
+expect_grep '^UNCHECKED reboots' "$tmp/verdict-reboot-unread.out" "and says so"
+boot_at_none
+
+# A start line from before a boot is not that boot's, even inside the minute `last reboot` rounds to.
+verdict_fixture
+boot_at "$(iso_after "$fx_swapped" 10)"
+printf '%s conbus daemon: beef: socket /x/sock log /x/log (10 record(s), 0 unreadable)\n' "$(iso_after "$fx_swapped" 30)" >>"$home/.conbus/daemon.log"
+code=0; run verdict >"$tmp/verdict-reboot-soon.out" 2>&1 || code=$?
+expect 0 "$code" "a reboot right after the swap has its own start line"
+expect_grep '^PASS reboots — 1 reboot(s) in the window' "$tmp/verdict-reboot-soon.out" "and it is counted"
+boot_at_none
+
+# Trimming daemon.log must not read as zero restarts. Only a planned restart's
+# line left: the swap's own boot is gone, so nothing can be said before that line.
+planned_at=$(iso_ago $((2 * DAY)))
+verdict_fixture "" "[{\"ts\":\"$planned_at\",\"serving_ms\":4000,\"new_drops\":0}]"
+printf '%s conbus daemon: beef: socket /x/sock log /x/log (10 record(s), 0 unreadable)\n' \
+    "$(iso_after "$planned_at" 4)" >"$home/.conbus/daemon.log"
+printf '{"build":"beef","pid":%s,"started":"%s","serving":"%s"}\n' "$recorder_pid" \
+    "$(iso_after "$planned_at" 1)" "$(iso_after "$planned_at" 4)" >"$home/.conbus/daemon.build"
+code=0
+run verdict >"$tmp/verdict-trimmed.out" 2>&1 || code=$?
+expect 4 "$code" "a log trimmed past the swap's boot is not a pass"
+expect_grep '^UNCHECKED restarts.*does not reach back to the swap' "$tmp/verdict-trimmed.out" "it says so"
+# Trimmed down to a start nobody planned: whatever else went, that boot happened.
+verdict_fixture
+printf '%s conbus daemon: beef: socket /x/sock log /x/log (10 record(s), 0 unreadable)\n' \
+    "$(iso_ago $((2 * DAY)))" >"$home/.conbus/daemon.log"
+code=0
+run verdict >"$tmp/verdict-trimmed-crash.out" 2>&1 || code=$?
+expect 1 "$code" "a start line nobody planned fails, trimmed log or not"
+expect_grep '^FAIL restarts.*1 unplanned.*does not reach back to the swap' "$tmp/verdict-trimmed-crash.out" \
+    "and the missing boot is said beside it"
+# A planned restart that never served does not cancel out a crash.
+restart_at=$(iso_ago $((5 * DAY)))
+verdict_fixture "" "[{\"ts\":\"$restart_at\",\"serving_ms\":-1,\"new_drops\":0}]"
+printf '%s conbus daemon: beef: socket /x/sock log /x/log (10 record(s), 0 unreadable)\n' \
+    "$(iso_ago $((2 * DAY)))" >>"$home/.conbus/daemon.log"
+code=0
+run verdict >"$tmp/verdict-offset.out" 2>&1 || code=$?
+expect 1 "$code" "a failed planned restart and a crash do not cancel out"
+expect_grep '^FAIL restarts.*1 unplanned' "$tmp/verdict-offset.out" "the crash is counted"
+expect_grep '^FAIL restarts.*never served' "$tmp/verdict-offset.out" "and the restart that never served is named"
+# A planned restart with no start line: the log lost it.
+verdict_fixture "" "[{\"ts\":\"$restart_at\",\"serving_ms\":4000,\"new_drops\":0}]"
+code=0
+run verdict >"$tmp/verdict-noline.out" 2>&1 || code=$?
+expect 4 "$code" "a planned restart the log has no line for is not a pass"
+expect_grep "^UNCHECKED restarts.*no start line for the planned restart at: $restart_at" "$tmp/verdict-noline.out" "it is named"
+# A stamp newer than any start line: this boot's line is missing.
+verdict_fixture
+printf '{"build":"beef","pid":%s,"started":"%s","serving":"%s"}\n' "$recorder_pid" \
+    "$(iso_ago 3600)" "$(iso_ago 3598)" >"$home/.conbus/daemon.build"
+code=0
+run verdict >"$tmp/verdict-stampnewer.out" 2>&1 || code=$?
+expect 4 "$code" "a daemon whose boot has no start line is not a pass"
+expect_grep "^UNCHECKED restarts.*stamp says it started" "$tmp/verdict-stampnewer.out" "it says so"
+
+# restart keeps what start recorded. Erasing rolled_back would bring a rolled-back
+# window back to life; erasing the swap count would lie about the swap.
+verdict_fixture
+sed -E 's/,"restarts":\[\]/,"restarts":[],"rolled_back":"2026-11-01T01:00:00.000Z","swap_window_drops":3/' \
+    "$home/.conbus/canary.json" >"$home/.conbus/canary.json.new"
+mv -f "$home/.conbus/canary.json.new" "$home/.conbus/canary.json"
+code=0
+run restart >/dev/null 2>&1 || code=$?
+expect 0 "$code" "restart runs on a state with both keys"
+expect_grep '"rolled_back":"2026-11-01T01:00:00.000Z"' "$home/.conbus/canary.json" "rolled_back survives a restart"
+expect_grep '"swap_window_drops":3' "$home/.conbus/canary.json" "swap_window_drops survives a restart"
+
+# Disk: daemon.log is the trace a full disk can leave. The 10% warning is a note,
+# because this Mac is always under it; a false FAIL there costs a week.
+# A build that holds what the log refuses says so at each end of the outage (#155).
+verdict_fixture
+printf '%s conbus daemon: the log refused a write (No space left on device (os error 28)); keeping what it refuses until it stops\n' \
+    "$(iso_ago $((2 * DAY)))" >>"$home/.conbus/daemon.log"
+code=0
+run verdict >"$tmp/verdict-refusing.out" 2>&1 || code=$?
+expect 1 "$code" "a log still refusing writes fails"
+expect_grep '^FAIL disk — the log refused a write.*No space left' "$tmp/verdict-refusing.out" "with the error"
+printf '%s conbus daemon: the log takes writes again; 3 record(s) waited and landed, 0 could not be kept, since 2026-11-01T00:00:00.000Z: No space left on device (os error 28)\n' \
+    "$(iso_ago $((2 * DAY - 60)))" >>"$home/.conbus/daemon.log"
+drop_line $((2 * DAY - 60)) 'the log refused writes for a while' '3 record(s) waited and landed, 0 could not be kept, since 2026-11-01T00:00:00.000Z: No space left on device (os error 28)'
+code=0
+run verdict >"$tmp/verdict-refused-over.out" 2>&1 || code=$?
+expect 0 "$code" "an outage the log came back from is left to its drop line"
+expect_grep '^PASS log-outages — 1 time(s)' "$tmp/verdict-refused-over.out" "and the drop line is what counts it"
+verdict_fixture
+install_persona lowdisk
+code=0
+run verdict >"$tmp/verdict-diskwarn.out" 2>&1 || code=$?
+expect 0 "$code" "doctor's 10% warning alone does not stop a pass"
+expect_grep '^PASS disk.*WARNING' "$tmp/verdict-diskwarn.out" "and is still shown"
+verdict_fixture
+install_persona readonly
+code=0
+run verdict >"$tmp/verdict-readonly.out" 2>&1 || code=$?
+expect 1 "$code" "a log that cannot be appended to fails"
+expect_grep '^FAIL disk.*NOT APPENDABLE' "$tmp/verdict-readonly.out" "and is named"
+
+# Refusing right now. The daemon.log note is throttled to one per 10 minutes, so a second outage inside that time can
+# leave only doctor's word for it, on a full disk.
+verdict_fixture; install_persona refusing
+code=0; run verdict >"$tmp/verdict-refusing-now.out" 2>&1 || code=$?
+expect 1 "$code" "a log refusing writes now is not a pass (P3)"
+expect_grep '^FAIL disk.*REFUSING since' "$tmp/verdict-refusing-now.out" "disk says so"
+expect_grep '^FAIL recorder-serving.*REFUSING since' "$tmp/verdict-refusing-now.out" "and so does recorder-serving"
+expect_no_grep '^PASS disk\|^PASS recorder-serving' "$tmp/verdict-refusing-now.out" "neither line passes"
+
+# serving-budget reads milliseconds: 5.9 s is not 5 s.
+verdict_fixture
+printf '{"build":"beef","pid":%s,"started":"%s","serving":"%s"}\n' "$recorder_pid" \
+    "$(iso_after "$fx_swapped" 1)" "$(iso_after "$fx_swapped" 6 | sed 's/\.000Z/.900Z/')" >"$home/.conbus/daemon.build"
+code=0
+run verdict >"$tmp/verdict-servingms.out" 2>&1 || code=$?
+expect 1 "$code" "a serving time over budget by a fraction fails"
+expect_grep '^FAIL serving-budget.*5900 ms' "$tmp/verdict-servingms.out" "the fraction is kept"
+
 # Inside the window the verdict is "incomplete", not a pass.
-cat >"$home/.conbus/canary.json" <<EOF
-{"swapped":"$(date -u +%Y-%m-%dT00:00:00.000Z)","prev_build":"01d","candidate_build":"beef","candidate_sha256":"x","restarts":[]}
-EOF
-cat >"$home/.conbus/daemon.log" <<EOF
-$(date -u +%Y-%m-%dT00:00:01.000Z) conbus daemon: beef: socket /x/sock log /x/log (10 record(s), 0 unreadable)
-EOF
+verdict_fixture "$(date -u +%Y-%m-%dT00:00:00.000Z)"
 code=0
 run verdict >"$tmp/verdict-open.out" 2>&1 || code=$?
 if [ "$code" != 3 ]; then cat "$tmp/verdict-open.out" >&2; fi
@@ -798,6 +2651,30 @@ expect 0 "${code:-0}" "planned restart with a sessionless refusal"
 expect_grep 'sessionless' "$tmp/restart-sessions.out" "the sessionless refusal is shown aside"
 expect_grep '"new_drops":0' "$home/.conbus/canary.json" "it is not counted as a loss"
 
+# Lost is lost on a planned restart too, whichever of the two lines says so.
+cat >"$home/.conbus/canary.json" <<EOF
+{"swapped":"$past","prev_build":"01d","candidate_build":"beef","candidate_sha256":"x","restarts":[]}
+EOF
+write_fake beef lostlines "$install_dir/conbus"
+daemon_boot beef 5013
+code=0
+run_real restart >"$tmp/restart-lostlines.out" 2>&1 || code=$?
+expect 0 "${code:-0}" "planned restart with lines that lost records"
+expect_grep '"new_drops":2' "$home/.conbus/canary.json" "both are counted in new_drops"
+
+# Tool bodies elided on a planned restart: the records landed, so new_drops
+# stays 0 however many tool calls were in flight.
+cat >"$home/.conbus/canary.json" <<EOF
+{"swapped":"$past","prev_build":"01d","candidate_build":"beef","candidate_sha256":"x","restarts":[]}
+EOF
+write_fake beef elided "$install_dir/conbus"
+daemon_boot beef 5012
+code=0
+run_real restart >"$tmp/restart-elided.out" 2>&1 || code=$?
+expect 0 "${code:-0}" "planned restart with elided tool bodies"
+expect_grep '"new_drops":0' "$home/.conbus/canary.json" "elided bodies are not counted in new_drops"
+expect_grep '2 line(s) that lost no record not counted' "$tmp/restart-elided.out" "they are shown aside"
+
 # rollback reports the spool it leaves behind.
 mkdir -p "$home/.conbus/spool"
 touch "$home/.conbus/spool/req-1" "$home/.conbus/spool/req-2"
@@ -813,6 +2690,607 @@ expect 1 "$code" "rollback refuses when conbus.rollback is missing"
 code=0
 run start --from "$tmp/stage/nonexistent" >/dev/null 2>&1 || code=$?
 expect 1 "$code" "start refuses a missing candidate"
+
+# A number that is not one. `[ 7d -lt 7 ]` fails, which reads as false, so a day-old window passed; a blank serving
+# limit ended the round trip with a blank reason and left its daemon running. All of them are refused before anything.
+verdict_fixture "$(iso_ago $((DAY + 3600)))"
+code=0; CONBUS_CANARY_WINDOW_DAYS=7d run verdict >"$tmp/verdict-window-junk.out" 2>&1 || code=$?
+expect 2 "$code" "a window length that is not a number is refused (P7)"
+expect_grep "CONBUS_CANARY_WINDOW_DAYS='7d'" "$tmp/verdict-window-junk.out" "by name"
+for junk_env in CONBUS_CANARY_WINDOW_DAYS CONBUS_CANARY_RSS_MB CONBUS_CANARY_NOISE_MAX CONBUS_CANARY_PROBE_S CONBUS_CANARY_SERVING_MS CONBUS_CANARY_DOCTOR_LIMIT; do
+    for junk_value in 7d -1 1.5 08; do
+        code=0
+        ( export "$junk_env=$junk_value"; run verdict ) >"$tmp/verdict-junk.out" 2>&1 || code=$?
+        expect 2 "$code" "$junk_env=$junk_value is refused"
+    done
+done
+for junk_var in TAIL_MS USAGE_MS DOCTOR_MS SERVING_LIMIT; do
+    code=0
+    ( export "$junk_var=lots"; run verdict ) >"$tmp/verdict-junk.out" 2>&1 || code=$?
+    expect 2 "$code" "$junk_var=lots is refused"
+done
+code=0; CONBUS_CANARY_WINDOW_DAYS=0 run verdict >/dev/null 2>&1 || code=$?
+expect 2 "$code" "a window of no days is refused"
+code=0; CONBUS_CANARY_NOISE_MAX=0 run verdict >/dev/null 2>&1 || code=$?
+expect 3 "$code" "a noise limit of zero is a limit: the window is still open"
+# Refused before anything moves, or leaves anything behind.
+write_fake 01d old "$install_dir/conbus"; rm -f "$rollback_bin" "$home/.conbus/canary.json"
+: >"$tmp/round-trip-daemons"
+code=0; SERVING_LIMIT=soon run start --from "$tmp/stage/conbus-good" >"$tmp/start-junk.out" 2>&1 || code=$?
+expect 2 "$code" "a serving limit that is not a number refuses a swap"
+expect "conbus 0.0.0-01d (01d)" "$("$install_dir/conbus" --version)" "nothing moved"
+expect 0 "$(wc -l <"$tmp/round-trip-daemons" | tr -d ' ')" "and no round-trip daemon was started"
+# A window other than the plan's says so on the pass.
+verdict_fixture "$(iso_ago $((DAY + 3600)))"
+code=0; CONBUS_CANARY_WINDOW_DAYS=1 run verdict >"$tmp/verdict-window-short.out" 2>&1 || code=$?
+expect 0 "$code" "a one-day window can complete"
+expect_grep 'verdict: PASS.*1-day window' "$tmp/verdict-window-short.out" "a PASS on a shortened window says so (P7b)"
+verdict_fixture
+code=0; run verdict >"$tmp/verdict-window-7.out" 2>&1 || code=$?
+expect_no_grep '7-day window' "$tmp/verdict-window-7.out" "the plan's own window needs no remark"
+
+# Records the log could not keep, said only in daemon.log.
+verdict_fixture
+printf '%s conbus daemon: the log refused a write (No space left on device (os error 28)); keeping what it refuses until it stops\n%s conbus daemon: the log takes writes again; 3 record(s) waited and landed, 2 could not be kept, since 2026-11-01T00:00:00.000Z: No space left on device (os error 28)\n' "$(iso_ago 7200)" "$(iso_ago 7000)" >>"$home/.conbus/daemon.log"
+code=0; run verdict >"$tmp/verdict-notkept.out" 2>&1 || code=$?
+expect 1 "$code" "could not be kept, in daemon.log alone, still fails (P8)"
+expect_grep '^FAIL disk — 2 record(s) could not be kept' "$tmp/verdict-notkept.out" "with its count"
+verdict_fixture
+printf '%s conbus daemon: the log takes writes again; 3 record(s) waited and landed, 0 could not be kept, since 2026-11-01T00:00:00.000Z: No space left on device (os error 28)\n' "$(iso_ago 7000)" >>"$home/.conbus/daemon.log"
+code=0; run verdict >"$tmp/verdict-allkept.out" 2>&1 || code=$?
+expect 0 "$code" "0 could not be kept is no such thing"
+verdict_fixture
+printf '%s conbus daemon: the log takes writes again; 3 record(s) waited and landed, 10 could not be kept, since 2026-11-01T00:00:00.000Z: x\n' "$(iso_ago $((30 * DAY)))" >>"$home/.conbus/daemon.log"
+code=0; run verdict >"$tmp/verdict-notkept-before.out" 2>&1 || code=$?
+expect 0 "$code" "before the swap it says nothing about the window"
+# The real count on a `may be lost` line, not one for the line.
+verdict_fixture
+drop_line 3600 'the log refused writes for a while and records may be lost' '3 record(s) waited and landed, 4 could not be kept, since 2026-11-01T00:00:00.000Z: No space left on device (os error 28)'
+code=0; run verdict >"$tmp/verdict-maybelost.out" 2>&1 || code=$?
+expect 1 "$code" "records may be lost fails"
+expect_grep '^FAIL drops — 4 lost record' "$tmp/verdict-maybelost.out" "with what the line says it lost"
+# A segment removed since the swap, with nothing else to show for it.
+verdict_fixture
+code=0; run verdict >"$tmp/verdict-segments.out" 2>&1 || code=$?
+expect 0 "$code" "every segment there at the swap is still there"
+expect_grep '^PASS log-files' "$tmp/verdict-segments.out" "and has its own line"
+touch "$home/.conbus/log/segment-00000002.jsonl" "$home/.conbus/log/segment-00000003.jsonl"
+code=0; run verdict >"$tmp/verdict-segments-new.out" 2>&1 || code=$?
+expect 0 "$code" "new segments since are the log growing"
+rm -f "$home/.conbus/log/segment-00000000.jsonl"
+code=0; run verdict >"$tmp/verdict-segment-gone.out" 2>&1 || code=$?
+expect 1 "$code" "a closed segment removed since the swap cannot pass"
+expect_grep '^FAIL log-files.*1 of the 2 segment(s) there at the swap' "$tmp/verdict-segment-gone.out" "it says how many"
+verdict_fixture
+touch "$home/.conbus/log/segment-00000002.jsonl" "$home/.conbus/log/segment-00000003.jsonl"
+rm -f "$home/.conbus/log/segment-00000002.jsonl"
+code=0; run verdict >"$tmp/verdict-segment-hole.out" 2>&1 || code=$?
+expect 1 "$code" "nor one written since then"
+expect_grep '^FAIL log-files.*written since' "$tmp/verdict-segment-hole.out" "and says that"
+verdict_fixture
+sed -E 's/,"log_files":"[^"]*"//' "$home/.conbus/canary.json" >"$home/.conbus/canary.json.new"
+mv -f "$home/.conbus/canary.json.new" "$home/.conbus/canary.json"
+code=0; run verdict >"$tmp/verdict-segment-norecord.out" 2>&1 || code=$?
+expect 4 "$code" "a window that recorded none cannot pass"
+expect_grep '^UNCHECKED log-files' "$tmp/verdict-segment-norecord.out" "and says so"
+write_fake 01d old "$install_dir/conbus"
+rm -f "$rollback_bin" "$home/.conbus/canary.json"
+rm -f "$home/.conbus/log/"segment-*
+touch "$home/.conbus/log/segment-00000005.jsonl" "$home/.conbus/log/segment-00000006.jsonl"
+daemon_boot beef 4290
+code=0; run start --from "$tmp/stage/conbus-good" >/dev/null 2>&1 || code=$?
+expect 0 "$code" "start with segments"
+expect_grep '"log_files":"2:00000005:00000006"' "$home/.conbus/canary.json" "records them"
+
+# #157 holds a tool event or a notification for a day on purpose: its session's prompt may still come. Parked is not stuck.
+for parked_kind in tool_requested tool_use tool_denied tool_batch_ended permission_asked notified; do
+    verdict_fixture
+    spool_entry parked "$parked_kind" -002000
+    code=0; run verdict >"$tmp/verdict-parked.out" 2>&1 || code=$?
+    expect 0 "$code" "a $parked_kind entry parked twenty minutes is no fault of a serving recorder (P6)"
+    expect_grep '^PASS recorder-serving.*1 tool event(s) or notification(s) waiting' "$tmp/verdict-parked.out" "and it is shown"
+done
+# Everything else keeps the ten minutes. A prompt or a stop has no reason to wait.
+verdict_fixture
+spool_entry stuck turn_started -002000
+code=0; run verdict >"$tmp/verdict-parked-prompt.out" 2>&1 || code=$?
+expect 1 "$code" "a prompt twenty minutes old is stuck"
+expect_grep '^FAIL recorder-serving.*1 spooled record' "$tmp/verdict-parked-prompt.out" "and counted"
+verdict_fixture
+spool_entry stuck turn_ended -002000
+code=0; run verdict >/dev/null 2>&1 || code=$?
+expect 1 "$code" "so is a stop"
+# Parked past its day, it should have gone.
+verdict_fixture
+spool_entry parked notified -235900
+code=0; run verdict >/dev/null 2>&1 || code=$?
+expect 0 "$code" "a parked entry just inside its day is still waiting"
+verdict_fixture
+spool_entry parked notified -240500
+code=0; run verdict >/dev/null 2>&1 || code=$?
+expect 0 "$code" "and just past it has the ten minutes a drain gets"
+verdict_fixture
+spool_entry parked notified -250000
+code=0; run verdict >"$tmp/verdict-parked-old.out" 2>&1 || code=$?
+expect 1 "$code" "one past its day is stuck"
+expect_grep '^FAIL recorder-serving.*1 spooled record' "$tmp/verdict-parked-old.out" "and counted"
+# An entry whose kind cannot be read gets no such allowance.
+if [ "$(id -u)" != 0 ]; then
+    verdict_fixture
+    spool_entry unread notified -002000
+    chmod 000 "$home/.conbus/spool/unread.json"
+    code=0; run verdict >/dev/null 2>&1 || code=$?
+    chmod 600 "$home/.conbus/spool/unread.json"
+    expect 1 "$code" "an entry that cannot be read is stuck"
+fi
+# A tool body that quotes the words is not its kind.
+verdict_fixture
+mkdir -p "$home/.conbus/spool"
+printf '{"pv":6,"harness":"claude_code","event":{"event":"turn_started","prompt":"\\"event\\":\\"notified\\""}}' >"$home/.conbus/spool/quoted.json"
+touch -A -002000 "$home/.conbus/spool/quoted.json"
+code=0; run verdict >/dev/null 2>&1 || code=$?
+expect 1 "$code" "words quoted in a prompt do not make it parked"
+
+# A vendor CLI that missed doctor's 2 s, or is gone with its directory left behind, says nothing about the swap.
+write_fake beef slowvendor "$tmp/stage/conbus-slowvendor"
+write_fake 01d old "$install_dir/conbus"; rm -f "$rollback_bin" "$home/.conbus/canary.json"
+daemon_boot beef 4261
+code=0; run start --from "$tmp/stage/conbus-slowvendor" >"$tmp/start-slowvendor.out" 2>&1 || code=$?
+expect 0 "$code" "a vendor CLI that missed doctor's 2 s does not roll a healthy swap back (P10)"
+expect_grep 'canary is live' "$tmp/start-slowvendor.out" "the swap stays"
+verdict_fixture
+install_persona slowvendor
+code=0; run verdict >"$tmp/verdict-slowvendor.out" 2>&1 || code=$?
+expect 0 "$code" "nor does it fail hooks"
+expect_grep '^PASS hooks' "$tmp/verdict-slowvendor.out" "hooks passes"
+expect_grep '^  not judged: opencode could not read which version' "$tmp/verdict-slowvendor.out" "and the line shows as a note"
+# A real mismatch still fails, at start and at the verdict.
+write_fake beef mismatch "$tmp/stage/conbus-mismatch"
+write_fake 01d old "$install_dir/conbus"; rm -f "$rollback_bin" "$home/.conbus/canary.json"
+daemon_boot beef 4263
+code=0; SERVING_LIMIT=5 run start --from "$tmp/stage/conbus-mismatch" >"$tmp/start-mismatch.out" 2>&1 || code=$?
+expect 1 "$code" "a plugin this vendor does not load rolls back"
+expect_grep "a hook is not 'runs'.*MISMATCH" "$tmp/start-mismatch.out" "and says so"
+verdict_fixture
+install_persona mismatch
+code=0; run verdict >"$tmp/verdict-mismatch.out" 2>&1 || code=$?
+expect 1 "$code" "and fails the verdict"
+expect_grep '^FAIL hooks.*MISMATCH' "$tmp/verdict-mismatch.out" "by name"
+# With that the only line, no hook is known to run.
+verdict_fixture
+install_persona slowonly
+code=0; run verdict >"$tmp/verdict-slowonly.out" 2>&1 || code=$?
+expect 4 "$code" "a slow vendor alone proves no hook runs"
+
+# Two outages minutes apart: the recovery note is throttled, and the drop line is the one that says it ended.
+verdict_fixture
+printf '%s conbus daemon: the log refused a write (No space left on device (os error 28)); keeping what it refuses until it stops\n' "$(iso_ago 7200)" >>"$home/.conbus/daemon.log"
+drop_line 7000 'the log refused writes for a while' '3 record(s) waited and landed, 0 could not be kept, since 2026-11-01T00:00:00.000Z: No space left on device (os error 28)'
+code=0; run verdict >"$tmp/verdict-recovered-drop.out" 2>&1 || code=$?
+expect 0 "$code" "a recovery in the drop log counts with no note in daemon.log"
+expect_grep '^PASS disk' "$tmp/verdict-recovered-drop.out" "disk passes"
+expect_grep '^PASS log-outages — 1 time(s)' "$tmp/verdict-recovered-drop.out" "and the outage is counted"
+# A drop line older than the note is an earlier outage, and says nothing about this one.
+verdict_fixture
+drop_line 7200 'the log refused writes for a while' '3 record(s) waited and landed, 0 could not be kept, since 2026-11-01T00:00:00.000Z: No space left on device (os error 28)'
+printf '%s conbus daemon: the log refused a write (No space left on device (os error 28)); keeping what it refuses until it stops\n' "$(iso_ago 3600)" >>"$home/.conbus/daemon.log"
+code=0; run verdict >"$tmp/verdict-recovered-older.out" 2>&1 || code=$?
+expect 1 "$code" "an older recovery does not end a later refusal"
+expect_grep '^FAIL disk — the log refused a write' "$tmp/verdict-recovered-older.out" "and disk says so"
+# An outage that lost records is no pass on the line about disks, whichever log said it.
+verdict_fixture
+drop_line 3600 'the log refused writes for a while and records may be lost' '3 record(s) waited and landed, 2 could not be kept, since 2026-11-01T00:00:00.000Z: No space left on device (os error 28)'
+code=0; run verdict >"$tmp/verdict-disk-lost.out" 2>&1 || code=$?
+expect 1 "$code" "an outage that lost records fails"
+expect_no_grep '^PASS disk' "$tmp/verdict-disk-lost.out" "and disk does not read as fine beside it"
+
+# A tool event from a session that never got a prompt. A known loss at a known rate, true on 14 of 39 past windows and
+# no regression: on its own line with its rate, and failing only when that rate is clearly above what it was.
+orphan_lines() { # orphan_lines <file> <count> <seconds ago>; real wording, one line each, sessions apart
+    perl -MPOSIX=strftime -e '
+        my ($n, $ago) = @ARGV;
+        my $ts = strftime("%Y-%m-%dT%H:%M:%S.000Z", gmtime(time - $ago));
+        my $i = 0;
+        print qq({"ts":"$ts","reason":"no conversation for this session; the daemon has no binding for it (no prompt from this session has reached it)","detail":"PreToolUse for session ) . sprintf("%08x", $i++) . qq("}\n) for 1 .. $n;' "$2" "$3" >>"$1"
+}
+old_line() { printf '{"ts":"%s","reason":"socket closed early"}\n' "$(iso_ago $((40 * DAY)))" >>"$1"; }
+verdict_fixture
+orphan_lines "$home/.conbus/drops.jsonl" 3 3600
+drop_line 3500 'spooled hook still has no conversation (orphan)' 'tool_requested for session 01a06304'
+code=0; run verdict >"$tmp/verdict-orphans.out" 2>&1 || code=$?
+expect 0 "$code" "a few tool events with no prompt do not fail a week"
+expect_grep '^PASS orphan-tools — 4 tool event(s) lost' "$tmp/verdict-orphans.out" "they are counted on their own line"
+expect_grep '^PASS orphan-tools.*/day' "$tmp/verdict-orphans.out" "with the rate"
+expect_grep '^PASS drops' "$tmp/verdict-orphans.out" "and drops is not where they fail"
+expect_no_grep '01a06304\|for session' "$tmp/verdict-orphans.out" "without a session id"
+verdict_fixture
+code=0; run verdict >"$tmp/verdict-noorphans.out" 2>&1 || code=$?
+expect_grep '^PASS orphan-tools — 0 tool event(s) lost' "$tmp/verdict-noorphans.out" "a window with none says so"
+# Above the floor, with nothing before the swap to explain it.
+verdict_fixture
+orphan_lines "$home/.conbus/drops.jsonl" 101 3600
+code=0; run verdict >"$tmp/verdict-orphans-many.out" 2>&1 || code=$?
+expect 1 "$code" "a hundred and one with no history fails"
+expect_grep '^FAIL orphan-tools — 101 tool event(s) lost' "$tmp/verdict-orphans-many.out" "by name"
+expect_grep 'over the limit of 100' "$tmp/verdict-orphans-many.out" "and says the limit"
+verdict_fixture
+orphan_lines "$home/.conbus/drops.jsonl" 100 3600
+code=0; run verdict >/dev/null 2>&1 || code=$?
+expect 0 "$code" "a hundred is at the floor"
+orphan_days() { # orphan_days <file> <lines a day> <first day ago> <last day ago>
+    od_day=$3
+    while [ "$od_day" -le "$4" ]; do
+        orphan_lines "$1" "$2" $((od_day * DAY))
+        od_day=$((od_day + 1))
+    done
+}
+# A flood before the swap is one day of 28. A mean let 2,000 lines raise the bar to 4,226, and 1,400 lost tool events
+# in the window passed. The median a day does not move for one day.
+verdict_fixture
+perl -e 'for (1..2000) { printf qq({"ts":"%s","reason":"no conversation for this session; the daemon has no binding for it (no prompt from this session has reached it)","detail":"PreToolUse for session a%07d"}\n), $ARGV[0], $_ }' "$(iso_ago $((17 * DAY)))" >"$home/.conbus/drops.archived.jsonl"
+orphan_lines "$home/.conbus/drops.jsonl" 1400 $((3 * DAY))
+code=0; run verdict >"$tmp/v-afterflood.out" 2>&1 || code=$?; rm -f "$home/.conbus/drops.archived.jsonl"
+expect 1 "$code" "1,400 tool events lost after a flood before the swap fail"
+expect_grep '^FAIL orphan-tools — 1400 tool event(s) lost.*median 0.0 a day.*over the limit of 100' "$tmp/v-afterflood.out" "against a median of 0 and the floor"
+# A rate held every day before the swap is the baseline: 15 a day, so 150 in the window is no regression and 400 is.
+verdict_fixture
+: >"$home/.pre"
+old_line "$home/.pre"
+orphan_days "$home/.pre" 15 8 35
+cat "$home/.conbus/drops.jsonl" >>"$home/.pre"
+cat "$home/.pre" >"$home/.conbus/drops.jsonl"
+rm -f "$home/.pre"
+state_with drops_file "$(drops_identity)"
+orphan_lines "$home/.conbus/drops.jsonl" 150 3600
+code=0; run verdict >"$tmp/verdict-orphans-base.out" 2>&1 || code=$?
+expect 0 "$code" "a rate no higher than before the swap is not a regression"
+expect_grep '^PASS orphan-tools — 150 tool event(s) lost.*median 15.0 a day over the 28 day(s) before the swap' "$tmp/verdict-orphans-base.out" "and the median is said"
+orphan_lines "$home/.conbus/drops.jsonl" 250 3600
+code=0; run verdict >"$tmp/verdict-orphans-above.out" 2>&1 || code=$?
+expect 1 "$code" "over three times that rate is"
+# From what the file was rotated or archived to as well, each line once.
+verdict_fixture
+old_line "$home/.conbus/drops.1.jsonl"
+orphan_days "$home/.conbus/drops.1.jsonl" 15 8 21
+orphan_days "$home/.conbus/drops.capped-20261025.jsonl" 15 22 35
+cat "$home/.conbus/drops.capped-20261025.jsonl" >"$home/.conbus/drops.capped-copy.jsonl"
+orphan_lines "$home/.conbus/drops.jsonl" 150 3600
+code=0; run verdict >"$tmp/verdict-orphans-archive.out" 2>&1 || code=$?
+rm -f "$home/.conbus/drops.capped-20261025.jsonl" "$home/.conbus/drops.capped-copy.jsonl"
+expect 0 "$code" "rotated and archived logs count toward the baseline"
+expect_grep 'median 15.0 a day over the 28 day(s) before the swap' "$tmp/verdict-orphans-archive.out" "each line once"
+# A drop log that only reaches back five days before the swap has five days of baseline, not 23 days of none.
+verdict_fixture
+: >"$home/.conbus/drops.jsonl"
+orphan_days "$home/.conbus/drops.jsonl" 15 8 12
+state_with drops_file "$(drops_identity)"
+orphan_lines "$home/.conbus/drops.jsonl" 150 3600
+code=0; run verdict >"$tmp/verdict-orphans-short.out" 2>&1 || code=$?
+expect 0 "$code" "days before the drop log begins are not days with none"
+expect_grep 'median 15.0 a day over the [45] day(s) before the swap' "$tmp/verdict-orphans-short.out" "and the days it covers are said"
+# A flood older than four weeks does not inflate it.
+verdict_fixture
+orphan_lines "$home/.conbus/drops.capped-20261025.jsonl" 5000 $((60 * DAY))
+orphan_lines "$home/.conbus/drops.jsonl" 150 3600
+code=0; run verdict >"$tmp/verdict-orphans-old.out" 2>&1 || code=$?
+rm -f "$home/.conbus/drops.capped-20261025.jsonl"
+expect 1 "$code" "a flood before the 28 days is not the baseline"
+# Prompts stay lost at any count.
+verdict_fixture
+drop_line 3600 'no conversation for this session; the daemon has no binding for it (no prompt from this session has reached it)' 'UserPromptSubmit for session 01a06305'
+code=0; run verdict >"$tmp/verdict-orphan-prompt.out" 2>&1 || code=$?
+expect 1 "$code" "a prompt with no conversation is a lost record at any count"
+expect_grep '^FAIL drops — 1 lost record' "$tmp/verdict-orphan-prompt.out" "and counted as one"
+# start does not roll back over one. A planned restart does count it: a restart that loses its bindings makes these.
+write_fake beef orphans "$tmp/stage/conbus-orphans"
+write_fake 01d old "$install_dir/conbus"
+rm -f "$rollback_bin" "$home/.install-called" "$home/.conbus/canary.json"
+cat >"$home/.conbus/drops.jsonl" <<'EOF'
+{"ts":"2026-10-30T09:00:00.000Z","reason":"socket closed early"}
+EOF
+daemon_boot beef 4264
+code=0; run_real start --from "$tmp/stage/conbus-orphans" >"$tmp/start-orphans.out" 2>&1 || code=$?
+expect 0 "$code" "a tool event with no prompt does not roll a swap back"
+cat >"$home/.conbus/canary.json" <<EOF
+{"swapped":"$(iso_ago $((7 * DAY)))","prev_build":"01d","candidate_build":"beef","candidate_sha256":"x","restarts":[]}
+EOF
+write_fake beef orphans "$install_dir/conbus"
+daemon_boot beef 4265
+code=0; run_real restart >"$tmp/restart-orphans.out" 2>&1 || code=$?
+expect 0 "$code" "planned restart with one"
+expect_grep '"new_drops":1' "$home/.conbus/canary.json" "it counts against the restart"
+
+# repeated: a median, so one busy month does not hide a regression and one bad day does not make one.
+repeated_on() { # repeated_on <days ago> <count>; the codex row that day
+    sed -E "/\"day\":\"$(day_ago "$1")\",\"harness\":\"codex\"/s/\"repeated\":[0-9]+/\"repeated\":$2/" "$home/.usage-rows" >"$home/.usage-rows.new"
+    mv -f "$home/.usage-rows.new" "$home/.usage-rows"
+}
+verdict_fixture
+for old_day in 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69; do
+    printf '{"day":"%s","harness":"codex","turns":3,"tool_calls":40,"tool_denials":0,"repeated":50,"recovered":0}\n' "$(day_ago "$old_day")" >>"$home/.usage-rows"
+done
+for d in 0 1 2 3 4 5 6; do repeated_on "$d" 5; done
+code=0; run verdict >"$tmp/verdict-repeated-sept.out" 2>&1 || code=$?
+expect 1 "$code" "a flood from before the 28 days does not hide a regression"
+expect_grep '^FAIL twins-repeated' "$tmp/verdict-repeated-sept.out" "it is named"
+verdict_fixture
+repeated_on 3 102
+code=0; run verdict >"$tmp/verdict-repeated-burst.out" 2>&1 || code=$?
+expect 0 "$code" "one bad day is a burst, not a regression"
+expect_grep '^PASS twins-repeated.*102' "$tmp/verdict-repeated-burst.out" "and its total is still shown"
+verdict_fixture
+for d in 9 10 11 12 13 14 15 16 17 18 19 20 21; do repeated_on "$d" 3; done
+for d in 0 1 2 3 4 5 6; do repeated_on "$d" 5; done
+code=0; run verdict >/dev/null 2>&1 || code=$?
+expect 0 "$code" "two a day above the baseline's median is within it"
+for d in 0 1 2 3 4 5 6; do repeated_on "$d" 6; done
+code=0; run verdict >"$tmp/verdict-repeated-three.out" 2>&1 || code=$?
+expect 1 "$code" "three a day above it is not"
+expect_grep '^FAIL twins-repeated.*median 6' "$tmp/verdict-repeated-three.out" "and the medians are shown"
+
+# A rollback goes back to what ran before the swap. start refreshes the copy, so one left from an earlier window cannot
+# send a failed swap two releases back, as 0.2.8 would have after rc.3.
+write_fake 02b old "$install_dir/conbus"; write_fake 01d old "$rollback_bin"
+rm -f "$home/.conbus/canary.json" "$parity_copy"; daemon_boot beef 4262
+cat >"$home/.conbus/drops.jsonl" <<'DROPS'
+{"ts":"2026-10-30T09:00:00.000Z","reason":"socket closed early"}
+DROPS
+code=0; SERVING_LIMIT=2 run start --from "$tmp/stage/conbus-dropper" >"$tmp/rb-target.out" 2>&1 || code=$?
+expect 1 "$code" "a failed swap rolls back"
+expect_grep 'rollback verified: 02b' "$tmp/rb-target.out" "to the build that ran before it, not an older copy left there"
+expect_grep 'it replaced conbus 0.0.0-01d (01d)' "$tmp/rb-target.out" "and it says what it replaced"
+expect "conbus 0.0.0-02b (02b)" "$("$install_dir/conbus" --version)" "the build before the swap is installed again"
+# preflight and start name both builds, by version and hash.
+write_fake 02b old "$install_dir/conbus"; write_fake 01d old "$rollback_bin"; rm -f "$home/.conbus/canary.json"
+code=0; run preflight --from "$tmp/stage/conbus-good" >"$tmp/preflight-targets.out" 2>&1 || code=$?
+expect_grep '^PASS rollback-target a rollback returns to conbus 0.0.0-02b (02b) (sha256 [0-9a-f]\{12\})' "$tmp/preflight-targets.out" "preflight names the rollback target by version and hash"
+expect_grep 'replacing conbus 0.0.0-01d (01d) (sha256 [0-9a-f]\{12\})' "$tmp/preflight-targets.out" "and the older copy start will replace"
+expect_grep '^PASS parity-baseline usage-parity compares against conbus 0.0.0-02b (02b) (sha256 [0-9a-f]\{12\})' "$tmp/preflight-targets.out" "and the parity baseline"
+# --parity names another baseline. It is copied before the rollback copy is refreshed, so it can name that copy.
+daemon_boot beef 4271
+code=0; run start --from "$tmp/stage/conbus-good" --parity "$rollback_bin" >"$tmp/start-parity.out" 2>&1 || code=$?
+expect 0 "$code" "start with --parity naming the old rollback copy"
+expect "conbus 0.0.0-01d (01d)" "$("$parity_copy" --version)" "parity compares against the build it named"
+expect "conbus 0.0.0-02b (02b)" "$("$rollback_bin" --version)" "while a rollback returns to the build it replaced"
+expect_grep 'usage-parity compares against conbus 0.0.0-01d (01d) (sha256 [0-9a-f]\{12\})' "$tmp/start-parity.out" "start names the parity baseline"
+expect_grep 'a rollback returns to conbus 0.0.0-02b (02b) (sha256 [0-9a-f]\{12\})' "$tmp/start-parity.out" "and the rollback target"
+# A --parity that does not run is refused before anything moves.
+write_fake 02b old "$install_dir/conbus"; rm -f "$home/.conbus/canary.json"
+code=0; run start --from "$tmp/stage/conbus-good" --parity /nonexistent/conbus >"$tmp/start-parity-bad.out" 2>&1 || code=$?
+expect 2 "$code" "a --parity that does not run refuses"
+expect_grep '^FAIL parity-baseline' "$tmp/start-parity-bad.out" "and says why"
+expect "conbus 0.0.0-02b (02b)" "$("$install_dir/conbus" --version)" "nothing moved"
+# The verdict compares against conbus.parity, and a window started before it existed against the rollback copy, as it did.
+verdict_fixture
+code=0; run verdict >"$tmp/verdict-parity-copy.out" 2>&1 || code=$?
+expect 0 "$code" "parity against the copy start made"
+expect_grep '^PASS usage-parity.*agree with conbus 0.0.0-01d (01d) (sha256 [0-9a-f]\{12\}), conbus.parity' "$tmp/verdict-parity-copy.out" "and it names that baseline"
+rm -f "$parity_copy"
+code=0; run verdict >"$tmp/verdict-parity-old.out" 2>&1 || code=$?
+expect 0 "$code" "a window from before the parity copy compares against the rollback copy"
+expect_grep '^PASS usage-parity.*conbus.rollback' "$tmp/verdict-parity-old.out" "and says so"
+rm -f "$rollback_bin"
+code=0; run verdict >"$tmp/verdict-parity-none.out" 2>&1 || code=$?
+expect 1 "$code" "with neither, parity fails"
+expect_grep '^FAIL usage-parity.*nothing to compare' "$tmp/verdict-parity-none.out" "and says why"
+# The restored daemon's first stamp comes before its socket.
+write_fake beef live "$install_dir/conbus"; write_fake 01d coldboot "$rollback_bin"
+write_stamp beef 4401; rm -f "$home/.cold"
+code=0; run rollback >"$tmp/rb-cold.out" 2>&1 || code=$?
+expect 0 "$code" "a rollback waits for the restored daemon to listen (P11)"
+expect_grep 'rollback verified: 01d' "$tmp/rb-cold.out" "and says so"
+# NOT VERIFIED means what it says, for each thing a verification looks at.
+write_fake beef live "$install_dir/conbus"; write_fake 01d stampnolisten "$rollback_bin"
+write_stamp beef 4405
+code=0; SERVING_LIMIT=2 run rollback >"$tmp/rb-nolisten.out" 2>&1 || code=$?
+expect 3 "$code" "a restored daemon that never listens is not verified"
+expect_grep 'ROLLBACK NOT VERIFIED.*not listening' "$tmp/rb-nolisten.out" "and says that"
+write_fake beef live "$install_dir/conbus"; write_fake 01d stampdiffers "$rollback_bin"
+write_stamp beef 4406
+code=0; SERVING_LIMIT=2 run rollback >"$tmp/rb-differs.out" 2>&1 || code=$?
+expect 3 "$code" "a doctor saying DIFFERS is not verified"
+expect_grep 'ROLLBACK NOT VERIFIED.*different build' "$tmp/rb-differs.out" "and says that"
+# A rollback copy that does not say what it is.
+write_fake beef live "$install_dir/conbus"; printf '#!/bin/sh\nexit 1\n' >"$rollback_bin"; chmod 755 "$rollback_bin"
+write_stamp beef 4407
+code=0; SERVING_LIMIT=1 run rollback >"$tmp/rb-unnamed.out" 2>&1 || code=$?
+expect 3 "$code" "a copy that does not run cannot be verified"
+expect_grep 'ROLLBACK NOT VERIFIED.*does not say which build' "$tmp/rb-unnamed.out" "and says that"
+# An install failure says that, on the real path, and is still exit 3: the old daemon may still be the one running.
+write_fake beef live "$install_dir/conbus"; write_fake 01d noinstall "$rollback_bin"
+write_stamp beef 4408
+code=0; SERVING_LIMIT=1 run_real rollback >"$tmp/rb-noinstall.out" 2>&1 || code=$?
+expect 3 "$code" "a restored build whose install --apply fails is not verified"
+expect_grep "ROLLBACK NOT VERIFIED.*'conbus install --apply' failed" "$tmp/rb-noinstall.out" "and it is the install it blames"
+expect_no_grep 'no 01d stamp' "$tmp/rb-noinstall.out" "not a stamp that was never going to come"
+# So does the automatic one. start copies the installed build, so that is where the failing install goes.
+write_fake 01d noinstall "$install_dir/conbus"
+rm -f "$home/.install-called" "$home/.conbus/canary.json"
+cat >"$home/.conbus/drops.jsonl" <<'EOF'
+{"ts":"2026-10-30T09:00:00.000Z","reason":"socket closed early"}
+EOF
+daemon_boot beef 4409
+code=0; SERVING_LIMIT=1 run_real start --from "$tmp/stage/conbus-dropper" >"$tmp/rb-auto-noinstall.out" 2>&1 || code=$?
+expect 3 "$code" "the automatic rollback too"
+expect_grep "ROLLBACK NOT VERIFIED.*'conbus install --apply' failed" "$tmp/rb-auto-noinstall.out" "with the same words"
+expect_grep 'rolled_back' "$home/.conbus/canary.json" "and the rollback is still recorded"
+# An unreadable spool does not end a rollback.
+if [ "$(id -u)" != 0 ]; then
+    write_fake beef live "$install_dir/conbus"; write_fake 01d old "$rollback_bin"
+    write_stamp beef 4410
+    mkdir -p "$home/.conbus/spool"; chmod 000 "$home/.conbus/spool"
+    code=0; run rollback >"$tmp/rb-nospool.out" 2>&1 || code=$?
+    chmod 700 "$home/.conbus/spool"
+    expect 0 "$code" "a spool that cannot be read does not end a rollback"
+    expect_grep 'rollback verified' "$tmp/rb-nospool.out" "it is verified"
+    expect_grep 'spool: .*could not be read' "$tmp/rb-nospool.out" "and the spool is said"
+fi
+rm -rf "$home/.conbus/spool"
+# A restart whose daemon never served is no success.
+cat >"$home/.conbus/canary.json" <<EOF
+{"swapped":"$(iso_ago $((7 * DAY)))","prev_build":"01d","candidate_build":"beef","candidate_sha256":"x","restarts":[]}
+EOF
+write_fake beef silent "$install_dir/conbus"
+write_stamp beef 5020
+code=0; SERVING_LIMIT=1 run_real restart >"$tmp/restart-noserve.out" 2>&1 || code=$?
+expect 1 "$code" "a restart that never served exits non-zero"
+expect_grep '"serving_ms":-1' "$home/.conbus/canary.json" "and is recorded as such"
+expect_grep 'no new serving stamp' "$tmp/restart-noserve.out" "and says so"
+
+# A blackout spec that cannot be read refuses, whichever part is wrong. A day part that was not a day used to read as
+# "not today", so a swap went through in the hours it was written to protect.
+for bad_spec in 'mon-fri 00:00-23:59 UTC' 'Mon-Fir 00:00-23:59 UTC' 'Monday 00:00-23:59 UTC' 'Mon-Fri-Sat 00:00-23:59 UTC' 'Mon,,Tue 00:00-23:59 UTC' \
+    'Mon-Fri 00:00-23:59 Nowhere' 'Mon-Fri 25:00-26:00 UTC' 'mon-fri 00:00-23:59'; do
+    write_fake 01d old "$install_dir/conbus"; rm -f "$rollback_bin" "$home/.conbus/canary.json"
+    code=0; CONBUS_CANARY_BLACKOUT=$bad_spec run start --from "$tmp/stage/conbus-good" >"$tmp/blackout-bad.out" 2>&1 || code=$?
+    expect 2 "$code" "blackout '$bad_spec' is refused (P9)"
+    expect_grep 'unparseable' "$tmp/blackout-bad.out" "and says it could not be read"
+    expect "conbus 0.0.0-01d (01d)" "$("$install_dir/conbus" --version)" "and nothing moved"
+done
+# Preflight names it too.
+code=0; CONBUS_CANARY_BLACKOUT='mon-fri 00:00-23:59 UTC' run preflight >"$tmp/blackout-preflight.out" 2>&1 || code=$?
+expect_grep '^FAIL blackout.*unparseable' "$tmp/blackout-preflight.out" "preflight says the same"
+# The forms it documents still parse, and a list works as a day part.
+blackout_today=$(env TZ=UTC date +%a)
+case $blackout_today in Mon) blackout_other=Wed ;; *) blackout_other=Mon ;; esac
+write_fake 01d old "$install_dir/conbus"; rm -f "$rollback_bin" "$home/.conbus/canary.json"
+code=0; CONBUS_CANARY_BLACKOUT="$blackout_other,$blackout_today 00:00-23:59 UTC" run start --from "$tmp/stage/conbus-good" >"$tmp/blackout-list.out" 2>&1 || code=$?
+expect 2 "$code" "a day list holding today blocks"
+expect_grep 'is active' "$tmp/blackout-list.out" "as active, not as unreadable"
+daemon_boot beef 4266
+code=0; CONBUS_CANARY_BLACKOUT="$blackout_other,$blackout_other 00:00-23:59 UTC" run start --from "$tmp/stage/conbus-good" >/dev/null 2>&1 || code=$?
+expect 0 "$code" "one that does not hold today does not"
+
+# The budgets a window was started with stay with it. A verdict run a week later from another shell forgot them twice.
+run_nobudget() { # the way an operator's later shell runs it: nothing from `start` left in the environment
+    home_is_throwaway
+    env -u CONBUS_HOME -u XDG_STATE_HOME -u CONBUS_CANARY_RSS_MB -u CONBUS_CANARY_DOCTOR_MS -u CONBUS_CANARY_DISK_WARN_OK -u CONBUS_CANARY_SERVING_LIMIT \
+        HOME="$home" CONBUS_SKIP_LAUNCHCTL=1 CONBUS_CANARY_REHEARSAL=1 ${LATER_SHELL_SET:-} \
+        CONBUS_CANARY_TAIL_MS=20000 CONBUS_CANARY_USAGE_MS=20000 \
+        bash "$canary" "$@"
+}
+write_fake 01d old "$install_dir/conbus"; rm -f "$rollback_bin" "$home/.conbus/canary.json"
+daemon_boot beef 4267
+code=0
+CONBUS_CANARY_RSS_MB=650 DOCTOR_MS=5000 CONBUS_CANARY_DISK_WARN_OK=1 SERVING_LIMIT=40 run start --from "$tmp/stage/conbus-good" >"$tmp/start-budgets.out" 2>&1 || code=$?
+expect 0 "$code" "start with budgets for this machine"
+expect_grep '"rss_mb":"650"' "$home/.conbus/canary.json" "stores the RSS budget"
+expect_grep '"doctor_ms":"5000"' "$home/.conbus/canary.json" "and the doctor budget"
+expect_grep '"disk_warn_ok":"1"' "$home/.conbus/canary.json" "and the disk warning it accepted"
+expect_grep '"serving_limit":"40"' "$home/.conbus/canary.json" "and the serving limit restarts are judged with"
+expect_grep 'budgets stored: recorder RSS 650 MB, doctor 5000 ms' "$tmp/start-budgets.out" "and says so"
+code=0; run restart >/dev/null 2>&1 || code=$?
+expect_grep '"rss_mb":"650"' "$home/.conbus/canary.json" "and a restart keeps them"
+# Read back, and said, with no environment at all.
+verdict_fixture
+state_add() { sed -E "s/,\"restarts\":/,\"$1\":\"$2\",\"restarts\":/" "$home/.conbus/canary.json" >"$home/.conbus/canary.json.new"; mv -f "$home/.conbus/canary.json.new" "$home/.conbus/canary.json"; }
+state_add rss_mb 1
+state_add doctor_ms 20000
+state_add disk_warn_ok 1
+code=0; run_nobudget verdict >"$tmp/verdict-stored.out" 2>&1 || code=$?
+expect 1 "$code" "a stored budget is the budget"
+expect_grep '^FAIL rss-budget.*> 1 MB' "$tmp/verdict-stored.out" "the stored RSS budget judged it"
+expect_grep 'budgets: recorder RSS 1 MB (stored at start), doctor 20000 ms (stored at start)' "$tmp/verdict-stored.out" "and the stored values are printed"
+expect_grep 'disk warning accepted at start: yes' "$tmp/verdict-stored.out" "the disk answer too"
+# The environment still wins, and says it did.
+code=0; LATER_SHELL_SET=CONBUS_CANARY_RSS_MB=650 run_nobudget verdict >"$tmp/verdict-stored-env.out" 2>&1 || code=$?
+expect 0 "$code" "the environment overrides what is stored"
+expect_grep 'recorder RSS 650 MB (from the environment)' "$tmp/verdict-stored-env.out" "and is named as the source"
+# Junk in the file is refused like junk in the environment.
+verdict_fixture
+state_add rss_mb lots
+code=0; run_nobudget verdict >"$tmp/verdict-stored-junk.out" 2>&1 || code=$?
+expect 2 "$code" "a stored budget that is not a number is refused"
+expect_grep "canary.json rss_mb='lots'" "$tmp/verdict-stored-junk.out" "by name"
+# A window started before budgets were stored runs on the defaults, and says that.
+verdict_fixture
+code=0; run_nobudget verdict >"$tmp/verdict-stored-none.out" 2>&1 || code=$?
+expect_grep 'recorder RSS 256 MB (default)' "$tmp/verdict-stored-none.out" "defaults are named as defaults"
+expect_grep 'disk warning accepted at start: no' "$tmp/verdict-stored-none.out" "and no answer is no"
+
+# What it says to the person reading it.
+code=0; run help >"$tmp/help.out" 2>&1 || code=$?
+expect 0 "$code" "help runs"
+for help_word in 'verdict exits' '0 pass' '4 the window is over' '\[--idle' 'rollback exit 3'; do
+    expect_grep "$help_word" "$tmp/help.out" "help says: $help_word"
+done
+expect_no_grep '^set \|^#!' "$tmp/help.out" "and stops at the usage"
+# PASS drops does not say a thing it cannot know.
+verdict_fixture
+drop_line 3600 'EOF while parsing a value at line 1 column 0'
+code=0; run verdict >"$tmp/verdict-drops-words.out" 2>&1 || code=$?
+expect_grep '^PASS drops — no line says a record was lost' "$tmp/verdict-drops-words.out" "over lines that cannot prove a loss, it does not say 0 lost"
+expect_no_grep '0 lost records' "$tmp/verdict-drops-words.out" "those words are gone"
+# The restarts line says the allowance it judged with.
+verdict_fixture
+code=0; run verdict >"$tmp/verdict-grace.out" 2>&1 || code=$?
+expect_grep '^PASS restarts.*within 90s' "$tmp/verdict-grace.out" "it says how long a start counts as the swap's or a planned restart's"
+# start and verdict agree on the swap window: 60 s from the swap, and a later line goes through the new-reason rule.
+write_fake beef swaplate "$tmp/stage/conbus-swaplate"
+write_fake 01d old "$install_dir/conbus"
+rm -f "$rollback_bin" "$home/.install-called" "$home/.conbus/canary.json"
+cat >"$home/.conbus/drops.jsonl" <<'EOF'
+{"ts":"2026-10-30T09:00:00.000Z","reason":"socket closed early"}
+EOF
+daemon_boot beef 4268
+code=0; SERVING_LIMIT=5 run_real start --from "$tmp/stage/conbus-swaplate" >"$tmp/start-swaplate.out" 2>&1 || code=$?
+expect 1 "$code" "a swap reason past the 60 s is not exempt at start either"
+expect_grep 'new drop reason' "$tmp/start-swaplate.out" "it goes through the new-reason rule"
+# A hook that spooled through a stall is in the spool, not lost: a moment later it has landed.
+write_fake beef slowlog "$tmp/stage/conbus-slowlog"
+write_fake 01d old "$install_dir/conbus"; rm -f "$rollback_bin" "$home/.conbus/canary.json"
+code=0; run preflight --from "$tmp/stage/conbus-slowlog" >"$tmp/preflight-slowlog.out" 2>&1 || code=$?
+expect_grep '^PASS round-trip' "$tmp/preflight-slowlog.out" "a record that lands a moment late still landed"
+
+# Each of these once survived having the check it covers taken out.
+# Any reply is not an answer: a stand-in on the socket that says something else is no recorder.
+verdict_fixture
+touch "$home/.conbus/conbus.sock.garbage"
+code=0; CONBUS_CANARY_PROBE_S=1 run verdict >"$tmp/verdict-garbage.out" 2>&1 || code=$?
+rm -f "$home/.conbus/conbus.sock.garbage"
+expect 1 "$code" "a socket that answers something other than the protocol fails"
+expect_grep '^FAIL recorder-serving.*did not answer' "$tmp/verdict-garbage.out" "as no answer"
+# Only a change of protocol is a swap's refusal. The same version on both sides is a daemon refusing its own hook.
+verdict_fixture "$(iso_ago 120)"
+drop_line 100 'the daemon refused the record: this daemon speaks protocol v6; the hook speaks v6. Restart the daemon.'
+code=0; run verdict >"$tmp/verdict-sameproto.out" 2>&1 || code=$?
+expect 1 "$code" "a refusal between the same protocol is not the swap's, even inside its 60 s"
+expect_grep '^FAIL drops — 1 lost record' "$tmp/verdict-sameproto.out" "and is counted as lost"
+# A row with more counted than recovered holds something the recorder saw, tool calls or not.
+verdict_fixture
+sed -E 's/"harness":"codex","turns":3,"tool_calls":40,"tool_denials":0,"repeated":0,"recovered":0/"harness":"codex","turns":12,"tool_calls":0,"tool_denials":0,"repeated":0,"recovered":9/' \
+    "$home/.usage-rows" >"$home/.usage-rows.new"
+mv -f "$home/.usage-rows.new" "$home/.usage-rows"
+code=0; run verdict >"$tmp/verdict-counted-live.out" 2>&1 || code=$?
+expect 0 "$code" "turns beyond what gap fill recovered count as seen, with no tool calls"
+expect_grep '^  codex: the recorder saw it on [1-9]' "$tmp/verdict-counted-live.out" "and the table says so"
+# The two weeks before the swap decide who counts as active. Twenty days before it is not news.
+verdict_fixture
+usage_row "$(day_ago 28)" cursor >>"$home/.usage-rows"
+code=0; run verdict >"$tmp/verdict-lookback.out" 2>&1 || code=$?
+expect 0 "$code" "a harness last used twenty days before the swap is not asked about"
+expect_no_grep 'cursor recorded' "$tmp/verdict-lookback.out" "not by name either"
+
+# A tear with no time and nothing after it is the newest thing in the file.
+verdict_fixture
+printf '{"ts":"2026-1' >>"$home/.conbus/drops.jsonl"
+code=0; run verdict >/dev/null 2>&1 || code=$?
+expect 4 "$code" "a tear at the end of the file, with no time, leaves drops open"
+
+# A harness with no hook has nothing to go silent. claude_chat arrives only by export, so a month's quiet there is
+# no question: it was 18 of the 35 windows asked about on the real log.
+verdict_fixture
+usage_row "$(day_ago 10)" claude_chat >>"$home/.usage-rows"
+code=0; run verdict >"$tmp/verdict-chat-silent.out" 2>&1 || code=$?
+expect 0 "$code" "a harness that only arrives by export is not asked about"
+expect_no_grep 'claude_chat recorded' "$tmp/verdict-chat-silent.out" "not by name either"
+# It is still shown when it is there, and every harness with a hook is still asked about.
+verdict_fixture
+usage_row "$(day_ago 10)" cursor >>"$home/.usage-rows"
+usage_row "$(day_ago 10)" claude_chat >>"$home/.usage-rows"
+code=0; run verdict >"$tmp/verdict-chat-and-cursor.out" 2>&1 || code=$?
+expect 4 "$code" "a harness with a hook still is"
+expect_grep 'answer with --idle cursor$' "$tmp/verdict-chat-and-cursor.out" "and only that one"
 
 # A real build under this throwaway HOME would ask an agy that is not signed
 # in, and a build older than the sign-in check opens a browser tab doing it.

@@ -12,7 +12,8 @@ that other programs call on every agent turn.
 
 - **Credentials.** conbus never reads, stores or forwards vendor auth tokens,
   and never changes how a vendor logs in. Quota comes from what the vendors
-  already expose to their own hooks and CLIs.
+  already expose to their own hooks and CLIs. An address you hand to `conbus auth
+  --url` can hold a token; it is not decoded, printed or kept.
 - **Consent gates.** Codex asks you to trust each hook before it runs one.
   conbus never writes that trust record for you.
 - **The socket.** The daemon listens on a Unix socket in its data directory

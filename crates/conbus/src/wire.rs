@@ -16,8 +16,30 @@ use serde::{Deserialize, Serialize};
 /// It protects upgrades from v1 onward, and not this one: a daemon built before
 /// this field existed ignores it, so the first deploy still needs the daemon
 /// restarted by hand. `the_wire_shape_is_pinned_to_the_protocol_version` below
-/// is what stops the constant falling behind the struct.
+/// is what stops the constant falling behind the struct. A new event kind is a
+/// change of shape too, though nothing pins that; a daemon treats a request it
+/// cannot parse at this version the same way, as coming from a newer build.
 pub const PROTOCOL_VERSION: u32 = 6;
+
+/// What `doctor` asks a running daemon, as one line on its socket.
+///
+/// Not a hook's request, and no part of the hook protocol: it names no protocol
+/// version and no harness, so an older daemon answers it with its ordinary
+/// `unreadable request`, which `doctor` takes as no information.
+pub const HEALTH_QUESTION: &str = r#"{"question":"health"}"#;
+
+/// What a daemon knows about the log that nothing on disk says. On a full disk it
+/// may be unable to write any of this down, which is why it is asked.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct Health {
+    /// When the log began refusing, if the last write tried was refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusing_since: Option<String>,
+    /// Records held in memory for the log.
+    pub held: u64,
+    /// Of those, the ones with no spool copy: lost if this daemon stops first.
+    pub in_memory_only: u64,
+}
 
 /// One observed vendor event, on its way to the log.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]

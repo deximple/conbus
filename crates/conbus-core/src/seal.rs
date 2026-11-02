@@ -89,6 +89,12 @@ pub fn kek() -> Option<[u8; 32]> {
     }
 }
 
+/// Whether sealing is something this machine does at all. Where there is no OS
+/// key store a tool body is elided by design, and that is no loss to report.
+pub fn seals_here() -> bool {
+    cfg!(target_os = "macos") || std::env::var_os("CONBUS_KEK_HEX").is_some()
+}
+
 pub fn seal_text(text: &str) -> Option<Body> {
     let key = kek()?;
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));

@@ -165,7 +165,7 @@ Codex는 새 훅을 승인받은 뒤에만 실행합니다. Codex를 한 번 켜
 | `build` | `0.2.8 (<commit>)` |
 | `socket` | `listening` |
 | `daemon` | `build`와 같은 커밋. `DIFFERS`는 바이너리를 바꾸고 데몬을 다시 시작하지 않았다는 뜻입니다 |
-| `writable` | `appendable` |
+| `writable` | `appendable`. `REFUSING`은 로그가 쓰기를 거절하고 있다는 뜻입니다. 공간을 비우고, 레코더를 다시 시작하지 마세요 |
 | `hooks` / `events` | 설치된 에이전트마다 `runs`와 `N/N registered`. 나머지는 `not installed here` |
 | `codex` | `7 hook(s) trusted`. `NOT TRUSTED`는 아직 Codex에서 승인하지 않았다는 뜻입니다 |
 | `last` | 방금 보낸 턴 |
@@ -176,6 +176,7 @@ Codex는 새 훅을 승인받은 뒤에만 실행합니다. Codex를 한 번 켜
 | 줄 | 알려 주는 것 |
 | --- | --- |
 | `hardening` | 레코더가 코어 덤프를 끄고 메모리를 잠갔는지 |
+| `backup` | 마지막 백업이 언제 어디로 갔는지, 또는 이 로그의 사본이 하나뿐이라는 것(11장) |
 | `chat` | Claude.ai 대화가 로그에 들어오는 경로(9장) |
 | `log` | 레코드 수, 대화 수, 레코더가 읽지 못한 줄 수(0이어야 합니다) |
 | `twins` | 실시간 기록과 백필 양쪽에 기록된 세션, 그리고 어느 사본으로 이어지는지 |
@@ -430,7 +431,7 @@ conbus quota
 | 레그 | 숫자의 출처 |
 | --- | --- |
 | Codex | Codex 자신의 app-server(`account/rateLimits/read`). Codex.app을 포함한 계정 전체 |
-| agy | `agy -p /usage`. `agy models`로 로그인을 확인한 뒤에만 실행 |
+| agy | `agy -p /usage`. `conbus quota`만 실행하고, `agy models`로 로그인을 확인한 뒤에만. `doctor`와 `status`는 캐시된 판독값을 보여 줌 |
 | Claude Code | Claude Code가 StatusLine 명령에 넘겨주는 `rate_limits` |
 | Cursor, grok, opencode | 아직 없음. 이들의 훅에는 남은 쿼터 필드가 없습니다 |
 
@@ -440,12 +441,20 @@ StatusLine을 실행하지 않으므로 판독값이 며칠 묵을 수 있습니
 StatusLine이 마지막으로 언제 돌았는지 알려 줍니다. conbus는 다른 방법으로 그
 숫자를 얻으려고 Claude의 자격 증명을 읽지 않습니다.
 
-**agy는 로그인돼 있을 때만 읽습니다.** 로그인하지 않은 `agy -p`는 브라우저 탭을
-열고, 시간 제한으로는 이를 막지 못합니다. 그래서 conbus는 먼저 `agy models`를
-실행합니다. 로그인이 없다고 나오면 `quota`, `doctor`, `status`가
-`AUTH_REQUIRED`라고 알리고, 다른 이유로 실패하거나 시간이 다 되면 `SKIP`이라고
-알립니다. 어느 쪽이든 `agy -p`는 실행되지 않고 판독값도 없으며, hop은 판독값 없이
-진행합니다. 로그인하려면 터미널에서 `agy`를 실행하세요.
+**agy는 `conbus quota`가 읽고, 로그인돼 있을 때만 읽습니다.** 로그인하지 않은
+`agy -p`는 브라우저 탭을 열고, 시간 제한으로는 이를 막지 못합니다. 그래서 `doctor`,
+`status`, hop이 판단할 때의 쿼터 읽기는 `agy`를 실행하지 않습니다. `conbus quota`는
+사람이 친 명령입니다. 먼저 `agy models`를 실행하고, 로그인이 확인될 때만
+`agy -p /usage`를 물은 뒤 판독값을 캐시합니다. 로그인이 없으면 `AUTH_REQUIRED`라고
+하고, `agy models`가 다른 이유로 실패하거나 시간이 다 되면 `SKIP`이라고 합니다.
+`conbus auth`도 묻지만 `agy models`만 실행하고 `-p`는 실행하지 않습니다.
+
+`doctor`와 `status`는 캐시된 판독값을 지난 시간과 함께 보여 줍니다. 90분이 지나면
+숫자를 보여 주지 않고 `last read 2h ago, so the numbers are not counted`라고 하며,
+판독값이 없으면 `no reading yet; conbus quota reads it`이라고 합니다. hop은 캐시로
+판단하고, 판독값이 없어도 진행합니다. 사람이 지시한 `agy`로의 hop과 `conbus run`은
+`agy` 자체를 대화형 세션으로 시작하며, 로그인이 없는 `agy`는 그때 로그인을 요구합니다.
+로그인하려면 터미널에서 `agy`를 실행하세요.
 
 ---
 
@@ -463,8 +472,8 @@ Claude Code의 트랜스크립트(`~/.claude/projects`)와 Codex의 스레드(Co
 app-server로)를 읽어, 세션마다 "되살린 것"으로 표시한 대화로 정리합니다. 레코더가
 이미 실시간으로 본 세션은 중복해서 만들지 않습니다.
 
-`--apply`는 레코더가 도는 동안에는 거부합니다. 둘이 같은 파일에 쓰게 되기
-때문입니다. 레코더를 멈추고, 백필하고, 다시 켜세요.
+`--apply`는 레코더나 그 시작 복구가 로그를 쥐고 있는 동안에는 거부하고, 실행하는
+동안에는 스스로 쥐고 있습니다. 둘이 같은 파일에 쓰게 되기 때문입니다. 레코더를 멈추고, 백필하고, 다시 켜세요.
 
 ```bash
 launchctl bootout gui/$(id -u)/sh.conbus.daemon
@@ -475,15 +484,45 @@ conbus install --apply     # 레코더를 다시 켭니다
 레코더가 꺼져 있던 동안 실시간 세션에서 **놓친 턴**은 레코더가 켜질 때 자동으로
 채워집니다. Claude Code 트랜스크립트, Codex 스레드, 채팅 내보내기에서 가져옵니다.
 시작 시 이 작업에는 최대 15초를 씁니다(`CONBUS_GAP_BUDGET_MS`로 바꿀 수 있습니다).
-예산이 부족해 다 채우지 못한 범위는 `cache/gap-since`에 기억했다가 다음 시작 때
-이어서 채우고, `daemon.log`에도 남깁니다. `conbus backfill --gaps`는 같은 빈틈을
-시간 제한 없이 필요할 때 채우며, Claude Code에 대해 전체 기록에 걸쳐 동작합니다.
-`--apply`를 붙이면 이것 역시 레코더를 멈춰야 합니다. `cache/`를 지우면 기억한
-범위도 사라지므로 그 뒤에는 `conbus backfill --gaps`를 실행하세요.
+예산이 부족해 다 채우지 못한 범위는 `cache/gap-since`와 `cache/gap-read`에
+기억했다가 다음 시작 때 멈춘 곳부터 이어서 채우고, `daemon.log`에도 남깁니다. `codex app-server`가 시작되지 않거나
+응답을 멈춰 Codex 단계가 돌지 못하면 그 범위는 `cache/gap-since-codex`에 따로
+기억하고, 멈춰 버린 app-server나 스레드는 시작을 매번 붙잡지 않도록 한 시간 동안
+다시 묻지 않습니다. `conbus backfill --gaps`는 같은 빈틈을 시간 제한 없이 필요할 때
+채우며, Claude Code와 Codex에 대해 전체 기록에 걸쳐 동작합니다. `--apply`를
+붙이면 이것 역시 레코더를 멈춰야 하고, Codex 스레드를 모두 읽고 나면 Codex 범위는
+끝납니다. `cache/`를 지우면 기억한 범위도
+사라지므로 그 뒤에는 `conbus backfill --gaps`를 실행하세요.
+
+`conbus doctor`는 아직 붙잡고 있는 범위마다 `gap fill` 줄을 보여 줍니다. 언제부터인지, 왜인지,
+무엇이 붙잡고 있는지 나옵니다. 각각을 끝내는 방법은 이렇습니다.
+
+- **예산이 부족했습니다.** 다음 시작이 이어서 하거나 `conbus backfill --gaps --apply`가 지금 전부
+  합니다.
+- **트랜스크립트를 읽을 수 없습니다.** `doctor`, `daemon.log`, `conbus backfill --gaps`가 파일을
+  알려 줍니다. 고치거나 `~/.claude/projects` 밖으로 옮기면 다음 시작이 마칩니다.
+- **`codex app-server`가 시작되지 않습니다.** Codex를 고치거나 설치하면 다음 시작이 읽습니다.
+- **스레드가 서버를 멈췄습니다.** 한 시간 뒤에 다시 묻습니다. `conbus backfill --gaps --apply`는
+  바로 묻고, 그 스레드를 읽으면 기다림이 끝납니다.
+- **서버가 스레드를 거절했습니다.** 롤아웃이 바뀔 때까지 다시 묻지 않으므로 기다리는 동안 비용이
+  없습니다. `conbus backfill --gaps --apply`는 바로 묻고 답을 보여 줍니다.
+
+그 범위가 채울 내용이 필요 없다면 `cache/gap-since`나 `cache/gap-since-codex`를 지우세요. 그
+범위를 포기하는 것이고 이미 쓴 레코드는 사라지지 않습니다.
+
+트랜스크립트가 만들어지기 1분 넘게 전에 찍힌 줄은 포크의 앞부분처럼 다른 대화에서 복사된
+것으로 보고 채우지 않습니다. `cp`, `rsync -a`로 옮기거나 다른 볼륨으로 옮긴 트랜스크립트는
+생성 시각이 새로 찍혀 거의 모든 줄이 그렇게 보이므로 아무것도 채워지지 않습니다.
+`conbus backfill --gaps`는 이렇게 제쳐 둔 줄 수를 알려 줍니다. 그래도 채우려면
+`--include-older-lines`를 붙이세요. 트랜스크립트를 옮긴 것이 확실할 때 쓰고, 먼저 dry run을
+보세요. 그 줄이 정말 다른 대화의 복사본일 수 있습니다. 포크라면 부모의 프롬프트이고, 포크 자신의
+턴처럼 나타납니다. 로그에 쓴 레코드는 지울 수 없습니다. 다른 대화가 가진 턴 id는 이때도
+채우지 않습니다.
 
 **Claude.ai 대화**는 데스크톱 앱에 훅이 없습니다. Claude.ai에서 데이터를
 내보내고(Settings → Privacy → Export data) 그 zip(또는 `conversations.json`)을
-`~/.conbus/chat-export/`에 넣으면 레코더가 가져갑니다.
+`~/.conbus/chat-export/`에 넣으면 레코더가 가져갑니다. 레코더가 꺼져 있었다면 파일 날짜와
+상관없이 다음 시작 때 가져갑니다.
 `conbus backfill --chat-export PATH`는 어디에 있는 파일이든 읽고, `--apply`를 붙이고
 레코더를 멈춘 상태에서는 기록합니다. Claude의 Inference hooks를 쓰는 조직은 그것을
 `conbus hook --inference-listen`(기본 `127.0.0.1:8787`)에 연결해 대화를 실시간으로
@@ -522,12 +561,14 @@ conbus arena link --from ~/src/shop --to ~/src/shop-admin
 | `drops.jsonl` | 기록하지 못한 이벤트와 그 이유 |
 | `daemon.log` | 레코더 자신의 메시지. 시각이 찍혀 있습니다 |
 | `daemon.build` | 지금 도는 레코더가 어떤 빌드인지 |
+| `daemon.lock` | 비어 있는 파일. 도는 레코더가 여기에 잠금을 걸어 두 번째 데몬이 아무것도 쓰지 못하게 합니다. **지우지 마세요.** 시작할 때 다른 레코더가 있다고 나와도 마찬가지입니다. 잠금을 쥔 쪽이 데몬보다 오래 살아남아 아직 쓰고 있는 시작 복구일 수 있고, 이 복구는 2분 안에 스스로 포기합니다. 복구가 도는 중에 파일을 지웠더니 다음 데몬이 그 옆에서 함께 써서 중복 `seq` 3개가 생겼고, 복구한 턴이 모두 두 번씩 영구히 남았습니다 |
 | `conbus.sock` | 레코더의 소켓(모드 `0600`) |
 | `quota/` | 마지막 쿼터 판독값 |
 | `takeover.json` | `conbus run`을 기다리는 hop이 있을 때만 |
 | `policy.json` | 직접 쓴 `PreToolUse` 규칙. 없으면 정책이 꺼져 있습니다(15장) |
+| `backup.json` | 마지막으로 성공한 `conbus backup`: 어디로, 언제, 얼마나 |
 | `cache/meta/` | 파생 읽기 캐시. 툴 본문을 SHA-256 요약으로 바꾼 레코드입니다. 지워도 잃는 것이 없습니다 |
-| `spool/` | 레코더가 재시작하는 동안 훅이 맡겨 둔 요청. 다음 레코더가 읽어 기록한 뒤 지웁니다 |
+| `spool/` | 레코더가 재시작하는 동안 훅이 맡겨 둔 요청. 다음 레코더가 읽어 기록한 뒤 지웁니다. 디스크가 꽉 차 로그가 받지 못해도 기다리며, 파일이 7일 지났고 로그도 7일 내내 한 번도 받지 못했을 때만 `drops.jsonl`에 남기고 지웁니다. 디스크가 정말로 꽉 차면 스풀에도 쓰지 못해 기록은 레코더의 메모리에만 남고, 로그가 받기 전에 레코더가 멈추면 사라집니다. 그동안 `conbus doctor`의 `writable` 줄이 알려 줍니다. 멈추라는 요청을 받으면 레코더는 최대 5초 동안 로그가 받는 만큼 먼저 기록하고, 공간이 있으면 기록하지 못한 건수를 `drops.jsonl`에 남깁니다. 강제 종료나 크래시에는 그럴 기회가 없습니다. 아직 대화에 묶이지 않은 세션의 툴 호출은 그 세션의 프롬프트를 최대 하루 기다립니다 |
 | `facts.jsonl`, `links.jsonl` | 10장 |
 | `chat-export/` | 넣어 둔 Claude.ai 내보내기 |
 
@@ -547,7 +588,7 @@ conbus arena link --from ~/src/shop --to ~/src/shop-admin
 | --- | --- | --- |
 | *(설정 안 함)* | 남김 | 쓰지 않음 — 크기만 |
 | `full` | 남김 | 남김(본문마다 16 KiB에서 자름) |
-| `encrypted_tools` | 남김 | 로그인 키체인에 있는 키로 AES-256-GCM 봉인. `conbus log --reveal`로 엽니다 |
+| `encrypted_tools` | 남김 | 로그인 키체인에 있는 키로 AES-256-GCM 봉인. `conbus log --reveal`로 엽니다. 스풀을 거친 툴 호출은 크기만 남습니다. 봉인은 레코더만 할 수 있기 때문이며, `doctor`의 `drops`에 집계됩니다 |
 | `ephemeral` | 아무것도 쓰지 않음 | 아무것도 쓰지 않음 |
 
 어느 수준에서든 16 KiB보다 긴 본문 하나는 로그에서 잘리고, 원래 크기가 함께
@@ -579,6 +620,11 @@ conbus에는 서버도, 계정도, 텔레메트리도 없습니다. 기능 세 �
 컬렉터로, 실행할 때만 보냅니다(5장). 그다음 어디로 가는지는 그 컬렉터의 설정에 달려
 있습니다.
 
+`conbus backup --to FOLDER`는 로그의 닫힌 세그먼트를 평문 그대로 지정한 폴더에
+복사합니다. 실행할 때만 동작합니다. 클라우드 동기화 폴더와 `~/Desktop`, `~/Documents`는
+거부하고, 네트워크 공유에서는 사본이 이 기기를 떠난다고 알려 줍니다
+([아래](#백업하기-experimental)).
+
 쿼터를 읽으려고 conbus는 에이전트 자신의 CLI를 실행합니다(8장). hop을 결정할 때는
 `gh`에 그 폴더의 풀 리퀘스트를 묻습니다.
 
@@ -587,10 +633,234 @@ conbus에는 서버도, 계정도, 텔레메트리도 없습니다. 기능 세 �
 벤더 자격 증명과 토큰. 에이전트의 세션 파일(`backfill`을 실행할 때와 레코더가
 켜지며 빈틈을 채울 때는 예외). `~/Downloads` 폴더.
 
+### 백업하기 (experimental)
+
+따로 만들기 전까지 로그는 하나뿐입니다. 디스크가 죽거나, Mac을 잃어버리거나, `rm`을
+잘못 치면 전부 사라집니다. `conbus doctor`가 지금 상태를 알려 줍니다.
+
+```text
+backup    none: this log has one copy
+```
+
+```bash
+conbus backup --to "/Volumes/My Disk"
+conbus backup --verify --to "/Volumes/My Disk"
+```
+
+직접 실행하거나 직접 설정한 스케줄러가 실행합니다. conbus 안의 어떤 것도 이것을
+실행하지 않습니다. 모르는 사이에 만들어진 사본은 프롬프트를 지우려고 `~/.conbus`를
+삭제해도 살아남기 때문입니다.
+
+- **무엇을 복사하는가.** 아직 없는 닫힌 세그먼트를 `<folder>/conbus-backup/log/`에
+  복사하고, 각 세그먼트의 이름, 크기, SHA-256을 담은 `manifest.json`을 함께 둡니다.
+  다시 실행하면 새로운 것만 복사합니다. 아직 쓰고 있는 세그먼트는 8 MiB에 이르러
+  넘어갈 때까지 그대로 두므로, 실행할 때마다 백업보다 새로운 레코드가 몇 개인지
+  알려 줍니다. 8 MiB가 안 되는 로그에는 아직 닫힌 세그먼트가 없습니다. 실행 결과가
+  그렇게 말하고, 사본은 여전히 하나뿐입니다.
+- **어떻게 복사하는가.** 세그먼트마다 임시 이름으로 쓰고, 다시 읽어 비교한 뒤에야
+  진짜 이름을 붙입니다. 그래서 중단된 실행이 완전해 보이는 반쪽 파일을 남기지
+  않습니다. 남은 임시 파일은 다음 실행이 지웁니다. 로그와 같은 APFS 볼륨에서는
+  클론으로 복사해 공간을 거의 쓰지 않으며, 실행 결과가 그렇게 알려 줍니다. 그 밖의
+  곳에서는 실제로 복사합니다.
+- **`--verify`**는 백업 전체를 다시 읽고, 내용이 다르거나 없거나 매니페스트에 없는
+  파일을 하나하나 이름으로 알린 뒤 1로 끝납니다. 손상은 찾아내지만 변조는 찾아내지
+  못합니다. 키가 없으므로 사본을 바꿀 수 있는 사람은 매니페스트도 맞게 바꿀 수 있습니다.
+  일반 실행은 이미 있는 파일을 읽지 않으므로 사본이 망가져도 알아채지 못합니다. 고치려면
+  백업에서 그 파일을 지우고 `conbus backup`을 실행하세요. 로그에 그 세그먼트가 남아 있으면
+  매니페스트와 대조해 다시 복사합니다. 로그에서 사라진 세그먼트는 백업에 그대로 남습니다.
+  백업은 아무것도 지우지 않습니다. 그 사본마저 사라지면 그 레코드는 없어진 것입니다. 실행마다
+  이름을 알려 주고, `doctor`는 잃은 것으로 세며, `--verify`는 매니페스트에 있는 동안 계속
+  알려 줍니다.
+- **아무것도 보증할 수 없는 사본.** 세그먼트 이름을 가졌지만 매니페스트에 없고 로그에 비교할
+  세그먼트도 없는 파일은 그 자리에 둡니다. 그 레코드의 전부일 수 있기 때문입니다. 매니페스트에
+  넣지는 않으며, 실행마다 그리고 `--verify`가 계속 이름을 알려 줍니다.
+- **마지막으로 성공한 실행**은 `~/.conbus/backup.json`에 있습니다. 백업이 간 모든 폴더도
+  함께 있으며, 첫 사본이 들어가기 전에 기록됩니다. `doctor`는 그 파일만 읽습니다. 그래서
+  빠르지만, 지금 디스크가 꽂혀 있는지는 말해 주지 않습니다.
+
+  ```text
+  backup    last ok 3h ago to /Volumes/My Disk (1,460 segments)
+  ```
+
+**거부하는 것.** 1로 끝나며, 어떤 플래그로도 넘어갈 수 없습니다.
+
+- 데이터 루트 안의 폴더, 또는 데이터 루트를 품은 폴더.
+- 클라우드 동기화 폴더: `~/Library/Mobile Documents`, `~/Library/CloudStorage`,
+  `~/Dropbox`, `~/Dropbox (…)`, `~/Google Drive`, `~/OneDrive*`. 심볼릭 링크로 가리켜도
+  마찬가지입니다. 로그에는 프롬프트와 답변이 평문으로 있고, conbus는 그것이 이 기기를 떠나지
+  않는다고 약속합니다. 암호화된 클라우드 백업은 아직 제공하지 않습니다.
+- `~/Desktop`과 `~/Documents`. 이름으로 거부합니다. Mac에서는 iCloud가 이 둘을 동기화할 수
+  있는데 conbus는 그 설정을 볼 수 없습니다. `~/conbus-backup` 같은 다른 폴더를 고르세요.
+- 부모 폴더가 없는 폴더, 또는 시스템이 디스크를 마운트하는 곳 바로 아래인데 디스크가
+  마운트되지 않은 폴더: Mac의 `/Volumes`, Linux의 `/mnt`, `/media`, `/media/$USER`,
+  `/run/media/$USER`. 뽑힌 디스크는 다른 디스크에 비슷한 이름의 폴더를 만드는 대신
+  실패합니다. 지난 실행 때 백업이 있었는데 지금은 없는 폴더도 거부합니다. 디스크가 빠진 뒤
+  마운트 폴더만 남으면 그렇게 보입니다. 일부러 지웠다면 먼저 `backup.json`의 destinations에서
+  그 폴더를 빼세요.
+- 복사할 공간이 없는 볼륨. 복사를 시작하기 전에 확인합니다.
+- 백업에 든 것과 다른 로그. 크기로 보아 그 사본이 아닌 닫힌 세그먼트가 있거나, 가장 새로운
+  세그먼트가 사본에 무언가 더해진 것이 아닌 경우입니다. 아무것도 복사하지 않고 아무것도
+  덮어쓰지 않습니다. 다른 로그의 백업이거나, 세그먼트가 망가졌거나, 로그를 잃은 뒤 새로
+  시작한 로그입니다.
+- 읽을 수 없는 `backup.json`. 평문이 어디로 갔는지 적은 유일한 목록이기 때문입니다. 고치거나
+  지우세요.
+
+conbus가 아는 것은 이 이름들뿐입니다. 다른 동기화 도구는 알아보지 못하므로, 그런 곳을 고르면
+프롬프트가 그곳이 보내는 데로 나갑니다. 네트워크 공유는 거부하지 않습니다. NAS는 백업을 두기에
+합당한 곳입니다. 다만 Mac에서는 실행 결과와 `doctor`가
+`network share: this copy leaves this machine, in plain text`라고 알려 줍니다. Linux에서는
+conbus가 알 수 없습니다.
+
+**백업이 아닌 것.**
+
+- **비공개가 아닙니다.** 프롬프트와 답변은 대상 폴더에 평문으로 있습니다. 로그를
+  `CONBUS_RETENTION=full`로 썼다면 툴 입력과 출력도 그렇습니다. 외장 디스크에서는 파일
+  권한이 아무것도 막지 못합니다. macOS는 거기서 소유권을 무시하고 exFAT에는 권한이 없습니다.
+  그래서 암호화되지 않은 외장 디스크는 그것을 가진 사람에게 내용을 그대로 보여 줍니다.
+  디스크를 암호화하세요.
+- **봉인된 툴 본문을 다른 곳에서 여는 방법이 아닙니다.** `encrypted_tools`에서는
+  로그인 키체인의 키(`log-kek`)로 봉인하는데, 백업은 이 키를 복사하지 않습니다. 다른
+  기기에서는 그 본문을 읽을 수 없고, 나머지 로그는 정상적으로 읽힙니다.
+- **정말 다른 디스크가 아니면 두 번째 디스크가 아닙니다.** 로그와 같은 볼륨이거나 같은 APFS
+  컨테이너의 다른 볼륨이면 실행 결과와 `doctor`가
+  `same disk: protects against deletion, not a failed disk`를 덧붙입니다. 클론은 원본과
+  블록을 공유합니다. 같은 물리 디스크의 다른 파티션은 알려 주지 않으며, 그 디스크가 고장 나면
+  함께 사라집니다.
+- **디스크가 가득 차는 것을 막아 주지 않습니다.** 디스크가 차면 새 레코드는 여전히
+  사라집니다.
+- **전부가 아닙니다.** 로그만 담습니다. `policy.json`, `facts.jsonl`, `links.jsonl`과
+  루트의 나머지는 담지 않습니다.
+
+**복원하기.** 복원 명령은 따로 없습니다. 시스템에 맞는 블록을 붙여 넣으세요. 세 번째 줄의
+폴더는 자기 것으로 바꿉니다. 블록은 실패한 곳에서 바로 멈추고, 레코더를 켜는 것은 마지막
+줄뿐입니다. 새 기기에서는 첫 `conbus install --apply`보다 먼저 하세요.
+
+Mac:
+
+```bash
+(
+  set -e
+  disk="/Volumes/My Disk"
+  conbus backup --verify --to "$disk"
+  find "$disk/conbus-backup/log/" -name 'segment-*.jsonl' | grep . >/dev/null
+  launchctl bootout "gui/$(id -u)/sh.conbus.daemon" || true
+  report="$(conbus doctor || true)"
+  printf '%s\n' "$report" | grep '^socket'
+  printf '%s\n' "$report" | grep '^socket.*not answering' >/dev/null
+  log="$(printf '%s\n' "$report" | sed -n 's/^log  *\(\/.*\)$/\1/p')"
+  (umask 077 && mkdir -p "$log")
+  find "$log" -name 'segment-*.jsonl' -empty -delete
+  for copy in "$disk/conbus-backup/log/"segment-*.jsonl; do
+    [ -e "$log/${copy##*/}" ] || cp "$copy" "$log/"
+  done
+  chmod 600 "$log/"segment-*.jsonl
+  rm -rf "$log/../cache/meta"
+  conbus backup --to "$disk"
+  conbus install --apply
+)
+```
+
+Linux:
+
+```bash
+(
+  set -e
+  disk="/Volumes/My Disk"
+  conbus backup --verify --to "$disk"
+  find "$disk/conbus-backup/log/" -name 'segment-*.jsonl' | grep . >/dev/null
+  systemctl --user disable --now sh.conbus.daemon.service || true
+  report="$(conbus doctor || true)"
+  printf '%s\n' "$report" | grep '^socket'
+  printf '%s\n' "$report" | grep '^socket.*not answering' >/dev/null
+  log="$(printf '%s\n' "$report" | sed -n 's/^log  *\(\/.*\)$/\1/p')"
+  (umask 077 && mkdir -p "$log")
+  find "$log" -name 'segment-*.jsonl' -empty -delete
+  for copy in "$disk/conbus-backup/log/"segment-*.jsonl; do
+    [ -e "$log/${copy##*/}" ] || cp "$copy" "$log/"
+  done
+  chmod 600 "$log/"segment-*.jsonl
+  rm -rf "$log/../cache/meta"
+  conbus backup --to "$disk"
+  conbus install --apply
+)
+```
+
+각 부분이 하는 일입니다.
+
+- **`--verify`가 먼저입니다.** 레코더가 아직 도는 동안 확인하므로, 디스크가 뽑혀 있거나
+  이름이 틀리면 아무것도 바꾸지 않은 채 멈춥니다.
+- **첫 번째 `find`는 백업에 세그먼트가 하나도 없으면 블록을 멈춥니다.** 이때도 아무것도
+  바뀌지 않습니다. 아무것도 닫히기 전에 만든 백업은 `--verify`를 통과하면서 복원할 것이
+  없다고 말하는데, 그런 백업 때문에 레코더를 멈춰서는 안 됩니다.
+- **레코더는 멈춰야 합니다.** 로그가 지워진 뒤에도 레코더가 돌고 있으면 새 로그를 시작합니다.
+  복원은 로그에 이미 있는 세그먼트를 그대로 두므로, 진짜 파일 대신 그 새 파일이 남습니다.
+  레코더가 멈추면 `conbus doctor`가 `socket … not answering`이라고
+  말합니다. 블록은 그 줄을 보여 주고, 다른 말이면 거기서 멈춥니다. `launchctl`이나
+  `systemctl`이 도는 것이 없다고 불평하는 것은 괜찮습니다.
+- **로그 폴더는 `conbus doctor`에서 가져옵니다.** 그래서 `CONBUS_HOME`이나
+  `XDG_STATE_HOME` 아래의 루트도 conbus가 읽는 곳으로 복원됩니다.
+- **두 번째 `find`는 빈 세그먼트를 지웁니다.** 빈 세그먼트에는 레코드가 없습니다. 옛 `conbus
+  doctor`는 빈 로그 폴더에 빈 세그먼트를 하나 만들고, 복원은 진짜 파일 대신 그것을 그대로
+  둡니다.
+- **`cache/meta`를 지웁니다.** 복원은 파일의 시각을 그대로 둘 수 있는데, 이 캐시는 세그먼트를
+  이름과 길이와 시각으로 믿기 때문입니다. 다음 읽기에서 다시 만들어집니다.
+- **마지막 `conbus backup`이 복원이 잘 됐는지 확인합니다.** 닫힌 세그먼트의 크기가 사본과
+  다르거나, 가장 새로운 세그먼트가 사본에 무언가 더해진 것이 아니면 거부합니다.
+
+블록이 `--verify`나 첫 번째 `find`에서 멈추면 아무것도 바뀌지 않았고 레코더도 그대로입니다.
+그 뒤에서 멈추면 이미 멈춘 레코더는 켤 때까지 그대로 멈춰 있습니다. 복원 없이 켜려면
+`conbus install --apply`를 실행하세요.
+
+- **`--verify`가 복원할 것이 없다고 할 때.** 그 백업을 할 때 닫힌 세그먼트가 없어서 레코드가
+  하나도 없습니다. 블록은 거기서 멈춥니다. 레코더가 돌고 있지 않으면 `conbus install --apply`로
+  켜세요.
+- **`--verify`가 실패했을 때.** 아무것도 바뀌지 않았습니다. 잘못된 파일을 하나하나 이름으로
+  알려 줍니다. 로그에 그 세그먼트가 아직 있으면 백업에서 그 사본을 지우고 `conbus backup`을
+  실행하세요. 다시 복사합니다. 로그에서도 사라졌다면 그 사본이 전부입니다. 망가진 줄은 읽을 수
+  없다고 나올 뿐 세그먼트의 나머지는 살아 있으므로 그래도 복원할 수 있습니다. `--verify` 줄을
+  뺀 블록을 붙여 넣고, 마지막 확인이 거부하면 `conbus install --apply`를 직접 실행하세요.
+  그 폴더는 그 세그먼트를 계속 거부하므로, 남겨 두고 다음 백업은 다른 폴더로 하세요.
+  이렇게 하면 `--verify`가 아무것도 보증하지 않는다고 한 파일도 복원되고, 가장 새로운
+  세그먼트가 되어 레코더가 거기에 씁니다. 자기 것이 확실하지 않으면 먼저 백업에서 옮겨 두세요.
+- **`socket` 줄이 `listening`일 때.** 레코더가 아직 돌고 있습니다. 멈추고 블록을 다시 붙여
+  넣으세요.
+- **마지막 확인이 거부했을 때.** 세그먼트 이름을 알려 줍니다. `cannot put it right`라고 하면
+  백업의 사본도 망가진 것이라 다시 붙여 넣어도 소용없습니다. `conbus install --apply`를 직접
+  실행하고, 이 폴더는 남겨 둔 채 다음 백업은 다른 폴더로 하세요. 그렇지 않고 로그 쪽 파일이
+  망가졌다면 로그에서 그 파일을 지우고 블록을 다시 붙여 넣으세요. 레코더가 거기서 새 로그를 시작했다면 아래의 "새
+  로그 위에는 복원하지 마세요"를 보세요.
+
+그 뒤의 일입니다.
+
+- **돌아오는 것.** 백업할 때 닫혀 있던 모든 것. 그 레코드에 대해 `conbus log --json`과
+  `conbus usage --json`은 예전과 똑같이 읽힙니다.
+- **돌아오지 않는 것.** 그 실행이 백업보다 새롭다고 알려 준 레코드. 로그 전체를 잃으면
+  이것들은 사라집니다. 세그먼트 하나까지이고, 그 실행 뒤에 쓰인 것이 더해집니다.
+  레코더가 켜질 때 빈틈 채우기(9장)가 에이전트 자신의 트랜스크립트에서 그중 일부 턴을
+  되살릴 수 있으며, 되살린 것으로 표시됩니다.
+- **일부만 사라진 로그 위에.** 같은 블록입니다. 없는 세그먼트만 복사되고, 열린
+  세그먼트가 남아 있으면 두 읽기 모두 사라지기 전과 똑같이 나옵니다.
+- **겹치는 경우.** 양쪽에 다 있는 세그먼트는 로그에 있는 그대로 둡니다. 세그먼트에는
+  이름이 하나뿐이므로 레코드가 두 번 나타날 수 없습니다. 로그 쪽을 지키는 것이
+  중요합니다. 복원한 뒤에는 복원된 가장 새로운 세그먼트가 다시 열린 세그먼트가 되어
+  자라는데, 덮어쓰면 그동안 늘어난 부분이 잘립니다. 망가진 것을 아는 세그먼트를
+  바꾸려면 먼저 로그에서 지우세요.
+- **그 폴더로 다음 `conbus backup`은 거기서 이어 갑니다.** 복원된 뒤 자란 세그먼트는 닫히고
+  나면 짧은 사본을 대신합니다. 옛 사본이 새 파일의 앞부분과 정확히 같기 때문입니다. 손으로
+  엉뚱한 폴더에 복원한 것은 알아채지 못하며, 모든 세그먼트가 `no longer in the log`로
+  나올 뿐입니다.
+- **새 로그 위에는 복원하지 마세요.** 레코더가 이미 새 로그를 시작했다면, 멈추고 그
+  `log/`를 먼저 옆으로 옮기세요. 두 로그는 같은 세그먼트 이름과 일련번호를 다시 쓰며,
+  conbus는 그것을 합치지 못합니다.
+
 ### 지우기
 
 `rm -rf ~/.conbus`는 conbus가 기록한 모든 것을 지웁니다. `uninstall`은 이것을 대신
-하지 않습니다.
+하지 않습니다. 둘 다 백업은 건드리지 않습니다. 백업은 직접 지정한 폴더에 있습니다.
+`conbus uninstall`은 백업이 간 모든 폴더를 알려 주며, 시작하고 끝내지 못한 실행의 폴더도
+포함합니다. 그 목록은 `~/.conbus`와 함께 사라지므로, 먼저 실행해서 알려 주는 `conbus-backup`을
+각각 지우세요. 로그와 같은 디스크에서는 클론도 지워야 블록이 비워지므로, 로그만 지워서는 공간이
+거의 늘지 않습니다.
 
 ---
 
@@ -640,6 +910,10 @@ conbus uninstall --apply  # 지우기
 - Codex는 승인을 위치로 기억합니다. 다른 훅이 한 칸씩 앞으로 당겨지면 uninstall이
   알려 주고, Codex가 그 훅을 다시 승인해 달라고 합니다.
 - **로그는 남깁니다.** 지우고 싶으면 `~/.conbus`를 직접 지우세요.
+- **백업도 모두 평문으로 남깁니다.** 제거는 백업이 간 폴더를 `backup.json`에서 읽어 각각
+  알려 주고, 건드리지는 않습니다. 지우고 싶으면 직접 지우세요. `rm -rf ~/.conbus`는 그 목록까지
+  지우므로 그 전에 하세요. 그 뒤로는 `conbus doctor`도 도와줄 수 없습니다. 제거가 바이너리를
+  지웠고, `doctor`는 마지막 폴더만 알려 주기 때문입니다.
 
 ---
 
@@ -675,6 +949,52 @@ conbus uninstall --apply  # 지우기
 
 **`takeover  stale → …`** — 기다리는 `conbus run`이 없을 때 hop이 일어났습니다.
 다음 `conbus run`이 그것을 버립니다. 따로 할 일은 없습니다.
+
+**누구 것인지 모를 로그인 탭이 떴다면** — 그 주소를 복사한 뒤
+`pbpaste | conbus auth --url -`를 실행하세요(Linux에서는
+`wl-paste | conbus auth --url -` 또는
+`xclip -o -selection clipboard | conbus auth --url -`). 표준 입력으로 넘기면 주소에
+든 토큰이 셸 기록에도, 이 명령을 실행한 에이전트의 기록에도 남지 않습니다.
+파이프로 넘길 때는 한 줄이어야 합니다. 주소에는 줄바꿈이 없기 때문입니다.
+`conbus auth --url "<URL>"`도 동작하지만, 쿼리가 있는 URL이면 경고합니다. 아무것도
+저장하지 않으며, 쿼리 값은 콜백 포트와 평범한 `client` 이름만 출력합니다. `client`
+이름은 URL의 주장으로만 보여 줍니다.
+
+페이지는 스킴과 호스트로만 판별하고, 그 밖은 `unknown page`입니다. 페이지가 이
+컴퓨터의 포트로 콜백하면 그 포트에서 듣는 프로세스를 모두 루트까지 거슬러 올라갑니다.
+그 결과는 다음과 같습니다.
+
+- `conbus yes` — 듣는 프로세스 위에 이 conbus가 있습니다. 레코더이거나, 설치된
+  바이너리 또는 지금 답하는 바이너리를 실행하는 프로세스여야 합니다. 무엇이든 conbus라는
+  이름을 가질 수 있기 때문입니다. 그리고 둘 사이에 그 페이지의 프로그램이 있어야 합니다.
+  OpenAI 페이지와 그 MCP 서버가 여는 브리지는 `codex`, Google 페이지는 `agy`, Claude
+  페이지는 `claude`입니다. 주소에는 어떤 포트든 적을 수 있으므로 `unknown page`는 이
+  답을 받지 못하고, conbus 아래 포트라도 다른 벤더의 것이면 마찬가지입니다.
+- `conbus no` — 계보가 앱이나 사람의 세션까지 올라가고 그 안에 conbus가 없습니다.
+  계보에 대한 말일 뿐이며, 다음 줄이 이 추적으로 볼 수 없는 것을 알려 줍니다. hop이 연
+  앱은 다른 앱처럼 launchd에 바로 매달립니다. conbus의 모든 읽기는 `codex app-server`를
+  시작하고, `conbus status`가 hop 목록을 보여 줍니다.
+- `conbus cannot tell` — 그 밖의 모든 경우이며, 무엇이 있으면 알 수 있는지 함께 알려
+  줍니다. 듣는 프로세스가 루트나 서비스 관리자(`launchd`, `init`, `systemd --user`)에
+  바로 매달려 있거나, 계보의 꼭대기가 앱도 세션도 아니면 이 답입니다. 서비스와, 시작한
+  프로세스가 끝난 뒤 남은 서버는 여기서 똑같이 보이기 때문입니다. 듣는 프로세스나 포트가
+  없을 때, 콜백이 다른 호스트나 사용자 지정 스킴을 쓰거나 conbus가 읽지 못하는 형태일
+  때, 추적이 도중에 끊겼을 때도 마찬가지입니다. `conbus run` 아래의 프로세스도 이
+  답입니다. 그것은 conbus가 아니라 당신의 에이전트이기 때문입니다.
+
+`conbus auth`는 벤더 설정을 읽지 않습니다. Playwright 브리지 페이지에
+`Invalid token provided`가 보이면 그 클라이언트가 받은 토큰이, 탭이 열린 Chrome
+프로필의 확장 프로그램 토큰과 다른 것입니다. 확장 프로그램 페이지의 토큰을 그
+클라이언트의 `PLAYWRIGHT_MCP_EXTENSION_TOKEN`에 복사하세요.
+`PLAYWRIGHT_MCP_PROFILE_DIR_NAME`으로 프로필을 고정할 수 있습니다.
+
+`conbus auth`만 실행하면 Codex, agy, gh에 로그인 여부를 묻고, 묻지 않은 벤더는
+`not checked`로 표시합니다. 즉 그 벤더들에 로그인이 필요 없다는 뜻이 아닙니다. hop에는
+Codex와 gh가 필요합니다. agy는 자기 쿼터 줄에만 쓰이므로, 쓰는 경우에만 로그인하세요.
+아무도 없을 때 conbus가 무엇을 실행하는지도 보여 줍니다. 기록에는 로그인이 필요
+없습니다. `conbus auth --html`은 같은 내용을 오프라인 한 장으로 쓰고, 그 배너는 어느
+벤더에 물었고 어느 벤더에 묻지 않았는지 알려 줍니다. `--html --open`이어야 그 페이지를
+엽니다. `--url`은 이 두 옵션과 함께 쓸 수 없습니다.
 
 **`nameless  <bus id> — N records…`** — 0.1.0 이전 빌드가 세션을 밝히지 않은
 이벤트를 공용 대화 하나 아래 묶었습니다. 0.1.0부터는 그런 이벤트를 거부합니다.
@@ -775,6 +1095,7 @@ hop도 대화를 내 계정 하나에서 다른 계정으로 옮기지 않습니
 | `conbus install --managed` | Claude Code 관리 설정에 넣을 훅 블록(stdout의 JSON)과 넣을 곳을 출력. 아무것도 쓰지 않음([Managed Macs](fleet.md)) |
 | `conbus uninstall [--apply]` | 모두 다시 빼기. 로그는 남김 |
 | `conbus doctor` | 무엇이 연결됐고 무엇이 안 됐는지 |
+| `conbus auth [--url URL] [--html [PATH]] [--open]` | Codex, agy, gh에 로그인 여부를 묻고(conbus 자체는 로그인이 필요 없음) 묻지 않은 벤더를 알려 줌. `--url`은 URL이 누구 페이지인지와 콜백 대상 위에 conbus가 있는지, 또는 알 수 없음을 알려 주고, `--url -`는 URL을 표준 입력에서 읽음. `--html`은 오프라인 한 장을 쓰고, `--open`을 함께 주면 그 페이지를 엶(실험적) |
 | `conbus status` | 라우팅 규칙, 쿼터, hop 기록, 비용 |
 | `conbus quota` | 각 레그에 남은 양 |
 | `conbus log [--json] [--bus-id ID] [--since TS] [--tail N] [--grep TEXT] [--reveal]` | 로그 읽기 |
@@ -782,6 +1103,8 @@ hop도 대화를 내 계정 하나에서 다른 계정으로 옮기지 않습니
 | `conbus go [HARNESS] [--from ID]` | 지금 대화에 대한 `hop --apply` |
 | `conbus run [HARNESS]` | 이 터미널에서 에이전트 시작. hop이 다음 에이전트를 여기서 띄움 |
 | `conbus backfill [--apply] [--gaps] [--chat-export PATH]` | 지난 기록 되살리기 |
+| `conbus backup --to FOLDER` | 닫힌 로그 세그먼트를 지정한 폴더에 복사하고 다시 읽어 확인(experimental, 11장) |
+| `conbus backup --verify --to FOLDER` | 백업 전체를 다시 확인. 내용이 다르거나 없는 파일을 이름으로 알리고 1로 끝남(experimental) |
 | `conbus summary --bus-id ID` | 다른 레그의 에이전트에게 대화 요약 요청 |
 | `conbus usage [--days N] [--since DAY] [--day DAY] [--json] [--shareable] [--otlp URL]` | 에이전트가 한 일을 셈. `--otlp`는 `--shareable`의 줄을 이 Mac의 컬렉터로 보냄(5장) |
 | `conbus progress [--days N] [--since DAY] [--day DAY] [--workspace DIR] [--json]` | 같은 숫자를 폴더별로: 거기서 일한 에이전트, 에이전트 사이의 넘김, `HEAD`에 쌓인 커밋(5장) |
@@ -829,3 +1152,4 @@ conbus는 가설 하나에서 출발했습니다. 여러 에이전트를 쓰는 
   v0.2.6부터는 Developer ID로 서명하고 공증합니다.
 - Cursor, grok, opencode는 남은 쿼터를 알려 주지 않으므로, conbus가 이들의 한도에
   앞서 hop을 계획할 수 없습니다.
+- 백업은 아직 쓰고 있는 세그먼트를 뺍니다. 가장 새로운 레코드 최대 8 MiB입니다(11장).

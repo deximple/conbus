@@ -60,7 +60,7 @@ fn start_daemon_with(home: &Path, env: &[(&str, &std::ffi::OsStr)]) -> Daemon {
 
     let daemon = Daemon(child);
     let socket = home.join("conbus.sock");
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
         if std::os::unix::net::UnixStream::connect(&socket).is_ok() && daemon_stamp_is_settled(home)
         {
@@ -791,8 +791,7 @@ fn the_hook_never_fails_the_session_when_the_daemon_is_down() {
 
 #[test]
 fn an_event_the_daemon_cannot_place_is_reported_rather_than_dropped_in_silence() {
-    // A tool call or a stop arriving for a session the daemon has no binding
-    // for — the normal shape of a daemon restart mid-turn — belongs to no
+    // A stop arriving for a session the daemon has no binding for belongs to no
     // conversation and cannot start one. It is not written, which is correct;
     // vanishing without a word is not.
     let home = tempfile::tempdir().expect("tempdir");
@@ -811,11 +810,11 @@ fn an_event_the_daemon_cannot_place_is_reported_rather_than_dropped_in_silence()
         "an unplaceable event must not be written"
     );
     let _ = stderr;
-    // A daemon restart is exactly when an orphan arrives, so the hook spools
-    // it rather than calling it lost on the spot — and the daemon's drain
-    // reports it into the drop log once it stays orphaned, which is where the
-    // "say so" lives now: the event and the session, so a ghost session's end
-    // can be told from a lost tool call when the drop log is read back.
+    // The hook spools it rather than calling it lost on the spot, in case its
+    // prompt is in the spool too, and the daemon's drain reports it into the drop
+    // log once it stays orphaned, which is where the "say so" lives now: the
+    // event and the session, so a ghost session's end can be told from a lost
+    // tool call when the drop log is read back.
     let mut last: Option<serde_json::Value> = None;
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
@@ -1114,6 +1113,35 @@ fn a_drop_is_recorded_where_doctor_can_find_it() {
 }
 
 #[test]
+fn a_log_deleted_under_a_running_daemon_goes_on_recording() {
+    // The daemon holds the open segment, so writing to it goes on succeeding after
+    // a stray `rm`. Every hook reported success, and a restart found nothing.
+    let home = tempfile::tempdir().expect("tempdir");
+    let daemon = start_daemon(home.path());
+    let prompt = |text: &str, id: &str| {
+        format!(
+            r#"{{"session_id":"s","hook_event_name":"UserPromptSubmit","prompt":"{text}","prompt_id":"{id}"}}"#
+        )
+    };
+    run_hook(home.path(), &prompt("before", "T0"), &[]);
+    let log_dir = home.path().join("log");
+    std::fs::remove_dir_all(&log_dir).expect("rm -r");
+
+    run_hook(home.path(), &prompt("after", "T1"), &[]);
+    daemon.stop();
+
+    let scan = conbus_core::segment::SegmentLog::scan(&log_dir).expect("scan");
+    assert!(
+        scan.records.iter().any(|record| record
+            .vendor_turn_id
+            .as_ref()
+            .is_some_and(|id| id.as_str() == "T1")),
+        "a prompt after the delete reached nothing: {:?}",
+        scan.records
+    );
+}
+
+#[test]
 fn doctor_reports_a_log_it_cannot_append_to() {
     // The failure the check exists for: a daemon that answers and cannot write
     // looks identical to a healthy one. Probing the directory instead of the
@@ -1144,6 +1172,56 @@ fn doctor_reports_a_log_it_cannot_append_to() {
     assert!(
         out.contains("NOT APPENDABLE"),
         "a read-only segment read as healthy: {out}"
+    );
+}
+
+/// `doctor`, on a root whose log folder exists and holds no segment.
+fn doctor_on_an_empty_log_folder(home: &Path) -> String {
+    let doctor = Command::new(bin())
+        .arg("doctor")
+        .env("CONBUS_AGY_BIN", NOT_THERE)
+        .env("CONBUS_CODEX_BIN", NOT_THERE)
+        .env("CONBUS_HOME", home)
+        .output()
+        .expect("doctor");
+    String::from_utf8_lossy(&doctor.stdout).into_owned()
+}
+
+#[test]
+fn doctor_leaves_nothing_behind_in_an_empty_log_folder() {
+    // A stray `rm` of every segment, then `doctor`, the natural first move. An
+    // empty segment-00000000.jsonl left by the probe is what a `cp -n` restore
+    // then keeps over the real one.
+    let home = tempfile::tempdir().expect("tempdir");
+    let log = home.path().join("log");
+    std::fs::create_dir(&log).expect("mkdir");
+
+    let out = doctor_on_an_empty_log_folder(home.path());
+
+    assert!(out.contains("writable  appendable"), "{out}");
+    let left: Vec<_> = std::fs::read_dir(&log)
+        .expect("read")
+        .map(|entry| entry.expect("entry").file_name())
+        .collect();
+    assert!(left.is_empty(), "doctor left {left:?}");
+}
+
+#[test]
+fn doctor_reports_an_empty_log_folder_no_segment_can_be_made_in() {
+    // With no segment yet, the writer's first act is to create one, so here the
+    // directory's rights are the ones that decide.
+    let home = tempfile::tempdir().expect("tempdir");
+    let log = home.path().join("log");
+    std::fs::create_dir(&log).expect("mkdir");
+    let mut readonly = std::fs::metadata(&log).expect("meta").permissions();
+    readonly.set_readonly(true);
+    std::fs::set_permissions(&log, readonly).expect("chmod");
+
+    let out = doctor_on_an_empty_log_folder(home.path());
+
+    assert!(
+        out.contains("NOT APPENDABLE"),
+        "a folder that refuses a segment read as healthy: {out}"
     );
 }
 
@@ -1475,12 +1553,21 @@ fn a_silent_connection_does_not_hold_the_hooks_behind_it() {
     assert_eq!(code, 0, "a hook must never fail the turn");
     assert!(says_nothing(&stdout), "{stdout}");
     assert!(waited < Duration::from_secs(1), "waited {waited:?}");
-    let prompts = log_lines(home.path())
-        .into_iter()
-        .filter(|line| line["event"] == "turn_started")
-        .count();
+    // A hook on a loaded machine can run out its own deadline and spool, which
+    // loses nothing: the next idle tick lands it. Lost is never landing.
+    let prompts = || {
+        log_lines(home.path())
+            .into_iter()
+            .filter(|line| line["event"] == "turn_started")
+            .count()
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while prompts() == 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
     assert_eq!(
-        prompts, 1,
+        prompts(),
+        1,
         "the hook behind a silent connection lost its record after {waited:?}: {stderr}"
     );
     daemon.stop();

@@ -49,10 +49,27 @@ pub enum Command {
     Backfill {
         apply: bool,
         gaps: bool,
+        /// With `--gaps`: also fill from lines older than their own transcript, which
+        /// may be another conversation's copies.
+        include_older_lines: bool,
         /// Official Claude.ai / Desktop `conversations.json` or its zip.
         chat_export: Option<String>,
     },
+    /// Copy closed segments to a folder a person names, or with `verify`
+    /// recheck what is there. Only ever run by a person or their scheduler.
+    Backup {
+        to: String,
+        verify: bool,
+    },
     Doctor,
+    /// Who needs a sign-in (never conbus itself), and for a URL that opened,
+    /// whose page it is and which process asked. `--html` writes one
+    /// self-contained page; `--open` opens it — explicit calls only.
+    Auth {
+        url: Option<String>,
+        html: Option<String>,
+        open: bool,
+    },
     /// Build the derived sidecars for every closed segment; writes only
     /// under `<root>/cache/`.
     LogIndex,
@@ -208,7 +225,13 @@ where
             "daemon" => (&["--prepare"], &[], &[], 0),
             "install" => (&["--apply", "--managed"], &["--profile"], &[], 0),
             "uninstall" => (&["--apply"], &["--profile"], &[], 0),
-            "backfill" => (&["--apply", "--gaps"], &["--chat-export"], &[], 0),
+            "backfill" => (
+                &["--apply", "--gaps", "--include-older-lines"],
+                &["--chat-export"],
+                &[],
+                0,
+            ),
+            "backup" => (&["--verify"], &["--to"], &[], 0),
             "log" => (
                 &["--json", "--reveal"],
                 &["--bus-id", "--since", "--tail", "--grep"],
@@ -216,6 +239,7 @@ where
                 usize::MAX,
             ),
             "doctor" | "status" | "quota" | "verdict" => (&[], &[], &[], 0),
+            "auth" => (&["--open"], &["--url"], &["--html"], 0),
             "policy" => (&[], &["--harness", "--tool", "--input"], &[], usize::MAX),
             "hop" => (&["--apply", "--demo"], &["--from", "--to"], &[], usize::MAX),
             "go" => (&[], &["--from", "--to"], &[], usize::MAX),
@@ -283,7 +307,15 @@ where
         "backfill" => Command::Backfill {
             apply: args.iter().any(|a| a == "--apply"),
             gaps: args.iter().any(|a| a == "--gaps"),
+            include_older_lines: args.iter().any(|a| a == "--include-older-lines"),
             chat_export: flag_value(&args, "--chat-export"),
+        },
+        "backup" => match flag_value(&args, "--to").filter(|to| !to.is_empty()) {
+            Some(to) => Command::Backup {
+                to,
+                verify: args.iter().any(|a| a == "--verify"),
+            },
+            None => Command::UsageError("backup needs --to FOLDER".into()),
         },
         "log" if args.get(1).map(String::as_str) == Some("index") => Command::LogIndex,
         "log" => Command::Log {
@@ -297,6 +329,25 @@ where
             },
         },
         "doctor" => Command::Doctor,
+        "auth" => {
+            let url = flag_value(&args, "--url");
+            let html = args.iter().any(|a| a == "--html").then(|| {
+                flag_value(&args, "--html")
+                    .filter(|value| !value.starts_with('-'))
+                    .unwrap_or_default()
+            });
+            let open = args.iter().any(|a| a == "--open");
+            match (&url, &html, open) {
+                (Some(_), Some(_), _) | (Some(_), None, true) => Command::UsageError(
+                    "--url answers for one address, and --html and --open write and open the page; run them apart"
+                        .into(),
+                ),
+                (None, None, true) => {
+                    Command::UsageError("--open opens the page --html writes; use them together".into())
+                }
+                _ => Command::Auth { url, html, open },
+            }
+        }
         "status" => Command::Status,
         "quota" => Command::Quota,
         "policy" => Command::Policy {
@@ -392,7 +443,8 @@ fn usage_error(
             i += 1;
         } else if values.contains(&arg) {
             match args.get(i + 1) {
-                Some(next) if !next.starts_with('-') => i += 2,
+                // A lone `-` is a value: stdin, for the flags that read it.
+                Some(next) if next == "-" || !next.starts_with('-') => i += 2,
                 _ => return Some(format!("{arg} needs an argument")),
             }
         } else if optional.contains(&arg) {
@@ -459,10 +511,29 @@ USAGE:
                                   it goes and the Codex and Cursor managed
                                   hooks on stderr; docs/fleet.md
     conbus uninstall [--apply]    take them all back out; the log is kept
-    conbus backfill [--apply] [--gaps] [--chat-export PATH]
-                                  recover history; --gaps fills missed turns of live sessions;
+    conbus backfill [--apply] [--gaps [--include-older-lines]] [--chat-export PATH]
+                                  recover history; --gaps fills missed turns of live sessions,
+                                  and --include-older-lines fills from lines older than their
+                                  file too, which may be another conversation's copies;
                                   --chat-export reads official Claude.ai conversations.json (or zip)
+    conbus backup --to FOLDER     (experimental) copy closed segments not yet there
+                                  into FOLDER/conbus-backup and read them back;
+                                  run by you, never automatically; refuses a
+                                  cloud-synced folder; prompts and replies stay
+                                  plain text there; docs/manual.md section 11
+    conbus backup --verify --to FOLDER
+                                  (experimental) recheck the whole backup; names
+                                  any file that differs or is missing and exits 1
     conbus doctor                 report what is and is not wired up
+    conbus auth [--url URL] [--html [PATH]] [--open]  (experimental)
+                                  asks codex, agy and gh whether they are signed in
+                                  (conbus itself needs no login), and says which it
+                                  did not ask; --url says whose page a URL is and
+                                  whether conbus is above what it calls back to, or
+                                  that it cannot tell; --url - reads the URL from
+                                  stdin, which keeps a token out of shell history;
+                                  --html writes one self-contained page, and --open
+                                  with it opens that page
     conbus status                 routing rules, quota, hop history, cost
     conbus quota                  Codex probe + Claude StatusLine cache + catalog
     conbus policy check           (experimental) the effective policy.json rules;
@@ -856,6 +927,7 @@ mod tests {
             Command::Backfill {
                 apply: false,
                 gaps: false,
+                include_older_lines: false,
                 chat_export: None
             }
         );
@@ -864,6 +936,16 @@ mod tests {
             Command::Backfill {
                 apply: true,
                 gaps: true,
+                include_older_lines: false,
+                chat_export: None
+            }
+        );
+        assert_eq!(
+            parse(["backfill", "--gaps", "--include-older-lines"], None),
+            Command::Backfill {
+                apply: false,
+                gaps: true,
+                include_older_lines: true,
                 chat_export: None
             }
         );
@@ -875,9 +957,38 @@ mod tests {
             Command::Backfill {
                 apply: false,
                 gaps: false,
+                include_older_lines: false,
                 chat_export: Some("/tmp/conversations.json".into())
             }
         );
+    }
+
+    #[test]
+    fn backup_needs_a_folder_and_nothing_stands_in_for_one() {
+        assert_eq!(
+            parse(["backup", "--to", "/Volumes/My Disk"], None),
+            Command::Backup {
+                to: "/Volumes/My Disk".into(),
+                verify: false
+            }
+        );
+        assert_eq!(
+            parse(["backup", "--verify", "--to", "/tmp/x"], None),
+            Command::Backup {
+                to: "/tmp/x".into(),
+                verify: true
+            }
+        );
+        for args in [
+            &["backup"][..],
+            &["backup", "--verify"][..],
+            &["backup", "--to", ""][..],
+        ] {
+            assert!(
+                matches!(parse(args, None), Command::UsageError(_)),
+                "{args:?}"
+            );
+        }
     }
 
     #[test]
@@ -1035,6 +1146,49 @@ mod tests {
         };
 
         assert_eq!(filter.tail, None);
+    }
+
+    #[test]
+    fn auth_url_takes_an_address_or_a_dash_for_stdin() {
+        for value in ["https://x.example/", "-"] {
+            match parse(["auth", "--url", value], None) {
+                Command::Auth { url, .. } => assert_eq!(url.as_deref(), Some(value)),
+                other => panic!("{other:?}"),
+            }
+        }
+        for args in [&["auth", "--url"][..], &["auth", "--url", "--open"]] {
+            assert!(
+                matches!(parse(args, None), Command::UsageError(_)),
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn auth_refuses_flags_it_could_only_ignore() {
+        for args in [
+            &["auth", "--open"][..],
+            &["auth", "--url", "x", "--open"],
+            &["auth", "--url", "x", "--html"],
+            &["auth", "--url", "x", "--html", "p", "--open"],
+        ] {
+            assert!(
+                matches!(parse(args, None), Command::UsageError(_)),
+                "{args:?}"
+            );
+        }
+        for args in [
+            &["auth"][..],
+            &["auth", "--html"],
+            &["auth", "--html", "--open"],
+            &["auth", "--html", "p", "--open"],
+            &["auth", "--url", "x"],
+        ] {
+            assert!(
+                matches!(parse(args, None), Command::Auth { .. }),
+                "{args:?}"
+            );
+        }
     }
 
     #[test]

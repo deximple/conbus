@@ -16,7 +16,11 @@ def turns(i):
     return [{"id": i[:8] + "-turn-1", "items": [
         {"type": "userMessage", "id": "u1", "content": [{"type": "text", "text": "prompt for " + i[:8]}]},
         {"type": "agentMessage", "id": "a1", "text": "answer for " + i[:8], "phase": "final_answer"}],
-        "status": "completed", "error": None, "startedAt": 1788368796, "completedAt": 1788368799, "durationMs": 3000}]
+        "status": "completed", "error": None, "startedAt": 1788368796, "completedAt": 1788368799, "durationMs": 3000},
+        {"id": i[:8] + "-turn-2", "items": [
+        {"type": "userMessage", "id": "u2", "content": [{"type": "text", "text": "and then for " + i[:8]}]},
+        {"type": "agentMessage", "id": "a2", "text": "the last answer for " + i[:8], "phase": "final_answer"}],
+        "status": "completed", "error": None, "startedAt": 1788368800, "completedAt": 1788368801, "durationMs": 1000}]
 for line in sys.stdin:
     try:
         msg = json.loads(line)
@@ -32,7 +36,11 @@ for line in sys.stdin:
         else:
             print(json.dumps({"jsonrpc": "2.0", "id": i, "result": {"data": [thread(T2, "/repo")], "nextCursor": None}}), flush=True)
     elif m == "thread/turns/list":
-        print(json.dumps({"jsonrpc": "2.0", "id": i, "result": {"data": turns(msg["params"]["threadId"]), "nextCursor": None}}), flush=True)
+        # Newest first unless asked otherwise: the schema of codex-cli 0.166.0.
+        listed = turns(msg["params"]["threadId"])
+        if msg["params"].get("sortDirection") != "asc":
+            listed.reverse()
+        print(json.dumps({"jsonrpc": "2.0", "id": i, "result": {"data": listed, "nextCursor": None}}), flush=True)
 "#;
 
 fn fake_app_server() -> (tempfile::TempDir, std::path::PathBuf) {
@@ -121,7 +129,13 @@ fn codex_history_is_recovered_through_the_app_server_and_a_live_session_is_left_
         .collect();
     assert_eq!(
         kinds,
-        vec!["session_candidate", "turn_started", "turn_ended"],
+        vec![
+            "session_candidate",
+            "turn_started",
+            "turn_ended",
+            "turn_started",
+            "turn_ended"
+        ],
         "one thread recovered whole, the live one left alone: {stdout}\n{lines:#?}"
     );
     assert!(
@@ -134,6 +148,10 @@ fn codex_history_is_recovered_through_the_app_server_and_a_live_session_is_left_
     assert_eq!(
         codex_lines[2]["assistant_message"]["text"],
         "answer for 01a06316"
+    );
+    assert_eq!(
+        codex_lines[4]["assistant_message"]["text"], "the last answer for 01a06316",
+        "oldest first, or the older turn's words end the newer prompt"
     );
     assert!(
         !lines

@@ -22,15 +22,30 @@ pub fn log(paths: &Paths, json: bool, filter: &LogFilter) -> io::Result<()> {
     // filters still apply below, so --tail --bus-id/--grep stay exact.
     let scan = match filter.tail {
         Some(n) => {
+            // The `aliased` lines joining two ids can be anywhere in the log, so
+            // a read that names a conversation pays for one pass of the cache to
+            // find them. A plain `--tail` still opens only what it needs.
+            let aliased = filter.bus_id.as_deref().and_then(|wanted| {
+                conbus_core::identity::expand_aliases_in_log(
+                    paths.log_dir(),
+                    Some(&paths.cache_dir()),
+                    wanted,
+                )
+                .map_err(|err| {
+                    eprintln!("could not read the log's aliases ({err}); showing this id alone");
+                })
+                .ok()
+            });
             let (records, defects) = SegmentLog::tail(paths.log_dir(), n, |record| {
-                filter
-                    .bus_id
-                    .as_ref()
-                    .is_none_or(|wanted| record.bus_id.to_string().starts_with(wanted.as_str()))
-                    && filter
-                        .since
+                filter.bus_id.as_ref().is_none_or(|wanted| {
+                    aliased
                         .as_ref()
-                        .is_none_or(|from| record.ts.to_string().as_str() >= from.as_str())
+                        .is_some_and(|set| set.contains(&record.bus_id))
+                        || record.bus_id.to_string().starts_with(wanted.as_str())
+                }) && filter
+                    .since
+                    .as_ref()
+                    .is_none_or(|from| record.ts.to_string().as_str() >= from.as_str())
                     && filter
                         .grep
                         .as_ref()
@@ -40,7 +55,13 @@ pub fn log(paths: &Paths, json: bool, filter: &LogFilter) -> io::Result<()> {
         }
         None => SegmentLog::scan(paths.log_dir())?,
     };
-    for record in select(&scan.records, filter) {
+    // A tail has already chosen by conversation, and the `aliased` lines that
+    // joined the ids are usually outside what it read.
+    let selecting = LogFilter {
+        bus_id: filter.bus_id.clone().filter(|_| filter.tail.is_none()),
+        ..filter.clone()
+    };
+    for record in select(&scan.records, &selecting) {
         let revealed;
         let record = if filter.reveal {
             revealed = Record {
@@ -114,8 +135,12 @@ fn select<'a>(records: &'a [Record], filter: &LogFilter) -> Vec<&'a Record> {
 /// segment refuses every record, and it fails while a daemon holding an open
 /// handle keeps recording fine.
 ///
-/// Deliberately does not create the log directory. A diagnostic that repairs
-/// what it is measuring cannot report on it.
+/// With no segment yet the writer's first act is to create one, so there the
+/// directory is what decides, and the probe creates a file and takes it away.
+///
+/// Deliberately leaves nothing behind, neither the log directory nor an empty
+/// segment. A diagnostic that repairs what it is measuring cannot report on it,
+/// and an empty segment is what a restore with `cp -n` keeps over the real one.
 fn appendable(paths: &Paths) -> io::Result<()> {
     let dir = paths.log_dir();
     if !dir.exists() {
@@ -125,11 +150,52 @@ fn appendable(paths: &Paths) -> io::Result<()> {
         ));
     }
     let segment = SegmentLog::current_segment(&dir)?;
+    if segment.exists() {
+        return OpenOptions::new().append(true).open(&segment).map(|_| ());
+    }
+    let probe = dir.join(format!(".appendable-{}.tmp", std::process::id()));
     OpenOptions::new()
-        .create(true)
+        .create_new(true)
         .append(true)
-        .open(&segment)
-        .map(|_| ())
+        .open(&probe)?;
+    std::fs::remove_file(&probe)
+}
+
+/// How long `doctor` waits for the recorder to answer, like every other probe.
+const HEALTH_WAIT: Duration = Duration::from_secs(2);
+
+/// What the running recorder says about the log, if it says anything. No recorder,
+/// one busy past the wait, and an older build that does not know the question all
+/// read as no information, because none of them says anything about the log.
+fn recorder_health(paths: &Paths) -> Option<crate::wire::Health> {
+    use std::io::{BufRead, Write};
+    let mut stream = UnixStream::connect(paths.socket()).ok()?;
+    stream.set_read_timeout(Some(HEALTH_WAIT)).ok()?;
+    stream.set_write_timeout(Some(HEALTH_WAIT)).ok()?;
+    writeln!(stream, "{}", crate::wire::HEALTH_QUESTION).ok()?;
+    let mut reply = String::new();
+    io::BufReader::new(&stream).read_line(&mut reply).ok()?;
+    serde_json::from_str(reply.trim()).ok()
+}
+
+/// The `writable` line. A daemon that is refusing knows more than a probe that can
+/// open the file: on a full disk the open works and the write does not, and the
+/// drop line that would say so comes only once a write has worked.
+fn describe_writable(health: Option<&crate::wire::Health>, appendable: &io::Result<()>) -> String {
+    let Some((since, health)) =
+        health.and_then(|health| health.refusing_since.as_deref().zip(Some(health)))
+    else {
+        return describe_appendable(appendable);
+    };
+    match health.in_memory_only {
+        0 => format!(
+            "REFUSING since {since} — {} record(s) held, all with a copy in the spool; free space and they land",
+            health.held
+        ),
+        only => format!(
+            "REFUSING since {since} — {only} record(s) in memory only, lost if the recorder stops; free space, do not restart it"
+        ),
+    }
 }
 
 fn describe_appendable(result: &io::Result<()>) -> String {
@@ -414,6 +480,14 @@ pub fn install(apply: bool, profile: Option<&str>) -> io::Result<()> {
                     ""
                 );
             }
+        }
+        if crate::install::vendor_present("opencode", &home)
+            && let Err(why) = crate::install::opencode_version_for_install()
+        {
+            println!(
+                "{:<12} could not read which version this is ({why}); the plugin is for the current major, and `conbus doctor` says if it does not load",
+                "opencode"
+            );
         }
 
         let cursor_hooks = crate::install::cursor_hooks_path(&home);
@@ -948,9 +1022,14 @@ fn report_hooks(home: &Path) {
     if !crate::install::vendor_present("opencode", home) {
         println!("hooks     {:<12} not installed here", "opencode");
     } else if crate::install::opencode_plugin_registered(home) {
-        let loads = crate::install::opencode_plugin_api();
-        match crate::install::opencode_plugin_api_in_place(home) {
-            Some(written) if written != loads => println!(
+        let loads = crate::install::opencode_plugin_api_within(Duration::from_secs(2));
+        match (&loads, crate::install::opencode_plugin_api_in_place(home)) {
+            (Err(why), _) => println!(
+                "hooks     {:<12} could not read which version this is ({why}), so whether {} loads is not known",
+                "opencode",
+                crate::install::opencode_plugin_path(home).display()
+            ),
+            (Ok(loads), Some(written)) if written != *loads => println!(
                 "hooks     {:<12} MISMATCH — {} is written for OpenCode {}, which this OpenCode does not load; run `conbus install --apply`",
                 "opencode",
                 crate::install::opencode_plugin_path(home).display(),
@@ -1220,25 +1299,18 @@ pub fn doctor(paths: &Paths) -> io::Result<()> {
         .unwrap_or(0);
     let probe_t = std::thread::spawn(move || {
         let started = std::time::Instant::now();
-        let probe = |read: &dyn Fn() -> std::io::Result<crate::quota::Quota>| {
-            let started = std::time::Instant::now();
-            match read() {
-                Ok(quota) => crate::quota::describe(&quota, now_probe),
-                Err(err) if crate::quota::agy_not_asked(&err) => format!("unavailable — {err}"),
-                // A probe that ran its whole deadline out says so;
-                // one that failed fast names why.
-                Err(err) if started.elapsed() >= std::time::Duration::from_secs(2) => {
-                    let _ = err;
-                    "did not answer within 2s".to_string()
-                }
-                Err(err) => format!("unavailable — {err}"),
+        let read = || crate::quota::read_with(std::time::Duration::from_secs(2));
+        let line = match read() {
+            Ok(quota) => crate::quota::describe(&quota, now_probe),
+            // A probe that ran its whole deadline out says so;
+            // one that failed fast names why.
+            Err(err) if started.elapsed() >= std::time::Duration::from_secs(2) => {
+                let _ = err;
+                "did not answer within 2s".to_string()
             }
+            Err(err) => format!("unavailable — {err}"),
         };
-        (
-            probe(&|| crate::quota::read_with(std::time::Duration::from_secs(2))),
-            probe(&|| crate::quota::read_agy_with(std::time::Duration::from_secs(2))),
-            started.elapsed(),
-        )
+        (line, started.elapsed())
     });
     println!("build     {}", crate::build_info::describe());
     println!(
@@ -1296,12 +1368,16 @@ pub fn doctor(paths: &Paths) -> io::Result<()> {
     #[cfg(not(target_os = "macos"))]
     println!("sealing   none — no OS key store; tool bodies are elided, not sealed");
 
-    println!("writable  {}", describe_appendable(&appendable(paths)));
+    println!(
+        "writable  {}",
+        describe_writable(recorder_health(paths).as_ref(), &appendable(paths))
+    );
     // Disk is the one resource the log cannot outlast: say how much it holds
     // and how much is left on its volume, and say it loudly under 10%.
     if let Some(line) = disk_line(paths) {
         println!("{line}");
     }
+    println!("{}", crate::backup::describe(paths));
 
     match std::env::var_os("HOME").map(PathBuf::from) {
         Some(home) => {
@@ -1328,6 +1404,9 @@ pub fn doctor(paths: &Paths) -> io::Result<()> {
         "drops     {}",
         crate::drops::describe(&crate::drops::summary(paths))
     );
+    for held in crate::backfill::describe_held_ranges(paths) {
+        println!("gap fill  {held}");
+    }
 
     // The local PreToolUse policy: a file that cannot be a policy decides
     // nothing, and the line says so because fail-open is silent by design.
@@ -1444,7 +1523,7 @@ pub fn doctor(paths: &Paths) -> io::Result<()> {
                 route,
             )
         });
-    let (codex_quota, agy_quota, probe_elapsed) = probe_t.join().expect("probes");
+    let (codex_quota, probe_elapsed) = probe_t.join().expect("probes");
     doctor_mark("probe quota", probe_elapsed);
     report_twins(twins_summary);
     report_nameless(nameless_sessions);
@@ -1470,7 +1549,9 @@ pub fn doctor(paths: &Paths) -> io::Result<()> {
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     println!("quota     codex {codex_quota}");
-    println!("quota     agy {agy_quota}");
+    // agy is the cache only: `conbus quota` fills it. An unattended probe
+    // here is what opened a vendor OAuth tab on a logged-out account.
+    println!("quota     agy {}", crate::quota::describe_agy(paths, now));
     println!(
         "quota     claude {}",
         crate::quota::describe_claude(paths, now)
@@ -1481,6 +1562,7 @@ pub fn doctor(paths: &Paths) -> io::Result<()> {
     println!("{}", meter.describe_cost());
     println!("{}", meter.describe_turns());
     println!("verdict   conbus verdict — 4-week dogfood score; open window is not a kill");
+    println!("auth      conbus needs no login of its own; see conbus auth");
     println!("{}", cursor_line(&scan.records));
     match route {
         Ok(line) => println!("route     {line}"),
@@ -1519,7 +1601,7 @@ fn cursor_line(records: &[Record]) -> String {
 }
 
 /// Free and total bytes on the volume holding `dir`, from statvfs.
-fn statvfs(dir: &std::path::Path) -> Option<(u64, u64)> {
+pub(crate) fn statvfs(dir: &std::path::Path) -> Option<(u64, u64)> {
     let text = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()).ok()?;
     let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
     if unsafe { libc::statvfs(text.as_ptr(), &mut stat) } != 0 {
@@ -1569,7 +1651,7 @@ fn disk_line(paths: &Paths) -> Option<String> {
     Some(disk_text(log_bytes(paths), free, total))
 }
 
-fn gib(bytes: u64) -> String {
+pub(crate) fn gib(bytes: u64) -> String {
     const GIB: f64 = 1_073_741_824.0;
     const MIB: f64 = 1_048_576.0;
     if bytes as f64 >= GIB {
@@ -1626,10 +1708,7 @@ pub fn status(paths: &Paths) -> io::Result<()> {
         Ok(quota) => println!("quota     codex {}", crate::quota::describe(&quota, now)),
         Err(err) => println!("quota     codex unavailable — {err}"),
     }
-    match crate::quota::read_agy() {
-        Ok(quota) => println!("quota     agy {}", crate::quota::describe(&quota, now)),
-        Err(err) => println!("quota     agy unavailable — {err}"),
-    }
+    println!("quota     agy {}", crate::quota::describe_agy(paths, now));
     println!(
         "quota     claude {}",
         crate::quota::describe_claude(paths, now)

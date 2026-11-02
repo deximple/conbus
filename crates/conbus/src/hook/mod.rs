@@ -51,6 +51,10 @@ pub enum Normalized {
 /// keying it merges strangers, silently, for as long as the machine runs.
 pub const NO_SESSION: &str = "the hook payload names no session; an empty id would merge unrelated sessions into one conversation";
 
+/// The hook's stdin could not be read. The usual cause is an invalid byte in a
+/// prompt, which loses that prompt and leaves its turn's end with no conversation.
+pub const PAYLOAD_UNREAD: &str = "the hook payload could not be read";
+
 /// A payload we could not read at all.
 #[derive(Debug, PartialEq, Eq)]
 pub struct HookError(pub String);
