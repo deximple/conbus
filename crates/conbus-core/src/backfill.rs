@@ -216,6 +216,7 @@ fn open_turn(
     *open = Some(OpenTurn {
         last_reply: None,
         stop: ModelStop::Unsaid,
+        tool_ended: None,
     });
 }
 
@@ -230,6 +231,9 @@ struct OpenTurn {
     /// What the turn's last line said about the model. A Chat export holds
     /// finished messages only, so its turns are always stopped.
     stop: ModelStop,
+    /// The result line that said a tool ended the turn: when, its stamp and its id. A
+    /// turn can end that way with no text at all, and 11 of the 313 real ones do.
+    tool_ended: Option<(Option<Timestamp>, Source, Option<VendorTurnId>)>,
 }
 
 /// What closed a turn, which is what an unsaid stop is read against.
@@ -384,6 +388,11 @@ pub fn parse_claude_transcript_born(
                     && let Some(turn) = open.as_mut()
                 {
                     turn.stop = ModelStop::Stopped;
+                    turn.tool_ended = Some((
+                        at,
+                        source.clone(),
+                        line.prompt_id.clone().map(VendorTurnId::new),
+                    ));
                 }
                 let content = line.message.as_ref().and_then(|m| m.content.as_ref());
                 let Some(text) = content.and_then(text_of).or_else(|| {
@@ -797,10 +806,32 @@ fn unix_seconds(value: Option<&serde_json::Value>) -> Option<Timestamp> {
 /// from `Stop`.
 fn close(out: &mut Recovered, bus_id: BusId, open: Option<OpenTurn>, closed_by: ClosedBy) {
     let Some(OpenTurn {
-        last_reply: Some((at, text, source)),
+        last_reply,
         stop,
+        tool_ended,
     }) = open
     else {
+        return;
+    };
+    let Some((at, text, source)) = last_reply else {
+        // No text to end on, and the vendor says a tool ended it, so it ends with no words
+        // rather than reading as still running for ever.
+        if let (ModelStop::Stopped, Some((at, source, vendor_turn_id))) = (stop, tool_ended) {
+            out.entries.push(Entry {
+                bus_id,
+                observed_at: at,
+                source,
+                vendor_turn_id,
+                vendor_agent_id: None,
+                hook_id: None,
+                spooled_at: None,
+                event: Event::TurnEnded {
+                    state: TurnState::Complete,
+                    assistant_message: None,
+                    tokens: None,
+                },
+            });
+        }
         return;
     };
     let over = match stop {
@@ -943,6 +974,7 @@ fn parse_chat_conversation(conversation: &Value) -> Recovered {
                 open = Some(OpenTurn {
                     last_reply: None,
                     stop: ModelStop::Stopped,
+                    tool_ended: None,
                 });
             }
             "assistant" => {
@@ -1761,6 +1793,65 @@ mod tests {
         ]);
 
         assert_eq!(endings(&out), vec!["the closing words"]);
+    }
+
+    /// A tool call with no text, as 11 of the 313 real flagged turns are.
+    fn said_nothing_but_a_tool_call() -> String {
+        r#"{"type":"assistant","sessionId":"S1","timestamp":"2026-11-01T00:00:01.000Z","message":{"role":"assistant","model":"m","stop_reason":"tool_use","content":[{"type":"tool_use","id":"t1","name":"StructuredOutput","input":{}}]}}"#.to_string()
+    }
+
+    fn the_ending_of(out: &Recovered) -> Option<&Entry> {
+        out.entries
+            .iter()
+            .find(|entry| matches!(entry.event, Event::TurnEnded { .. }))
+    }
+
+    #[test]
+    fn a_turn_a_tool_ended_with_no_text_ends_with_no_words() {
+        let out = parse(&[
+            user("", "P1", "a prompt"),
+            said_nothing_but_a_tool_call(),
+            tool_result(Some(true)),
+        ]);
+
+        let ending = the_ending_of(&out).expect("an ending");
+        assert!(matches!(
+            ending.event,
+            Event::TurnEnded {
+                state: TurnState::Complete,
+                assistant_message: None,
+                ..
+            }
+        ));
+        assert_eq!(
+            ending.vendor_turn_id.as_ref().map(VendorTurnId::as_str),
+            Some("P1")
+        );
+    }
+
+    #[test]
+    fn a_turn_with_no_text_and_no_flag_still_has_no_ending() {
+        for flag in [None, Some(false)] {
+            let out = parse(&[
+                user("", "P1", "a prompt"),
+                said_nothing_but_a_tool_call(),
+                tool_result(flag),
+            ]);
+
+            assert!(the_ending_of(&out).is_none(), "{flag:?}");
+        }
+    }
+
+    #[test]
+    fn the_model_going_on_with_no_text_after_a_flag_keeps_the_turn_open() {
+        let out = parse(&[
+            user("", "P1", "a prompt"),
+            said_nothing_but_a_tool_call(),
+            tool_result(Some(true)),
+            said_nothing_but_a_tool_call(),
+        ]);
+
+        assert!(the_ending_of(&out).is_none());
     }
 
     #[test]

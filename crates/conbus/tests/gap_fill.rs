@@ -3623,3 +3623,42 @@ fn what_a_stalled_thread_is_told_names_the_command_that_ends_the_wait() {
         "not from doctor"
     );
 }
+
+#[test]
+fn a_missed_turn_a_tool_ended_with_no_text_at_all_gets_its_ending() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let daemon = start(home);
+    hook(home, &prompt(S, "p0", "before"));
+    hook(home, &ended(S, "p0", "a0"));
+    stop(daemon);
+    let tool_use = json!({"type": "assistant", "sessionId": S, "timestamp": now(), "version": "2.1.316",
+        "message": {"role": "assistant", "stop_reason": "tool_use",
+                    "content": [{"type": "tool_use", "id": "tu", "name": "StructuredOutput", "input": {}}]}})
+    .to_string();
+    let result = json!({"type": "user", "sessionId": S, "timestamp": now(), "version": "2.1.316",
+        "promptId": "p1", "toolEndsTurn": true, "toolUseResult": "ok",
+        "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "tu", "content": "ok"}]}})
+    .to_string();
+    transcript(
+        home,
+        S,
+        &[
+            user(S, "p0", "before"),
+            reply(S, "a0"),
+            sdk_user(S, "p1", "missed"),
+            tool_use,
+            result,
+        ],
+    );
+
+    stop(start(home));
+    stop(start(home));
+
+    let all = log_lines(home);
+    let ended: Vec<&Value> = all
+        .iter()
+        .filter(|record| record["vendor_turn_id"] == "p1" && record["event"] == "turn_ended")
+        .collect();
+    assert_eq!(ended.len(), 1, "\n{}", show(&all));
+}
