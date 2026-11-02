@@ -1195,14 +1195,21 @@ fn fill_live_codex_gaps(
     Ok(fill)
 }
 
-/// What a cut range has read at this length is done, and what it has not read at all
-/// goes first, or a file that keeps growing uses every budget up.
-fn unread_files_first(to_read: &mut Vec<(&PathBuf, &str, BusId)>, read: &ReadSoFar) {
+/// Noted in a held range for the file a start was reading when its budget ran out.
+fn used_up_a_budget(file: &Path) -> String {
+    format!("used up a budget: {}", file.display())
+}
+
+/// What a cut range has read at this length is done, and what is left stays oldest
+/// first, so a parent still reaches a turn before its fork's copy does. Only a file
+/// that used a whole budget up goes behind the rest: if it also keeps growing, it would
+/// use every budget up and nothing behind it would ever be read.
+fn files_left_to_read(to_read: &mut Vec<(&PathBuf, &str, BusId)>, read: &ReadSoFar) {
     to_read.retain(|(file, ..)| {
         !fs::metadata(file)
             .is_ok_and(|meta| read.is_current(&file.to_string_lossy(), meta.len() as i64))
     });
-    to_read.sort_by_key(|(file, ..)| read.knows(&file.to_string_lossy()));
+    to_read.sort_by_key(|(file, ..)| read.knows(&used_up_a_budget(file)));
 }
 
 /// What a held range has read in this state is done. What it has not read at all
@@ -1847,16 +1854,24 @@ fn append_gaps_files(
         (born.is_none(), born)
     });
     if let Some(read) = start.as_ref().map(|start| &*start.read) {
-        unread_files_first(&mut to_read, read);
+        files_left_to_read(&mut to_read, read);
     }
     let targets: Vec<(&str, BusId)> = to_read.iter().map(|&(_, stem, bus)| (stem, bus)).collect();
     let grouped = records_of(held, &targets);
+    let mut read_last: Option<&Path> = None;
     for (file, stem, live_bus) in to_read {
-        if let Some(start) = start.as_mut()
-            && Instant::now() >= start.deadline
-        {
-            start.timing.budget_exhausted = true;
-            break;
+        if let Some(start) = start.as_mut() {
+            let last = read_last.take().map(used_up_a_budget);
+            if Instant::now() >= start.deadline {
+                start.timing.budget_exhausted = true;
+                if let Some(last) = last {
+                    start.read.note(&last, 1);
+                }
+                break;
+            }
+            if let Some(last) = last {
+                start.read.forget(&last);
+            }
         }
         let Ok(text) = fs::read_to_string(file) else {
             *outcome.unread.entry("unreadable file".into()).or_default() += 1;
@@ -1896,6 +1911,7 @@ fn append_gaps_files(
         if let Some(start) = start.as_mut() {
             start.read.note(&file.to_string_lossy(), text.len() as i64);
         }
+        read_last = Some(file.as_path());
     }
     Ok(outcome)
 }
@@ -4023,45 +4039,120 @@ for line in sys.stdin:
         );
     }
 
-    #[test]
-    fn a_file_that_grew_after_it_was_read_is_read_again_behind_the_unread_ones() {
-        // What goes first is decided by what the range has read, so this reads no
-        // clock. It used to cut a real fill on a small budget and expect the next
-        // start to reach the other file, which a busy machine does not owe it: a first
-        // start whose setup used the budget up has read nothing, and then the big file
-        // rightly goes first again.
-        let home = tempfile::tempdir().expect("tempdir");
-        let (grew, done, unread) = (
+    /// Three files of a held range, oldest first, and what the range has read of them.
+    fn files_of_a_held_range(project: &Path) -> Vec<(PathBuf, &'static str)> {
+        fs::create_dir_all(project).expect("dir");
+        [
             "aaaaaaaa-0000-4000-8000-000000000001",
             "bbbbbbbb-0000-4000-8000-000000000003",
             "ffffffff-0000-4000-8000-000000000002",
+        ]
+        .into_iter()
+        .map(|session| {
+            a_missed_turn(project, session, "a turn");
+            (project.join(format!("{session}.jsonl")), session)
+        })
+        .collect()
+    }
+
+    fn order_left(files: &[(PathBuf, &'static str)], read: &ReadSoFar) -> Vec<&'static str> {
+        let bus = BusId::mint();
+        let mut to_read: Vec<(&PathBuf, &str, BusId)> = files
+            .iter()
+            .map(|(file, stem)| (file, *stem, bus))
+            .collect();
+        files_left_to_read(&mut to_read, read);
+        to_read
+            .iter()
+            .map(|(file, ..)| files.iter().find(|(f, _)| f == *file).expect("listed").1)
+            .collect()
+    }
+
+    fn noted_at_an_old_length(read: &mut ReadSoFar, file: &Path) {
+        let length = fs::metadata(file).expect("meta").len() as i64;
+        read.note(&file.to_string_lossy(), length - 1);
+    }
+
+    #[test]
+    fn a_file_read_at_this_length_is_done_and_the_rest_stay_oldest_first() {
+        // A file a range read when it was shorter keeps its place. Put behind one it has
+        // not read, a fork would reach a parent's turn before the parent does. What
+        // goes first is decided by what the range has read, so this reads no clock.
+        let home = tempfile::tempdir().expect("tempdir");
+        let files = files_of_a_held_range(&home.path().join("-repo"));
+        let mut read = ReadSoFar::default();
+        noted_at_an_old_length(&mut read, &files[0].0);
+        read.note(
+            &files[1].0.to_string_lossy(),
+            fs::metadata(&files[1].0).expect("meta").len() as i64,
         );
+
+        assert_eq!(order_left(&files, &read), [files[0].1, files[2].1]);
+    }
+
+    #[test]
+    fn a_file_that_used_up_a_budget_goes_behind_the_rest() {
+        // If it keeps growing it would use every budget up, and nothing behind it would
+        // ever be read.
+        let home = tempfile::tempdir().expect("tempdir");
+        let files = files_of_a_held_range(&home.path().join("-repo"));
+        let mut read = ReadSoFar::default();
+        noted_at_an_old_length(&mut read, &files[0].0);
+        read.note(&used_up_a_budget(&files[0].0), 1);
+
+        assert_eq!(
+            order_left(&files, &read),
+            [files[1].1, files[2].1, files[0].1]
+        );
+    }
+
+    #[test]
+    fn a_file_that_keeps_growing_does_not_use_up_every_start() {
+        // A real cut, so this leans on the clock: the file must take longer to read than
+        // the budget, and setup less. A slow machine only costs another try.
+        let machine = machine();
+        let home = tempfile::tempdir().expect("tempdir");
+        let first = "aaaaaaaa-0000-4000-8000-000000000001";
+        let last = "ffffffff-0000-4000-8000-000000000002";
         let project = home.path().join(".claude/projects/-repo");
         fs::create_dir_all(&project).expect("dir");
-        a_missed_turn(&project, grew, "it grew");
-        a_missed_turn(&project, done, "read at this length");
-        a_missed_turn(&project, unread, "the turn nobody reaches");
-        let path = |session: &str| project.join(format!("{session}.jsonl"));
-        let length = |session: &str| fs::metadata(path(session)).expect("meta").len() as i64;
-        let mut read = ReadSoFar::default();
-        read.note(&path(grew).to_string_lossy(), length(grew) - 1);
-        read.note(&path(done).to_string_lossy(), length(done));
-        let bus = BusId::mint();
-        let (grew_file, done_file, unread_file) = (path(grew), path(done), path(unread));
-        let mut to_read = vec![
-            (&grew_file, grew, bus),
-            (&done_file, done, bus),
-            (&unread_file, unread, bus),
-        ];
-
-        unread_files_first(&mut to_read, &read);
-
-        let order: Vec<&str> = to_read.iter().map(|(_, stem, _)| *stem).collect();
-        assert_eq!(
-            order,
-            vec![unread, grew],
-            "what the range has not read at all goes first, and what it read is done"
-        );
+        a_big_transcript(&project, first, 60_000);
+        a_missed_turn(&project, last, "the turn nobody reaches");
+        let now = conbus_core::clock::Timestamp::now();
+        live_at(&machine, now, first);
+        live_at(&machine, now, last);
+        let mut log =
+            SegmentLog::open(machine.paths.log_dir(), Retention::default()).expect("open");
+        for _ in 0..8 {
+            let mut grown = fs::OpenOptions::new()
+                .append(true)
+                .open(project.join(format!("{first}.jsonl")))
+                .expect("open");
+            std::io::Write::write_all(
+                &mut grown,
+                format!(
+                    "{{\"type\":\"user\",\"sessionId\":\"{first}\",\"timestamp\":\"{}\",\
+                     \"promptId\":\"{}\",\"message\":{{\"role\":\"user\",\"content\":\"it grew\"}}}}\n",
+                    stamp_now(),
+                    BusId::mint()
+                )
+                .as_bytes(),
+            )
+            .expect("grow");
+            let records = held(&machine);
+            let _ = append_gaps_at_start_in(
+                &machine.paths,
+                &records,
+                &mut log,
+                std::time::Duration::from_millis(100),
+                Some(home.path()),
+            )
+            .expect("a start");
+            if holds_prompt(&machine, "the turn nobody reaches") {
+                return;
+            }
+        }
+        panic!("eight starts in, the file behind it has never been read");
     }
 
     #[test]

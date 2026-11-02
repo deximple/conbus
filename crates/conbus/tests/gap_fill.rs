@@ -288,17 +288,22 @@ fn sdk_user(session: &str, id: &str, text: &str) -> String {
     flagged(session, id, text, flags)
 }
 
-/// A line stamped well before the file it is written to can have existed.
-fn from_before_the_file(line: String) -> String {
+/// The same line, stamped `secs` ago.
+fn aged(line: String, secs: i64) -> String {
     let mut line: Value = serde_json::from_str(&line).expect("json");
     let epoch = conbus_core::clock::Timestamp::from_unix_seconds(0).expect("epoch");
-    let hours_ago = conbus_core::clock::Timestamp::now().seconds_since(epoch) - 2 * 3600;
+    let at = conbus_core::clock::Timestamp::now().seconds_since(epoch) - secs;
     line["timestamp"] = json!(
-        conbus_core::clock::Timestamp::from_unix_seconds(hours_ago)
+        conbus_core::clock::Timestamp::from_unix_seconds(at)
             .expect("a time")
             .to_string()
     );
     line.to_string()
+}
+
+/// A line stamped well before the file it is written to can have existed.
+fn from_before_the_file(line: String) -> String {
+    aged(line, 2 * 3600)
 }
 
 /// A turn neither conversation holds, in the parent's transcript and in the one of
@@ -3027,6 +3032,80 @@ for line in sys.stdin:
         !all.iter()
             .any(|record| record["vendor_turn_id"] == "t3" && record["event"] == "turn_ended"),
         "a running turn ended, with an older turn's words:\n{}",
+        show(&all)
+    );
+}
+
+#[test]
+fn a_parent_a_held_range_knows_is_not_beaten_to_its_turn_by_its_fork() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    a_fork_taken_right_after_a_turn_nobody_holds(home);
+    // What an earlier cut leaves: the parent read at the length it had then.
+    std::fs::create_dir_all(home.join("cache")).expect("cache");
+    let parent_file = home.join(format!(".claude/projects/-repo/{PARENT}.jsonl"));
+    std::fs::write(
+        home.join("cache/gap-read"),
+        format!("10\t{}\n", parent_file.display()),
+    )
+    .expect("marker");
+
+    stop(start(home));
+
+    let all = log_lines(home);
+    let under = |session: &str| {
+        all.iter()
+            .filter(|record| {
+                record["vendor_turn_id"] == "pq" && record["vendor_session_id"] == session
+            })
+            .count()
+    };
+    assert_eq!(
+        (under(CHILD), under(PARENT)),
+        (0, 1),
+        "the parent's turn is under the fork:\n{}",
+        show(&all)
+    );
+}
+
+#[test]
+fn a_fork_inside_the_margin_with_its_first_hook_lost_records_neither_set_of_words() {
+    // The current shape: copied lines carry the fork's first prompt id. Inside the
+    // margin the stamps do not tell them apart, so the turn is left out, and the fork's
+    // real first prompt goes with it. A wrong record is permanent.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let daemon = start(home);
+    hook(home, &prompt(CHILD, "later", "a later prompt the hook saw"));
+    hook(home, &ended(CHILD, "later", "a later reply"));
+    stop(daemon);
+    transcript(
+        home,
+        CHILD,
+        &[
+            aged(sdk_user(CHILD, "Y", "the parent's words"), 30),
+            aged(reply(CHILD, "the parent's reply"), 29),
+            sdk_user(CHILD, "Y", "the fork's first prompt"),
+            reply(CHILD, "the fork's first reply"),
+            sdk_user(CHILD, "later", "a later prompt the hook saw"),
+            reply(CHILD, "a later reply"),
+        ],
+    );
+
+    stop(start(home));
+
+    let all = log_lines(home);
+    assert!(
+        !all.iter().any(|record| record["vendor_turn_id"] == "Y"),
+        "{}",
+        show(&all)
+    );
+    assert!(
+        !all.iter()
+            .any(|record| record["prompt"]["text"] == "the parent's words"
+                || record["assistant_message"]["text"] == "the parent's reply"
+                || record["assistant_message"]["text"] == "the fork's first reply"),
+        "{}",
         show(&all)
     );
 }

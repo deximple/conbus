@@ -13,7 +13,7 @@
 //! record is a weaker fact than a mirrored one and a reader that cannot tell
 //! them apart will over-trust the log.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -201,12 +201,16 @@ fn open_turn(
     out: &mut Recovered,
     bus_id: BusId,
     open: &mut Option<OpenTurn>,
-    opened: &mut HashSet<String>,
+    opened: &mut HashMap<String, String>,
     entry: Entry,
 ) {
     close(out, bus_id, open.take(), ClosedBy::NextPrompt);
-    if let Some(id) = &entry.vendor_turn_id {
-        opened.insert(id.as_str().to_string());
+    if let (Some(id), Event::TurnStarted { prompt, .. }) = (&entry.vendor_turn_id, &entry.event) {
+        let words = match prompt {
+            Body::Kept { text } | Body::Clipped { text, .. } => text.clone(),
+            Body::Elided { .. } | Body::Sealed { .. } => String::new(),
+        };
+        opened.insert(id.as_str().to_string(), words);
     }
     out.entries.push(entry);
     *open = Some(OpenTurn {
@@ -310,8 +314,12 @@ pub fn parse_claude_transcript_born(
     let mut tentative: Option<Entry> = None;
     // The vendor numbers its turns: every line of one carries the same
     // `promptId`, so a skill's body or a second block of one prompt starts
-    // nothing.
-    let mut opened: HashSet<String> = HashSet::new();
+    // nothing. Each id opened, with the words it opened on.
+    let mut opened: HashMap<String, String> = HashMap::new();
+    // Ids with two prompt lines in different words. A fork's copied lines carry the id
+    // of the fork's first prompt, so which of them is that prompt cannot be told, and
+    // the other words are another conversation's. Neither goes in the log.
+    let mut contested: HashSet<String> = HashSet::new();
     let mut harness_version: Option<String> = None;
 
     for raw in text.lines() {
@@ -403,11 +411,10 @@ pub fn parse_claude_transcript_born(
                     }
                     UserLine::Prompt | UserLine::Tentative => {}
                 }
-                if line
-                    .prompt_id
-                    .as_ref()
-                    .is_some_and(|id| opened.contains(id))
-                {
+                if let Some(words) = line.prompt_id.as_ref().and_then(|id| opened.get(id)) {
+                    if kind == UserLine::Prompt && *words != text {
+                        contested.extend(line.prompt_id.clone());
+                    }
                     out.skip("another line of an open turn");
                     continue;
                 }
@@ -456,8 +463,32 @@ pub fn parse_claude_transcript_born(
         }
     }
     close(&mut out, bus_id, open.take(), ClosedBy::EndOfFile);
+    leave_out_turns(&mut out, &contested);
     prepend_session_candidate(&mut out, bus_id, harness_version);
     out
+}
+
+/// Take these turns out whole, the prompt and what follows it.
+fn leave_out_turns(out: &mut Recovered, turns: &HashSet<String>) {
+    if turns.is_empty() {
+        return;
+    }
+    let mut keep = true;
+    let entries = std::mem::take(&mut out.entries);
+    for entry in entries {
+        if matches!(entry.event, Event::TurnStarted { .. }) {
+            keep = entry
+                .vendor_turn_id
+                .as_ref()
+                .is_none_or(|id| !turns.contains(id.as_str()));
+            if !keep {
+                out.skip("prompt id with different prompts");
+            }
+        }
+        if keep {
+            out.entries.push(entry);
+        }
+    }
 }
 
 /// Put a session record at the head of a recovered conversation.
@@ -1559,16 +1590,54 @@ mod tests {
     }
 
     #[test]
-    fn one_prompt_id_opens_one_turn() {
+    fn one_prompt_id_in_the_same_words_opens_one_turn() {
+        // 22 of the 36 real ids with several prompt lines are this: one line, twice.
         let out = parse(&[
             user(r#""promptSource":"sdk","#, "P1", "the prompt"),
             assistant("part one"),
-            user(r#""promptSource":"sdk","#, "P1", "more of the same turn"),
+            user(r#""promptSource":"sdk","#, "P1", "the prompt"),
             assistant("part two"),
         ]);
 
         assert_eq!(prompts(&out), vec!["the prompt"]);
         assert_eq!(endings(&out), vec!["part two"]);
+        assert_eq!(out.skipped.get("prompt id with different prompts"), None);
+    }
+
+    #[test]
+    fn one_prompt_id_in_different_words_is_left_out_whole() {
+        // A fork's copied lines carry the id of the fork's first prompt. Which line is
+        // that prompt cannot be told, and the first is another conversation's words.
+        let out = parse(&[
+            user(r#""promptSource":"sdk","#, "P0", "before"),
+            assistant("the answer before"),
+            user(r#""promptSource":"sdk","#, "P1", "the parent's words"),
+            assistant("the parent's reply"),
+            user(r#""promptSource":"sdk","#, "P1", "the fork's first prompt"),
+            assistant("the fork's first reply"),
+            user(r#""promptSource":"sdk","#, "P2", "after"),
+            assistant("the answer after"),
+        ]);
+
+        assert_eq!(prompts(&out), vec!["before", "after"]);
+        assert_eq!(endings(&out), vec!["the answer before", "the answer after"]);
+        assert_eq!(
+            out.skipped.get("prompt id with different prompts"),
+            Some(&1)
+        );
+    }
+
+    #[test]
+    fn a_command_line_on_an_open_id_does_not_contest_its_prompt() {
+        // Not a prompt until the model answers it, and this id is already open.
+        let out = parse(&[
+            user(r#""promptSource":"sdk","#, "P1", "the prompt"),
+            user("", "P1", "<command-name>/model</command-name>"),
+            assistant("the answer"),
+        ]);
+
+        assert_eq!(prompts(&out), vec!["the prompt"]);
+        assert_eq!(endings(&out), vec!["the answer"]);
     }
 
     #[test]
