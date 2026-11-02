@@ -427,6 +427,97 @@ mod tests {
         assert!(!is_unknown_method(&gone, method));
     }
 
+    const WEDGED_AFTER_INITIALIZE: &str = r#"#!/usr/bin/env python3
+import json, sys, time
+if len(sys.argv) < 2: sys.exit(0)
+msg = json.loads(sys.stdin.readline())
+print(json.dumps({"jsonrpc":"2.0","id":msg.get("id"),"result":{}}), flush=True)
+time.sleep(60)
+"#;
+
+    /// A recorder's handler lands what it holds on its way out, and a server started after
+    /// it must not take that away. A signal belongs to a whole process, so this runs in one
+    /// of its own.
+    #[test]
+    fn a_handler_already_there_still_runs_when_a_signal_kills_a_server() {
+        use std::os::unix::process::ExitStatusExt;
+        use std::sync::atomic::{AtomicI32, Ordering};
+
+        const ALONE: &str = "CONBUS_TEST_SIGNAL_ALONE";
+        if std::env::var_os(ALONE).is_none() {
+            let out = Command::new(std::env::current_exe().expect("this test binary"))
+                .args([
+                    "--exact",
+                    "appserver::tests::a_handler_already_there_still_runs_when_a_signal_kills_a_server",
+                    "--nocapture",
+                ])
+                .env(ALONE, "1")
+                .stdin(Stdio::null())
+                .output()
+                .expect("ran alone");
+            assert!(
+                out.status.success(),
+                "{:?}\n{}\n{}",
+                out.status,
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+
+        static NOTED: AtomicI32 = AtomicI32::new(0);
+        extern "C" fn note(signal: libc::c_int) {
+            NOTED.store(signal, Ordering::SeqCst);
+        }
+        // SAFETY: the handler only stores to an atomic, and `action` is fully initialised
+        // before the call reads it.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = note as *const () as usize;
+            libc::sigemptyset(&mut action.sa_mask);
+            assert_eq!(
+                libc::sigaction(libc::SIGTERM, &action, std::ptr::null_mut()),
+                0
+            );
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake = dir.path().join("codex");
+        crate::test_support::write_executable(&fake, WEDGED_AFTER_INITIALIZE);
+        let _ = Command::new(&fake)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+
+        // Twice, as the first signal hands the signal back to the handler that was there.
+        for _ in 0..2 {
+            NOTED.store(0, Ordering::SeqCst);
+            let mut server =
+                AppServer::start_with(fake.as_os_str(), Duration::from_secs(30)).expect("started");
+
+            // SAFETY: raising a signal touches no memory.
+            unsafe { libc::raise(libc::SIGTERM) };
+
+            assert_eq!(
+                NOTED.load(Ordering::SeqCst),
+                libc::SIGTERM,
+                "the handler that was there ran"
+            );
+            let until = Instant::now() + Duration::from_secs(10);
+            let status = loop {
+                let status = server.child.try_wait().expect("try_wait");
+                if status.is_some() || Instant::now() > until {
+                    break status;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            assert_eq!(
+                status.and_then(|status| status.signal()),
+                Some(libc::SIGKILL),
+                "the server went too"
+            );
+        }
+    }
+
     #[test]
     fn a_server_gone_is_not_a_group_a_signal_would_kill() {
         // Its id can be someone else's once it has been reaped.
