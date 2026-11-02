@@ -3036,6 +3036,30 @@ expect 1 "$code" "a restart that never served exits non-zero"
 expect_grep '"serving_ms":-1' "$home/.conbus/canary.json" "and is recorded as such"
 expect_grep 'no new serving stamp' "$tmp/restart-noserve.out" "and says so"
 
+# A blackout spec that cannot be read refuses, whichever part is wrong. A day part that was not a day used to read as
+# "not today", so a swap went through in the hours it was written to protect.
+for bad_spec in 'mon-fri 00:00-23:59 UTC' 'Mon-Fir 00:00-23:59 UTC' 'Monday 00:00-23:59 UTC' 'Mon-Fri-Sat 00:00-23:59 UTC' 'Mon,,Tue 00:00-23:59 UTC' \
+    'Mon-Fri 00:00-23:59 Nowhere' 'Mon-Fri 25:00-26:00 UTC' 'mon-fri 00:00-23:59'; do
+    write_fake 01d old "$install_dir/conbus"; rm -f "$rollback_bin" "$home/.conbus/canary.json"
+    code=0; CONBUS_CANARY_BLACKOUT=$bad_spec run start --from "$tmp/stage/conbus-good" >"$tmp/blackout-bad.out" 2>&1 || code=$?
+    expect 2 "$code" "blackout '$bad_spec' is refused (P9)"
+    expect_grep 'unparseable' "$tmp/blackout-bad.out" "and says it could not be read"
+    expect "conbus 0.0.0-01d (01d)" "$("$install_dir/conbus" --version)" "and nothing moved"
+done
+# Preflight names it too.
+code=0; CONBUS_CANARY_BLACKOUT='mon-fri 00:00-23:59 UTC' run preflight >"$tmp/blackout-preflight.out" 2>&1 || code=$?
+expect_grep '^FAIL blackout.*unparseable' "$tmp/blackout-preflight.out" "preflight says the same"
+# The forms it documents still parse, and a list works as a day part.
+blackout_today=$(env TZ=UTC date +%a)
+case $blackout_today in Mon) blackout_other=Wed ;; *) blackout_other=Mon ;; esac
+write_fake 01d old "$install_dir/conbus"; rm -f "$rollback_bin" "$home/.conbus/canary.json"
+code=0; CONBUS_CANARY_BLACKOUT="$blackout_other,$blackout_today 00:00-23:59 UTC" run start --from "$tmp/stage/conbus-good" >"$tmp/blackout-list.out" 2>&1 || code=$?
+expect 2 "$code" "a day list holding today blocks"
+expect_grep 'is active' "$tmp/blackout-list.out" "as active, not as unreadable"
+daemon_boot beef 4266
+code=0; CONBUS_CANARY_BLACKOUT="$blackout_other,$blackout_other 00:00-23:59 UTC" run start --from "$tmp/stage/conbus-good" >/dev/null 2>&1 || code=$?
+expect 0 "$code" "one that does not hold today does not"
+
 # A real build under this throwaway HOME would ask an agy that is not signed
 # in, and a build older than the sign-in check opens a browser tab doing it.
 expect_file "$tmp/agy-bin.seen" "the fakes saw doctor run"

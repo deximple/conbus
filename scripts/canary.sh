@@ -246,27 +246,23 @@ fi
 
 # --- blackout ---------------------------------------------------------------
 
-# Weekday spec like Mon, Mon-Fri, Sat,Sun — 0 if it parses.
+is_day() { case $1 in Mon | Tue | Wed | Thu | Fri | Sat | Sun) return 0 ;; *) return 1 ;; esac; }
+
+# Weekday spec like Mon, Mon-Fri, Sat,Sun — 0 if it parses, and nothing else does.
 is_day_spec() {
     case $1 in
-        Mon | Tue | Wed | Thu | Fri | Sat | Sun) return 0 ;;
+        *-*)
+            [ "$1" = "${1%%-*}-${1##*-}" ] && is_day "${1%%-*}" && is_day "${1##*-}"
+            ;;
+        *,*)
+            rest=$1,
+            while [ -n "$rest" ]; do
+                is_day "${rest%%,*}" || return 1
+                rest=${rest#*,}
+            done
+            ;;
+        *) is_day "$1" ;;
     esac
-    case $1 in
-        Mon- | Tue- | Wed- | Thu- | Fri- | Sat- | Sun- | \
-        *-Mon | *-Tue | *-Wed | *-Thu | *-Fri | *-Sat | *-Sun) : ;;
-        *) return 1 ;;
-    esac
-    rest=$1
-    while :; do
-        case $rest in
-            Mon | Tue | Wed | Thu | Fri | Sat | Sun) return 0 ;;
-            Mon-* | Tue-* | Wed-* | Thu-* | Fri-* | Sat-* | Sun-*)
-                rest=${rest#*-} ;;
-            Mon,* | Tue,* | Wed,* | Thu,* | Fri,* | Sat,* | Sun,*)
-                rest=${rest#*,} ;;
-            *) return 1 ;;
-        esac
-    done
 }
 
 # Map an English weekday name to date +%u (Mon=1 .. Sun=7).
@@ -349,7 +345,12 @@ blackout_active() {
             else range=$1 tz=$2
             fi
             ;;
-        3) days=$1 range=$2 tz=$3 ;;
+        3)
+            # A day part that is not a day must not read as "not today": that is a
+            # swap in the very hours the spec was written to protect.
+            is_day_spec "$1" || { BLACKOUT_REASON="unparseable"; return 0; }
+            days=$1 range=$2 tz=$3
+            ;;
         *) BLACKOUT_REASON="unparseable"; return 0 ;;
     esac
     if is_time_range "$range"; then
