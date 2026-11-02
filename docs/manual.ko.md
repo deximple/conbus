@@ -1015,9 +1015,24 @@ conbus uninstall --apply
 `not checked`로 표시합니다. 즉 그 벤더들에 로그인이 필요 없다는 뜻이 아닙니다. hop에는
 Codex와 gh가 필요합니다. agy는 자기 쿼터 줄에만 쓰이므로, 쓰는 경우에만 로그인하세요.
 아무도 없을 때 conbus가 무엇을 실행하는지도 보여 줍니다. 기록에는 로그인이 필요
-없습니다. `conbus auth --html`은 같은 내용을 오프라인 한 장으로 쓰고, 그 배너는 어느
-벤더에 물었고 어느 벤더에 묻지 않았는지 알려 줍니다. `--html --open`이어야 그 페이지를
-엽니다. `--url`은 이 두 옵션과 함께 쓸 수 없습니다.
+없습니다. `conbus auth --html`은 같은 내용을 오프라인 한 장으로 쓰고, `--html --open`이어야
+그 페이지를 엽니다. `--url`은 이 두 옵션과 함께 쓸 수 없습니다. 페이지의 배너는 conbus에
+필요한 것만, 답한 벤더에게서 들은 것만으로 말합니다.
+
+- **노란색**, `conbus needs a sign-in that is missing: …` — conbus에 필요한 벤더가
+  로그아웃 상태라고 답했습니다. 그 벤더에 로그인하세요.
+- **회색**, `conbus could not tell for: …`(한국어 줄은 `conbus가 확인하지 못했습니다: …`)
+  — conbus가 물었지만 그 벤더가 읽을 수 있는 답을 주지 않았습니다. GitHub에 닿지 못한
+  `gh`나 실패한 `agy`가 그렇습니다. 텍스트 출력에서는 같은 행이 `SKIP`과
+  `its sign-in could not be told`로 나옵니다. 로그아웃이 아니므로 이것 때문에 로그인하지
+  마세요. 왜 답하지 않았는지는 그 벤더를 직접 실행해 보면 압니다. conbus에 필요 없는
+  벤더는 물어본 벤더가 하나도 답하지 않았을 때만 여기에 나옵니다.
+- **회색**, `conbus asked nothing` — 물어볼 수 있는 벤더가 설치돼 있지 않습니다.
+- **초록색**, `of what conbus asked, nothing it needs is signed out` — 그 밖의 경우입니다.
+
+배너 아래 한 줄은 벤더를 `asked`, `could not tell`, `not installed`, `not asked`로 나누고,
+한국어 줄은 `물어봄`, `확인 못 함`, `설치 안 됨`, `묻지 않음`으로 나눕니다. `agy`처럼
+conbus에 필요 없는 벤더는 `could not tell`에 있어도 배너가 초록색일 수 있습니다.
 
 **`nameless  <bus id> — N records…`** — 0.1.0 이전 빌드가 세션을 밝히지 않은
 이벤트를 공용 대화 하나 아래 묶었습니다. 0.1.0부터는 그런 이벤트를 거부합니다.

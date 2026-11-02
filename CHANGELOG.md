@@ -223,6 +223,9 @@ the entry says so when it does.
   arguments to the command before it, and a line that was only a comment was a
   command not found. What each line does is now said beside its block, and
   `scripts/check-docs.sh` fails on a comment in one.
+- Both manuals now say what each `conbus auth --html` banner means, including the grey
+  `conbus could not tell for: …` and the `could not tell` list under it: a vendor that
+  gave no answer conbus could read, which is no reason to sign in.
 ### Added
 
 - `conbus auth` (experimental): for when a sign-in tab opens and you should not have

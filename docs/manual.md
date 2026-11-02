@@ -1122,9 +1122,24 @@ extension's page into the client's `PLAYWRIGHT_MCP_EXTENSION_TOKEN`;
 vendors it does not ask `not checked`, so it does not say that those need no sign-in.
 A hop needs Codex and gh. Only agy's own quota line needs agy, so sign in there only
 if you use it. It also lists what conbus runs with nobody at the keyboard; recording
-needs no sign-in. `conbus auth --html` writes the same as one offline page, whose
-banner says which vendors it asked and which it did not, and `--html --open` opens
-that page. `--url` takes neither of those flags.
+needs no sign-in. `conbus auth --html` writes the same as one offline page, and
+`--html --open` opens that page. `--url` takes neither of those flags. The page's
+banner speaks only for what conbus needs, and only from the vendors that answered:
+
+- **Yellow**, `conbus needs a sign-in that is missing: …` — a vendor conbus needs said
+  it is signed out. Sign in to that one.
+- **Grey**, `conbus could not tell for: …` — conbus asked, and the vendor gave no
+  answer it could read: a `gh` that could not reach GitHub, say, or an `agy` that
+  failed. In the text output the same row reads `SKIP` and `its sign-in could not be
+  told`. That is not a sign-out, so do not sign in because of it; run the vendor
+  yourself to see why it did not answer. A vendor conbus does not need is named here
+  only when none of the vendors it asked answered.
+- **Grey**, `conbus asked nothing` — no vendor it can ask is installed.
+- **Green**, `of what conbus asked, nothing it needs is signed out` — anything else.
+
+Under the banner one line sorts the vendors into `asked`, `could not tell`, `not
+installed` and `not asked`. A vendor conbus does not need, such as `agy`, can be under
+`could not tell` while the banner is green.
 
 **A hop did not happen when a limit hit** — check `conbus status`: the rules
 line, the destination's quota, and whether the session was a program
