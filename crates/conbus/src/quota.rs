@@ -147,7 +147,12 @@ pub fn run(paths: &Paths) -> io::Result<()> {
         Err(err) => println!("codex     unavailable — {err}"),
     }
     match read_agy() {
-        Ok(quota) => println!("agy       {}", describe(&quota, now)),
+        Ok(quota) => {
+            // `quota` is the one place a person asked for the vendor — the
+            // answer is cached so doctor/status/hop never have to run it.
+            let _ = write_cached(paths, Harness::AGY, &quota);
+            println!("agy       {}", describe(&quota, now));
+        }
         Err(err) => println!("agy       unavailable — {err}"),
     }
     println!("claude    {}", describe_claude(paths, now));
@@ -171,18 +176,15 @@ pub fn run(paths: &Paths) -> io::Result<()> {
 
 /// Official print-mode JSON. Not a TUI scrape: the unmodified binary
 /// already fetched remaining quota and emits `command.data.groups`.
-pub fn read_agy() -> io::Result<Quota> {
-    read_agy_with(Duration::from_secs(15))
-}
-
-/// [`read_agy`] with the caller's deadline — the same two seconds `doctor`
-/// gives every probe. The sign-in check spends it first.
 ///
-/// `agy -p` runs only on an account [`agy_signed_in`] vouched for. Measured on
-/// 1.4.12 in a throwaway HOME: with no login it starts an OAuth flow and opens
-/// a browser tab, with or without a controlling terminal. `--print-timeout` and
-/// this deadline stop the wait, not the tab.
-pub fn read_agy_with(deadline: Duration) -> io::Result<Quota> {
+/// Only `conbus quota` calls this — a command a person ran, never a path
+/// that fires unattended. `agy -p` runs only on an account [`agy_signed_in`]
+/// vouched for. Measured on 1.4.12 in a throwaway HOME: with no login it
+/// starts an OAuth flow and opens a browser tab, with or without a
+/// controlling terminal. `--print-timeout` and this deadline stop the wait,
+/// not the tab.
+pub fn read_agy() -> io::Result<Quota> {
+    let deadline = Duration::from_secs(15);
     let started = Instant::now();
     let binary = agy_binary();
     agy_signed_in(&binary, deadline).map_err(io::Error::other)?;
@@ -247,12 +249,6 @@ impl std::fmt::Display for AgyNotAsked {
 }
 
 impl std::error::Error for AgyNotAsked {}
-
-/// True when [`read_agy_with`] gave up before asking for usage: the reason is
-/// the answer, however long the check took.
-pub fn agy_not_asked(err: &io::Error) -> bool {
-    err.get_ref().is_some_and(|inner| inner.is::<AgyNotAsked>())
-}
 
 /// With no login, `agy models` says so, fails and opens nothing. Only a plain
 /// listing counts as a login: a request to sign in outranks a clean exit, and
@@ -654,6 +650,24 @@ fn claude_profiles(paths: &Paths) -> Vec<String> {
 
 pub fn describe_claude(paths: &Paths, now: i64) -> String {
     describe_claude_named(paths, Harness::CLAUDE_CODE, now)
+}
+
+/// What doctor/status say about the agy reading: the cache `conbus quota`
+/// writes, and nothing else. No code path that runs unattended may invoke
+/// the vendor — `agy -p` on a logged-out account opens an OAuth tab, and
+/// `agy models` measures 2–4s, over every probe deadline it was ever given.
+pub fn describe_agy(paths: &Paths, now: i64) -> String {
+    if let Some(at) = cached_observed_at(paths, Harness::AGY) {
+        let age = now.saturating_sub(at);
+        if age > CACHE_TTL_SECS {
+            return format!("last read {} ago, so the numbers are not counted", ago(age));
+        }
+        if let Some(quota) = read_cached_at(paths, Harness::AGY, now) {
+            return format!("{} · read {} ago", describe(&quota, now), ago(age));
+        }
+        return format!("last read {} ago, so the numbers are not counted", ago(age));
+    }
+    "no reading yet; conbus quota reads it".into()
 }
 
 fn describe_claude_named(paths: &Paths, name: &str, now: i64) -> String {
