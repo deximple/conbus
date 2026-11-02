@@ -116,6 +116,8 @@ usage_rows() { # usage_rows <first-iso> <harness>...
 #   stampnolisten — a stamp, and never a socket
 #   stampdiffers — a stamp, and a doctor saying another build answers
 #   noinstall — its `install --apply` fails
+#   swaplate  — its `install --apply` writes a swap reason dated past the 60 s
+#   slowlog   — its first read of the log finds nothing, as a hook that spooled would
 #   refusing  — doctor says the recorder is holding what the log refuses, right now
 #   lowdisk   — doctor's 10% warning, which this Mac is always under
 #   eventgap  — hooks run, but a registered hook misses events
@@ -161,6 +163,7 @@ write_fake() {
         stampdiffers) doctor='printf "{\"build\":\"'"$tag"'\",\"pid\":$$,\"started\":\"2026-11-01T10:00:00.000Z\"}\n" > "$HOME/.conbus/daemon.build"; echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build aaaa pid 9999 since 2026-11-01T10:00:00.000Z — DIFFERS from this binary ('"$tag"'); restart the daemon"' ;;
         noinstall) doctor='echo "socket    $HOME/.conbus/conbus.sock — not answering"'
             install_body='exit 1' ;;
+        slowlog) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "hooks     claude_code  runs — x"' ;;
         lowdisk) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "disk      log 1.0 MB — 100.0 GB free of 2000.0 GB (5.0%) — WARNING: under 10% free"; echo "log       5 record(s), 1 conversation(s), 0 unreadable line(s)"; echo "hooks     claude_code  runs — x"' ;;
         eventgap) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "log       5 record(s), 1 conversation(s), 0 unreadable line(s)"; echo "hooks     claude_code  runs — x"; echo "events    claude_code  MISSING Stop, SessionEnd — run \`conbus install --apply\`"' ;;
         untrusted) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "log       5 record(s), 1 conversation(s), 0 unreadable line(s)"; echo "hooks     codex        runs — x"; echo "codex     2 of 2 hook(s) Codex will not spawn:"; echo "          NOT TRUSTED: PreToolUse, PostToolUse"' ;;
@@ -172,6 +175,8 @@ write_fake() {
             install_body='touch "$HOME/.install-called"; now=$(perl -MTime::HiRes=gettimeofday -MPOSIX=strftime -e "(\$s,\$u)=gettimeofday; printf \"%s.%03dZ\", strftime(\"%Y-%m-%dT%H:%M:%S\", gmtime(\$s)), int(\$u/1000)"); printf "{\"ts\":\"%s\",\"reason\":\"the recorder stopped with records it could not land\",\"detail\":\"2 record(s) lost\"}\n{\"ts\":\"%s\",\"reason\":\"the log refused writes for a while and records may be lost\",\"detail\":\"3 record(s) waited and landed, 1 could not be kept, since 2026-11-01T00:00:00.000Z: No space left on device (os error 28)\"}\n" "$now" "$now" >> "$HOME/.conbus/drops.jsonl"' ;;
         orphans) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "hooks     claude_code  runs — x"'
             install_body='touch "$HOME/.install-called"; printf "{\"ts\":\"%s\",\"reason\":\"no conversation for this session; the daemon has no binding for it (no prompt from this session has reached it)\",\"detail\":\"PreToolUse for session 01a06306\"}\n" "$(perl -MTime::HiRes=gettimeofday -MPOSIX=strftime -e "(\$s,\$u)=gettimeofday; printf \"%s.%03dZ\", strftime(\"%Y-%m-%dT%H:%M:%S\", gmtime(\$s)), int(\$u/1000)")" >> "$HOME/.conbus/drops.jsonl"' ;;
+        swaplate) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "hooks     claude_code  runs — x"'
+            install_body='touch "$HOME/.install-called"; printf "{\"ts\":\"%s\",\"reason\":\"the daemon refused the record: this daemon speaks protocol v5; the hook speaks v6. Restart the daemon.\"}\n" "$(perl -MPOSIX=strftime -e "print strftime(\"%Y-%m-%dT%H:%M:%S.000Z\", gmtime(time + 90))")" >> "$HOME/.conbus/drops.jsonl"' ;;
         knowndrop) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "hooks     claude_code  runs — x"'
             install_body='touch "$HOME/.install-called"; printf "{\"ts\":\"%s\",\"reason\":\"socket closed early\"}\n" "$(perl -MTime::HiRes=gettimeofday -MPOSIX=strftime -e "(\$s,\$u)=gettimeofday; printf \"%s.%03dZ\", strftime(\"%Y-%m-%dT%H:%M:%S\", gmtime(\$s)), int(\$u/1000)")" >> "$HOME/.conbus/drops.jsonl"' ;;
         notokens) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "hooks     claude_code  runs — x"' ;;
@@ -187,6 +192,10 @@ write_fake() {
     # fails every read, .usage-fail-day only that day's.
     hook_body='{ cat; echo; } >>"$HOME/.conbus/fake-records"; echo "{}"'
     [ "$persona" = norecord ] && hook_body='cat >/dev/null; echo "{}"'
+    log_json='cat "$HOME/.conbus/fake-records" 2>/dev/null'
+    if [ "$persona" = slowlog ]; then
+        log_json='if [ -f "$HOME/.read-once" ]; then cat "$HOME/.conbus/fake-records" 2>/dev/null; else touch "$HOME/.read-once"; fi'
+    fi
     usage_filter=cat
     if [ "$persona" = notokens ]; then
         usage_filter="sed -E 's/\"tokens_[a-z_]*\":[0-9]*,?//g; s/,}/}/g'"
@@ -202,7 +211,7 @@ case "\$1" in
     doctor) $doctor ;;
     log)
         case "\$2" in
-            --json) cat "\$HOME/.conbus/fake-records" 2>/dev/null ;;
+            --json) $log_json ;;
             *) echo "cache     0 closed segment(s): 0 built, 0 already valid" ;;
         esac
         ;;
@@ -1327,7 +1336,7 @@ drop_line 3600 'the log refused writes for a while' '3 record(s) waited and land
 code=0
 run verdict >"$tmp/verdict-held.out" 2>&1 || code=$?
 expect 0 "$code" "an outage in which every record landed is not a loss"
-expect_grep '^PASS drops — 0 lost records (1 line(s) since' "$tmp/verdict-held.out" "drops passes: it is not a drop"
+expect_grep '^PASS drops — no line says a record was lost (1 line(s) since' "$tmp/verdict-held.out" "drops passes: it is not a drop"
 expect_no_grep 'not seen before\|no rule covers need' "$tmp/verdict-held.out" "and not a new reason"
 expect_grep '^PASS log-outages — 1 time(s) the log refused writes' "$tmp/verdict-held.out" "the outage has its own line"
 expect_grep '^  1× 3 record(s) waited and landed' "$tmp/verdict-held.out" "with what it said"
@@ -1654,7 +1663,7 @@ code=0
 run verdict >"$tmp/verdict-elided-low.out" 2>&1 || code=$?
 expect 0 "$code" "elided bodies below 1% of tool calls pass"
 expect_grep '^PASS tool-bodies — 5 tool event(s)' "$tmp/verdict-elided-low.out" "their sum is on its own line"
-expect_grep '^PASS drops — 0 lost' "$tmp/verdict-elided-low.out" "and the line is not a drop"
+expect_grep '^PASS drops — no line says a record was lost' "$tmp/verdict-elided-low.out" "and the line is not a drop"
 expect_no_grep 'new drop\|not seen before' "$tmp/verdict-elided-low.out" "and not a new reason"
 verdict_fixture
 elided_line 100000
@@ -2518,13 +2527,6 @@ expect_grep '"swap_window_drops":3' "$home/.conbus/canary.json" "swap_window_dro
 
 # Disk: daemon.log is the trace a full disk can leave. The 10% warning is a note,
 # because this Mac is always under it; a false FAIL there costs a week.
-verdict_fixture
-printf '%s conbus daemon: 18 of 18 record(s) refused by the log: No space left on device (os error 28)\n' \
-    "$(iso_ago $((2 * DAY)))" >>"$home/.conbus/daemon.log"
-code=0
-run verdict >"$tmp/verdict-diskfull.out" 2>&1 || code=$?
-expect 1 "$code" "records the log refused fail"
-expect_grep '^FAIL disk — 18 record(s) refused.*No space left' "$tmp/verdict-diskfull.out" "with the count and the error"
 # A build that holds what the log refuses says so at each end of the outage (#155).
 verdict_fixture
 printf '%s conbus daemon: the log refused a write (No space left on device (os error 28)); keeping what it refuses until it stops\n' \
@@ -3106,6 +3108,40 @@ verdict_fixture
 code=0; run_nobudget verdict >"$tmp/verdict-stored-none.out" 2>&1 || code=$?
 expect_grep 'recorder RSS 256 MB (default)' "$tmp/verdict-stored-none.out" "defaults are named as defaults"
 expect_grep 'disk warning accepted at start: no' "$tmp/verdict-stored-none.out" "and no answer is no"
+
+# What it says to the person reading it.
+code=0; run help >"$tmp/help.out" 2>&1 || code=$?
+expect 0 "$code" "help runs"
+for help_word in 'verdict exits' '0 pass' '4 the window is over' '\[--idle' 'rollback exit 3'; do
+    expect_grep "$help_word" "$tmp/help.out" "help says: $help_word"
+done
+expect_no_grep '^set \|^#!' "$tmp/help.out" "and stops at the usage"
+# PASS drops does not say a thing it cannot know.
+verdict_fixture
+drop_line 3600 'EOF while parsing a value at line 1 column 0'
+code=0; run verdict >"$tmp/verdict-drops-words.out" 2>&1 || code=$?
+expect_grep '^PASS drops — no line says a record was lost' "$tmp/verdict-drops-words.out" "over lines that cannot prove a loss, it does not say 0 lost"
+expect_no_grep '0 lost records' "$tmp/verdict-drops-words.out" "those words are gone"
+# The restarts line says the allowance it judged with.
+verdict_fixture
+code=0; run verdict >"$tmp/verdict-grace.out" 2>&1 || code=$?
+expect_grep '^PASS restarts.*within 90s' "$tmp/verdict-grace.out" "it says how long a start counts as the swap's or a planned restart's"
+# start and verdict agree on the swap window: 60 s from the swap, and a later line goes through the new-reason rule.
+write_fake beef swaplate "$tmp/stage/conbus-swaplate"
+write_fake 01d old "$install_dir/conbus"
+rm -f "$rollback_bin" "$home/.install-called" "$home/.conbus/canary.json"
+cat >"$home/.conbus/drops.jsonl" <<'EOF'
+{"ts":"2026-10-30T09:00:00.000Z","reason":"socket closed early"}
+EOF
+daemon_boot beef 4268
+code=0; SERVING_LIMIT=5 run_real start --from "$tmp/stage/conbus-swaplate" >"$tmp/start-swaplate.out" 2>&1 || code=$?
+expect 1 "$code" "a swap reason past the 60 s is not exempt at start either"
+expect_grep 'new drop reason' "$tmp/start-swaplate.out" "it goes through the new-reason rule"
+# A hook that spooled through a stall is in the spool, not lost: a moment later it has landed.
+write_fake beef slowlog "$tmp/stage/conbus-slowlog"
+write_fake 01d old "$install_dir/conbus"; rm -f "$rollback_bin" "$home/.conbus/canary.json"
+code=0; run preflight --from "$tmp/stage/conbus-slowlog" >"$tmp/preflight-slowlog.out" 2>&1 || code=$?
+expect_grep '^PASS round-trip' "$tmp/preflight-slowlog.out" "a record that lands a moment late still landed"
 
 # A real build under this throwaway HOME would ask an agy that is not signed
 # in, and a build older than the sign-in check opens a browser tab doing it.

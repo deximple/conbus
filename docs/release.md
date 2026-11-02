@@ -119,6 +119,33 @@ been run under the hardened runtime this way — recorder, hook, `doctor`,
 entitlement lets a landed hop open Terminal through `osascript`. That path
 has not been exercised under the hardened runtime.
 
+## Reading the canary's verdict
+
+`scripts/canary.sh verdict` judges the window since `canary.sh start`, and its exit
+code is the answer:
+
+| Exit | Meaning |
+|---|---|
+| 0 | Pass. Every item was judged. `operator-feel` is still yours to answer. |
+| 1 | An item failed. |
+| 2 | It refused its arguments, or a number in the environment or in `canary.json`. |
+| 3 | The window is still open. A fail inside the window still exits 1. |
+| 4 | The window is over and an item other than `operator-feel` could not be judged. It names what is open. This is neither a fail nor a pass. |
+
+`--idle <harness|day>[,...]` is your answer to the one question a log cannot settle:
+"was this harness or day idle, or not recorded?". The question names what to pass, and
+a PASS prints the answer. Nothing else can be answered this way.
+
+`start` keeps what the verdict needs to judge the window in `canary.json`, including
+the budgets it ran under: `CONBUS_CANARY_RSS_MB`, `CONBUS_CANARY_DOCTOR_MS`,
+`CONBUS_CANARY_SERVING_LIMIT` and `CONBUS_CANARY_DISK_WARN_OK`. The verdict prints each
+one with where it came from, and the environment still wins. A window started by an
+older script has none of this recorded, and exits 4 on `drops` and `log-files`.
+
+`start` exits 1 when it rolled back and 2 when it refused before anything moved.
+`start` and `rollback` exit 3 when the rollback could not be verified, and say which
+check it was. `restart` exits 1 when the daemon never served.
+
 ## Operator decisions
 
 These are not engineering steps and no agent takes them on its own.

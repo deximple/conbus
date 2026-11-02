@@ -8,9 +8,19 @@
 #   scripts/canary.sh restart
 #   scripts/canary.sh rollback
 #
-# preflight, status and verdict are read-only (preflight also makes the
-# plist backup — a copy, never a change). start, restart and rollback swap
-# or reload the installed binary. Per the 1.0 plan, §7:
+#   verdict exits: 0 pass, 1 an item failed, 2 arguments refused, 3 the window is
+#   still open, 4 the window is over and an item other than operator-feel could not
+#   be judged. It names what is open, and that is neither a fail nor a pass.
+#   --idle is your answer to "was this harness or day idle, or not recorded?". The
+#   question names what to pass, and a PASS prints the answer.
+#   start exits 1 when it rolled back, 2 when it refused before anything moved.
+#   start and rollback exit 3 when the rollback could not be verified.
+#   restart exits 1 when the daemon never served.
+#
+# status and verdict are read-only. preflight makes the plist backup, a copy; with
+# --from it also prebuilds the candidate's cache/ next to the live log, a rebuildable
+# sidecar, and runs the candidate's own daemon on a throwaway root. start, restart and
+# rollback swap or reload the installed binary. Per the 1.0 plan, §7:
 #   - the swap is real only when ALL of these hold: HOME is the passwd
 #     home, CONBUS_SKIP_LAUNCHCTL is unset, CONBUS_CANARY_REHEARSAL is
 #     unset. It then ends in `conbus install --apply` (bootout +
@@ -538,33 +548,6 @@ rollback_reload() { # rollback_reload <mode>
     fi
 }
 
-# Report the socket state and fail (1) only when a real reload did not come
-# up; in rehearsal, not-listening is expected.
-check_doctor() {
-    mode=$1
-    doctor_rc=0
-    doctor_out=$(run_doctor) || doctor_rc=$?
-    [ "$doctor_rc" -eq 142 ] &&
-        say "doctor: no answer inside ${doctor_limit_s}s (cap)"
-    echo "$doctor_out" | grep -E '^(socket|daemon|recorder|hardening)' || true
-    if grep -q 'DIFFERS' <<<"$doctor_out"; then
-        say "doctor: the answering daemon is a different build —"
-        say "  check \`canary.sh status\`, or roll back: canary.sh rollback"
-        return 1
-    fi
-    if grep -q 'listening' <<<"$doctor_out"; then
-        say "doctor: socket listening"
-        return 0
-    fi
-    if [ "$mode" = real ]; then
-        say "doctor: the daemon is not answering after install --apply —"
-        say "  check \`canary.sh status\`, or roll back: canary.sh rollback"
-        return 1
-    fi
-    say "doctor: not answering — expected while the daemon is not restarted"
-    return 0
-}
-
 # --- canary.json ------------------------------------------------------------
 
 state_get() { # state_get <dotted key> — flat fields only
@@ -745,14 +728,17 @@ drop_reasons() {
 
 # "<class><tab><reason>" for each drop line later than <ts>, from both
 # generations: a rotation can rename the file mid-window, so "after this moment"
-# is a timestamp cut, not a line count. `swap` marks a reason a swap window makes.
-drop_classes_after() { # drop_classes_after <ts>
+# is a timestamp cut, not a line count. `swap` marks a reason a swap window makes,
+# no later than <swap end>: the same 60 s the verdict exempts. A restart has none.
+drop_classes_after() { # drop_classes_after <ts> [swap end]
     dca_after=$1
+    dca_end=${2:-}
     shift
+    [ $# -eq 0 ] || shift
     if [ -r "$drops_rotated" ]; then set -- "$@" "$drops_rotated"; fi
     if [ -r "$drops_log" ]; then set -- "$@" "$drops_log"; fi
     [ $# -gt 0 ] || return 0
-    LC_ALL=C awk -v s="$dca_after" "$drop_awk_lib"'
+    LC_ALL=C awk -v s="$dca_after" -v swap_end="$dca_end" "$drop_awk_lib"'
         {
             drop_split($0)
             for (f = 1; f <= n_frag; f++) {
@@ -761,7 +747,7 @@ drop_classes_after() { # drop_classes_after <ts>
                 if (!drop_whole(frag[f])) continue
                 drop_parse(frag[f])
                 if (d_ts > s && d_reason != "")
-                    printf "%s\t%s\n", (drop_swap_reason(d_reason) ? "swap" : drop_class(d_reason, d_detail)), d_reason
+                    printf "%s\t%s\n", (drop_swap_reason(d_reason) && swap_end != "" && !(d_ts > swap_end) ? "swap" : drop_class(d_reason, d_detail)), d_reason
             }
         }' "$@"
 }
@@ -779,15 +765,6 @@ drops_blind() { # drops_blind <binary that will be writing>
     [ -r "$drops_log" ] || return 1
     [ "$(wc -c <"$drops_log" | tr -d ' ')" -ge "$drops_cap_bytes" ] || return 1
     ! build_rotates "$1"
-}
-
-# Reasons in the second file/list that the first did not have.
-# new_drop_reasons <before-file> — prints nothing when there is no diff.
-new_drop_reasons() {
-    tmp=$(mktemp)
-    drop_reasons >"$tmp"
-    comm -13 "$1" "$tmp"
-    rm -f "$tmp"
 }
 
 # `<device>:<inode>:<size>:<sha256 of those bytes>`, empty when there is no such file.
@@ -947,8 +924,7 @@ verdict_drops() {
             dt_problem="$dt_problem $f"
         fi
     done
-    dt_end=$(perl -MPOSIX=strftime -e 'print strftime("%Y-%m-%dT%H:%M:%S.000Z", gmtime($ARGV[0] + 60))' \
-        "$(ts_epoch "${recorded_swap:-$since}")")
+    dt_end=$(swap_window_end "${recorded_swap:-$since}")
     if [ $# -gt 0 ]; then
         dt_rc=0
         dt_rows=$(drop_table "$since" "$dt_end" "$@") || dt_rc=$?
@@ -1027,7 +1003,7 @@ verdict_drops() {
     elif [ -n "$open" ]; then
         line UNCHECKED drops "${open#; } ($tally)"
     else
-        line PASS drops "0 lost records ($tally)"
+        line PASS drops "no line says a record was lost ($tally)"
     fi
 
     # What was decided, so a person can argue with it.
@@ -1044,7 +1020,7 @@ verdict_drops() {
     group ghost "end of a session or turn with no binding — not lost, shown only:"
     group sessionless "payload named no session — the vendor's, not lost, shown only:"
     group payload "payload the hook could not parse — cannot prove a loss, shown only:"
-    printf '  rule: a lost record or adapter gap fails at any count; a reason new since the swap fails; the three shown kinds stop a pass only above %s lines each; the swap window exempts its two reasons for 60 s\n' "$noise_limit"
+    printf '  rule: a lost record or adapter gap fails at any count; a reason new since the swap fails; the three shown kinds stop a pass only above %s lines each; tool events with no prompt are judged on orphan-tools; the swap window exempts its two reasons for 60 s\n' "$noise_limit"
     if [ -r "$daemon_log" ]; then
         refused_hooks=$(awk -v s="$since" '$1 ~ /^[0-9]/ && $1 > s && /refusing a hook speaking protocol/ { n++ } END { print n + 0 }' "$daemon_log")
         if [ "$refused_hooks" -gt 0 ]; then
@@ -1544,9 +1520,10 @@ verdict_restarts() {
     vs_newest=$(printf '%s\n' "$vs_lines" | sed -n '$p')
     vs_stamped=$(sed -n 's/.*"started":"\([^"]*\)".*/\1/p' "$stamp" 2>/dev/null || true)
 
+    vs_grace="a start within $((serving_limit * 2 + 30))s of the swap or a planned restart counts as theirs"
     vs_faults="" vs_open=""
     if [ "$vs_unplanned" -gt 0 ]; then
-        vs_faults="$vs_faults; $vs_unplanned unplanned daemon start(s) since $since ($vs_seen seen: 1 swap + $vs_count planned + $vs_rebooted after a reboot)"
+        vs_faults="$vs_faults; $vs_unplanned unplanned daemon start(s) since $since ($vs_seen seen: 1 swap + $vs_count planned + $vs_rebooted after a reboot); $vs_grace"
     fi
     if [ -n "$vs_never" ]; then
         vs_faults="$vs_faults; a planned restart never served: $vs_never"
@@ -1566,7 +1543,7 @@ verdict_restarts() {
         line UNCHECKED restarts "${vs_open#; }"
     else
         line PASS restarts \
-            "0 unplanned daemon start(s) since $since ($vs_seen seen: 1 swap + $vs_count planned + $vs_rebooted after a reboot)"
+            "0 unplanned daemon start(s) since $since ($vs_seen seen: 1 swap + $vs_count planned + $vs_rebooted after a reboot); $vs_grace"
     fi
 }
 
@@ -1666,11 +1643,6 @@ verdict_disk() {
     vd_rows=""
     if [ -r "$daemon_log" ]; then
         vd_rows=$(awk -v s="$since" -v recovered="$(row_value "$dt_rows" last_outage)" '
-            $1 ~ /^[0-9]/ && $1 > s && /record\(s\) refused by the log/ {
-                lines++
-                if (first == "") { first = $0; sub(/^.*refused by the log: */, "", first) }
-                for (i = 1; i <= NF; i++) if ($i == "of") { total += $(i - 1); break }
-            }
             $1 ~ /^[0-9]/ && $1 > s && /the log refused a write / {
                 refusing = $0
                 refusing_at = $1
@@ -1680,12 +1652,9 @@ verdict_disk() {
             $1 ~ /^[0-9]/ && $1 > s && match($0, /[1-9][0-9]* could not be kept/) { not_kept += substr($0, RSTART, RLENGTH) }
             END {
                 if (recovered > refusing_at) refusing = ""
-                printf "lines %d\ntotal %d\nfirst %s\nrefusing %s\nnot_kept %d\n", lines, total, first, refusing, not_kept
+                printf "refusing %s\nnot_kept %d\n", refusing, not_kept
             }' "$daemon_log")
     fi
-    vd_lines=$(row_value "$vd_rows" lines)
-    vd_total=$(row_value "$vd_rows" total)
-    vd_first=$(row_value "$vd_rows" first | cut -c1-120)
     vd_refusing=$(row_value "$vd_rows" refusing | cut -c1-120)
     vd_not_kept=$(row_value "$vd_rows" not_kept)
     # Whichever log said it. A throttled note leaves only the drop line.
@@ -1695,9 +1664,7 @@ verdict_disk() {
     fi
     vd_line=$(printf '%s\n' "$doctor_out" | sed -n 's/^disk  *//p' | sed -n '1p')
     vd_write_bad=$(log_cannot_take "$doctor_out")
-    if [ "${vd_lines:-0}" -gt 0 ]; then
-        line FAIL disk "$vd_total record(s) refused by the log since $since, $vd_lines time(s) in daemon.log: $vd_first"
-    elif [ "${vd_not_kept:-0}" -gt 0 ]; then
+    if [ "${vd_not_kept:-0}" -gt 0 ]; then
         line FAIL disk "$vd_not_kept record(s) could not be kept since $since"
     elif [ -n "$vd_refusing" ]; then
         line FAIL disk "the log refused a write and daemon.log does not say it stopped: $vd_refusing"
@@ -1706,7 +1673,7 @@ verdict_disk() {
     elif [ ! -r "$daemon_log" ] || [ -z "$vd_line" ]; then
         line UNCHECKED disk "needs daemon.log and doctor's disk line${doctor_failed:+ ($doctor_failed)}"
     else
-        line PASS disk "no record refused by the log since $since, as far as a write to daemon.log could say; now: $vd_line"
+        line PASS disk "no refusal left open and no record it could not keep since $since, as far as a write to daemon.log or the drop log could say; now: $vd_line"
     fi
 }
 
@@ -1752,6 +1719,12 @@ ts_epoch() {
     fi
 }
 
+# Where the swap window ends: its two reasons are exempt for 60 s from the swap, at
+# `start` and at the verdict alike.
+swap_window_end() { # swap_window_end <swap time>
+    perl -MPOSIX=strftime -e 'print strftime("%Y-%m-%dT%H:%M:%S.000Z", gmtime($ARGV[0] + 60))' "$(ts_epoch "$1")"
+}
+
 # Does a record land through this binary? Its own hook, its own daemon, a log in a
 # throwaway root. No vendor can be found on this PATH, the empty root gives gap fill
 # nothing to read, and an unset retention never asks the Keychain. It proves the
@@ -1786,7 +1759,15 @@ candidate_round_trip() { # candidate_round_trip <binary>; says what happened, 0 
             $rt_env "$1" hook --harness claude_code >/dev/null 2>&1 || rt_said="its hook exited non-zero"
     fi
     if [ -z "$rt_said" ]; then
-        rt_records=$($rt_env "$1" log --json 2>/dev/null | wc -l | tr -d ' ' || true)
+        # A stall makes the hook spool, and an idle daemon drains every 2 s, so a first
+        # look that finds nothing has not shown that nothing landed.
+        rt_n=0
+        while :; do
+            rt_records=$($rt_env "$1" log --json 2>/dev/null | wc -l | tr -d ' ' || true)
+            [ "${rt_records:-0}" -eq 0 ] && [ "$rt_n" -lt 10 ] || break
+            sleep 0.5
+            rt_n=$((rt_n + 1))
+        done
         if [ "${rt_records:-0}" -gt 0 ]; then
             rt_said="ok"
         else
@@ -2722,7 +2703,7 @@ case $sub in
                         fi
                         ;;
                 esac
-            done <<<"$(drop_classes_after "$before_ts")"
+            done <<<"$(drop_classes_after "$before_ts" "$(swap_window_end "$swapped_ts")")"
         fi
         if [ "$swap_window_drops" -gt 0 ]; then
             say "start: $swap_window_drops swap-window drop(s) — the old daemon" \
@@ -2781,7 +2762,7 @@ case $sub in
         ;;
 
     "" | -h | --help | help)
-        sed -n '3,10p' "$0"
+        sed -n '3,19p' "$0" | sed 's/^# \{0,1\}//'
         ;;
     *)
         refuse "unknown subcommand: $sub (preflight|status|verdict|start|restart|rollback)"
