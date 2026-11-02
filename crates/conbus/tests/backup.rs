@@ -2887,7 +2887,7 @@ fn an_unplugged_disk_stops_the_restore_before_the_recorder_starts() {
     let restored = try_restore(&world, &world.base.join("not plugged in"));
 
     assert!(!restored.out.status.success(), "{}", stdout(&restored.out));
-    assert!(!restored.started_the_recorder(), "{:?}", restored.calls);
+    assert!(restored.left_the_recorder_alone(), "{:?}", restored.calls);
     assert!(segment_names(&world.log()).is_empty());
 }
 
@@ -2997,7 +2997,7 @@ fn a_damaged_backup_stops_the_restore_before_it_copies_anything() {
         stderr(&restored.out).contains(&closed[0]),
         "it names the file"
     );
-    assert!(!restored.started_the_recorder(), "{:?}", restored.calls);
+    assert!(restored.left_the_recorder_alone(), "{:?}", restored.calls);
     assert!(segment_names(&world.log()).is_empty(), "nothing was copied");
 }
 

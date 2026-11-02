@@ -821,8 +821,9 @@ What each part is for:
   closed segment is not the size of its copy, or if the newest segment is not its copy
   and perhaps more.
 
-If the block stops, the recorder stays stopped until you start it, and
-`conbus install --apply` does that without restoring anything.
+If the block stops at `--verify` or the first `find`, nothing has changed and the
+recorder is as it was. If it stops later, the recorder it stopped stays stopped until
+you start it, and `conbus install --apply` does that without restoring anything.
 
 - **`--verify` says there is nothing to restore.** No segment had closed when that
   backup ran, so it holds no records. The block stops there. If the recorder is not
