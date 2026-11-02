@@ -353,6 +353,7 @@ fn a_thousand_hooks_survive_a_daemon_restart() {
         "every hook's id must reach the log exactly once ({dup_hook_ids} re-deliveries)"
     );
     assert_eq!(markers.len() as u64, HOOKS, "every storm event was written");
+    assert_eq!(dup_hook_ids, 0, "a hook id reached the log twice");
 }
 
 fn wait_for_socket(home: &Path) {

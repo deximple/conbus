@@ -27,6 +27,11 @@ use conbus_core::segment::{Scan, SegmentLog};
 use crate::harden;
 use crate::wire::{Request, Response};
 
+/// How many hook ids a daemon keeps, written or restored. A re-delivery is the
+/// last few records at most: the one spool file a dying daemon had not deleted,
+/// and hooks that gave up waiting on a reply just before it died.
+const REMEMBERED_HOOKS: usize = 4096;
+
 /// Derived state plus the log it feeds. Lives in one process, in one thread, so
 /// the registry needs no lock: hook clients are short-lived and a handful of
 /// events per turn does not need concurrency.
@@ -59,8 +64,9 @@ pub struct Daemon {
     arena_root: Option<std::path::PathBuf>,
     /// Official Chat export drop folder. `None` in tests that do not watch.
     chat_watch: Option<ChatWatch>,
-    /// The last 4,096 hook ids written, in arrival order — a spooled request
-    /// that already landed is answered Recorded, not written twice.
+    /// The last [`REMEMBERED_HOOKS`] hook ids written, in arrival order — a
+    /// spooled request that already landed is answered Recorded, not written
+    /// twice. Seeded from the log at start, so that holds across a restart too.
     seen_hooks: std::collections::VecDeque<String>,
     seen_hook_bus: std::collections::HashMap<String, conbus_core::ids::BusId>,
 }
@@ -102,13 +108,12 @@ impl Daemon {
         }
     }
 
-    /// Remember that this hook id already wrote, under this bus — the last
-    /// 4,096. A drained spool re-sending it gets Recorded, not a second
-    /// record.
+    /// Remember that this hook id already wrote, under this bus. A drained
+    /// spool re-sending it gets Recorded, not a second record.
     fn remember_hook(&mut self, hook_id: String, bus_id: conbus_core::ids::BusId) {
         self.seen_hook_bus.insert(hook_id.clone(), bus_id);
         self.seen_hooks.push_back(hook_id);
-        while self.seen_hooks.len() > 4096 {
+        while self.seen_hooks.len() > REMEMBERED_HOOKS {
             if let Some(old) = self.seen_hooks.pop_front() {
                 self.seen_hook_bus.remove(&old);
             }
@@ -1063,10 +1068,11 @@ fn repair_splits(held: &[Record], log: &mut SegmentLog) -> io::Result<u64> {
 }
 
 /// What a daemon keeps from the log it starts on: the bindings, the chapters,
-/// and two counts for its start line. Not the records.
+/// the newest hook ids, and two counts for its start line. Not the records.
 struct Restored {
     registry: Registry,
     chapters: HashMap<BusId, Chapter>,
+    hooks: std::collections::VecDeque<(String, BusId)>,
     records: usize,
     unreadable: usize,
 }
@@ -1204,16 +1210,26 @@ fn prepare_in_child(paths: &Paths, retention: Retention) {
 fn restore(paths: &Paths, retention: Retention) -> io::Result<(SegmentLog, Restored)> {
     let mut registry = conbus_core::registry::Restoring::default();
     let mut chapters = HashMap::new();
+    let mut hooks = std::collections::VecDeque::new();
     let mut records = 0;
     let folded = SegmentLog::scan_meta_each(paths.log_dir(), Some(&paths.cache_dir()), |record| {
         registry.absorb(&record);
         Chapter::apply(&mut chapters, &record);
         records += 1;
+        // Part of the read start-up already does, so this costs a queue and not
+        // a second pass over the log.
+        if let Some(hook_id) = record.hook_id {
+            hooks.push_back((hook_id, record.bus_id));
+            if hooks.len() > REMEMBERED_HOOKS {
+                hooks.pop_front();
+            }
+        }
     });
     let restored = match folded {
         Ok(defects) => Restored {
             registry: registry.finish(),
             chapters,
+            hooks,
             records,
             unreadable: defects.len(),
         },
@@ -1226,6 +1242,7 @@ fn restore(paths: &Paths, retention: Retention) -> io::Result<(SegmentLog, Resto
             Restored {
                 registry: Registry::new(),
                 chapters: HashMap::new(),
+                hooks: std::collections::VecDeque::new(),
                 records: 0,
                 unreadable: 0,
             }
@@ -1268,6 +1285,9 @@ pub fn serve(paths: &Paths, retention: Retention) -> io::Result<()> {
     let mut daemon = Daemon::new(log, restored.registry, restored.chapters)
         .with_arena(paths.root().to_path_buf())
         .watch_chat_exports(paths);
+    for (hook_id, bus_id) in restored.hooks {
+        daemon.remember_hook(hook_id, bus_id);
+    }
     // Anything the last daemon lost to its restart is answered before the
     // socket exists — these hooks already waited once.
     drain_spool(&mut daemon, paths);
@@ -1913,6 +1933,41 @@ mod tests {
         assert_eq!(restored.records, written);
         assert_eq!(restored.unreadable, 0);
         assert_eq!(restored.chapters.len(), 1, "one conversation");
+    }
+
+    #[test]
+    fn restore_remembers_the_newest_hook_ids_and_no_more() {
+        // A daemon that dies between writing a record and deleting its spool
+        // file leaves both behind. The next one has to know the id is on disk,
+        // and holding every id the log has ever seen would grow for ever.
+        let home = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::from_env(home.path().join("bus").to_str(), None, None).expect("paths");
+        {
+            let log = SegmentLog::open(paths.log_dir(), Retention::default()).expect("open");
+            let mut daemon = Daemon::new(log, Registry::new(), HashMap::new());
+            for n in 0..(REMEMBERED_HOOKS + 5) {
+                daemon.handle(Request {
+                    hook_id: Some(format!("hook-{n}")),
+                    ..request(Event::TurnStarted {
+                        author: None,
+                        prompt: Body::kept("hello"),
+                    })
+                });
+            }
+        }
+
+        let (_log, restored) = restore(&paths, Retention::default()).expect("restore");
+
+        assert_eq!(restored.hooks.len(), REMEMBERED_HOOKS);
+        assert_eq!(
+            restored.hooks.front().map(|(id, _)| id.as_str()),
+            Some("hook-5"),
+            "the oldest go first"
+        );
+        assert_eq!(
+            restored.hooks.back().map(|(id, _)| id.clone()),
+            Some(format!("hook-{}", REMEMBERED_HOOKS + 4)),
+        );
     }
 
     #[test]
