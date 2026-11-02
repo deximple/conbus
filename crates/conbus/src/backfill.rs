@@ -45,6 +45,8 @@ pub struct Outcome {
     pub recorded_live: u64,
     /// Lines and files not read, counted by why.
     pub unread: BTreeMap<String, u64>,
+    /// What holds a range, each by name: a person cannot fix a count.
+    pub holding: Vec<String>,
     /// Codex threads recovered whole through the app-server.
     pub codex_threads: u64,
     pub codex_turns: u64,
@@ -115,7 +117,7 @@ pub fn run(paths: &Paths, apply: bool) -> io::Result<()> {
             outcome.codex_live
         ),
     }
-    println!("not read  {}", summarise_unread(&outcome.unread));
+    println!("not read  {}", summarise_unread(&outcome.unread, 6));
     if apply {
         println!("written to {}", paths.log_dir().display());
     } else {
@@ -154,7 +156,13 @@ pub fn run_gaps(paths: &Paths, apply: bool, include_older_lines: bool) -> io::Re
             outcome.gap_codex_threads, outcome.gap_codex_turns, outcome.gap_codex_records
         ),
     }
-    println!("not read  {}", summarise_unread(&outcome.unread));
+    println!(
+        "not read  {}",
+        summarise_unread(&outcome.unread, usize::MAX)
+    );
+    for holding in &outcome.holding {
+        println!("holding   {holding}");
+    }
     if apply {
         println!("written to {}", paths.log_dir().display());
     } else {
@@ -229,7 +237,7 @@ pub fn run_chat_export(paths: &Paths, export: &str, apply: bool) -> io::Result<(
             outcome.recorded_live
         );
     }
-    println!("not read  {}", summarise_unread(&outcome.unread));
+    println!("not read  {}", summarise_unread(&outcome.unread, 6));
     if apply {
         println!("written to {}", paths.log_dir().display());
     } else {
@@ -445,7 +453,9 @@ pub struct GapTiming {
     pub budget_exhausted: bool,
     /// Transcripts in range that could not be read. Their range is held in
     /// `cache/gap-since` too: nothing of them was compared with the log.
-    pub claude_unreadable: u64,
+    pub claude_unreadable: Vec<String>,
+    /// The threads that hold the Codex range, and why.
+    pub codex_holding: Vec<String>,
     /// Transcripts, rollouts and exports in range that were not regular files, and
     /// so were not read.
     pub not_regular: u64,
@@ -670,7 +680,7 @@ fn append_gaps_at_start_in(
         n += ingest_chat_exports_at_start(paths, held, log, since, &mut timing.not_regular)?;
         timing.chat_export_ms = elapsed_ms(export);
     }
-    let transcripts_read = !timing.budget_exhausted && timing.claude_unreadable == 0;
+    let transcripts_read = !timing.budget_exhausted && timing.claude_unreadable.is_empty();
     if transcripts_read {
         let _ = std::fs::remove_file(&marker);
     }
@@ -682,7 +692,75 @@ fn append_gaps_at_start_in(
     } else {
         let _ = std::fs::remove_file(&read_marker);
     }
+    say_what_holds_the_ranges(paths, &timing);
     Ok((n, timing))
+}
+
+/// Which range a line of `cache/gap-held` is about.
+const TRANSCRIPTS: &str = "transcripts";
+const CODEX: &str = "codex";
+
+/// Keep what holds each range where `doctor` can read it.
+fn say_what_holds_the_ranges(paths: &Paths, timing: &GapTiming) {
+    let mut lines = Vec::new();
+    if timing.budget_exhausted {
+        lines.push(format!("{TRANSCRIPTS}\tthe start's budget ran out"));
+    }
+    for file in &timing.claude_unreadable {
+        lines.push(format!("{TRANSCRIPTS}\tcould not read {file}"));
+    }
+    if let Some(why) = &timing.codex_deferred {
+        lines.push(format!("{CODEX}\t{why}"));
+    }
+    for holding in &timing.codex_holding {
+        lines.push(format!("{CODEX}\t{holding}"));
+    }
+    let marker = paths.cache_dir().join("gap-held");
+    if lines.is_empty() {
+        let _ = fs::remove_file(&marker);
+    } else {
+        write_cache_file(paths, &marker, &(lines.join("\n") + "\n"));
+    }
+}
+
+/// For `doctor`: each range still held, since when, why, and what ends it.
+pub fn describe_held_ranges(paths: &Paths) -> Vec<String> {
+    let cache = paths.cache_dir();
+    let reasons = fs::read_to_string(cache.join("gap-held")).unwrap_or_default();
+    let now = Timestamp::now();
+    let epoch = Timestamp::from_unix_seconds(0);
+    [
+        (TRANSCRIPTS, "gap-since", "`conbus backfill --gaps --apply` fills it by hand"),
+        (CODEX, "gap-since-codex", "`conbus backfill --gaps --apply` asks at once; deleting cache/gap-since-codex gives it up"),
+    ]
+    .into_iter()
+    .filter_map(|(range, marker, way_out)| {
+        let path = cache.join(marker);
+        if !path.exists() {
+            return None;
+        }
+        let why: Vec<&str> = reasons
+            .lines()
+            .filter_map(|line| line.strip_prefix(range)?.strip_prefix('\t'))
+            .take(5)
+            .collect();
+        let why = if why.is_empty() {
+            "no reason recorded".to_string()
+        } else {
+            why.join("; ")
+        };
+        let since = match (read_since(&path), epoch) {
+            (Some(since), Some(epoch)) => {
+                let hours = (now.seconds_since(epoch) - since).max(0) / 3600;
+                let when = Timestamp::from_unix_seconds(since)
+                    .map_or_else(|| since.to_string(), |when| when.to_string());
+                format!("since {when}, {hours} h ago")
+            }
+            _ => "since a time that does not read".to_string(),
+        };
+        Some(format!("{range} range held {since}: {why}. {way_out}"))
+    })
+    .collect()
 }
 
 /// The time a marker under `cache/` holds, as unix seconds.
@@ -744,6 +822,11 @@ pub fn defer_fill(paths: &Paths) {
         paths,
         &marker,
         read_since(&marker).map_or(fresh, |old| old.min(fresh)),
+    );
+    write_cache_file(
+        paths,
+        &paths.cache_dir().join("gap-held"),
+        &format!("{TRANSCRIPTS}\tthe log could not be read at a start\n"),
     );
 }
 
@@ -1002,7 +1085,14 @@ const STALLED: &str = "codex app-server stalled";
 const STALL_BACK_OFF_SECS: i64 = 3600;
 
 /// What a start says about a server or a thread it is leaving alone.
-const LEFT_ALONE: &str = "it stalled at an earlier start, and is asked again after an hour or by `conbus backfill --gaps`";
+const LEFT_ALONE: &str = "it stalled at an earlier start, and is asked again after an hour or by `conbus backfill --gaps --apply`";
+
+/// Noted in a held range for a thread the server refused, with the state of its rollout.
+/// Asking again gets the same answer until that changes, so it is left alone until then.
+/// "Retry later" is not noted: that one is asked at every start.
+fn refused_at(thread: &str) -> String {
+    format!("codex app-server refused {thread}")
+}
 
 /// How long a server or a thread has to have had before it can be called stalled. A real
 /// app-server has taken about 2 s to come up, so a limit the transcripts left under this
@@ -1024,23 +1114,38 @@ fn within_back_off(at: i64, now_unix: i64) -> bool {
     (0..STALL_BACK_OFF_SECS).contains(&(now_unix - at))
 }
 
-/// Take out the threads the server stalled on within the back-off. Their range
-/// stays held, and the ones behind them are still read.
-fn leave_stalled_alone(
+/// Take out the threads the server stalled on within the back-off, and those it refused
+/// in the state they are in now. Their range stays held, and the ones behind them are
+/// still read.
+fn leave_alone(
     threads: &mut Vec<(BusId, i64)>,
     read: &ReadSoFar,
     now_unix: i64,
     timing: &mut GapTiming,
 ) {
-    let asked = threads.len();
-    threads.retain(|(thread, _)| {
-        !read
-            .state_of(&stalled_on(&thread.to_string()))
+    threads.retain(|(thread, state)| {
+        let name = thread.to_string();
+        if read
+            .state_of(&stalled_on(&name))
             .is_some_and(|at| within_back_off(at, now_unix))
+        {
+            timing.codex_deferred = Some(LEFT_ALONE.to_string());
+            timing
+                .codex_holding
+                .push(format!("thread {name} stalled the server"));
+            return false;
+        }
+        if *state != NO_STATE && read.state_of(&refused_at(&name)) == Some(*state) {
+            timing.codex_deferred.get_or_insert_with(|| {
+                "the server refused a thread, and it has not changed since".to_string()
+            });
+            timing.codex_holding.push(format!(
+                "thread {name} was refused by the server, and its rollout has not changed"
+            ));
+            return false;
+        }
+        true
     });
-    if threads.len() < asked {
-        timing.codex_deferred = Some(LEFT_ALONE.to_string());
-    }
 }
 
 /// The state of a thread with no rollout on disk to give it one.
@@ -1144,7 +1249,7 @@ fn fill_live_codex_gaps(
     let now_unix = Timestamp::from_unix_seconds(0).map_or(0, |epoch| now.seconds_since(epoch));
     if let Some(recent) = recent.as_mut() {
         unread_first(recent, read);
-        leave_stalled_alone(recent, read, now_unix, timing);
+        leave_alone(recent, read, now_unix, timing);
     }
     if recent.as_ref().is_some_and(|recent| recent.is_empty()) {
         return Ok(fill);
@@ -1196,7 +1301,7 @@ fn fill_live_codex_gaps(
             .collect(),
     };
     unread_first(&mut sessions, read);
-    leave_stalled_alone(&mut sessions, read, now_unix, timing);
+    leave_alone(&mut sessions, read, now_unix, timing);
     let names: Vec<(String, BusId, i64)> = sessions
         .iter()
         .filter_map(|(session, state)| {
@@ -1233,6 +1338,12 @@ fn fill_live_codex_gaps(
                     fill.refused += 1;
                     if !crate::appserver::is_unknown_method(&err, "thread/turns/list") {
                         read.note(name, FAILED);
+                        if !crate::appserver::says_retry_later(&err) {
+                            read.note(&refused_at(name), *state);
+                        }
+                        timing
+                            .codex_holding
+                            .push(format!("thread {name} was refused by the server: {why}"));
                         fill.refused_for_now.get_or_insert(why);
                     }
                     continue;
@@ -1252,6 +1363,9 @@ fn fill_live_codex_gaps(
                 } else if had_its_turn {
                     read.note(name, FAILED);
                     read.note(&stalled_on(name), now_unix);
+                    timing
+                        .codex_holding
+                        .push(format!("thread {name} stalled the server"));
                     // Asked first because the last limit caught it, it says nothing of
                     // the threads behind it.
                     if timing.list_turns_threads == 0 && !suspect {
@@ -1527,6 +1641,7 @@ pub fn fill_gaps_with(
         if fill.not_regular > 0 {
             *outcome.unread.entry(NOT_REGULAR.into()).or_default() += fill.not_regular;
         }
+        outcome.holding.extend(timing.codex_holding);
     }
     if elsewhere.claims.set_aside > 0 {
         outcome.unread.insert(
@@ -1986,8 +2101,14 @@ fn append_gaps_files(
         }
         let Ok(text) = fs::read_to_string(file) else {
             *outcome.unread.entry("unreadable file".into()).or_default() += 1;
+            outcome
+                .holding
+                .push(format!("could not read {}", file.display()));
             if let Some(start) = start.as_mut() {
-                start.timing.claude_unreadable += 1;
+                start
+                    .timing
+                    .claude_unreadable
+                    .push(file.display().to_string());
             }
             continue;
         };
@@ -2384,7 +2505,7 @@ fn session_files(root: &Path) -> io::Result<Vec<PathBuf>> {
     Ok(files)
 }
 
-fn summarise_unread(unread: &BTreeMap<String, u64>) -> String {
+fn summarise_unread(unread: &BTreeMap<String, u64>, reasons: usize) -> String {
     if unread.is_empty() {
         return "nothing".to_string();
     }
@@ -2392,7 +2513,7 @@ fn summarise_unread(unread: &BTreeMap<String, u64>) -> String {
     by_count.sort_by(|a, b| b.1.cmp(a.1));
     by_count
         .iter()
-        .take(6)
+        .take(reasons)
         .map(|(reason, count)| format!("{count} {reason}"))
         .collect::<Vec<_>>()
         .join(", ")
@@ -3718,6 +3839,24 @@ for line in sys.stdin:
             assert_eq!(outcome.gap_turns, 1, "its record is {session}, {under:?}");
             assert_eq!(outcome.records, 0);
         }
+    }
+
+    #[test]
+    fn gaps_can_print_every_reason_and_the_others_the_biggest() {
+        let unread: BTreeMap<String, u64> =
+            (1..=8u64).map(|n| (format!("reason {n}"), n)).collect();
+
+        let all = summarise_unread(&unread, usize::MAX);
+        let some = summarise_unread(&unread, 6);
+
+        assert!(
+            all.contains("1 reason 1") && all.contains("8 reason 8"),
+            "{all}"
+        );
+        assert!(
+            !some.contains("1 reason 1") && some.contains("8 reason 8"),
+            "{some}"
+        );
     }
 
     #[test]

@@ -3408,3 +3408,218 @@ for line in sys.stdin:
         std::fs::read_to_string(&notes).unwrap_or_default()
     );
 }
+
+fn launches(stub: &Path) -> usize {
+    std::fs::read_to_string(stub.join("launches"))
+        .unwrap_or_default()
+        .lines()
+        .count()
+}
+
+/// Refuses every thread with this error, and counts how often it is brought up.
+fn refuses_and_counts(error: &str) -> String {
+    format!(
+        r#"
+here = os.path.dirname(os.path.abspath(sys.argv[0]))
+open(os.path.join(here, "launches"), "a").write("x\n")
+{}"#,
+        refuses_with(error)
+    )
+}
+
+fn doctor_says(home: &Path) -> String {
+    let mut command = Command::new(bin());
+    command.arg("doctor");
+    env_for(&mut command, home);
+    let output = command.output().expect("doctor");
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+fn gap_fill_lines(said: &str) -> Vec<&str> {
+    said.lines()
+        .filter(|line| line.starts_with("gap fill  "))
+        .collect()
+}
+
+#[test]
+fn a_thread_refused_every_time_stops_costing_starts() {
+    // Nothing has changed between these starts, so asking again cannot help. The range
+    // stays held, and `doctor` says what holds it and what ends it.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let (stub, fake) = codex_stand_in(&refuses_and_counts(
+        r#"{"code":-32600,"message":"no rollout found"}"#,
+    ));
+    a_live_codex_thread(home);
+    let notes = home.join("notes");
+    timed_start(home, &fake, "4000", &notes);
+    newer_records_arrive(home);
+    let before = launches(stub.path());
+
+    for _ in 0..4 {
+        timed_start(home, &fake, "4000", &notes);
+    }
+    assert_eq!(launches(stub.path()), before, "brought up to ask again");
+    assert!(home.join("cache/gap-since-codex").exists(), "still held");
+
+    let said = doctor_says(home);
+    let lines = gap_fill_lines(&said);
+    assert_eq!(lines.len(), 1, "{said}");
+    assert!(lines[0].contains("codex range held since"), "{}", lines[0]);
+    assert!(lines[0].contains(THREAD), "{}", lines[0]);
+    assert!(
+        lines[0].contains("deleting cache/gap-since-codex"),
+        "{}",
+        lines[0]
+    );
+
+    // By hand it is asked, and says so, and a start after that still does not ask.
+    let (ok, by_hand) = backfill_gaps(home, &fake, true);
+    assert!(ok, "{by_hand}");
+    assert!(by_hand.contains(THREAD), "{by_hand}");
+    assert!(by_hand.contains("no rollout found"), "{by_hand}");
+    let after = launches(stub.path());
+    assert_eq!(after, before + 1, "by hand it was asked");
+    timed_start(home, &fake, "4000", &notes);
+    assert_eq!(launches(stub.path()), after);
+
+    // Its rollout changes, so asking can help again.
+    let sessions = home.join(".codex/sessions/2026/11/01");
+    let rollout = sessions.join(format!("rollout-2026-11-01T00-00-00-{THREAD}.jsonl"));
+    std::fs::File::options()
+        .write(true)
+        .open(&rollout)
+        .expect("open")
+        .set_modified(std::time::SystemTime::now() + Duration::from_secs(60))
+        .expect("mtime");
+    timed_start(home, &fake, "4000", &notes);
+    assert_eq!(launches(stub.path()), after + 1, "asked once it changed");
+}
+
+#[test]
+fn a_refused_thread_that_reads_by_hand_is_done_with() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let flag = home.join("answers");
+    let (_stub, fake) = codex_stand_in(&format!(
+        r#"
+for line in sys.stdin:
+    msg = json.loads(line)
+    m = msg.get("method"); i = msg.get("id")
+    if m == "initialize":
+        print(json.dumps({{"jsonrpc":"2.0","id":i,"result":{{"userAgent":"fake"}}}}), flush=True)
+    elif m == "thread/turns/list":
+        if not os.path.exists({flag:?}):
+            print(json.dumps({{"jsonrpc":"2.0","id":i,"error":{{"code":-32600,"message":"no rollout found"}}}}), flush=True)
+            continue
+        print(json.dumps(turns_page(msg, [])), flush=True)
+"#,
+        flag = flag.to_str().expect("utf-8")
+    ));
+    a_live_codex_thread(home);
+    timed_start(home, &fake, "4000", &home.join("notes"));
+    assert!(home.join("cache/gap-since-codex").exists());
+    std::fs::write(&flag, "").expect("flag");
+
+    let (ok, said) = backfill_gaps(home, &fake, true);
+
+    assert!(ok, "{said}");
+    assert!(!home.join("cache/gap-since-codex").exists(), "{said}");
+    assert!(gap_fill_lines(&doctor_says(home)).is_empty());
+
+    // And a start does not go on leaving it alone.
+    timed_start(home, &fake, "4000", &home.join("notes"));
+    assert!(!home.join("cache/gap-since-codex").exists());
+}
+
+#[test]
+fn gaps_prints_every_reason_it_did_not_read_something() {
+    // Six used to be the most it said, so a count that holds a range could be hidden
+    // behind the tens of thousands of attachments every transcript has.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let daemon = start(home);
+    hook(home, &prompt(S, "p0", "before"));
+    stop(daemon);
+    let mut lines = vec![user(S, "p0", "before")];
+    for kind in 1..=8 {
+        for _ in 0..(9 - kind) {
+            lines.push(json!({"type": format!("kind-{kind}"), "sessionId": S}).to_string());
+        }
+    }
+    transcript(home, S, &lines);
+
+    let (ok, said) = backfill_gaps(home, Path::new("/nonexistent/codex"), false);
+
+    assert!(ok, "{said}");
+    assert!(
+        said.contains("8 kind-1") && said.contains("1 kind-8"),
+        "{said}"
+    );
+}
+
+#[test]
+fn a_transcript_that_holds_the_range_is_named_where_a_person_looks() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let daemon = start(home);
+    hook(home, &prompt(S, "p0", "before"));
+    stop(daemon);
+    let project = home.join(".claude/projects/-repo");
+    std::fs::create_dir_all(&project).expect("dir");
+    std::fs::write(
+        project.join(format!("{S}.jsonl")),
+        b"{\"type\":\"user\",\"x\":\"\xff\xfe\"}\n",
+    )
+    .expect("write");
+    let notes = home.join("notes");
+
+    timed_start(home, Path::new("/nonexistent/codex"), "4000", &notes);
+    let (_, by_hand) = backfill_gaps(home, Path::new("/nonexistent/codex"), false);
+    let said = doctor_says(home);
+
+    assert!(home.join("cache/gap-since").exists(), "the range is held");
+    let daemon_said = std::fs::read_to_string(&notes).unwrap_or_default();
+    assert!(daemon_said.contains(S), "not in daemon.log: {daemon_said}");
+    assert!(by_hand.contains(S), "not from --gaps: {by_hand}");
+    let lines = gap_fill_lines(&said);
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("transcripts range held")
+                && line.contains(S)
+                && line.contains("--gaps --apply")),
+        "not from doctor: {said}"
+    );
+}
+
+#[test]
+fn doctor_says_nothing_of_a_range_when_none_is_held() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    stop(start(home));
+
+    assert!(gap_fill_lines(&doctor_says(home)).is_empty());
+}
+
+#[test]
+fn what_a_stalled_thread_is_told_names_the_command_that_ends_the_wait() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let (_stub, fake) = codex_stand_in(WEDGED_ON_B);
+    a_thread_behind_one_that_keeps_growing(home);
+    let notes = home.join("notes");
+    timed_start(home, &fake, "4000", &notes);
+    rollout_of(home, THREAD_A, 0);
+    timed_start(home, &fake, "4000", &notes);
+
+    let said = std::fs::read_to_string(&notes).unwrap_or_default();
+    assert!(said.contains("conbus backfill --gaps --apply`"), "{said}");
+    assert!(said.contains(THREAD_B), "the thread is named: {said}");
+    assert!(
+        gap_fill_lines(&doctor_says(home))
+            .iter()
+            .any(|line| line.contains(THREAD_B)),
+        "not from doctor"
+    );
+}

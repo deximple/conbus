@@ -86,6 +86,12 @@ pub fn is_unknown_method(err: &io::Error, method: &str) -> bool {
             || said.contains(&format!("unknown variant `{method}`")))
 }
 
+/// Whether the server said to ask again later, in the words the real binary holds.
+pub fn says_retry_later(err: &io::Error) -> bool {
+    let said = err.to_string();
+    is_refusal(err) && (said.contains("\"code\":-32001") || said.contains("retry later"))
+}
+
 pub struct AppServer {
     /// `None` once reaped, when its id can belong to someone else.
     child: Arc<Mutex<Option<Child>>>,

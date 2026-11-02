@@ -527,6 +527,23 @@ history; with `--apply` it too needs the recorder stopped, and once it has read 
 Codex thread the Codex range is done. Deleting `cache/` drops
 the remembered ranges — run `conbus backfill --gaps` after one.
 
+`conbus doctor` has a `gap fill` line for each range still held: since when, why, and what
+holds it. What ends each:
+
+- **The budget ran out.** The next start goes on from there, or
+  `conbus backfill --gaps --apply` does it all now.
+- **A transcript could not be read.** `doctor`, `daemon.log` and `conbus backfill --gaps`
+  name it. Fix it, or move it out of `~/.claude/projects`. The next start then finishes.
+- **`codex app-server` would not start.** Fix or install Codex, and the next start reads it.
+- **A thread stalled the server.** It is asked again after an hour, or at once by
+  `conbus backfill --gaps --apply`, which ends the wait if it reads the thread.
+- **The server refused a thread.** It is not asked again until its rollout changes, so this
+  costs nothing while it waits. `conbus backfill --gaps --apply` asks at once and shows the
+  answer.
+
+If you do not need what a range would fill, delete `cache/gap-since` or
+`cache/gap-since-codex` and that range is given up. No record already written is lost.
+
 A fill takes a line stamped over a minute before its transcript was created for a copy
 from another conversation, as a fork's opening lines are, and leaves it out. A transcript
 moved by `cp`, `rsync -a` or across volumes has a new creation time, so almost every line
