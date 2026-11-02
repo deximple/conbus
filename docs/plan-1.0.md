@@ -306,13 +306,13 @@ AGENTS.md의 "SQLite는 파생" 항목에 사이드카와 스풀을 추가해 �
 
 **첫 교체의 유실이 불가피한 이유**: `mv`와 레코더 정지 사이에 돈 새 훅(프로토콜 v6)은 옛 0.2.8 레코더(v5)에 거절당한다. 0.2.8의 `daemon.build`에는 보존 수준(`retention`)이 없어 훅이 스풀 동의를 얻지 못하고 드롭한다. `start`는 이 사유(`this daemon speaks protocol v<이전>; the hook speaks v<후보>`, `no daemon on … Connection refused`)를 실패가 아니라 `swap_window_drops`로 세고, `verdict`는 교체 후 60초 안의 것만 면제한다. 60초 뒤에도 같은 사유가 나오면 새 데몬이 거절하고 있다는 뜻이라 FAIL이다. 시작 복구의 gap fill이 일부를 되찾는다.
 
-**계획된 재시작**: 1일 차와 6일 차에 `canary.sh restart`(`install --apply`를 돌리고 serving ms·재시작 중 `drops.jsonl`에 추가된 줄 수를 `~/.conbus/canary.json`에 기록 — `verdict`가 이 항목들을 계획된 것으로 제외한다. 세션 없는 페이로드 거절은 유실이 아니라 따로 표시).
+**계획된 재시작**: 1일 차와 6일 차에 `canary.sh restart`(`install --apply`를 돌리고 serving ms·재시작 중 `drops.jsonl`에 추가된 줄 수를 `~/.conbus/canary.json`에 기록 — `verdict`가 이 항목들을 계획된 것으로 제외한다. 세션 없는 페이로드 거절, 로그에 없는 세션의 끝, 도구 본문 생략처럼 기록을 잃지 않은 줄은 유실이 아니라 따로 표시).
 
 **통과 조건** (`canary.sh verdict`가 교체 시각 이후 로그로 계산):
 
 1. 계획 외 레코더 재시작 0.
 2. 읽지 못한 줄 0.
-3. 계획된 재시작에서 유실 0(추가된 드롭 줄 수), 새 드롭 사유 0 — 교체 후 60초 안의 예상 사유(`swap_window_drops`)는 면제되고 개수가 표시된다.
+3. 유실 0. 드롭은 사유 문구가 아니라 뜻으로 판정하고, 판정 근거를 출력한다. 기록을 잃은 줄(`no daemon`, `no reply`, `could not send`, 로그가 거부한 기록, 스풀에서 거부된 기록, 대화 없는 도구·프롬프트 이벤트)과 어댑터 공백(`no mapping`, 이벤트 이름별로 표시)은 아는 사유여도 1건이면 FAIL이다. `the log refused writes for a while`은 기다린 기록이 모두 들어간 장애라 표시만 하고, `and records may be lost`가 붙으면 잃은 줄이다. 어느 규칙에도 없는 사유는 교체 전에 없었으면 FAIL, 있었으면 사람이 봐야 하므로 UNCHECKED다. 로그에 없는 세션의 끝(`SessionEnd`, `Stop` 등), 세션 없는 페이로드, 파싱 못 한 페이로드는 유실로 세지 않고 표시만 하며, 종류별로 `CONBUS_CANARY_NOISE_MAX`(기본 2000줄)를 넘으면 UNCHECKED다. 교체 후 60초 안의 예상 사유(`swap_window_drops`)는 면제되고 개수가 표시된다. 계획된 재시작의 `new_drops`도 같은 분류로 세고 1건이면 FAIL이다. 회전하지 않는 빌드에서 상한에 닿은 로그와 회전 두 번으로 창 앞부분이 버려진 로그는 UNCHECKED지만, 남아 있는 줄은 그대로 판정한다. `tool bodies elided, not sealed`는 기록이 들어간 것이라 드롭이 아니다. `detail`의 N을 합해 `tool-bodies` 줄에 따로 표시하고, 창 안 도구 호출의 1%를 넘으면 FAIL, 도구 호출 수를 못 읽으면 UNCHECKED다.
 4. 7일 동안 활동이 있는 하네스(최근 실측 기준 `claude_code`, `codex`, `grok`, `cursor`) 전부 활동일마다 기록 있음. OpenCode는 S2로 대체.
 5. twins·`repeated` 증가가 기준선 이하.
 6. **닫힌 날마다** RC의 `usage --json` = 같은 로그를 읽은 0.2.8 (`tokens_*` 제외).
