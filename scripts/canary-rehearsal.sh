@@ -1360,6 +1360,60 @@ expect 1 "$code" "an invalid byte does not hide the lost record on its line"
 expect_grep '^FAIL drops — 1 lost record' "$tmp/verdict-badbyte.out" "the line is counted, under a UTF-8 locale too"
 expect_grep 'verdict: FAIL' "$tmp/verdict-badbyte.out" "and the verdict reaches its summary"
 
+# A torn line as the real writer leaves it: ts first, no newline, and the next line glued on. It must not swallow what
+# comes next, whichever class it was torn from and whichever side of the swap it fell on.
+verdict_fixture
+printf '{"ts":"%s","reason":"no conversation for this session; the daemon has no binding for it (no prompt from this session has reached it)","detail":"Stop for session gl' "$(iso_ago 7200)" >>"$home/.conbus/drops.jsonl"
+drop_line 3600 'no mapping for hook event \"BrandNew\" (as claude_code, fields: cwd)'
+code=0; run verdict >"$tmp/verdict-glued.out" 2>&1 || code=$?
+expect 1 "$code" "a new fault glued to a torn ghost line still fails (P2)"
+expect_grep '1× BrandNew as claude_code' "$tmp/verdict-glued.out" "and is named"
+verdict_fixture
+printf '{"ts":"%s","reason":"no daem' "$(iso_ago $((8 * DAY)))" >>"$home/.conbus/drops.jsonl"
+drop_line 3600 'BrandNewVendorEvent'
+code=0; run verdict >"$tmp/verdict-glued-before.out" 2>&1 || code=$?
+expect 1 "$code" "a new fault glued to a pre-swap torn line still fails (P2b)"
+expect_grep 'BrandNewVendorEvent' "$tmp/verdict-glued-before.out" "and is named"
+verdict_fixture
+printf '{"ts":"%s","reason":"the hook payload names no session; an empty id would merge unrelated sessions into one conversation","detail":"preTool' "$(iso_ago 7200)" >>"$home/.conbus/drops.jsonl"
+drop_line 3600 'no daemon on /x/sock: Connection refused (os error 61)'
+code=0; run verdict >"$tmp/verdict-glued-detail.out" 2>&1 || code=$?
+expect 1 "$code" "a tear inside a shown class's detail swallows nothing"
+expect_grep '^FAIL drops — 1 lost record' "$tmp/verdict-glued-detail.out" "the next line is counted"
+# A tear before the swap, with nothing glued to it, costs nothing. One in the window leaves the item open.
+verdict_fixture
+printf '{"ts":"%s","reason":"no daem\n' "$(iso_ago $((8 * DAY)))" >>"$home/.conbus/drops.jsonl"
+code=0; run verdict >"$tmp/verdict-torn-before.out" 2>&1 || code=$?
+expect 0 "$code" "a line torn before the swap says nothing about the window"
+verdict_fixture
+printf '{"ts":"%s","reason":"no conversation for this session; the daemon has no binding for it (no prompt from this session has reached it)","detail":"Stop for sess\n' "$(iso_ago 3600)" >>"$home/.conbus/drops.jsonl"
+code=0; run verdict >"$tmp/verdict-torn-detail.out" 2>&1 || code=$?
+expect 4 "$code" "one torn in the window leaves drops open, whatever it was"
+# Torn inside its time, it is placed by the line after it.
+verdict_fixture
+printf '{"ts":"2026-1' >>"$home/.conbus/drops.jsonl"
+drop_line $((8 * DAY)) 'EOF while parsing a value at line 1 column 0'
+code=0; run verdict >"$tmp/verdict-torn-ts-before.out" 2>&1 || code=$?
+expect 0 "$code" "a tear with no time, before a pre-swap line, is before the swap"
+verdict_fixture
+printf '{"ts":"2026-1' >>"$home/.conbus/drops.jsonl"
+drop_line 3600 'EOF while parsing a value at line 1 column 0'
+code=0; run verdict >"$tmp/verdict-torn-ts-after.out" 2>&1 || code=$?
+expect 4 "$code" "before a line in the window, it is in the window"
+# Two whole records on one line are two records.
+verdict_fixture
+printf '{"ts":"%s","reason":"EOF while parsing a value at line 1 column 0"}{"ts":"%s","reason":"no daemon on /x/sock: Connection refused (os error 61)"}\n' \
+    "$(iso_ago 7200)" "$(iso_ago 3600)" >>"$home/.conbus/drops.jsonl"
+code=0; run verdict >"$tmp/verdict-glued-whole.out" 2>&1 || code=$?
+expect 1 "$code" "two whole records on one line are both read"
+expect_grep '(2 line(s) since' "$tmp/verdict-glued-whole.out" "and both counted"
+# An escaped quote in a real reason is not the start of a record.
+verdict_fixture
+drop_line 3600 'unreadable reply \"{\"ts\":\"x\"}\": EOF while parsing a value at line 1 column 0'
+code=0; run verdict >"$tmp/verdict-escaped.out" 2>&1 || code=$?
+expect 1 "$code" "JSON quoted inside a reason is not a second record"
+expect_grep '^FAIL drops — 1 lost record' "$tmp/verdict-escaped.out" "it stays one lost record"
+
 # A capped log still shows what it recorded before it filled. A new reason on
 # day 2 plus a cap on day 5 used to read as a pass, and main said FAIL.
 fill_to_cap() { # fill_to_cap <ts> — plain perl: `yes | head` dies on SIGPIPE under pipefail

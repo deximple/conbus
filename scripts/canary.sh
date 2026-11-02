@@ -599,6 +599,20 @@ function drop_parse(line) {
     if (match(line, /"reason":"([^"\\]|\\.)*"/)) d_reason = substr(line, RSTART + 10, RLENGTH - 11)
     if (match(line, /"detail":"([^"\\]|\\.)*"/)) d_detail = substr(line, RSTART + 10, RLENGTH - 11)
 }
+# One physical line can hold more than one record: a write cut short by a full disk,
+# then the next line glued on. A quote inside a JSON string is escaped, so `{"ts":"`
+# can only start a record, and each field can come first: older files, other writers.
+function drop_split(line,    rest, at) {
+    n_frag = 0
+    rest = line
+    while (match(substr(rest, 2), /\{"(ts|reason|detail)":"/)) {
+        at = RSTART + 1
+        frag[++n_frag] = substr(rest, 1, at - 1)
+        rest = substr(rest, at)
+    }
+    frag[++n_frag] = rest
+}
+function drop_whole(fragment) { return fragment ~ /\}[[:space:]]*$/ }
 function drop_event(detail,    event) {
     event = detail
     sub(/ for session .*/, "", event)
@@ -666,7 +680,10 @@ drop_reasons() {
         # `continue`, not `&&`: a missing last file would end the loop non-zero
         # and take the whole script down under pipefail, without a word.
         [ -r "$f" ] || continue
-        LC_ALL=C awk "$drop_awk_lib"'{ drop_parse($0); if (d_reason != "") print d_reason }' "$f"
+        LC_ALL=C awk "$drop_awk_lib"'{
+            drop_split($0)
+            for (f = 1; f <= n_frag; f++) { drop_parse(frag[f]); if (d_reason != "") print d_reason }
+        }' "$f"
     done | LC_ALL=C sort -u
 }
 
@@ -681,9 +698,15 @@ drop_classes_after() { # drop_classes_after <ts>
     [ $# -gt 0 ] || return 0
     LC_ALL=C awk -v s="$dca_after" "$drop_awk_lib"'
         {
-            drop_parse($0)
-            if (d_ts > s && d_reason != "")
-                printf "%s\t%s\n", (drop_swap_reason(d_reason) ? "swap" : drop_class(d_reason, d_detail)), d_reason
+            drop_split($0)
+            for (f = 1; f <= n_frag; f++) {
+                # A torn line is for the verdict: it says what it could read, and a
+                # guess at its class must not roll a swap back.
+                if (!drop_whole(frag[f])) continue
+                drop_parse(frag[f])
+                if (d_ts > s && d_reason != "")
+                    printf "%s\t%s\n", (drop_swap_reason(d_reason) ? "swap" : drop_class(d_reason, d_detail)), d_reason
+            }
         }' "$@"
 }
 
@@ -776,22 +799,32 @@ drop_table() { # drop_table <since> <end of the swap window> <file>...
     dt_since=$1 dt_end=$2
     shift 2
     LC_ALL=C awk -v s="$dt_since" -v swap_end="$dt_end" -v rotated="$drops_rotated" "$drop_awk_lib"'
-        {
-            drop_parse($0)
-            if (FILENAME == rotated && FNR == 1 && d_ts != "") first_rotated = d_ts
-            if (d_ts == "" || d_reason == "") { bad++; next }
+        function one(fragment,    c, key, weight) {
+            drop_parse(fragment)
+            if (FILENAME == rotated && first_rotated == "" && d_ts != "") first_rotated = d_ts
+            if (!drop_whole(fragment) || d_ts == "" || d_reason == "") {
+                # Torn: nothing more can be read from it, and it can only be judged
+                # for where it fell. With no time of its own, the next line says.
+                if (d_ts == "") pending++
+                else if (d_ts > s) bad++
+                return
+            }
+            if (pending > 0) {
+                if (d_ts > s) bad += pending
+                pending = 0
+            }
             if (d_ts > last) last = d_ts
             if (!(d_ts > s)) {
                 if (!(d_reason in before)) { before[d_reason] = 1; baseline++ }
-                next
+                return
             }
             lines++
             c = drop_class(d_reason, d_detail)
-            if (c == "lost" && drop_swap_reason(d_reason) && !(d_ts > swap_end)) { swap++; next }
+            if (c == "lost" && drop_swap_reason(d_reason) && !(d_ts > swap_end)) { swap++; return }
             if (c == "elided") {
                 if (d_detail ~ /^[0-9]+ tool event\(s\)$/) elided += d_detail + 0
                 else elided_bad++
-                next
+                return
             }
             if (c == "gap") key = drop_gap_name(d_reason)
             else if (c == "ghost" || c == "sessionless" || c == "held") { key = d_detail; sub(/ \(fields:.*/, "", key); sub(/ for session .*/, "", key) }
@@ -802,7 +835,7 @@ drop_table() { # drop_table <since> <end of the swap window> <file>...
             if (c == "other") {
                 other_key[key] = 1
                 n_other[key]++
-                next
+                return
             }
             # One line can stand for many records. Zero or no count still counts
             # as one: the line says records were lost, so it fails either way.
@@ -811,7 +844,12 @@ drop_table() { # drop_table <since> <end of the swap window> <file>...
             total[c] += weight
             n[c SUBSEP key]++
         }
+        {
+            drop_split($0)
+            for (f = 1; f <= n_frag; f++) one(frag[f])
+        }
         END {
+            bad += pending
             for (key in other_key) {
                 c = (key in before) ? "known" : "new"
                 total[c] += n_other[key]
@@ -873,7 +911,7 @@ verdict_drops() {
     open=""
     [ -z "$dt_problem" ] || open="$open; cannot read:$dt_problem"
     if [ "${n_bad:-0}" -gt 0 ]; then
-        open="$open; ${n_bad} line(s) have no readable time or reason"
+        open="$open; ${n_bad} line(s) are torn, or have no readable time or reason: what each one said is gone"
     fi
     held_floor=""
     if drops_blind "$bin"; then
