@@ -15,10 +15,18 @@ use std::time::Duration;
 /// for a Codex the daemon's launchd `PATH` (`/usr/bin:/bin:…`) cannot see.
 /// When that PATH is empty of `codex`, the sibling next to this binary is
 /// the install layout — both live under `~/.local/bin`.
+///
+/// This crate's own tests never reach for one. `cargo test` must not run a vendor
+/// CLI that happens to be on `PATH`, and they share one process, where `set_var` is
+/// unsound while another thread reads the environment.
 pub fn codex_binary() -> OsString {
-    std::env::var_os("CONBUS_CODEX_BIN")
-        .filter(|value| !value.is_empty())
-        .or_else(|| on_path("codex"))
+    if let Some(named) = std::env::var_os("CONBUS_CODEX_BIN").filter(|value| !value.is_empty()) {
+        return named;
+    }
+    if cfg!(test) {
+        return "/nonexistent/conbus-test-vendor".into();
+    }
+    on_path("codex")
         .or_else(|| sibling_of_bus("codex"))
         .unwrap_or_else(|| "codex".into())
 }
@@ -187,6 +195,15 @@ impl Drop for AppServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn these_tests_never_reach_for_a_codex_on_path() {
+        // Seven `hop` tests ran the real app-server on any machine that has one. No
+        // test here sets this variable, because `set_var` is unsound beside them.
+        if std::env::var_os("CONBUS_CODEX_BIN").is_none() {
+            assert_eq!(codex_binary(), "/nonexistent/conbus-test-vendor");
+        }
+    }
     use std::fs;
 
     #[test]

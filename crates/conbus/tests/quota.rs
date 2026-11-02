@@ -2,7 +2,7 @@
 //! account, and the shape it answers with was captured on 2026-09-03
 //! (see `fixtures/codex_0.152.1_contract.md`).
 
-use std::process::Command;
+use std::process::{Command, Stdio};
 mod support;
 
 /// A vendor binary that is not there. A test that does not name one runs
@@ -49,6 +49,19 @@ fn fake_app_server() -> (tempfile::TempDir, std::path::PathBuf) {
     let path = dir.path().join("codex");
     support::write_executable(&path, FAKE_APP_SERVER);
     (dir, path)
+}
+
+/// Run a stand-in once, on its own time. On a loaded Mac the first exec of a newly
+/// written script can take seconds, and `doctor` gives every probe two. That is a
+/// fact about the machine and says nothing about the line under test.
+fn first_exec_out_of_the_way(stand_in: &std::path::Path) {
+    let status = Command::new(stand_in)
+        .arg("app-server")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .status()
+        .expect("run the stand-in");
+    assert!(status.success(), "{status}");
 }
 
 #[test]
@@ -103,6 +116,7 @@ fn quota_says_so_when_the_app_server_is_not_there() {
 fn doctor_carries_the_quota_line() {
     // The router's signal belongs where every other health fact is.
     let (_dir, codex) = fake_app_server();
+    first_exec_out_of_the_way(&codex);
     let root = tempfile::tempdir().expect("tempdir");
 
     let output = conbus(root.path())

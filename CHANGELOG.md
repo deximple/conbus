@@ -15,6 +15,12 @@ the entry says so when it does.
   segment changed without changing length is read again. Before, a damaged
   segment could read as healthy, and a restored one could keep reporting damage
   it no longer had.
+- `install` and `doctor` now ask the binary `CONBUS_OPENCODE_BIN` names which
+  OpenCode this is, as every other use of that binary does, and `cargo test` no
+  longer runs the real `opencode` or `codex app-server` when they are on `PATH`.
+- `install` waits ten seconds to hear which OpenCode this is, not two, and says when
+  it could not tell. A slow answer used to write the plugin for the wrong major with
+  no word. `doctor` says it could not read the version, rather than `runs`.
 
 ## [1.0.0-rc.3] — 2026-11-01
 
