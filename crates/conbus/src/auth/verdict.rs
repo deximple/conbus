@@ -28,6 +28,8 @@ enum Looked {
     Port(u16, Holders),
     NoPort,
     Remote,
+    AppScheme,
+    Unread,
 }
 
 fn look(callback: &Callback) -> Looked {
@@ -35,6 +37,8 @@ fn look(callback: &Callback) -> Looked {
         Callback::Local(port) => Looked::Port(*port, ancestry::holders(*port)),
         Callback::LocalNoPort => Looked::NoPort,
         Callback::Remote => Looked::Remote,
+        Callback::AppScheme => Looked::AppScheme,
+        Callback::Unread => Looked::Unread,
     }
 }
 
@@ -61,6 +65,14 @@ fn process_line(looked: &Looked) -> Vec<String> {
                 .into(),
         ],
         Looked::NoPort => vec!["process   its callback names this machine but no port".into()],
+        Looked::AppScheme => vec![
+            "process   its callback goes through a custom scheme, which the system hands to an app, so no port says which process"
+                .into(),
+        ],
+        Looked::Unread => vec![
+            "process   its callback is written in a way conbus does not read, so nothing was looked up"
+                .into(),
+        ],
         Looked::Port(port, Holders::Nothing) => {
             vec![format!("process   lsof sees nothing listening on port {port}")]
         }
@@ -203,6 +215,12 @@ fn why_it_cannot_tell(looked: &[Looked]) -> Option<String> {
         )),
         Looked::NoPort => Some(format!(
             "its callback names no port, so no process can be picked out. A callback with a port would tell; {HOPS}"
+        )),
+        Looked::AppScheme => Some(format!(
+            "its callback goes through a custom scheme, so no port says which process asked. Which app registered that scheme would tell; {HOPS}"
+        )),
+        Looked::Unread => Some(format!(
+            "something in the URL may be a callback, written in a way conbus does not read, so it cannot say where this page goes back to. A callback with a plain address would tell; {HOPS}"
         )),
         Looked::Port(port, Holders::Nothing) => Some(format!(
             "nothing lsof sees listens on port {port}, so there is no process to walk. Looking again while the page still waits would tell; lsof does not show another account's processes"

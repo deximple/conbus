@@ -141,3 +141,57 @@ fn a_bad_percent_in_the_pages_script_does_not_lose_the_verdict() {
     assert!(said[0].contains("Google"), "the verdict: {}", said[0]);
     assert!(!said[0].contains("SECRET2"), "{}", said[0]);
 }
+
+#[test]
+fn the_pages_script_says_what_each_kind_of_callback_is() {
+    let (_root, page) = a_page();
+    let page_says = |value: &str| {
+        page_script_says(
+            &page,
+            &[&format!("https://x.example/?redirect_uri={value}")],
+        )
+        .remove(0)
+    };
+
+    // A port the browser's parser would hide because it is the scheme's default.
+    assert!(page_says("http%3A%2F%2Flocalhost%3A80%2F").contains("-iTCP:80 "));
+    assert!(page_says("https%3A%2F%2Flocalhost%3A443%2F").contains("-iTCP:443 "));
+    assert!(page_says("http%3A%2F%2Flocalhost%2F").contains("names this machine but no port"));
+
+    for value in [
+        "cursor%3A%2F%2Fanysphere.cursor-retrieval%2Foauth",
+        "http%3A%2F%2F0.0.0.0%3A1%2F",
+        "http%3A%2F%2F%5B%3A%3A%5D%3A1%2F",
+        "http%3A%2F%2Flocalhost%3A99999%2F",
+        "someFunction",
+        "",
+    ] {
+        let said = page_says(value);
+        assert!(!said.contains("another host"), "{value:?}: {said}");
+        assert!(!said.contains("names no callback"), "{value:?}: {said}");
+        assert!(!said.contains("lsof"), "{value:?}: {said}");
+    }
+    assert!(page_says("cursor%3A%2F%2Fx").contains("custom scheme"));
+    assert!(page_says("someFunction").contains("does not read"));
+}
+
+#[test]
+fn the_pages_script_reads_a_callback_under_another_spelling() {
+    let (_root, page) = a_page();
+    for name in [
+        "redirectUri",
+        "callbackUrl",
+        "REDIRECT-URI",
+        "returnTo",
+        "relay_url",
+    ] {
+        let said = page_script_says(
+            &page,
+            &[&format!(
+                "https://x.example/?{name}=http%3A%2F%2F127.0.0.1%3A59999%2F"
+            )],
+        )
+        .remove(0);
+        assert!(said.contains("-iTCP:59999 "), "{name}: {said}");
+    }
+}

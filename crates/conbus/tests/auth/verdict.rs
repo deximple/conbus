@@ -270,7 +270,6 @@ fn a_callback_on_another_host_is_not_looked_up_here() {
         "https://evil.example/?redirect_uri=http%3A%2F%2F127.0.0.1.another.example%3A55407%2F",
         "https://evil.example/?redirect_uri=http%3A%2F%2Flocalhost.another.example%3A55407%2F",
         "https://evil.example/?redirect_uri=http%3A%2F%2F10.0.0.1%3A55407%2F",
-        "https://evil.example/?redirect_uri=http%3A%2F%2F0.0.0.0%3A55407%2F",
         "https://evil.example/?redirect_uri=http%3A%2F%2F%5B2001%3Adb8%3A%3A1%5D%3A55407%2F",
     ] {
         let stdout = table.ask(url);
@@ -1047,4 +1046,95 @@ fn a_real_listener_under_a_real_conbus_run_is_not_a_yes() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(verdict_of(&stdout).contains("`conbus run`"), "{stdout}");
+}
+
+#[test]
+fn nothing_that_may_be_a_second_callback_allows_a_no() {
+    // One clean callback, and something else that may be where the page really goes.
+    let local = "http%3A%2F%2F127.0.0.1%3A55407%2F";
+    for extra in [
+        "callback=http%3A%2F%2Flocalhost%3A99999%2F",
+        "callback=not-an-address",
+        "callback=",
+        "callback",
+        "redirect_url=cursor%3A%2F%2Fanysphere.cursor-retrieval%2Foauth",
+        "redirectUri=https%3A%2F%2Fanother.example%3A1%2F",
+        "callbackUrl=https%3A%2F%2Fanother.example%3A1%2F",
+        "return_to=https%3A%2F%2Fanother.example%3A1%2F",
+        "returnUrl=https%3A%2F%2Fanother.example%3A1%2F",
+        "relayUrl=ws%3A%2F%2Fanother.example%3A1%2F",
+        "REDIRECT-URI=https%3A%2F%2Fanother.example%3A1%2F",
+        // Under a name nothing here reads, but naming this machine all the same.
+        "to=http%3A%2F%2F127.0.0.1%3A2%2F",
+        "next=http%3A%2F%2Flocalhost%3A2%2F",
+        "go=ws%3A%2F%2F%5B%3A%3A1%5D%3A2%2F",
+    ] {
+        let table = ProcessTable::new(&[4242], CODEX_TREE);
+        let stdout = table.ask(&format!(
+            "https://accounts.google.com/o/oauth2/auth?redirect_uri={local}&{extra}"
+        ));
+        assert!(
+            verdict_of(&stdout).starts_with("conbus    cannot tell:"),
+            "{extra}: {stdout}"
+        );
+    }
+
+    let table = ProcessTable::new(&[4242], CODEX_TREE);
+    let stdout = table.ask(&format!(
+        "https://accounts.google.com/o/oauth2/auth?redirect_uri={local}#to=http://127.0.0.1:2/"
+    ));
+    assert!(
+        verdict_of(&stdout).starts_with("conbus    cannot tell:"),
+        "a fragment: {stdout}"
+    );
+}
+
+#[test]
+fn a_callback_under_another_spelling_of_the_name_is_looked_up() {
+    for name in [
+        "redirectUri",
+        "callbackUrl",
+        "REDIRECT-URI",
+        "returnTo",
+        "relay_url",
+    ] {
+        let table = ProcessTable::new(&[4242], CODEX_TREE);
+        let stdout = table.ask(&format!(
+            "https://accounts.google.com/o/oauth2/auth?{name}=http%3A%2F%2F127.0.0.1%3A55407%2F"
+        ));
+        assert!(
+            table.lsof_calls().contains("-iTCP:55407 "),
+            "{name}: {stdout}"
+        );
+        assert!(
+            verdict_of(&stdout).starts_with("conbus    no:"),
+            "{name}: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn what_a_real_sign_in_carries_beside_its_callback_does_not_stop_a_no() {
+    // A scope is a URL, and a state is noise. Neither names this machine.
+    let table = ProcessTable::new(&[4242], CODEX_TREE);
+    let stdout = table.ask(
+        "https://accounts.google.com/o/oauth2/auth?client_id=x&scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fcloud-platform&state=abc123&redirect_uri=http%3A%2F%2Flocalhost%3A55407%2Foauth2callback",
+    );
+    assert!(verdict_of(&stdout).starts_with("conbus    no:"), "{stdout}");
+}
+
+#[test]
+fn the_real_claude_pages_can_earn_a_yes() {
+    for page in [
+        "https://platform.claude.com/oauth/authorize",
+        "https://claude.com/cai/oauth/authorize",
+        "https://antigravity.google/auth-success",
+    ] {
+        let table = ProcessTable::new(&[50], UNDER_A_CONBUS_READ);
+        let stdout = table.ask(&page_calling_back(page, 55407));
+        assert!(
+            verdict_of(&stdout).starts_with("conbus    yes:"),
+            "{page}: {stdout}"
+        );
+    }
 }

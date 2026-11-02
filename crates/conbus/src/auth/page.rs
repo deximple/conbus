@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use conbus_core::clock::Timestamp;
 
-use super::url::{CALLBACK_PARAMS, PAGES};
+use super::url::{CALLBACK_NAME_PARTS, PAGES};
 use super::{Row, Standing};
 
 /// Everything that comes from outside passes through here: a vendor's error text
@@ -94,7 +94,7 @@ fn asked_and_not(rows: &[Row], labels: [&str; 3]) -> String {
 }
 
 fn render(rows: &[Row]) -> String {
-    let callback_params_json = serde_json::json!(CALLBACK_PARAMS);
+    let callback_name_parts_json = serde_json::json!(CALLBACK_NAME_PARTS);
     let pages_json = serde_json::Value::Array(
         PAGES
             .iter()
@@ -144,7 +144,9 @@ input[type=text] {{ width: 34em; max-width: 90%; font: inherit; padding: .4em; }
 <div id="verdict"></div>
 <script>
 var PAGES = {pages_json};
-var CALLBACK_PARAMS = {callback_params_json};
+var CALLBACK_NAME_PARTS = {callback_name_parts_json};
+var WEB_SCHEMES = ["http:", "https:", "ws:", "wss:"];
+var THIS_MACHINE = ["localhost", "127.0.0.1", "[::1]"];
 function parsed(text) {{
   try {{ return new URL(text); }} catch (e) {{ return null; }}
 }}
@@ -165,30 +167,52 @@ function isLoopback(host) {{
   return host === "localhost" || host === "[::1]" || /^127\.\d+\.\d+\.\d+$/.test(host) ||
     /^\[::ffff:7f[0-9a-f]{{2}}:[0-9a-f]{{1,4}}\]$/.test(host);
 }}
-function callbackOf(value) {{
+function namesCallback(name) {{
+  var plain = name.toLowerCase().replace(/[^a-z0-9]/g, "");
+  return CALLBACK_NAME_PARTS.some(function (part) {{ return plain.indexOf(part) >= 0; }});
+}}
+function mentionsThisMachine(text) {{
+  var low = text.toLowerCase();
+  return THIS_MACHINE.some(function (spelling) {{ return low.indexOf(spelling) >= 0; }});
+}}
+function placeOf(value) {{
   var hasScheme = value.indexOf("://") >= 0;
-  if (!hasScheme && !/^[^\/?#\\]*:\d+([\/?#]|$)/.test(value)) return null;
-  return parsed(hasScheme ? value : "http://" + value);
+  var written = value.match(/^(?:[a-z][a-z0-9+.-]*:\/\/)?(?:[^\/?#\\]*@)?(?:\[[^\]]*\]|[^\/?#\\:]*):(\d+)(?:[\/?#\\]|$)/i);
+  if (!hasScheme && !written) return {{ kind: "unread" }};
+  var address = parsed(hasScheme ? value : "http://" + value);
+  if (!address) return {{ kind: "unread" }};
+  if (WEB_SCHEMES.indexOf(address.protocol) < 0) return {{ kind: "app" }};
+  var host = address.hostname.toLowerCase();
+  if (host === "0.0.0.0" || host === "[::]") return {{ kind: "unread" }};
+  if (!isLoopback(host)) return {{ kind: "elsewhere" }};
+  // The parser drops a port that is its scheme's default, so ask what was written.
+  var port = address.port || (written ? written[1] : "");
+  return port ? {{ kind: "local", port: port }} : {{ kind: "noPort" }};
 }}
 function look() {{
   var address = parsed(document.getElementById("url").value.trim());
-  var ports = [], elsewhere = false;
+  var ports = [], seen = {{}};
   if (address) {{
-    CALLBACK_PARAMS.forEach(function (name) {{
-      address.searchParams.getAll(name).forEach(function (value) {{
-        var callback = callbackOf(value);
-        if (!callback) return;
-        if (!isLoopback(callback.hostname.toLowerCase())) elsewhere = true;
-        else if (callback.port && ports.indexOf(callback.port) < 0) ports.push(callback.port);
-      }});
+    address.searchParams.forEach(function (value, name) {{
+      if (namesCallback(name)) {{
+        var place = placeOf(value);
+        seen[place.kind] = true;
+        if (place.kind === "local" && ports.indexOf(place.port) < 0) ports.push(place.port);
+      }} else if (name !== "client" && mentionsThisMachine(value)) {{
+        seen.unread = true;
+      }}
     }});
+    if (mentionsThisMachine(address.hash)) seen.unread = true;
   }}
   var out = "this      " + pageOf(address) + "\n";
   ports.forEach(function (port) {{
     out += "process   lsof -nP -iTCP:" + port + " -sTCP:LISTEN -t   # then: ps -o ppid=,comm= -p <pid>, up to the root\n";
   }});
-  if (elsewhere) out += "process   its callback is on another host, so this machine's processes say nothing about it\n";
-  if (!ports.length && !elsewhere) out += "process   the URL names no callback to look up\n";
+  if (seen.noPort) out += "process   its callback names this machine but no port\n";
+  if (seen.elsewhere) out += "process   its callback is on another host, so this machine's processes say nothing about it\n";
+  if (seen.app) out += "process   its callback goes through a custom scheme, which the system hands to an app, so no port says which process\n";
+  if (seen.unread) out += "process   its callback is written in a way conbus does not read, so nothing was looked up\n";
+  if (!ports.length && !seen.noPort && !seen.elsewhere && !seen.app && !seen.unread) out += "process   the URL names no callback to look up\n";
   out += "conbus    this page cannot see processes; pbpaste | conbus auth --url - gives the verdict";
   document.getElementById("verdict").textContent = out;
 }}

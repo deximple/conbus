@@ -27,7 +27,10 @@ pub(super) const BRIDGE_SCHEME: &str = "chrome-extension";
 
 /// One table, for the command and for the `--html` page's script. A label says
 /// what the host is, because the path is not looked at: `github.com` is where
-/// `gh` signs in, and every other page of that site too.
+/// `gh` signs in, and every other page of that site too. Hosts come from the
+/// programs themselves: `platform.claude.com` and `claude.com/cai` are in the Claude
+/// Code binary, `antigravity.google` in agy's. Nothing is added from memory, so a
+/// sign-in moved elsewhere reads `unknown page` rather than a guess.
 pub(super) const PAGES: &[Page] = &[
     Page {
         scheme: BRIDGE_SCHEME,
@@ -56,6 +59,20 @@ pub(super) const PAGES: &[Page] = &[
         subdomains: true,
         conbus_runs_it: true,
         label: "a claude.ai page (Claude Code signs in here)",
+    },
+    Page {
+        scheme: "https",
+        host: "claude.com",
+        subdomains: true,
+        conbus_runs_it: true,
+        label: "a claude.com page (Claude Code signs in here)",
+    },
+    Page {
+        scheme: "https",
+        host: "antigravity.google",
+        subdomains: true,
+        conbus_runs_it: true,
+        label: "an antigravity.google page (agy signs in here)",
     },
     Page {
         scheme: "https",
@@ -94,47 +111,113 @@ impl Page {
     }
 }
 
-/// Query parameters that may name where the page calls back to.
-pub(super) const CALLBACK_PARAMS: &[&str] =
-    &["mcpRelayUrl", "redirect_uri", "redirect_url", "callback"];
+/// What a query parameter's name contains, once lower-cased with its punctuation
+/// gone, when it may say where the page calls back to: `redirect_uri`, `redirectUri`,
+/// `mcpRelayUrl`, `callback`, `return_to`.
+pub(super) const CALLBACK_NAME_PARTS: &[&str] = &[
+    "redirect",
+    "callback",
+    "relayurl",
+    "returnto",
+    "returnurl",
+    "returnuri",
+];
+
+/// How an address on this machine looks in a value that has not been decoded.
+const THIS_MACHINE: &[&str] = &["localhost", "127.0.0.1", "[::1]", "%5b%3a%3a1%5d"];
+
+/// The schemes a callback to a port is written in. Any other is handed to an app.
+const WEB_SCHEMES: &[&str] = &["http", "https", "ws", "wss"];
+
+fn names_a_callback(name: &str) -> bool {
+    let plain: String = name
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    CALLBACK_NAME_PARTS.iter().any(|part| plain.contains(part))
+}
+
+fn mentions_this_machine(raw: &str) -> bool {
+    let raw = raw.to_ascii_lowercase();
+    THIS_MACHINE.iter().any(|spelling| raw.contains(spelling))
+}
 
 /// Where a page calls back to, as far as it matters here: a port on another
-/// machine says nothing about this machine's processes.
+/// machine says nothing about this machine's processes. Anything that is not plainly
+/// one of these stands in the way of a `no`, rather than being skipped.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum Callback {
     Local(u16),
     LocalNoPort,
     Remote,
+    /// A custom scheme, which the system hands to an app: no port says which process.
+    AppScheme,
+    /// Written in a way this parser does not place.
+    Unread,
 }
 
 /// `ws://127.0.0.1:1234/`, `http://[::1]:1234/cb`, or a bare `localhost:1234/cb`.
 /// A value with no scheme counts only with a port: `callback=someFunction` is a
 /// name, not an address.
-fn callback(value: &str) -> Option<Callback> {
+fn callback(value: &str) -> Callback {
     let (rest, has_scheme) = match value.split_once("://") {
-        Some((scheme, rest)) => valid_scheme(scheme).then_some((rest, true))?,
+        Some((scheme, _)) if !valid_scheme(scheme) => return Callback::Unread,
+        Some((scheme, _)) if !WEB_SCHEMES.contains(&scheme.to_ascii_lowercase().as_str()) => {
+            return Callback::AppScheme;
+        }
+        Some((_, rest)) => (rest, true),
         None => (value, false),
     };
-    let (host, port, _) = authority(rest)?;
-    match (loopback(&host), port) {
-        (true, Some(port)) => Some(Callback::Local(port)),
-        (_, None) if !has_scheme => None,
-        (true, None) => Some(Callback::LocalNoPort),
-        (false, _) => Some(Callback::Remote),
+    let Some((host, port, _)) = authority(rest) else {
+        return Callback::Unread;
+    };
+    match (place_of(&host), port) {
+        (Place::Unplaced, _) => Callback::Unread,
+        (_, None) if !has_scheme => Callback::Unread,
+        (Place::ThisMachine, Some(port)) => Callback::Local(port),
+        (Place::ThisMachine, None) => Callback::LocalNoPort,
+        (Place::Elsewhere, _) => Callback::Remote,
     }
 }
 
-/// Exactly `localhost`, or an address that is loopback. Nothing that merely
-/// starts like one: `127.0.0.1.evil.example` is a name.
-fn loopback(host: &str) -> bool {
+enum Place {
+    ThisMachine,
+    Elsewhere,
+    Unplaced,
+}
+
+/// Exactly `localhost`, or an address that is loopback, is this machine. Nothing
+/// that merely starts like one: `127.0.0.1.evil.example` is a name, and so elsewhere.
+/// `0.0.0.0` and the spellings a browser reads as an address (`127.1`, `2130706433`)
+/// are neither, as far as this parser will say.
+fn place_of(host: &str) -> Place {
     use std::net::IpAddr;
-    host == "localhost"
-        || host.parse::<IpAddr>().is_ok_and(|ip| match ip {
-            IpAddr::V4(v4) => v4.is_loopback(),
-            IpAddr::V6(v6) => {
-                v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
-            }
-        })
+    if host == "localhost" {
+        return Place::ThisMachine;
+    }
+    match host.parse::<IpAddr>() {
+        Ok(ip) if ip.is_unspecified() => Place::Unplaced,
+        Ok(IpAddr::V4(v4)) if v4.is_loopback() => Place::ThisMachine,
+        Ok(IpAddr::V6(v6))
+            if v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback()) =>
+        {
+            Place::ThisMachine
+        }
+        Ok(_) => Place::Elsewhere,
+        Err(_) if ends_in_a_number(host) => Place::Unplaced,
+        Err(_) => Place::Elsewhere,
+    }
+}
+
+/// A host whose last label is a number is read as an address by a browser.
+fn ends_in_a_number(host: &str) -> bool {
+    let last = host.rsplit('.').next().unwrap_or(host);
+    !last.is_empty()
+        && (last.bytes().all(|b| b.is_ascii_digit())
+            || last
+                .strip_prefix("0x")
+                .is_some_and(|hex| hex.bytes().all(|b| b.is_ascii_hexdigit())))
 }
 
 /// The longest client name that is printed.
@@ -176,6 +259,7 @@ pub(super) struct Address<'a> {
     scheme: String,
     host: String,
     query: &'a str,
+    fragment: &'a str,
 }
 
 impl<'a> Address<'a> {
@@ -186,12 +270,13 @@ impl<'a> Address<'a> {
             return None;
         }
         let (host, _port, tail) = authority(rest)?;
-        let tail = tail.split_once('#').map_or(tail, |(before, _)| before);
+        let (tail, fragment) = tail.split_once('#').unwrap_or((tail, ""));
         let query = tail.split_once('?').map_or("", |(_, query)| query);
         Some(Address {
             scheme: scheme.to_ascii_lowercase(),
             host,
             query,
+            fragment,
         })
     }
 
@@ -199,17 +284,30 @@ impl<'a> Address<'a> {
         PAGES.iter().find(|page| page.serves(self))
     }
 
-    /// Each distinct place the page says it calls back to.
+    /// Each distinct place the page says it calls back to. A parameter named like a
+    /// callback is read whatever its spelling; any other that names this machine, or
+    /// a fragment that does, may be where the page really goes, so it counts as
+    /// unread. That is looked for in the raw text: other values stay undecoded.
     pub fn callbacks(&self) -> Vec<Callback> {
-        self.values(CALLBACK_PARAMS)
-            .iter()
-            .filter_map(|value| callback(value))
-            .fold(Vec::new(), |mut found, callback| {
-                if !found.contains(&callback) {
-                    found.push(callback);
-                }
-                found
-            })
+        let mut found: Vec<Callback> = Vec::new();
+        let mut add = |callback: Callback| {
+            if !found.contains(&callback) {
+                found.push(callback);
+            }
+        };
+        for pair in self.query.split('&').filter(|pair| !pair.is_empty()) {
+            let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+            let name = percent_decode(name);
+            if names_a_callback(&name) {
+                add(callback(&percent_decode(value)));
+            } else if name != "client" && mentions_this_machine(value) {
+                add(Callback::Unread);
+            }
+        }
+        if mentions_this_machine(self.fragment) {
+            add(Callback::Unread);
+        }
+        found
     }
 
     /// The decoded values of the query parameters in `wanted`, in order. Every
@@ -380,33 +478,96 @@ mod tests {
     #[test]
     fn a_callback_is_local_only_when_its_host_is_loopback() {
         for (value, want) in [
-            ("ws://127.0.0.1:1234/x", Some(Callback::Local(1234))),
-            ("ws://127.9.9.9:1234/x", Some(Callback::Local(1234))),
-            ("http://LOCALHOST:1234", Some(Callback::Local(1234))),
-            ("http://[::1]:1234/", Some(Callback::Local(1234))),
-            ("http://[::ffff:127.0.0.1]:1/", Some(Callback::Local(1))),
-            ("localhost:1234/cb", Some(Callback::Local(1234))),
-            ("127.0.0.1:1234", Some(Callback::Local(1234))),
-            ("http://u:9@localhost:1234/", Some(Callback::Local(1234))),
-            ("http://localhost/cb", Some(Callback::LocalNoPort)),
-            ("https://example.com:1234/", Some(Callback::Remote)),
-            ("http://u:9@example.com/", Some(Callback::Remote)),
-            ("http://127.0.0.1.example.com:1/", Some(Callback::Remote)),
-            ("http://localhost.example.com:1/", Some(Callback::Remote)),
-            ("http://0.0.0.0:1/", Some(Callback::Remote)),
-            ("http://[2001:db8::1]:1/", Some(Callback::Remote)),
-            ("example.com:1234/cb", Some(Callback::Remote)),
-            ("someFunction", None),
-            ("localhost/cb", None),
-            ("/cb", None),
-            ("", None),
-            ("urn:ietf:wg:oauth:2.0:oob", None),
-            ("1ttp://localhost:1/", None),
-            ("http://localhost:port/", None),
-            ("http%3A%2F%2Flocalhost%3A1", None),
+            ("ws://127.0.0.1:1234/x", Callback::Local(1234)),
+            ("ws://127.9.9.9:1234/x", Callback::Local(1234)),
+            ("http://LOCALHOST:1234", Callback::Local(1234)),
+            ("HTTP://localhost:1234", Callback::Local(1234)),
+            ("http://[::1]:1234/", Callback::Local(1234)),
+            ("http://[::ffff:127.0.0.1]:1/", Callback::Local(1)),
+            ("localhost:1234/cb", Callback::Local(1234)),
+            ("127.0.0.1:1234", Callback::Local(1234)),
+            ("http://u:9@localhost:1234/", Callback::Local(1234)),
+            ("http://localhost/cb", Callback::LocalNoPort),
+            ("https://example.com:1234/", Callback::Remote),
+            ("http://u:9@example.com/", Callback::Remote),
+            ("http://127.0.0.1.example.com:1/", Callback::Remote),
+            ("http://localhost.example.com:1/", Callback::Remote),
+            ("http://10.0.0.1:1/", Callback::Remote),
+            ("http://[2001:db8::1]:1/", Callback::Remote),
+            ("example.com:1234/cb", Callback::Remote),
+            (
+                "cursor://anysphere.cursor-retrieval/oauth",
+                Callback::AppScheme,
+            ),
+            ("VSCODE://auth", Callback::AppScheme),
+            ("chrome-extension://abc/x", Callback::AppScheme),
+            ("http://0.0.0.0:1/", Callback::Unread),
+            ("http://[::]:1/", Callback::Unread),
+            ("http://127.1:1/", Callback::Unread),
+            ("http://2130706433:1/", Callback::Unread),
+            ("http://0x7f.1:1/", Callback::Unread),
+            ("127.1:1", Callback::Unread),
+            ("someFunction", Callback::Unread),
+            ("localhost/cb", Callback::Unread),
+            ("/cb", Callback::Unread),
+            ("", Callback::Unread),
+            ("urn:ietf:wg:oauth:2.0:oob", Callback::Unread),
+            ("1ttp://localhost:1/", Callback::Unread),
+            ("http://localhost:port/", Callback::Unread),
+            ("http://localhost:99999/", Callback::Unread),
+            ("localhost:99999", Callback::Unread),
+            ("http%3A%2F%2Flocalhost%3A1", Callback::Unread),
         ] {
             assert_eq!(callback(value), want, "{value}");
         }
+    }
+
+    #[test]
+    fn a_name_counts_as_a_callback_whatever_its_spelling() {
+        for name in [
+            "redirect_uri",
+            "redirectUri",
+            "REDIRECT-URI",
+            "post_logout_redirect_uri",
+            "mcpRelayUrl",
+            "relay_url",
+            "callback",
+            "callbackUrl",
+            "return_to",
+            "returnUrl",
+        ] {
+            assert!(names_a_callback(name), "{name}");
+        }
+        for name in ["scope", "state", "client_id", "token", "code", "next", ""] {
+            assert!(!names_a_callback(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn only_a_value_naming_this_machine_stands_in_the_way() {
+        for raw in [
+            "http%3A%2F%2FLOCALHOST%3A1",
+            "http://127.0.0.1:2/",
+            "ws://[::1]:2/",
+            "ws%3A%2F%2F%5B%3A%3A1%5D%3A2%2F",
+        ] {
+            assert!(mentions_this_machine(raw), "{raw}");
+        }
+        for raw in [
+            "https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fcloud-platform",
+            "abc123",
+            "",
+        ] {
+            assert!(!mentions_this_machine(raw), "{raw}");
+        }
+    }
+
+    #[test]
+    fn a_client_parameter_is_not_read_as_a_callback() {
+        let address =
+            Address::parse("https://x.example/?client=%7B%22name%22%3A%22localhost%22%7D")
+                .expect("parse");
+        assert!(address.callbacks().is_empty());
     }
 
     #[test]
