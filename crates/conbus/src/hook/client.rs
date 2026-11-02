@@ -255,7 +255,7 @@ pub fn run_in(
     if grok_echo(harness, &key, &hook_event_name, home.as_deref()) {
         return Ok(silent_reply(harness).to_string());
     }
-    named_session(&key, &hook_event_name)?;
+    named_session(&key, &hook_event_name, &payload)?;
     let paths = paths.ok_or_else(|| "no home directory to resolve".to_string())?;
     if let Some(problem) = paths.socket_problem() {
         return Err(Dropped::new(problem));
@@ -456,10 +456,16 @@ fn grok_echo(
 /// Refuse a payload that names no session, before any socket is opened
 /// (`hook::NO_SESSION`). Its own function so a test can hold the refusal
 /// without a daemon — and without ever reaching someone's real one.
-fn named_session(key: &SessionKey, hook_event_name: &str) -> Result<(), Dropped> {
+fn named_session(key: &SessionKey, hook_event_name: &str, payload: &str) -> Result<(), Dropped> {
     if key.vendor_session_id.trim().is_empty() {
-        return Err(Dropped::new(hook::NO_SESSION)
-            .with_detail(format!("{hook_event_name} as {}", key.harness.as_str())));
+        // The field names ride along like the `no mapping` drop's `fields:` —
+        // a payload whose session lives under a key this adapter does not
+        // read is only diagnosable from its schema. Names, never values.
+        return Err(Dropped::new(hook::NO_SESSION).with_detail(format!(
+            "{hook_event_name} as {} (fields: {})",
+            key.harness.as_str(),
+            field_names(payload)
+        )));
     }
     Ok(())
 }
@@ -586,14 +592,18 @@ mod tests {
             other => panic!("{other:?}"),
         };
 
-        let dropped = named_session(&key(nameless), "UserPromptSubmit")
+        let dropped = named_session(&key(nameless), "UserPromptSubmit", nameless)
             .expect_err("an empty session id must not be sent");
         assert_eq!(dropped.reason, hook::NO_SESSION);
         assert_eq!(
             dropped.detail.as_deref(),
-            Some("UserPromptSubmit as claude_code")
+            Some(
+                "UserPromptSubmit as claude_code (fields: hook_event_name,prompt,prompt_id,session_id)"
+            )
         );
-        assert!(named_session(&key(named), "UserPromptSubmit").is_ok());
+        // Key names, never values: the session id's content stays out.
+        assert!(!dropped.detail.as_deref().unwrap().contains("hi\""));
+        assert!(named_session(&key(named), "UserPromptSubmit", named).is_ok());
     }
 
     /// A home where `install` wrote Grok's own registration, naming a binary

@@ -16,10 +16,16 @@
 //!   normal case. `writeln!` on an unbuffered `File` issues a syscall per
 //!   formatting fragment, which interleaves at JSON-token granularity and
 //!   shreds the file. One `write_all` of one complete line is atomic on an
-//!   `O_APPEND` regular file.
-//! - **Never rewritten.** Trimming means a read-modify-write racing those same
-//!   appenders, and it makes the count a lie. The file only grows, and stops
-//!   growing at a cap.
+//!   `O_APPEND` regular file. A full disk can still cut a line short, so a drop
+//!   that finds the file ending mid-line starts on a fresh one, in that same write,
+//!   or the next reason would be glued to the torn text and read as nothing.
+//! - **Rotated, never rewritten.** Trimming means a read-modify-write racing
+//!   those same appenders, and it makes the count a lie. The file only grows,
+//!   and at the cap it is renamed whole to `drops.1.jsonl` — overwriting the
+//!   previous rotation — and started fresh, so one cap of history is kept and
+//!   a standing fault can never again keep a new one out of sight: the live
+//!   log sat at the cap for seven days in October 2026 while a full disk and
+//!   a canary swap's refused hooks went unrecorded.
 //! - **The throttle keys on when we last *spoke*, not on when we last dropped.**
 //!   Keying on the drop file meant every drop pushed the window forward, so a
 //!   standing fault spoke once and then never again. It is also keyed on the
@@ -28,7 +34,7 @@
 //!   behind "the daemon is down".
 
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::time::{Duration, SystemTime};
 
 use conbus_core::clock::Timestamp;
@@ -46,9 +52,24 @@ fn drops_file(paths: &Paths) -> std::path::PathBuf {
     paths.root().join("drops.jsonl")
 }
 
+/// Where a full drop log goes: one generation back, overwritten each time.
+fn rotated_file(paths: &Paths) -> std::path::PathBuf {
+    paths.root().join("drops.1.jsonl")
+}
+
+/// The `O_EXCL` gate that lets exactly one of the racing hook processes do
+/// the rename; everyone else just appends.
+fn rotate_lock(paths: &Paths) -> std::path::PathBuf {
+    paths.root().join("drops.rotate.lock")
+}
+
 fn spoke_file(paths: &Paths) -> std::path::PathBuf {
     paths.root().join("drops.spoke")
 }
+
+/// A lock whose holder died mid-rename is removed after this. Sixty seconds
+/// is far past the two syscalls the lock covers.
+const LOCK_STALE: Duration = Duration::from_secs(60);
 
 /// A record that did not land: why, and — when the hook knew — what it was.
 ///
@@ -120,14 +141,87 @@ fn record_at(paths: &Paths, dropped: &Dropped) -> bool {
     should_speak(paths, &dropped.reason)
 }
 
-fn append(paths: &Paths, dropped: &Dropped) {
-    let file = drops_file(paths);
-    if fs::metadata(&file).map(|m| m.len()).unwrap_or(0) >= CAP_BYTES {
+/// Move a full drop log one generation back so the next line still lands.
+///
+/// The rename is atomic and overwrites the previous `drops.1.jsonl`; a lock
+/// file keeps the racing hooks from renaming over each other, and whoever
+/// cannot take it simply appends — the file goes past the cap rather than
+/// the line going missing, and the next append retries the rotation. The
+/// size is checked again under the lock because the previous rotator may
+/// have just finished.
+fn rotate_if_full(paths: &Paths, file: &std::path::Path) {
+    if fs::metadata(file).map(|m| m.len()).unwrap_or(0) < CAP_BYTES {
         return;
     }
-    let Ok(mut handle) = OpenOptions::new().create(true).append(true).open(&file) else {
+    let lock = rotate_lock(paths);
+    if let Ok(at) = fs::metadata(&lock).and_then(|m| m.modified())
+        && SystemTime::now()
+            .duration_since(at)
+            .is_ok_and(|since| since > LOCK_STALE)
+    {
+        let _ = fs::remove_file(&lock);
+    }
+    rotate_under_lock(paths, file, &lock);
+}
+
+fn rotate_under_lock(paths: &Paths, file: &std::path::Path, lock: &std::path::Path) {
+    let Ok(_guard) = OpenOptions::new().write(true).create_new(true).open(lock) else {
         return;
     };
+    if fs::metadata(file).map(|m| m.len()).unwrap_or(0) >= CAP_BYTES {
+        let rotated = rotated_file(paths);
+        if fs::rename(file, &rotated).is_ok() {
+            // A rename keeps the mode, and an older build wrote this file 0644.
+            // Nothing appends by this name now; a hook that still holds the file
+            // open keeps its handle whatever the mode becomes.
+            close_to_owner(&rotated);
+        }
+    }
+    let _ = fs::remove_file(lock);
+}
+
+#[cfg(unix)]
+fn close_to_owner(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+}
+
+#[cfg(not(unix))]
+fn close_to_owner(_path: &std::path::Path) {}
+
+/// A new log is 0600 from the moment it exists.
+fn open_for_append(file: &std::path::Path) -> std::io::Result<fs::File> {
+    let mut options = OpenOptions::new();
+    options.create(true).read(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(file)
+}
+
+/// Whether the file ends part way through a line. An empty file does not. Two hooks
+/// that both find a torn end each start a fresh line, which leaves a blank one, and a
+/// blank line is skipped when the log is read.
+fn ends_mid_line(file: &mut fs::File) -> bool {
+    let mut last = [0u8; 1];
+    file.seek(SeekFrom::End(-1)).is_ok() && file.read_exact(&mut last).is_ok() && last[0] != b'\n'
+}
+
+fn append(paths: &Paths, dropped: &Dropped) {
+    let file = drops_file(paths);
+    rotate_if_full(paths, &file);
+    let Ok(mut handle) = open_for_append(&file) else {
+        return;
+    };
+    // A file an older build left 0644 is closed through this handle: whichever
+    // file it is now, it cannot race a rotation the way a path could.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = handle.set_permissions(fs::Permissions::from_mode(0o600));
+    }
     // Built whole, written once. See the module note.
     let mut entry = serde_json::json!({
         "ts": Timestamp::now().to_string(),
@@ -136,7 +230,12 @@ fn append(paths: &Paths, dropped: &Dropped) {
     if let Some(detail) = &dropped.detail {
         entry["detail"] = serde_json::Value::String(detail.clone());
     }
-    let mut line = entry.to_string();
+    let mut line = if ends_mid_line(&mut handle) {
+        String::from("\n")
+    } else {
+        String::new()
+    };
+    line.push_str(&entry.to_string());
     line.push('\n');
     let _ = handle.write_all(line.as_bytes());
 }
@@ -175,7 +274,7 @@ pub struct Summary {
     pub count: usize,
     /// Broken pipe / ENOTCONN during a daemon restart, not a standing fault.
     pub transient: usize,
-    /// True once the file stopped growing, so `count` is a floor.
+    /// True once the file hit the cap or was rotated, so `count` is a floor.
     pub capped: bool,
     pub last: Option<(String, String)>,
     /// Standing drops grouped to a reason family, most frequent first —
@@ -229,8 +328,16 @@ pub fn is_transient(reason: &str) -> bool {
 }
 
 pub fn summary(paths: &Paths) -> Summary {
-    let file = drops_file(paths);
-    let Ok(text) = fs::read_to_string(&file) else {
+    // The rotated generation first — its lines are older than the live
+    // file's. Either may be absent. Each is read and split on its own: a torn
+    // last line in one must not run into the first line of the next, and a byte
+    // that is not UTF-8 costs its line, not the generation.
+    let generations: Vec<String> = [rotated_file(paths), drops_file(paths)]
+        .iter()
+        .filter_map(|file| fs::read(file).ok())
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .collect();
+    if generations.is_empty() {
         return Summary {
             count: 0,
             transient: 0,
@@ -238,8 +345,12 @@ pub fn summary(paths: &Paths) -> Summary {
             last: None,
             reasons: Vec::new(),
         };
-    };
-    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    }
+    let lines: Vec<&str> = generations
+        .iter()
+        .flat_map(|text| text.lines())
+        .filter(|l| !l.trim().is_empty())
+        .collect();
     let mut transient = 0;
     // First-seen order per family gloss, so identical reasons merge and
     // different ones under one family stay one row.
@@ -277,10 +388,16 @@ pub fn summary(paths: &Paths) -> Summary {
         }
     }
     families.sort_by_key(|a| std::cmp::Reverse(a.2));
+    // A rotation already discarded history; so does a file at the cap.
+    let capped = rotated_file(paths).exists()
+        || fs::metadata(drops_file(paths))
+            .map(|m| m.len())
+            .unwrap_or(0)
+            >= CAP_BYTES;
     Summary {
         count: lines.len(),
         transient,
-        capped: text.len() as u64 >= CAP_BYTES,
+        capped,
         last,
         reasons: families
             .into_iter()
@@ -420,23 +537,381 @@ mod tests {
         );
     }
 
+    /// Fill `drops.jsonl` to at least the cap with real drop lines.
+    fn fill_to_cap(paths: &Paths, reason: &str) {
+        let file = drops_file(paths);
+        std::fs::create_dir_all(paths.root()).expect("dir");
+        let filler = format!("{}\n", serde_json::json!({"ts": "t", "reason": reason}));
+        let mut text = String::new();
+        while (text.len() as u64) < CAP_BYTES {
+            text.push_str(&filler);
+        }
+        std::fs::write(&file, &text).expect("fill");
+    }
+
     #[test]
-    fn the_drop_log_stops_growing_and_says_so() {
+    fn a_full_log_rotates_and_a_new_reason_is_still_seen() {
+        // The standing fault this prevents: the live log hit the cap on
+        // 2026-10-25 and stayed blind for seven days — a full disk and a
+        // canary swap's refused hooks all passed without a line. A drop that
+        // lands after the cap must still be findable.
         let dir = home();
         let paths = paths_at(dir.path());
-        let file = drops_file(&paths);
-        std::fs::create_dir_all(paths.root()).expect("dir");
-        std::fs::write(&file, "x".repeat(CAP_BYTES as usize + 10)).expect("fill");
+        fill_to_cap(&paths, "old flood");
+
+        append(&paths, &Dropped::new("a brand new fault"));
+
+        let summary = summary(&paths);
+        assert_eq!(
+            summary.last.as_ref().map(|(_, reason)| reason.as_str()),
+            Some("a brand new fault")
+        );
+        assert!(
+            describe(&summary).contains("a brand new fault"),
+            "a drop after the cap must be visible: {}",
+            describe(&summary)
+        );
+    }
+
+    #[test]
+    fn rotation_keeps_the_old_file_beside_the_new_one() {
+        let dir = home();
+        let paths = paths_at(dir.path());
+        fill_to_cap(&paths, "old flood");
 
         append(&paths, &Dropped::new("one more"));
 
-        let grown = std::fs::metadata(&file).expect("meta").len();
-        assert_eq!(grown, CAP_BYTES + 10, "it kept growing past the cap");
-        assert!(summary(&paths).capped);
+        let rotated = paths.root().join("drops.1.jsonl");
+        let old = std::fs::read_to_string(&rotated).expect("rotated file kept");
+        assert!(old.contains("old flood"));
+        let current = std::fs::read_to_string(drops_file(&paths)).expect("new file");
+        assert!(current.contains("one more"));
+        assert!(!current.contains("old flood"));
+        // The rotated file means earlier lines were discarded, so the count
+        // is a floor either way — the reader is told "at least".
         assert!(
             describe(&summary(&paths)).contains("at least"),
-            "a capped count must not be reported as exact: {}",
+            "{}",
             describe(&summary(&paths))
+        );
+    }
+
+    #[test]
+    fn a_summary_reads_both_sides_of_a_rotation() {
+        let dir = home();
+        let paths = paths_at(dir.path());
+        fill_to_cap(&paths, "old flood");
+        append(&paths, &Dropped::new("after the flood"));
+
+        let summary = summary(&paths);
+        // One family per side of the rotation.
+        let mut texts: Vec<&str> = summary
+            .reasons
+            .iter()
+            .map(|(reason, _)| reason.text.as_str())
+            .collect();
+        texts.sort();
+        assert_eq!(texts, ["after the flood", "old flood"]);
+    }
+
+    #[test]
+    fn a_lock_another_rotator_holds_does_not_lose_the_line() {
+        // The lock is only there so two hooks do not rename at once; failing
+        // to take it must not lose the drop — the file grows past the cap
+        // until someone wins it.
+        let dir = home();
+        let paths = paths_at(dir.path());
+        fill_to_cap(&paths, "old flood");
+        let lock = paths.root().join("drops.rotate.lock");
+        std::fs::write(&lock, "").expect("held lock");
+
+        append(&paths, &Dropped::new("one more"));
+
+        let current = std::fs::read_to_string(drops_file(&paths)).expect("file");
+        assert!(current.contains("one more"));
+        assert!(
+            !paths.root().join("drops.1.jsonl").exists(),
+            "a held lock defers the rename, it does not drop the line"
+        );
+    }
+
+    #[test]
+    fn a_torn_last_line_in_the_old_generation_does_not_swallow_the_first_live_reason() {
+        // The generations used to be joined into one text, so a line cut off
+        // by a full disk or a killed hook ran into the first line of the next
+        // file, and neither parsed.
+        let dir = home();
+        let paths = paths_at(dir.path());
+        std::fs::write(
+            rotated_file(&paths),
+            "{\"ts\":\"t\",\"reason\":\"old flood\"}\n{\"ts\":\"t\",\"rea",
+        )
+        .expect("old generation");
+        append(&paths, &Dropped::new("the first live reason"));
+
+        let summary = summary(&paths);
+
+        assert_eq!(summary.count, 3);
+        let texts: Vec<&str> = summary
+            .reasons
+            .iter()
+            .map(|(reason, _)| reason.text.as_str())
+            .collect();
+        assert!(texts.contains(&"the first live reason"), "{texts:?}");
+        assert!(texts.contains(&"old flood"), "{texts:?}");
+        assert_eq!(
+            summary.last.as_ref().map(|(_, reason)| reason.as_str()),
+            Some("the first live reason")
+        );
+    }
+
+    #[test]
+    fn one_bad_byte_costs_one_line_not_a_generation() {
+        // `read_to_string` refused the whole file over one byte that is not
+        // UTF-8, so a generation of reasons read as none recorded.
+        for file in [drops_file as fn(&Paths) -> std::path::PathBuf, rotated_file] {
+            let dir = home();
+            let paths = paths_at(dir.path());
+            let mut bytes = b"{\"ts\":\"t\",\"reason\":\"before it\"}\n".to_vec();
+            bytes.extend_from_slice(b"\xff\xfe not json\n");
+            bytes.extend_from_slice(b"{\"ts\":\"t\",\"reason\":\"after it\"}\n");
+            std::fs::write(file(&paths), bytes).expect("log");
+
+            let summary = summary(&paths);
+
+            assert_eq!(summary.count, 3);
+            let mut texts: Vec<&str> = summary
+                .reasons
+                .iter()
+                .map(|(reason, _)| reason.text.as_str())
+                .collect();
+            texts.sort();
+            assert_eq!(texts, ["after it", "before it"]);
+            assert_ne!(describe(&summary), "none recorded");
+        }
+    }
+
+    #[test]
+    fn a_log_of_nothing_but_a_bad_byte_is_not_none_recorded() {
+        let dir = home();
+        let paths = paths_at(dir.path());
+        std::fs::write(drops_file(&paths), b"\xff\n").expect("log");
+
+        assert_ne!(describe(&summary(&paths)), "none recorded");
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &std::path::Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).expect("stat").permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_new_log_is_created_owner_only() {
+        let dir = home();
+        let file = dir.path().join("drops.jsonl");
+
+        drop(open_for_append(&file).expect("open"));
+
+        assert_eq!(mode_of(&file), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_drop_logs_are_owner_only_from_their_first_byte() {
+        let dir = home();
+        let paths = paths_at(dir.path());
+
+        append(&paths, &Dropped::new("first"));
+        assert_eq!(mode_of(&drops_file(&paths)), 0o600);
+
+        fill_to_cap(&paths, "old flood");
+        append(&paths, &Dropped::new("after the rotation"));
+        assert_eq!(mode_of(&drops_file(&paths)), 0o600);
+        assert_eq!(mode_of(&rotated_file(&paths)), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_log_an_older_build_left_open_is_closed_through_the_handle() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = home();
+        let paths = paths_at(dir.path());
+        std::fs::write(drops_file(&paths), "").expect("log");
+        std::fs::set_permissions(drops_file(&paths), std::fs::Permissions::from_mode(0o644))
+            .expect("chmod");
+
+        append(&paths, &Dropped::new("next"));
+
+        assert_eq!(mode_of(&drops_file(&paths)), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_full_log_an_older_build_left_open_rotates_closed() {
+        // A rename keeps the mode, and the append that rotates it never opens
+        // it, so the rotation itself has to close it.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = home();
+        let paths = paths_at(dir.path());
+        fill_to_cap(&paths, "old flood");
+        std::fs::set_permissions(drops_file(&paths), std::fs::Permissions::from_mode(0o644))
+            .expect("chmod");
+
+        append(&paths, &Dropped::new("after the rotation"));
+
+        assert_eq!(mode_of(&rotated_file(&paths)), 0o600);
+        assert_eq!(mode_of(&drops_file(&paths)), 0o600);
+    }
+
+    #[test]
+    fn a_rotator_that_lost_the_race_leaves_the_fresh_log_alone() {
+        // Two hooks see a full log. One rotates. The other then takes the lock
+        // and must look again: renaming now would throw the previous generation
+        // away and put a nearly empty file in its place.
+        let dir = home();
+        let paths = paths_at(dir.path());
+        std::fs::write(
+            rotated_file(&paths),
+            "{\"ts\":\"t\",\"reason\":\"the flood\"}\n",
+        )
+        .expect("old generation");
+        std::fs::write(drops_file(&paths), "{\"ts\":\"t\",\"reason\":\"fresh\"}\n").expect("log");
+
+        rotate_under_lock(&paths, &drops_file(&paths), &rotate_lock(&paths));
+
+        let old = std::fs::read_to_string(rotated_file(&paths)).expect("old generation");
+        assert!(old.contains("the flood"), "{old}");
+        let live = std::fs::read_to_string(drops_file(&paths)).expect("log");
+        assert!(live.contains("fresh"), "{live}");
+        assert!(!rotate_lock(&paths).exists(), "the lock is given back");
+    }
+
+    #[test]
+    fn a_rotator_holding_the_lock_renames_a_full_log_and_gives_the_lock_back() {
+        let dir = home();
+        let paths = paths_at(dir.path());
+        fill_to_cap(&paths, "old flood");
+
+        rotate_under_lock(&paths, &drops_file(&paths), &rotate_lock(&paths));
+
+        assert!(rotated_file(&paths).exists());
+        assert!(!drops_file(&paths).exists());
+        assert!(!rotate_lock(&paths).exists());
+    }
+
+    /// A lock file, aged as a dead rotator would have left it.
+    fn lock_aged(paths: &Paths, age: Duration) {
+        let lock = std::fs::File::create(rotate_lock(paths)).expect("lock");
+        lock.set_modified(SystemTime::now() - age).expect("age it");
+    }
+
+    #[test]
+    fn a_lock_left_by_a_dead_rotator_is_removed_and_the_log_rotates() {
+        let dir = home();
+        let paths = paths_at(dir.path());
+        fill_to_cap(&paths, "old flood");
+        lock_aged(&paths, LOCK_STALE + Duration::from_secs(5));
+
+        append(&paths, &Dropped::new("after the rotation"));
+
+        assert!(rotated_file(&paths).exists(), "the rotation went ahead");
+        assert!(!rotate_lock(&paths).exists(), "the stale lock is gone");
+        let live = std::fs::read_to_string(drops_file(&paths)).expect("log");
+        assert!(live.contains("after the rotation"), "{live}");
+        assert!(!live.contains("old flood"), "{}", live.len());
+    }
+
+    #[test]
+    fn a_lock_younger_than_the_limit_is_left_to_its_holder() {
+        let dir = home();
+        let paths = paths_at(dir.path());
+        fill_to_cap(&paths, "old flood");
+        lock_aged(&paths, LOCK_STALE - Duration::from_secs(5));
+
+        append(&paths, &Dropped::new("one more"));
+
+        assert!(!rotated_file(&paths).exists());
+        assert!(rotate_lock(&paths).exists(), "somebody is still rotating");
+    }
+
+    #[test]
+    fn a_log_under_the_cap_never_touches_the_lock() {
+        // Below the cap a stale lock stays, and nothing is renamed: the check
+        // before the lock is what keeps an ordinary drop down to one write.
+        let dir = home();
+        let paths = paths_at(dir.path());
+        append(&paths, &Dropped::new("small"));
+        lock_aged(&paths, LOCK_STALE + Duration::from_secs(5));
+
+        append(&paths, &Dropped::new("still small"));
+
+        assert!(rotate_lock(&paths).exists());
+        assert!(!rotated_file(&paths).exists());
+    }
+
+    #[test]
+    fn a_torn_line_in_the_live_file_does_not_swallow_the_next_reason() {
+        let dir = home();
+        let paths = paths_at(dir.path());
+        fs::write(
+            drops_file(&paths),
+            b"{\"ts\":\"2026-11-02T00:00:00.000Z\",\"reason\":\"old\",\"detail\":\"cut sho",
+        )
+        .expect("torn");
+
+        append(&paths, &Dropped::new("no mapping for hook event \"New\""));
+
+        let summary = summary(&paths);
+        assert!(
+            summary
+                .reasons
+                .iter()
+                .any(|(reason, _)| reason.text.contains("New")),
+            "{summary:?}"
+        );
+        assert!(summary.last.is_some(), "{summary:?}");
+    }
+
+    #[test]
+    fn a_line_ending_where_it_should_gets_nothing_added() {
+        // The usual case: one line per drop, and no blank line between them.
+        let dir = home();
+        let paths = paths_at(dir.path());
+
+        append(&paths, &Dropped::new("first"));
+        append(&paths, &Dropped::new("second"));
+
+        let text = fs::read_to_string(drops_file(&paths)).expect("log");
+        assert_eq!(text.lines().count(), 2, "{text}");
+        assert!(!text.contains("\n\n"), "{text}");
+        assert!(text.ends_with('\n'), "{text}");
+    }
+
+    #[test]
+    fn the_fresh_line_after_a_torn_one_is_still_one_write() {
+        // Everything goes out in one write, so a racing hook cannot land between the
+        // line break and the line. What this can pin from here: the torn text is
+        // kept, the new line is whole, and an empty file gets no blank first line.
+        let dir = home();
+        let paths = paths_at(dir.path());
+        fs::write(drops_file(&paths), b"").expect("empty");
+
+        append(&paths, &Dropped::new("into an empty file"));
+
+        let text = fs::read_to_string(drops_file(&paths)).expect("log");
+        assert!(text.starts_with('{'), "{text}");
+
+        fs::write(drops_file(&paths), b"{\"cut sho").expect("torn");
+        append(&paths, &Dropped::new("whole"));
+
+        let text = fs::read_to_string(drops_file(&paths)).expect("log");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "{\"cut sho", "{text}");
+        assert!(
+            serde_json::from_str::<serde_json::Value>(lines[1]).is_ok(),
+            "{text}"
         );
     }
 
