@@ -1212,6 +1212,15 @@ probe_recorder() { # exits 0 answered, 1 connected and no answer, 2 nothing ther
     return 1
 }
 
+# Doctor's `writable` line when the log cannot take a record right now: read-only,
+# or a recorder holding what a full disk refuses. Empty when it can.
+log_cannot_take() { # log_cannot_take <doctor output>
+    lc_line=$(printf '%s\n' "$1" | sed -n 's/^writable  *//p' | sed -n '1p')
+    case $lc_line in
+        NOT\ APPENDABLE* | REFUSING*) printf '%s\n' "$lc_line" ;;
+    esac
+}
+
 verdict_recorder() {
     vr_faults=""
     vr_rc=0
@@ -1231,6 +1240,10 @@ verdict_recorder() {
     fi
     if [ "$vr_stale" -gt 0 ]; then
         vr_faults="$vr_faults; $vr_stale spooled record(s) older than 10 minutes have not reached the log"
+    fi
+    vr_write=$(log_cannot_take "$doctor_out")
+    if [ -n "$vr_write" ]; then
+        vr_faults="$vr_faults; it answers, and what it is told to record is not landing: $vr_write"
     fi
     if [ -n "$vr_faults" ]; then
         line FAIL recorder-serving "${vr_faults#; }"
@@ -1392,11 +1405,7 @@ verdict_disk() {
     vd_first=$(row_value "$vd_rows" first | cut -c1-120)
     vd_refusing=$(row_value "$vd_rows" refusing | cut -c1-120)
     vd_line=$(printf '%s\n' "$doctor_out" | sed -n 's/^disk  *//p' | sed -n '1p')
-    vd_write=$(printf '%s\n' "$doctor_out" | sed -n 's/^writable  *//p' | sed -n '1p')
-    case $vd_write in
-        NOT\ APPENDABLE*) vd_write_bad=$vd_write ;;
-        *) vd_write_bad="" ;;
-    esac
+    vd_write_bad=$(log_cannot_take "$doctor_out")
     if [ "${vd_lines:-0}" -gt 0 ]; then
         line FAIL disk "$vd_total record(s) refused by the log since $since, $vd_lines time(s) in daemon.log: $vd_first"
     elif [ -n "$vd_refusing" ]; then

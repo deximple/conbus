@@ -80,6 +80,7 @@ usage_rows() { # usage_rows <first-iso> <harness>...
 #   tornlive  — doctor counts an unreadable line the last boot never saw
 #   nocount   — doctor fails before its log count, as with an unreadable segment
 #   readonly  — doctor says the log cannot be appended to
+#   refusing  — doctor says the recorder is holding what the log refuses, right now
 #   lowdisk   — doctor's 10% warning, which this Mac is always under
 #   eventgap  — hooks run, but a registered hook misses events
 #   untrusted — Codex will not spawn the hooks until a person approves them
@@ -115,6 +116,7 @@ write_fake() {
         tornlive) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "disk      log 1.0 MB — 1.0 GB free of 2.0 GB (50.0%)"; echo "log       5 record(s), 1 conversation(s), 1 unreadable line(s)"; echo "hooks     claude_code  runs — x"' ;;
         nocount) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "disk      log 1.0 MB — 1.0 GB free of 2.0 GB (50.0%)"; echo "hooks     claude_code  runs — x"; exit 1' ;;
         readonly) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "writable  NOT APPENDABLE: Read-only file system — records will be refused"; echo "disk      log 1.0 MB — 1.0 GB free of 2.0 GB (50.0%)"; echo "log       5 record(s), 1 conversation(s), 0 unreadable line(s)"; echo "hooks     claude_code  runs — x"' ;;
+        refusing) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "writable  REFUSING since 2026-11-01T00:00:00.000Z — 20 record(s) in memory only, lost if the recorder stops; free space, do not restart it"; echo "disk      log 1.0 MB — 0.0 GB free of 2.0 GB (0.0%) — WARNING: under 10% free"; echo "log       5 record(s), 1 conversation(s), 0 unreadable line(s)"; echo "hooks     claude_code  runs — x"' ;;
         lowdisk) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "disk      log 1.0 MB — 100.0 GB free of 2000.0 GB (5.0%) — WARNING: under 10% free"; echo "log       5 record(s), 1 conversation(s), 0 unreadable line(s)"; echo "hooks     claude_code  runs — x"' ;;
         eventgap) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "log       5 record(s), 1 conversation(s), 0 unreadable line(s)"; echo "hooks     claude_code  runs — x"; echo "events    claude_code  MISSING Stop, SessionEnd — run \`conbus install --apply\`"' ;;
         untrusted) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "log       5 record(s), 1 conversation(s), 0 unreadable line(s)"; echo "hooks     codex        runs — x"; echo "codex     2 of 2 hook(s) Codex will not spawn:"; echo "          NOT TRUSTED: PreToolUse, PostToolUse"' ;;
@@ -2322,6 +2324,15 @@ code=0
 run verdict >"$tmp/verdict-readonly.out" 2>&1 || code=$?
 expect 1 "$code" "a log that cannot be appended to fails"
 expect_grep '^FAIL disk.*NOT APPENDABLE' "$tmp/verdict-readonly.out" "and is named"
+
+# Refusing right now. The daemon.log note is throttled to one per 10 minutes, so a second outage inside that time can
+# leave only doctor's word for it, on a full disk.
+verdict_fixture; install_persona refusing
+code=0; run verdict >"$tmp/verdict-refusing-now.out" 2>&1 || code=$?
+expect 1 "$code" "a log refusing writes now is not a pass (P3)"
+expect_grep '^FAIL disk.*REFUSING since' "$tmp/verdict-refusing-now.out" "disk says so"
+expect_grep '^FAIL recorder-serving.*REFUSING since' "$tmp/verdict-refusing-now.out" "and so does recorder-serving"
+expect_no_grep '^PASS disk\|^PASS recorder-serving' "$tmp/verdict-refusing-now.out" "neither line passes"
 
 # serving-budget reads milliseconds: 5.9 s is not 5 s.
 verdict_fixture
