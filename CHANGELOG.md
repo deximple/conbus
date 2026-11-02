@@ -8,6 +8,11 @@ the entry says so when it does.
 
 ### Fixed
 
+- A recorder sent SIGHUP, as a closed terminal or `kill -HUP` sends it, now lands
+  what the log will take and says what it could not, as it does for SIGTERM. It used
+  to go at once, and a record only memory held went with no trace, also after a
+  start whose repair had to run in the recorder itself. A recorder started with
+  hangups ignored, as `nohup` starts it, still ignores them.
 - `doctor` no longer leaves an empty `segment-00000000.jsonl` in a log folder
   with no segments. It checked that a segment could be written by creating one,
   and a later restore with `cp -n` would keep that empty file over the real one.
