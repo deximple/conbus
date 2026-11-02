@@ -48,6 +48,11 @@ fn fake_app_server() -> (tempfile::TempDir, std::path::PathBuf) {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("codex");
     support::write_executable(&path, FAKE_APP_SERVER);
+    // A fresh script's first run is the slow one: seven seconds on a Mac that was
+    // scanning it, against `doctor`'s two for this read. Pay for it here.
+    let _ = Command::new(&path)
+        .stdin(std::process::Stdio::null())
+        .output();
     (dir, path)
 }
 
