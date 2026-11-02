@@ -117,8 +117,12 @@ usage_ms_budget=${CONBUS_CANARY_USAGE_MS:-2000}
 doctor_ms_budget=${CONBUS_CANARY_DOCTOR_MS:-3000}
 serving_ms_budget=${CONBUS_CANARY_SERVING_MS:-5000}
 doctor_limit_s=${CONBUS_CANARY_DOCTOR_LIMIT:-120}
+noise_limit=${CONBUS_CANARY_NOISE_MAX:-2000}
+probe_s=${CONBUS_CANARY_PROBE_S:-5}
 
 is_uint() { case $1 in '' | *[!0-9]*) return 1 ;; *) return 0 ;; esac }
+# A whole number with no leading zero: `$((08))` ends the script under `set -e`.
+is_count() { is_uint "$1" && case $1 in 0?*) return 1 ;; *) return 0 ;; esac }
 
 # An ISO-8601 UTC timestamp with real milliseconds — `date` only writes a
 # literal .000, and drop lines carry true ms, so a same-second boundary
@@ -1244,7 +1248,7 @@ probe_recorder() { # exits 0 answered, 1 connected and no answer, 2 nothing ther
             print $s "{}\n";
             IO::Select->new($s)->can_read($limit) or exit 1;
             sysread($s, my $reply, 4096) or exit 1;
-            exit($reply =~ /"status"/ ? 0 : 1);' "$root/conbus.sock" "${CONBUS_CANARY_PROBE_S:-5}" || probe_rc=$?
+            exit($reply =~ /"status"/ ? 0 : 1);' "$root/conbus.sock" "$probe_s" || probe_rc=$?
         [ "$probe_rc" -eq 1 ] || return "$probe_rc"
         probe_try=$((probe_try + 1))
     done
@@ -1267,7 +1271,7 @@ verdict_recorder() {
     case $vr_rc in
         0) ;;
         2) vr_faults="$vr_faults; nothing answers at $root/conbus.sock" ;;
-        *) vr_faults="$vr_faults; something holds $root/conbus.sock and did not answer in three tries of ${CONBUS_CANARY_PROBE_S:-5}s" ;;
+        *) vr_faults="$vr_faults; something holds $root/conbus.sock and did not answer in three tries of ${probe_s}s" ;;
     esac
     # An idle daemon drains the spool every two seconds, so an old entry is a
     # record that has not reached the log.
@@ -1791,8 +1795,22 @@ while [ $# -gt 0 ]; do
     shift
 done
 
-is_uint "$doctor_limit_s" && [ "$doctor_limit_s" -ge 1 ] ||
-    refuse "CONBUS_CANARY_DOCTOR_LIMIT='$doctor_limit_s' is not a positive integer"
+# Every number from the environment, before any of them is used. Junk read as a
+# failed test, and a failed test reads as false: `[ 7d -lt 7 ]` let a day-old window
+# through, and a blank serving limit left the round trip's daemon running.
+want_positive() { # want_positive <variable> <value>
+    { is_count "$2" && [ "$2" -ge 1 ]; } || refuse "$1='$2' is not a positive integer"
+}
+want_positive CONBUS_CANARY_DOCTOR_LIMIT "$doctor_limit_s"
+want_positive CONBUS_CANARY_SERVING_LIMIT "$serving_limit"
+want_positive CONBUS_CANARY_RSS_MB "$rss_budget_mb"
+want_positive CONBUS_CANARY_WINDOW_DAYS "$window_days"
+want_positive CONBUS_CANARY_TAIL_MS "$tail_ms_budget"
+want_positive CONBUS_CANARY_USAGE_MS "$usage_ms_budget"
+want_positive CONBUS_CANARY_DOCTOR_MS "$doctor_ms_budget"
+want_positive CONBUS_CANARY_SERVING_MS "$serving_ms_budget"
+want_positive CONBUS_CANARY_PROBE_S "$probe_s"
+is_count "$noise_limit" || refuse "CONBUS_CANARY_NOISE_MAX='$noise_limit' is not a number"
 
 case $sub in
     preflight)
@@ -1912,8 +1930,6 @@ case $sub in
         say "window: since $since"
 
         [ -x "$bin" ] || die "no installed conbus at $bin — verdict needs its reads"
-        noise_limit=${CONBUS_CANARY_NOISE_MAX:-2000}
-        is_uint "$noise_limit" || refuse "CONBUS_CANARY_NOISE_MAX='$noise_limit' is not a number"
 
         # One doctor for every item that reads it. Each doctor starts Codex's
         # app-server two or three times, so items do not get their own.
@@ -2238,10 +2254,12 @@ case $sub in
             printf '%s' "$unchecked" | sed 's/^/canary:   /'
             exit 4
         fi
+        window_said=""
+        [ "$window_days" -eq 7 ] || window_said="on a ${window_days}-day window, not the plan's 7; "
         if [ -n "$operator_answers" ]; then
-            say "verdict: PASS — on the operator's word that these were idle:$operator_answers; operator-feel is still yours to answer"
+            say "verdict: PASS — ${window_said}on the operator's word that these were idle:$operator_answers; operator-feel is still yours to answer"
         else
-            say "verdict: PASS — every item judged; operator-feel is still yours to answer"
+            say "verdict: PASS — ${window_said}every item judged; operator-feel is still yours to answer"
         fi
         exit 0
         ;;

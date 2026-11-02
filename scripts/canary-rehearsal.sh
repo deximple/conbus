@@ -2504,6 +2504,44 @@ code=0
 run start --from "$tmp/stage/nonexistent" >/dev/null 2>&1 || code=$?
 expect 1 "$code" "start refuses a missing candidate"
 
+# A number that is not one. `[ 7d -lt 7 ]` fails, which reads as false, so a day-old window passed; a blank serving
+# limit ended the round trip with a blank reason and left its daemon running. All of them are refused before anything.
+verdict_fixture "$(iso_ago $((DAY + 3600)))"
+code=0; CONBUS_CANARY_WINDOW_DAYS=7d run verdict >"$tmp/verdict-window-junk.out" 2>&1 || code=$?
+expect 2 "$code" "a window length that is not a number is refused (P7)"
+expect_grep "CONBUS_CANARY_WINDOW_DAYS='7d'" "$tmp/verdict-window-junk.out" "by name"
+for junk_env in CONBUS_CANARY_WINDOW_DAYS CONBUS_CANARY_RSS_MB CONBUS_CANARY_NOISE_MAX CONBUS_CANARY_PROBE_S CONBUS_CANARY_SERVING_MS CONBUS_CANARY_DOCTOR_LIMIT; do
+    for junk_value in 7d -1 1.5 08; do
+        code=0
+        ( export "$junk_env=$junk_value"; run verdict ) >"$tmp/verdict-junk.out" 2>&1 || code=$?
+        expect 2 "$code" "$junk_env=$junk_value is refused"
+    done
+done
+for junk_var in TAIL_MS USAGE_MS DOCTOR_MS SERVING_LIMIT; do
+    code=0
+    ( export "$junk_var=lots"; run verdict ) >"$tmp/verdict-junk.out" 2>&1 || code=$?
+    expect 2 "$code" "$junk_var=lots is refused"
+done
+code=0; CONBUS_CANARY_WINDOW_DAYS=0 run verdict >/dev/null 2>&1 || code=$?
+expect 2 "$code" "a window of no days is refused"
+code=0; CONBUS_CANARY_NOISE_MAX=0 run verdict >/dev/null 2>&1 || code=$?
+expect 3 "$code" "a noise limit of zero is a limit: the window is still open"
+# Refused before anything moves, or leaves anything behind.
+write_fake 01d old "$install_dir/conbus"; rm -f "$rollback_bin" "$home/.conbus/canary.json"
+: >"$tmp/round-trip-daemons"
+code=0; SERVING_LIMIT=soon run start --from "$tmp/stage/conbus-good" >"$tmp/start-junk.out" 2>&1 || code=$?
+expect 2 "$code" "a serving limit that is not a number refuses a swap"
+expect "conbus 0.0.0-01d (01d)" "$("$install_dir/conbus" --version)" "nothing moved"
+expect 0 "$(wc -l <"$tmp/round-trip-daemons" | tr -d ' ')" "and no round-trip daemon was started"
+# A window other than the plan's says so on the pass.
+verdict_fixture "$(iso_ago $((DAY + 3600)))"
+code=0; CONBUS_CANARY_WINDOW_DAYS=1 run verdict >"$tmp/verdict-window-short.out" 2>&1 || code=$?
+expect 0 "$code" "a one-day window can complete"
+expect_grep 'verdict: PASS.*1-day window' "$tmp/verdict-window-short.out" "a PASS on a shortened window says so (P7b)"
+verdict_fixture
+code=0; run verdict >"$tmp/verdict-window-7.out" 2>&1 || code=$?
+expect_no_grep '7-day window' "$tmp/verdict-window-7.out" "the plan's own window needs no remark"
+
 # A real build under this throwaway HOME would ask an agy that is not signed
 # in, and a build older than the sign-in check opens a browser tab doing it.
 expect_file "$tmp/agy-bin.seen" "the fakes saw doctor run"
