@@ -8,9 +8,8 @@ use std::ffi::OsString;
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Which binary answers. `CONBUS_CODEX_BIN` overrides `PATH`, for tests and
@@ -93,15 +92,14 @@ pub fn says_retry_later(err: &io::Error) -> bool {
 }
 
 pub struct AppServer {
-    /// `None` once reaped, when its id can belong to someone else.
-    child: Arc<Mutex<Option<Child>>>,
-    stdin: ChildStdin,
+    child: Child,
     /// What the server wrote, read by a thread of its own: a read blocks for as long
     /// as anything holds the other end open, which need not be the server.
     lines: Receiver<io::Result<String>>,
+    /// What to write to it, written by a thread of its own for the same reason: a long
+    /// write blocks for as long as something holds the other end open and reads nothing.
+    to_server: Sender<String>,
     deadline: Instant,
-    /// Dropped with the server, which is what stops the watchdog.
-    _stop_watchdog: Sender<()>,
     next_id: u64,
 }
 
@@ -233,12 +231,14 @@ mod on_signal {
 
 /// Kill the server and whatever it started. An npm `codex` is a node script spawning
 /// the native binary with stdout inherited, so the process we started is not the one
-/// that wedges. Started in a group of its own, all of them go together.
-fn kill_group(child: &Child) {
+/// that wedges. Started in a group of its own, all of them go together. The server itself
+/// is killed by id as well, in case it moved out of that group: reaping it waits for it.
+fn kill_group(child: &mut Child) {
     let group = child.id() as libc::pid_t;
     // SAFETY: `killpg` takes no pointers. The caller holds the unreaped child, whose
     // id leads this group and so cannot have been reused.
     unsafe { libc::killpg(group, libc::SIGKILL) };
+    let _ = child.kill();
 }
 
 impl AppServer {
@@ -246,9 +246,9 @@ impl AppServer {
     ///
     /// `deadline` bounds the whole conversation, not one call: what stalls an
     /// app-server is the MCP servers it tries to start, not any question of
-    /// ours. At the deadline a watchdog kills the server's process group, and a read
-    /// gives up whatever is still holding its pipe open. Something that started a
-    /// session of its own leaves the group, so it can outlive this, but not hold it up.
+    /// ours. At the deadline a call gives up, whatever is still holding its pipes open,
+    /// and dropping the server kills its process group. Something that started a session
+    /// of its own leaves the group, so it can outlive this, but not hold it up.
     pub fn start(deadline: Duration) -> io::Result<Self> {
         Self::start_with(&codex_binary(), deadline)
     }
@@ -285,15 +285,16 @@ impl AppServer {
             .stdout
             .take()
             .ok_or_else(|| io::Error::other("no stdout"))?;
-        let child = Arc::new(Mutex::new(Some(child)));
-        let watched = Arc::clone(&child);
-        let (stop_watchdog, stopped) = mpsc::channel::<()>();
+        let (to_server, to_write) = mpsc::channel::<String>();
         std::thread::spawn(move || {
-            if stopped.recv_timeout(deadline) == Err(RecvTimeoutError::Timeout)
-                && let Ok(child) = watched.lock()
-                && let Some(child) = child.as_ref()
-            {
-                kill_group(child);
+            let mut stdin = stdin;
+            for line in to_write {
+                if writeln!(stdin, "{line}")
+                    .and_then(|()| stdin.flush())
+                    .is_err()
+                {
+                    break;
+                }
             }
         });
         // Bounded, so that a server talking to nobody waits as it would on the pipe.
@@ -307,10 +308,9 @@ impl AppServer {
         });
         let mut server = AppServer {
             child,
-            stdin,
             lines,
+            to_server,
             deadline: until,
-            _stop_watchdog: stop_watchdog,
             next_id: 0,
         };
         server.call(
@@ -326,8 +326,13 @@ impl AppServer {
 
     fn notify(&mut self, method: &str, params: serde_json::Value) -> io::Result<()> {
         let line = serde_json::json!({"jsonrpc": "2.0", "method": method, "params": params});
-        writeln!(self.stdin, "{line}")?;
-        self.stdin.flush()
+        self.write(line.to_string())
+    }
+
+    fn write(&self, line: String) -> io::Result<()> {
+        self.to_server
+            .send(line)
+            .map_err(|_| io::Error::other("codex app-server stopped reading"))
     }
 
     /// Ask one question and wait for its answer. Notifications and other
@@ -341,8 +346,7 @@ impl AppServer {
         let id = self.next_id;
         let line =
             serde_json::json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
-        writeln!(self.stdin, "{line}")?;
-        self.stdin.flush()?;
+        self.write(line.to_string())?;
         loop {
             let left = self.deadline.saturating_duration_since(Instant::now());
             let line = match self.lines.recv_timeout(left) {
@@ -375,13 +379,9 @@ impl AppServer {
 
 impl Drop for AppServer {
     fn drop(&mut self) {
-        if let Ok(mut child) = self.child.lock()
-            && let Some(mut child) = child.take()
-        {
-            kill_group(&child);
-            on_signal::forget(child.id() as libc::pid_t);
-            let _ = child.wait();
-        }
+        kill_group(&mut self.child);
+        on_signal::forget(self.child.id() as libc::pid_t);
+        let _ = self.child.wait();
     }
 }
 
@@ -438,13 +438,7 @@ mod tests {
         );
         let server =
             AppServer::start_with(fake.as_os_str(), Duration::from_secs(30)).expect("started");
-        let group = server
-            .child
-            .lock()
-            .expect("lock")
-            .as_ref()
-            .expect("alive")
-            .id() as libc::pid_t;
+        let group = server.child.id() as libc::pid_t;
         assert!(on_signal::watching(group));
 
         drop(server);
@@ -484,6 +478,73 @@ time.sleep(60)
             .expect("the write was still blocked long past its deadline");
 
         assert!(said.is_err(), "{said:?}");
+    }
+
+    #[test]
+    fn a_process_outside_the_group_holding_stdin_cannot_hold_a_long_write_past_the_deadline() {
+        // It holds the server's stdin open and reads nothing, and killing the group does
+        // not reach it, so the pipe stays open and full.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = r#"#!/usr/bin/env python3
+import json, os, sys, time
+if len(sys.argv) < 2: sys.exit(0)
+msg = json.loads(sys.stdin.readline())
+print(json.dumps({"jsonrpc":"2.0","id":msg.get("id"),"result":{}}), flush=True)
+if os.fork() == 0:
+    os.setsid()
+    time.sleep(25)
+    os._exit(0)
+time.sleep(60)
+"#;
+        let fake = dir.path().join("codex");
+        crate::test_support::write_executable(&fake, script);
+        let _ = Command::new(&fake)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        let mut server =
+            AppServer::start_with(fake.as_os_str(), Duration::from_secs(2)).expect("started");
+        let (answer, answered) = mpsc::channel();
+        std::thread::spawn(move || {
+            let big = "x".repeat(4 * 1024 * 1024);
+            let _ = answer.send(server.call("thread/inject_items", serde_json::json!(big)));
+        });
+
+        let said = answered.recv_timeout(Duration::from_secs(10));
+
+        assert!(said.is_ok(), "still blocked 8 s past its deadline");
+    }
+
+    #[test]
+    fn a_child_that_left_its_group_does_not_hang_the_drop() {
+        // The group kill does not reach it, and reaping it waits for it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = r#"#!/usr/bin/env python3
+import json, os, sys, time
+if len(sys.argv) < 2: sys.exit(0)
+os.setpgid(0, os.getpgid(os.getppid()))
+msg = json.loads(sys.stdin.readline())
+print(json.dumps({"jsonrpc":"2.0","id":msg.get("id"),"result":{}}), flush=True)
+time.sleep(25)
+"#;
+        let fake = dir.path().join("codex");
+        crate::test_support::write_executable(&fake, script);
+        let _ = Command::new(&fake)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        let server =
+            AppServer::start_with(fake.as_os_str(), Duration::from_secs(30)).expect("started");
+        let (done, dropped) = mpsc::channel();
+        std::thread::spawn(move || {
+            drop(server);
+            let _ = done.send(());
+        });
+
+        assert!(
+            dropped.recv_timeout(Duration::from_secs(8)).is_ok(),
+            "drop still waiting after 8 s"
+        );
     }
 
     #[test]
