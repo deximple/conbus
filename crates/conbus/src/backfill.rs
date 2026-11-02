@@ -249,7 +249,9 @@ fn ingest_chat_text(
 ) -> io::Result<Outcome> {
     let known = known_from(held.iter().chain(written.iter()));
     let mut outcome = Outcome::default();
-    for recovered in parse_claude_chat_export(text) {
+    let conversations = parse_claude_chat_export(text);
+    let of_conversation = held_by_conversation(held, &conversations);
+    for recovered in conversations {
         for (reason, count) in &recovered.skipped {
             *outcome.unread.entry(reason.clone()).or_default() += count;
         }
@@ -263,13 +265,15 @@ fn ingest_chat_text(
         let already = known.live.contains(&session) || known.backfilled.contains_key(&session);
         if already {
             let sid = session.to_string();
-            let mine: Vec<&Record> = held
-                .iter()
-                .chain(written.iter())
-                .filter(|record| {
+            let mine: Vec<&Record> = of_conversation
+                .get(&session)
+                .into_iter()
+                .flatten()
+                .copied()
+                .chain(written.iter().filter(|record| {
                     record.bus_id == session
                         || record.source.vendor_session_id.as_deref() == Some(sid.as_str())
-                })
+                }))
                 .collect();
             let Some(bus) = mine.last().map(|record| record.bus_id) else {
                 continue;
@@ -313,6 +317,38 @@ fn ingest_chat_text(
         }
     }
     Ok(outcome)
+}
+
+/// Each conversation's records, by its own id or by naming it, in the log's order. One
+/// pass, because a pass per conversation made a re-read of a 1,000-conversation export
+/// cost 14.4 s against a real log, at a start, with the socket closed.
+fn held_by_conversation<'a>(
+    held: &'a [Record],
+    conversations: &[Recovered],
+) -> HashMap<BusId, Vec<&'a Record>> {
+    let named: HashMap<&str, BusId> = conversations
+        .iter()
+        .filter_map(|recovered| {
+            let name = recovered.vendor_session_id.as_deref()?;
+            Some((name, name.parse().ok()?))
+        })
+        .collect();
+    let mut found: HashMap<BusId, Vec<&Record>> =
+        named.values().map(|bus| (*bus, Vec::new())).collect();
+    for record in held {
+        let by_name = record
+            .source
+            .vendor_session_id
+            .as_deref()
+            .and_then(|name| named.get(name).copied())
+            .filter(|bus| *bus != record.bus_id);
+        for bus in [Some(record.bus_id), by_name].into_iter().flatten() {
+            if let Some(records) = found.get_mut(&bus) {
+                records.push(record);
+            }
+        }
+    }
+    found
 }
 
 fn read_chat_export(path: &Path) -> io::Result<String> {
@@ -3530,6 +3566,58 @@ for line in sys.stdin:
             !read.knows(STALLED),
             "a stall note would leave it alone for an hour"
         );
+    }
+
+    /// One conversation's export, of two turns.
+    fn an_export_of(conversation: &str) -> String {
+        serde_json::json!([{"uuid": conversation, "chat_messages": [
+            {"uuid": "m1", "sender": "human", "text": "said in the chat", "created_at": "2026-09-06T12:00:00.000Z"},
+            {"uuid": "m2", "sender": "assistant", "text": "answered", "created_at": "2026-09-06T12:01:00.000Z"},
+            {"uuid": "m3", "sender": "human", "text": "said later", "created_at": "2026-09-06T12:02:00.000Z"},
+            {"uuid": "m4", "sender": "assistant", "text": "answered later", "created_at": "2026-09-06T12:03:00.000Z"}
+        ]}])
+        .to_string()
+    }
+
+    #[test]
+    fn an_export_finds_a_conversation_by_its_id_or_by_a_record_naming_it() {
+        let chat = "00000000-1111-2222-3333-444444444444";
+        let bus: BusId = chat.parse().expect("uuid");
+        for (session, under) in [(chat, BusId::mint()), ("another-session", bus)] {
+            let machine = machine();
+            let records = logged(
+                &machine,
+                vec![live_prompt(
+                    session,
+                    Harness::CLAUDE_CHAT,
+                    under,
+                    Some("m1"),
+                    "said in the chat",
+                )],
+            );
+            // Makes it known as a chat conversation, under either shape.
+            let mut with_a_stamp = records.clone();
+            let mut stamp = records[0].clone();
+            stamp.source.vendor_session_id = Some(chat.to_string());
+            stamp.bus_id = bus;
+            stamp.vendor_turn_id = None;
+            stamp.event = Event::SessionCandidate { trigger: None };
+            with_a_stamp.push(stamp);
+            let mut log =
+                SegmentLog::open(machine.paths.log_dir(), Retention::default()).expect("open");
+
+            let outcome = ingest_chat_text(
+                &with_a_stamp,
+                &mut Vec::new(),
+                &an_export_of(chat),
+                Some(&mut log),
+            )
+            .expect("ingest");
+
+            // `m1` is held, so only `m3` is missing, and the conversation is not new.
+            assert_eq!(outcome.gap_turns, 1, "its record is {session}, {under:?}");
+            assert_eq!(outcome.records, 0);
+        }
     }
 
     #[test]
