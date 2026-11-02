@@ -73,12 +73,20 @@ fn gh_saying(json: &str) -> (tempfile::TempDir, std::path::PathBuf) {
     (dir, path)
 }
 
+/// What gh 2.101 says of a token GitHub refuses: go-gh's error for an HTTP 401.
+const GH_REFUSED: &str =
+    r#""state":"error","error":"HTTP 401: Bad credentials (https://api.github.com/)""#;
+
 /// `gh` with one active account on github.com: signed in when `exit_code` is 0,
 /// and otherwise with a token GitHub refuses.
 fn fake_gh(exit_code: i32) -> (tempfile::TempDir, std::path::PathBuf) {
-    let state = if exit_code == 0 { "success" } else { "error" };
+    let state = if exit_code == 0 {
+        r#""state":"success""#
+    } else {
+        GH_REFUSED
+    };
     gh_saying(&format!(
-        r#"{{"hosts":{{"github.com":[{{"state":"{state}","active":true,"host":"github.com","login":"someone","tokenSource":"keyring","gitProtocol":"https"}}]}}}}"#
+        r#"{{"hosts":{{"github.com":[{{{state},"active":true,"host":"github.com","login":"someone","tokenSource":"keyring","gitProtocol":"https"}}]}}}}"#
     ))
 }
 

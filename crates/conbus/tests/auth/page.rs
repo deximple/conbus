@@ -481,7 +481,8 @@ fn an_api_key_login_is_not_called_signed_out() {
 }
 
 #[test]
-fn gh_that_could_not_reach_github_is_not_called_signed_out() {
+fn gh_that_prints_no_json_is_not_called_signed_out() {
+    // Plain words, as from a gh too old for `--json`: these never reach the JSON.
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("gh");
     support::write_executable(
@@ -491,6 +492,15 @@ fn gh_that_could_not_reach_github_is_not_called_signed_out() {
     warmed(&path);
     let html = page_with(&[("CONBUS_GH", path.as_path())]);
     assert!(!html.contains("not signed in"), "{html}");
+}
+
+#[test]
+fn gh_that_cannot_reach_github_is_not_called_signed_out() {
+    let html = page_with_gh_saying(
+        r#"{"hosts":{"github.com":[{"state":"error","error":"dial tcp: lookup api.github.com: no such host","active":true,"host":"github.com","login":"x","tokenSource":"keyring","gitProtocol":"https"}]}}"#,
+    );
+    assert!(!html.contains("not signed in"), "{html}");
+    assert_ne!(banner(&html), "warn", "{html}");
 }
 
 #[test]
@@ -527,9 +537,23 @@ fn page_with_gh_saying(json: &str) -> String {
     page_with(&[("CONBUS_CODEX_BIN", &codex), ("CONBUS_GH", &gh)])
 }
 
+/// One account. `error` is a token GitHub refused, as gh 2.101 says it.
 fn gh_account(state: &str, active: bool) -> String {
+    let state = if state == "error" {
+        GH_REFUSED.to_string()
+    } else {
+        format!(r#""state":"{state}""#)
+    };
     format!(
-        r#"{{"state":"{state}","active":{active},"host":"github.com","login":"someone","tokenSource":"keyring","token":"gho_NOT_FOR_PRINTING","gitProtocol":"https"}}"#
+        r#"{{{state},"active":{active},"host":"github.com","login":"someone","tokenSource":"keyring","token":"gho_NOT_FOR_PRINTING","gitProtocol":"https"}}"#
+    )
+}
+
+/// An active account whose check failed with `error`, or with no error at all.
+fn gh_failing(error: Option<&str>) -> String {
+    let error = error.map_or(String::new(), |error| format!(r#""error":"{error}","#));
+    format!(
+        r#"{{"state":"error",{error}"active":true,"host":"github.com","login":"someone","tokenSource":"keyring","gitProtocol":"https"}}"#
     )
 }
 
@@ -569,6 +593,40 @@ fn gh_is_read_account_by_account() {
         ),
         (gh_account("something new", true), "SKIP", "neutral"),
         (gh_account("success", false), "SKIP", "neutral"),
+        // Every failed check is `error` to gh. Only GitHub refusing the token is a
+        // sign-out; a lookup, a proxy or GitHub being down says nothing of it.
+        (
+            gh_failing(Some("HTTP 401 (https://api.github.com/)")),
+            "not signed in",
+            "warn",
+        ),
+        (
+            gh_failing(Some("dial tcp: lookup api.github.com: no such host")),
+            "SKIP",
+            "neutral",
+        ),
+        (
+            gh_failing(Some(
+                "HTTP 503: Service Unavailable (https://api.github.com/)",
+            )),
+            "SKIP",
+            "neutral",
+        ),
+        (
+            gh_failing(Some(
+                "HTTP 403: Must have admin rights (https://api.github.com/)",
+            )),
+            "SKIP",
+            "neutral",
+        ),
+        (
+            gh_failing(Some(
+                "proxyconnect tcp: dial tcp 127.0.0.1:4010: connect: connection refused",
+            )),
+            "SKIP",
+            "neutral",
+        ),
+        (gh_failing(None), "SKIP", "neutral"),
     ] {
         let html = page_with_gh_saying(&format!(r#"{{"hosts":{{"github.com":[{accounts}]}}}}"#));
         assert!(

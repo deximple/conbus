@@ -215,7 +215,8 @@ fn agy_row() -> Row {
 
 /// `gh auth status --json hosts`, five seconds. With `--json` it exits 0 whatever
 /// the accounts' state, and says for each whether it worked, so a timeout is not a
-/// sign-out and another account's bad token is not this one's.
+/// sign-out, a check that failed is not one unless GitHub refused the token, and
+/// another account's bad token is not this one's.
 fn gh_row() -> Row {
     let bin = std::env::var("CONBUS_GH").unwrap_or_else(|_| "gh".into());
     let mut command = std::process::Command::new(bin);
@@ -228,7 +229,9 @@ fn gh_row() -> Row {
 }
 
 /// The active account decides, on github.com if it has one there, because that is
-/// where a hop's lookup goes. Only `state` and `active` are read.
+/// where a hop's lookup goes. gh 2.101 says `error` for every check that failed,
+/// from a DNS lookup to GitHub being down, so only GitHub refusing the token is a
+/// sign-out. Only `state`, `error` and `active` are read.
 fn gh_answer(stdout: &[u8]) -> Answer {
     let unreadable = || Answer::Failed(GH_UNREADABLE.to_string());
     let parsed = serde_json::from_slice::<serde_json::Value>(stdout).ok();
@@ -245,22 +248,41 @@ fn gh_answer(stdout: &[u8]) -> Answer {
         Some(host) => vec![host],
         None => hosts.values().collect(),
     };
-    let active: Vec<&str> = accounts
+    let active: Vec<(&str, &str)> = accounts
         .iter()
         .filter_map(|host| host.as_array())
         .flatten()
         .filter(|account| account.get("active").and_then(|a| a.as_bool()) == Some(true))
-        .filter_map(|account| account.get("state")?.as_str())
+        .filter_map(|account| {
+            let state = account.get("state")?.as_str()?;
+            let error = account.get("error").and_then(|e| e.as_str()).unwrap_or("");
+            Some((state, error))
+        })
         .collect();
-    if active.contains(&"success") {
+    let has = |wanted: &str| active.iter().any(|(state, _)| *state == wanted);
+    let unchecked = active
+        .iter()
+        .find(|(state, error)| *state == "error" && !refused(error));
+    if has("success") {
         Answer::SignedIn
-    } else if active.contains(&"timeout") {
+    } else if has("timeout") {
         Answer::Failed("gh could not reach GitHub in time".to_string())
-    } else if active.contains(&"error") {
+    } else if let Some((_, error)) = unchecked {
+        Answer::Failed(match error.lines().next().unwrap_or("").trim() {
+            "" => "gh could not check its sign-in".to_string(),
+            why => format!("gh could not check its sign-in: {why}"),
+        })
+    } else if has("error") {
         Answer::SignedOut("not signed in")
     } else {
         unreadable()
     }
+}
+
+/// GitHub refused the token: go-gh writes an HTTP 401 as `HTTP 401: <message>
+/// (<url>)`, or `HTTP 401 (<url>)` with no message.
+fn refused(error: &str) -> bool {
+    error.starts_with("HTTP 401:") || error.starts_with("HTTP 401 (")
 }
 
 /// What of `text` may reach a terminal: printable characters, and `?` for the
