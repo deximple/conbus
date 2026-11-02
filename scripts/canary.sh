@@ -4,7 +4,7 @@
 #   scripts/canary.sh preflight [--evidence DIR]
 #   scripts/canary.sh status
 #   scripts/canary.sh verdict [--since <ts>] [--idle <harness|day>[,...]]
-#   scripts/canary.sh start --from <candidate-binary>
+#   scripts/canary.sh start --from <candidate-binary> [--parity <binary>]
 #   scripts/canary.sh restart
 #   scripts/canary.sh rollback
 #
@@ -105,6 +105,8 @@ install_dir=$HOME/.local/bin
 daemon_label=sh.conbus.daemon
 bin=$install_dir/conbus
 rollback_bin=$install_dir/conbus.rollback
+# usage-parity's baseline, kept apart from the rollback copy: a rollback uses that up.
+parity_bin=$install_dir/conbus.parity
 new_bin=$install_dir/conbus.new
 
 # Every check must describe the install and data root the managed daemon
@@ -458,6 +460,14 @@ wait_for_serving() {
         n=$((n + 1))
     done
     return 1
+}
+
+# A binary as a person checks it against a release: its version and the start of its
+# sha256.
+describe_build() { # describe_build <binary>
+    db_version=$("$1" --version 2>/dev/null || true)
+    db_sha=$({ shasum -a 256 "$1" 2>/dev/null || true; } | awk '{ print substr($1, 1, 12) }')
+    printf '%s (sha256 %s)' "${db_version:-does not run}" "${db_sha:-unreadable}"
 }
 
 # The build a binary says it is, empty when it does not run.
@@ -1894,13 +1904,24 @@ do_preflight() {
         check 0 drops-cap "drops.jsonl below the cap"
     fi
 
-    # The rollback copy: present already, or makeable from the install.
-    if [ -f "$rollback_bin" ]; then
-        check 0 rollback-copy "$rollback_bin"
-    elif [ -x "$bin" ]; then
-        check 0 rollback-copy "absent — will be made from $bin at start"
+    # Where a rollback goes: start copies the binary installed now to the rollback copy,
+    # replacing one left from an earlier window, so a failed swap returns to what ran
+    # before it. And what usage-parity compares against: what --parity names, or the
+    # build being replaced.
+    if [ -x "$bin" ]; then
+        rb_said="a rollback returns to $(describe_build "$bin"), the build installed now; start copies it to $rollback_bin"
+        if [ -f "$rollback_bin" ] && ! cmp -s "$bin" "$rollback_bin"; then
+            rb_said="$rb_said, replacing $(describe_build "$rollback_bin")"
+        fi
+        check 0 rollback-target "$rb_said"
     else
-        check 1 rollback-copy "no $rollback_bin and no $bin to copy"
+        check 1 rollback-target "no $bin to copy"
+    fi
+    parity_source=${parity_from:-$bin}
+    if [ -x "$parity_source" ] && [ -n "$("$parity_source" --version 2>/dev/null || true)" ]; then
+        check 0 parity-baseline "usage-parity compares against $(describe_build "$parity_source")${parity_from:+, named with --parity}"
+    else
+        check 1 parity-baseline "$parity_source does not run, so usage-parity would have nothing to compare against"
     fi
 
     # The launchd plist (or systemd unit on Linux), backed up beside
@@ -2003,6 +2024,7 @@ do_preflight() {
 sub=${1:-}
 [ $# -ge 1 ] && shift
 from=""
+parity_from=""
 evidence=""
 since=""
 idle=""
@@ -2022,6 +2044,11 @@ while [ $# -gt 0 ]; do
         --since)
             [ $# -ge 2 ] || refuse "--since wants a timestamp"
             since=$2
+            shift
+            ;;
+        --parity)
+            [ $# -ge 2 ] || refuse "--parity wants a binary"
+            parity_from=$2
             shift
             ;;
         --idle)
@@ -2064,9 +2091,12 @@ case $sub in
             say "installed: no conbus at $bin"
         fi
         if [ -f "$rollback_bin" ]; then
-            say "rollback: $("$rollback_bin" --version 2>&1 || echo 'present, does not run')"
+            say "rollback: $(describe_build "$rollback_bin")"
         else
             say "rollback: none ($rollback_bin absent)"
+        fi
+        if [ -f "$parity_bin" ]; then
+            say "parity: $(describe_build "$parity_bin")"
         fi
         if [ -f "$stamp" ]; then
             say "daemon stamp: $(cat "$stamp")"
@@ -2322,11 +2352,15 @@ case $sub in
             line UNCHECKED twins-repeated "$usage_problem"
         fi
 
-        # 6. usage-parity: every closed UTC day in the window, the rollback
-        #    binary's usage --json --day D against the candidate's, with
-        #    the documented tokens_* keys stripped.
-        if [ ! -x "$rollback_bin" ]; then
-            line FAIL usage-parity "no $rollback_bin — the 0.2.8 side of the parity is missing"
+        # 6. usage-parity: every closed UTC day in the window, the baseline's
+        #    usage --json --day D against the candidate's, with the documented
+        #    tokens_* keys stripped. The baseline is the copy start made of what
+        #    --parity named, or of the build it replaced. A window started before
+        #    that copy existed compares against the rollback copy, as it did.
+        parity_against=$parity_bin
+        [ -x "$parity_against" ] || parity_against=$rollback_bin
+        if [ ! -x "$parity_against" ]; then
+            line FAIL usage-parity "no $parity_bin and no $rollback_bin — nothing to compare the candidate's usage with"
         else
             strip='s/"tokens_[a-z_]*":[0-9]*,?//g; s/,\}/}/g; s/,]/]/g'
             parity_bad=""
@@ -2337,7 +2371,7 @@ case $sub in
             guard=0
             while [ "$d" \< "$today_utc" ] && [ "$guard" -lt 370 ]; do
                 old_rc=0 new_rc=0
-                old=$("$rollback_bin" usage --json --day "$d" 2>/dev/null) || old_rc=$?
+                old=$("$parity_against" usage --json --day "$d" 2>/dev/null) || old_rc=$?
                 new=$("$bin" usage --json --day "$d" 2>/dev/null) || new_rc=$?
                 if [ "$old_rc" -ne 0 ] || [ "$new_rc" -ne 0 ]; then
                     # A side that failed compared nothing, whichever way the
@@ -2368,7 +2402,7 @@ case $sub in
                     "no closed day produced rows on either side — nothing was compared"
             else
                 line PASS usage-parity \
-                    "$parity_seen closed day(s) with rows agree (tokens_* stripped)${parity_empty:+; empty on both sides, so not compared:$parity_empty}"
+                    "$parity_seen closed day(s) with rows agree with $(describe_build "$parity_against"), $(basename "$parity_against") (tokens_* stripped)${parity_empty:+; empty on both sides, so not compared:$parity_empty}"
             fi
         fi
 
@@ -2654,13 +2688,24 @@ case $sub in
         # is a timestamp cut across both generations, not a line offset.
         before_ts=$(now_iso_ms)
 
+        # usage-parity's baseline: what --parity names, or the build being replaced.
+        # Copied first, so --parity can name the rollback copy refreshed next.
+        cp -p "${parity_from:-$bin}" "$parity_bin.new"
+        mv -f "$parity_bin.new" "$parity_bin"
+        say "usage-parity compares against $(describe_build "$parity_bin")"
+        # Where a rollback goes: the build installed right now. A copy left from an
+        # earlier window would send a failed swap back to it, releases behind.
+        rb_replaced=""
+        if [ -f "$rollback_bin" ] && ! cmp -s "$bin" "$rollback_bin"; then
+            rb_replaced=$(describe_build "$rollback_bin")
+        fi
+        cp -p "$bin" "$rollback_bin.new"
+        mv -f "$rollback_bin.new" "$rollback_bin"
+        say "a rollback returns to $(describe_build "$rollback_bin")${rb_replaced:+; it replaced $rb_replaced}"
+
         # Stage the candidate beside the target first, then swap names.
         cp "$from" "$new_bin"
         chmod 755 "$new_bin"
-        if [ ! -f "$rollback_bin" ]; then
-            cp -p "$bin" "$rollback_bin"
-            say "kept the current binary at $rollback_bin"
-        fi
         mv -f "$new_bin" "$bin"
         say "swapped $bin: $old_version -> $cand_version ($mode)"
 

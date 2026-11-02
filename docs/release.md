@@ -142,6 +142,15 @@ the budgets it ran under: `CONBUS_CANARY_RSS_MB`, `CONBUS_CANARY_DOCTOR_MS`,
 one with where it came from, and the environment still wins. A window started by an
 older script has none of this recorded, and exits 4 on `drops` and `log-files`.
 
+Where a rollback goes: `start` copies the binary installed at that moment to
+`conbus.rollback`, replacing any copy left from an earlier window. A rollback, the
+automatic one after a failed `start` or `canary.sh rollback`, returns to that build, the
+one that ran before the swap. `usage-parity` compares against a separate copy,
+`conbus.parity`: the binary named with `--parity <binary>`, or by default the build
+being replaced. It is copied first, so `--parity ~/.local/bin/conbus.rollback` compares
+against an older copy before `start` replaces it. `preflight` and `start` print both
+builds by version and hash.
+
 `start` exits 1 when it rolled back, or when it found no candidate or install to swap.
 It exits 2 when it refused before anything moved.
 `start` and `rollback` exit 3 when the rollback could not be verified, and say which

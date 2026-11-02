@@ -57,6 +57,7 @@ reboot_listed() { # reboot_listed <seconds ago>: a line in `last reboot`, to the
 home=$tmp/home
 install_dir=$home/.local/bin
 rollback_bin=$install_dir/conbus.rollback
+parity_copy=$install_dir/conbus.parity
 mkdir -p "$install_dir" "$tmp/stage" "$home/.conbus" \
     "$home/Library/LaunchAgents" "$tmp/evidence"
 
@@ -724,7 +725,10 @@ expect "$mf_expect" "$code" "'Mon-Fri HH:MM-HH:MM Asia/Seoul' parses and applies
 # --- the healthy start -------------------------------------------------------
 
 # A good candidate: serving stamp appears, doctor agrees, hooks run, no
-# new drops — the swap stays.
+# new drops — the swap stays. Over the "0.2.8" again: the blackout scenarios above
+# left a swapped install, and start keeps whatever it replaces.
+write_fake 01d old "$install_dir/conbus"
+rm -f "$home/.conbus/canary.json"
 daemon_boot beef 4243
 code=0
 run start --from "$tmp/stage/conbus-good" >"$tmp/start.out" 2>&1 || code=$?
@@ -977,8 +981,7 @@ expect_grep "rollback verified" "$tmp/drop.out" "the old build came back and is 
 # (b) a post-swap failure whose rollback never comes back: the restored
 # binary cannot boot a daemon, so the stamp keeps the candidate's pid and
 # build. exit 3, not the ordinary 1.
-write_fake 01d silent "$rollback_bin"
-restore_candidate
+write_fake 01d silent "$install_dir/conbus"
 code=0
 SERVING_LIMIT=1 run start --from "$tmp/stage/conbus-dropper" >"$tmp/norb.out" 2>&1 || code=$?
 expect 3 "$code" "unverified rollback -> start exits 3"
@@ -1018,16 +1021,13 @@ expect_grep "rollback verified" "$tmp/stuck.out" "the old build came back and is
 
 # The same wedge on the rollback path: the rehearsal kick writes the old
 # build's stamp before the doctor hangs, so the stamp check passes and the
-# verifying call is the one that hits the cap -> ROLLBACK NOT VERIFIED.
-cat >"$home/.conbus/drops.jsonl" <<'EOF'
-{"ts":"2026-10-30T09:00:00.000Z","reason":"socket closed early"}
-EOF
+# verifying call is the one that hits the cap -> ROLLBACK NOT VERIFIED. Through
+# `rollback`: a copy whose doctor wedges would fail start's preflight first.
 write_fake 01d stuckboot "$rollback_bin"
 restore_candidate
-daemon_boot beef 4404
+write_stamp beef 4404
 code=0
-CONBUS_CANARY_DOCTOR_LIMIT=2 SERVING_LIMIT=2 run start \
-    --from "$tmp/stage/conbus-dropper" >"$tmp/stuckrb.out" 2>&1 || code=$?
+CONBUS_CANARY_DOCTOR_LIMIT=2 SERVING_LIMIT=2 run rollback >"$tmp/stuckrb.out" 2>&1 || code=$?
 expect 3 "$code" "a capped rollback-verify doctor -> exit 3"
 expect_grep "ROLLBACK NOT VERIFIED" "$tmp/stuckrb.out" "the cap-hit verification says NOT VERIFIED"
 rm -f "$rollback_bin"
@@ -1063,6 +1063,7 @@ verdict_fixture() { # verdict_fixture [swapped-iso] [restarts-json]
     rm -rf "$home/.conbus/spool"
     write_fake beef live "$install_dir/conbus"
     write_fake 01d notokens "$rollback_bin"
+    write_fake 01d notokens "$parity_copy"
     printf '%s conbus daemon: beef: socket /x/sock log /x/log (10 record(s), 0 unreadable)\n' \
         "$(iso_after "$fx_swapped" 4)" >"$home/.conbus/daemon.log"
     printf '{"build":"beef","pid":%s,"started":"%s","serving":"%s","core_dumps_disabled":true,"memory_locked":true}\n' \
@@ -1134,7 +1135,7 @@ expect_grep '^FAIL restarts' "$tmp/verdict-crash.out" "the crash is counted as u
 printf '%s\n' "$planned_log" >"$home/.conbus/daemon.log"
 
 # A parity mismatch fails.
-cat >"$rollback_bin" <<'EOF'
+cat >"$parity_copy" <<'EOF'
 #!/bin/sh
 case "$1" in
     --version) echo "conbus 0.0.0-01d (01d)" ;;
@@ -1142,12 +1143,12 @@ case "$1" in
     *) echo old ;;
 esac
 EOF
-chmod 755 "$rollback_bin"
+chmod 755 "$parity_copy"
 code=0
 run verdict >"$tmp/verdict-parity.out" 2>&1 || code=$?
 expect 1 "$code" "a usage parity mismatch fails"
 expect_grep '^FAIL usage-parity' "$tmp/verdict-parity.out" "the mismatch day is named FAIL"
-write_fake 01d notokens "$rollback_bin"
+write_fake 01d notokens "$parity_copy"
 
 # F1 verdict side: a swap-window reason is exempt only inside 60s after the
 # swap. swapped=now-30s + a refusal at +20s -> exempt (exit 3, window open);
@@ -2146,15 +2147,15 @@ run verdict >"$tmp/verdict-badswap.out" 2>&1 || code=$?
 expect 4 "$code" "a swap time that is not a time cannot end in a pass"
 expect_grep '^UNCHECKED window' "$tmp/verdict-badswap.out" "the bad swap time is named"
 
-# Parity has no 0.2.8 side at all when the rollback copy is gone — that is
-# a FAIL, not an agreement of empties.
+# Parity has no baseline at all when both copies are gone — that is a FAIL, not an
+# agreement of empties.
 verdict_fixture
-rm -f "$rollback_bin"
+rm -f "$rollback_bin" "$parity_copy"
 code=0
 run verdict >"$tmp/verdict-noroll.out" 2>&1 || code=$?
-expect 1 "$code" "a missing rollback binary fails the parity check"
+expect 1 "$code" "a missing parity baseline fails the parity check"
 expect_grep '^FAIL usage-parity' "$tmp/verdict-noroll.out" \
-    "the missing 0.2.8 side is named"
+    "the missing baseline is named"
 
 # A daemon.log without the "(N record(s), N unreadable)" parenthetical
 # falls back to the doctor's own log line for the unreadable count.
@@ -3003,16 +3004,51 @@ code=0; run verdict >"$tmp/verdict-repeated-three.out" 2>&1 || code=$?
 expect 1 "$code" "three a day above it is not"
 expect_grep '^FAIL twins-repeated.*median 6' "$tmp/verdict-repeated-three.out" "and the medians are shown"
 
-# The rollback copy is what was kept at the first swap, not always the build being replaced. Verify what was restored.
+# A rollback goes back to what ran before the swap. start refreshes the copy, so one left from an earlier window cannot
+# send a failed swap two releases back, as 0.2.8 would have after rc.3.
 write_fake 02b old "$install_dir/conbus"; write_fake 01d old "$rollback_bin"
-rm -f "$home/.conbus/canary.json"; daemon_boot beef 4262
-cat >"$home/.conbus/drops.jsonl" <<'EOF'
+rm -f "$home/.conbus/canary.json" "$parity_copy"; daemon_boot beef 4262
+cat >"$home/.conbus/drops.jsonl" <<'DROPS'
 {"ts":"2026-10-30T09:00:00.000Z","reason":"socket closed early"}
-EOF
-code=0; SERVING_LIMIT=2 run start --from "$tmp/stage/conbus-dropper" >"$tmp/rb-older.out" 2>&1 || code=$?
-expect 1 "$code" "a rollback to an older copy verifies against what it restored (P12)"
-expect_grep 'rollback verified: 01d' "$tmp/rb-older.out" "the build it names is the one restored"
-expect_no_grep 'ROLLBACK NOT VERIFIED' "$tmp/rb-older.out" "and it does not say otherwise"
+DROPS
+code=0; SERVING_LIMIT=2 run start --from "$tmp/stage/conbus-dropper" >"$tmp/rb-target.out" 2>&1 || code=$?
+expect 1 "$code" "a failed swap rolls back"
+expect_grep 'rollback verified: 02b' "$tmp/rb-target.out" "to the build that ran before it, not an older copy left there"
+expect_grep 'it replaced conbus 0.0.0-01d (01d)' "$tmp/rb-target.out" "and it says what it replaced"
+expect "conbus 0.0.0-02b (02b)" "$("$install_dir/conbus" --version)" "the build before the swap is installed again"
+# preflight and start name both builds, by version and hash.
+write_fake 02b old "$install_dir/conbus"; write_fake 01d old "$rollback_bin"; rm -f "$home/.conbus/canary.json"
+code=0; run preflight --from "$tmp/stage/conbus-good" >"$tmp/preflight-targets.out" 2>&1 || code=$?
+expect_grep '^PASS rollback-target a rollback returns to conbus 0.0.0-02b (02b) (sha256 [0-9a-f]\{12\})' "$tmp/preflight-targets.out" "preflight names the rollback target by version and hash"
+expect_grep 'replacing conbus 0.0.0-01d (01d) (sha256 [0-9a-f]\{12\})' "$tmp/preflight-targets.out" "and the older copy start will replace"
+expect_grep '^PASS parity-baseline usage-parity compares against conbus 0.0.0-02b (02b) (sha256 [0-9a-f]\{12\})' "$tmp/preflight-targets.out" "and the parity baseline"
+# --parity names another baseline. It is copied before the rollback copy is refreshed, so it can name that copy.
+daemon_boot beef 4271
+code=0; run start --from "$tmp/stage/conbus-good" --parity "$rollback_bin" >"$tmp/start-parity.out" 2>&1 || code=$?
+expect 0 "$code" "start with --parity naming the old rollback copy"
+expect "conbus 0.0.0-01d (01d)" "$("$parity_copy" --version)" "parity compares against the build it named"
+expect "conbus 0.0.0-02b (02b)" "$("$rollback_bin" --version)" "while a rollback returns to the build it replaced"
+expect_grep 'usage-parity compares against conbus 0.0.0-01d (01d) (sha256 [0-9a-f]\{12\})' "$tmp/start-parity.out" "start names the parity baseline"
+expect_grep 'a rollback returns to conbus 0.0.0-02b (02b) (sha256 [0-9a-f]\{12\})' "$tmp/start-parity.out" "and the rollback target"
+# A --parity that does not run is refused before anything moves.
+write_fake 02b old "$install_dir/conbus"; rm -f "$home/.conbus/canary.json"
+code=0; run start --from "$tmp/stage/conbus-good" --parity /nonexistent/conbus >"$tmp/start-parity-bad.out" 2>&1 || code=$?
+expect 2 "$code" "a --parity that does not run refuses"
+expect_grep '^FAIL parity-baseline' "$tmp/start-parity-bad.out" "and says why"
+expect "conbus 0.0.0-02b (02b)" "$("$install_dir/conbus" --version)" "nothing moved"
+# The verdict compares against conbus.parity, and a window started before it existed against the rollback copy, as it did.
+verdict_fixture
+code=0; run verdict >"$tmp/verdict-parity-copy.out" 2>&1 || code=$?
+expect 0 "$code" "parity against the copy start made"
+expect_grep '^PASS usage-parity.*agree with conbus 0.0.0-01d (01d) (sha256 [0-9a-f]\{12\}), conbus.parity' "$tmp/verdict-parity-copy.out" "and it names that baseline"
+rm -f "$parity_copy"
+code=0; run verdict >"$tmp/verdict-parity-old.out" 2>&1 || code=$?
+expect 0 "$code" "a window from before the parity copy compares against the rollback copy"
+expect_grep '^PASS usage-parity.*conbus.rollback' "$tmp/verdict-parity-old.out" "and says so"
+rm -f "$rollback_bin"
+code=0; run verdict >"$tmp/verdict-parity-none.out" 2>&1 || code=$?
+expect 1 "$code" "with neither, parity fails"
+expect_grep '^FAIL usage-parity.*nothing to compare' "$tmp/verdict-parity-none.out" "and says why"
 # The restored daemon's first stamp comes before its socket.
 write_fake beef live "$install_dir/conbus"; write_fake 01d coldboot "$rollback_bin"
 write_stamp beef 4401; rm -f "$home/.cold"
@@ -3043,8 +3079,8 @@ code=0; SERVING_LIMIT=1 run_real rollback >"$tmp/rb-noinstall.out" 2>&1 || code=
 expect 3 "$code" "a restored build whose install --apply fails is not verified"
 expect_grep "ROLLBACK NOT VERIFIED.*'conbus install --apply' failed" "$tmp/rb-noinstall.out" "and it is the install it blames"
 expect_no_grep 'no 01d stamp' "$tmp/rb-noinstall.out" "not a stamp that was never going to come"
-# So does the automatic one.
-write_fake 02b old "$install_dir/conbus"; write_fake 01d noinstall "$rollback_bin"
+# So does the automatic one. start copies the installed build, so that is where the failing install goes.
+write_fake 01d noinstall "$install_dir/conbus"
 rm -f "$home/.install-called" "$home/.conbus/canary.json"
 cat >"$home/.conbus/drops.jsonl" <<'EOF'
 {"ts":"2026-10-30T09:00:00.000Z","reason":"socket closed early"}
