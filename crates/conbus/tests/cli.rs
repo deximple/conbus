@@ -98,3 +98,17 @@ fn the_hook_exits_zero_even_on_a_flag_it_does_not_know() {
     let (code, _, _) = run(&["hook", "--bogus-flag"]);
     assert_eq!(code, 0, "conbus hook always exits 0");
 }
+
+#[test]
+fn the_binary_carries_the_stamp_the_release_script_looks_for() {
+    // scripts/sign-release.sh and scripts/package.sh read this from a binary they
+    // cannot run, and 1.0.0 alone is also inside 1.0.0-rc.3.
+    let binary = std::fs::read(env!("CARGO_BIN_EXE_conbus")).expect("read the binary");
+    let stamp = format!("conbus-version {};", env!("CARGO_PKG_VERSION"));
+    assert!(
+        binary
+            .windows(stamp.len())
+            .any(|window| window == stamp.as_bytes()),
+        "no {stamp} in the binary"
+    );
+}
