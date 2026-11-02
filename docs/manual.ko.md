@@ -703,6 +703,7 @@ Mac:
   set -e
   disk="/Volumes/My Disk"
   conbus backup --verify --to "$disk"
+  find "$disk/conbus-backup/log" -name 'segment-*.jsonl' | grep . >/dev/null
   launchctl bootout "gui/$(id -u)/sh.conbus.daemon" || true
   report="$(conbus doctor || true)"
   printf '%s\n' "$report" | grep '^socket'
@@ -727,6 +728,7 @@ Linux:
   set -e
   disk="/Volumes/My Disk"
   conbus backup --verify --to "$disk"
+  find "$disk/conbus-backup/log" -name 'segment-*.jsonl' | grep . >/dev/null
   systemctl --user disable --now sh.conbus.daemon.service || true
   report="$(conbus doctor || true)"
   printf '%s\n' "$report" | grep '^socket'
@@ -748,6 +750,9 @@ Linux:
 
 - **`--verify`가 먼저입니다.** 레코더가 아직 도는 동안 확인하므로, 디스크가 뽑혀 있거나
   이름이 틀리면 아무것도 바꾸지 않은 채 멈춥니다.
+- **첫 번째 `find`는 백업에 세그먼트가 하나도 없으면 블록을 멈춥니다.** 이때도 아무것도
+  바뀌지 않습니다. 아무것도 닫히기 전에 만든 백업은 `--verify`를 통과하면서 복원할 것이
+  없다고 말하는데, 그런 백업 때문에 레코더를 멈춰서는 안 됩니다.
 - **레코더는 멈춰야 합니다.** 로그가 지워진 뒤에도 레코더가 돌고 있으면 새 로그를 시작합니다.
   복원은 로그에 이미 있는 세그먼트를 그대로 두므로, 진짜 파일 대신 그 새 파일이 남습니다.
   레코더가 멈추면 `conbus doctor`가 `socket … not answering`이라고
@@ -755,7 +760,7 @@ Linux:
   `systemctl`이 도는 것이 없다고 불평하는 것은 괜찮습니다.
 - **로그 폴더는 `conbus doctor`에서 가져옵니다.** 그래서 `CONBUS_HOME`이나
   `XDG_STATE_HOME` 아래의 루트도 conbus가 읽는 곳으로 복원됩니다.
-- **`find`는 빈 세그먼트를 지웁니다.** 빈 세그먼트에는 레코드가 없습니다. 옛 `conbus
+- **두 번째 `find`는 빈 세그먼트를 지웁니다.** 빈 세그먼트에는 레코드가 없습니다. 옛 `conbus
   doctor`는 빈 로그 폴더에 빈 세그먼트를 하나 만들고, 복원은 진짜 파일 대신 그것을 그대로
   둡니다.
 - **`cache/meta`를 지웁니다.** 복원은 파일의 시각을 그대로 둘 수 있는데, 이 캐시는 세그먼트를
@@ -766,6 +771,9 @@ Linux:
 블록이 멈추면 레코더는 켤 때까지 멈춰 있습니다. 복원 없이 켜려면 `conbus install --apply`를
 실행하세요.
 
+- **`--verify`가 복원할 것이 없다고 할 때.** 그 백업을 할 때 닫힌 세그먼트가 없어서 레코드가
+  하나도 없습니다. 블록은 거기서 멈춥니다. 레코더가 돌고 있지 않으면 `conbus install --apply`로
+  켜세요.
 - **`--verify`가 실패했을 때.** 아무것도 바뀌지 않았습니다. 잘못된 파일을 하나하나 이름으로
   알려 줍니다. 로그에 그 세그먼트가 아직 있으면 백업에서 그 사본을 지우고 `conbus backup`을
   실행하세요. 다시 복사합니다. 로그에서도 사라졌다면 그 사본이 전부입니다. 망가진 줄은 읽을 수

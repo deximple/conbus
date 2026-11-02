@@ -754,6 +754,7 @@ On a Mac:
   set -e
   disk="/Volumes/My Disk"
   conbus backup --verify --to "$disk"
+  find "$disk/conbus-backup/log" -name 'segment-*.jsonl' | grep . >/dev/null
   launchctl bootout "gui/$(id -u)/sh.conbus.daemon" || true
   report="$(conbus doctor || true)"
   printf '%s\n' "$report" | grep '^socket'
@@ -778,6 +779,7 @@ On Linux:
   set -e
   disk="/Volumes/My Disk"
   conbus backup --verify --to "$disk"
+  find "$disk/conbus-backup/log" -name 'segment-*.jsonl' | grep . >/dev/null
   systemctl --user disable --now sh.conbus.daemon.service || true
   report="$(conbus doctor || true)"
   printf '%s\n' "$report" | grep '^socket'
@@ -799,6 +801,9 @@ What each part is for:
 
 - **`--verify` comes first,** while the recorder is still running, so a disk that is
   unplugged or misnamed stops the block with nothing changed.
+- **The first `find` stops the block if the backup holds no segment,** again with
+  nothing changed. A backup made before anything had closed passes `--verify`, which
+  says there is nothing to restore, and the recorder must not be stopped for it.
 - **The recorder has to stop.** A recorder left running after its log is deleted
   starts a new log, and a restore keeps any segment the log already has, so it would
   keep that new file over the real one. `conbus doctor` says
@@ -807,9 +812,9 @@ What each part is for:
   was running is fine.
 - **The log's folder comes from `conbus doctor`,** so a root under `CONBUS_HOME` or
   `XDG_STATE_HOME` is restored where conbus reads it.
-- **The `find` removes empty segments,** which hold no records. An older `conbus
-  doctor` makes one in an empty log folder, and the restore would keep it in place of
-  the real one.
+- **The second `find` removes empty segments,** which hold no records. An older
+  `conbus doctor` makes one in an empty log folder, and the restore would keep it in
+  place of the real one.
 - **`cache/meta` goes** because a restore can keep a file's time, and that cache trusts
   a segment by its name, length and time. It is rebuilt on the next read.
 - **The last `conbus backup` is the check that the restore worked.** It refuses if a
@@ -819,6 +824,9 @@ What each part is for:
 If the block stops, the recorder stays stopped until you start it, and
 `conbus install --apply` does that without restoring anything.
 
+- **`--verify` says there is nothing to restore.** No segment had closed when that
+  backup ran, so it holds no records. The block stops there. If the recorder is not
+  running, `conbus install --apply` starts it.
 - **`--verify` failed.** Nothing has changed. It names each bad file. While the log
   still has that segment, delete the copy from the backup and run `conbus backup`,
   which copies it again. If the log has lost it too, that copy is all there is. A

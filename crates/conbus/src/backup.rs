@@ -637,6 +637,9 @@ fn verify(to: &Path) -> io::Result<()> {
         gib(bytes),
         layout.dir.display()
     );
+    if rows.is_empty() {
+        println!("backup    nothing to restore: no segment had closed when this backup ran");
+    }
     Ok(())
 }
 

@@ -418,6 +418,15 @@ impl Restored {
             .iter()
             .any(|call| call.starts_with("conbus install"))
     }
+
+    /// Neither stopped nor started: a service manager would not have noticed.
+    fn left_the_recorder_alone(&self) -> bool {
+        !self.started_the_recorder()
+            && !self
+                .calls
+                .iter()
+                .any(|call| call.starts_with("launchctl") || call.starts_with("systemctl"))
+    }
 }
 
 /// A shell set up the way a person's would be for a restore on this `world`.
@@ -462,6 +471,43 @@ fn restore(world: &World, folder: &Path) {
     let restored = try_restore(world, folder);
     ok(&restored.out);
     assert!(restored.started_the_recorder(), "{:?}", restored.calls);
+}
+
+/// The manual's way to save what is left of a damaged backup.
+fn block_without_verify() -> String {
+    restore_block(MANUAL, "launchctl")
+        .lines()
+        .filter(|line| !line.contains("--verify"))
+        .map(|line| format!("{line}\n"))
+        .collect()
+}
+
+/// A block pasted into an interactive zsh, as a Mac's Terminal has one: comments
+/// are off, and a glob that matches nothing is an error. `None` with no zsh here.
+fn paste_into_zsh(world: &World, folder: &Path, block: &str) -> Option<Output> {
+    use std::io::Write;
+    let Some(zsh) = ["/bin/zsh", "/usr/bin/zsh"]
+        .into_iter()
+        .find(|path| Path::new(path).exists())
+    else {
+        eprintln!("no zsh here: skipped; a Mac always has one");
+        return None;
+    };
+    let script = block.replace(EXAMPLE_DISK, folder.to_str().expect("utf-8"));
+    let mut child = restore_shell(world, zsh)
+        .args(["-f", "-i"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("zsh");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(format!("{script}exit\n").as_bytes())
+        .expect("paste");
+    Some(child.wait_with_output().expect("wait"))
 }
 
 // ---- What it copies ----
@@ -1117,6 +1163,25 @@ fn verify_passes_a_good_backup_and_changes_nothing() {
     assert!(said.contains("verified"), "{said}");
     assert_eq!(fingerprint(&folder), held);
     assert_eq!(fs::read(world.root.join("backup.json")).expect("r"), record);
+}
+
+#[test]
+fn verify_of_a_backup_holding_nothing_says_there_is_nothing_to_restore() {
+    let world = World::empty();
+    world.write_turns(1, 1024 * 1024);
+    let folder = world.base.join("dest");
+    ok(&world.backup(&folder));
+
+    let said = ok(&world.verify(&folder));
+
+    assert!(said.contains("verified 0 segment(s)"), "{said}");
+    assert!(said.contains("nothing to restore"), "{said}");
+
+    let world = World::with_log();
+    let folder = world.base.join("dest");
+    ok(&world.backup(&folder));
+    let said = ok(&world.verify(&folder));
+    assert!(!said.contains("nothing to restore"), "{said}");
 }
 
 #[test]
@@ -2597,14 +2662,6 @@ fn no_line_of_a_restore_block_would_trip_an_interactive_shell() {
 
 #[test]
 fn the_restore_runs_in_an_interactive_zsh() {
-    let Some(zsh) = ["/bin/zsh", "/usr/bin/zsh"]
-        .into_iter()
-        .find(|path| Path::new(path).exists())
-    else {
-        eprintln!("no zsh here: skipped; a Mac always has one");
-        return;
-    };
-    use std::io::Write;
     let world = World::with_log();
     roll_with_nothing_written(&world);
     let before = world.reads();
@@ -2612,23 +2669,10 @@ fn the_restore_runs_in_an_interactive_zsh() {
     ok(&world.backup(&folder));
     fs::remove_dir_all(world.log()).expect("delete the log");
 
-    let script = restore_block(MANUAL_KO, "launchctl")
-        .replace(EXAMPLE_DISK, folder.to_str().expect("utf-8"));
-    let mut shell = restore_shell(&world, zsh);
-    let mut child = shell
-        .args(["-f", "-i"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("zsh");
-    child
-        .stdin
-        .take()
-        .expect("stdin")
-        .write_all(format!("{script}exit\n").as_bytes())
-        .expect("paste");
-    let out = child.wait_with_output().expect("wait");
+    let block = restore_block(MANUAL_KO, "launchctl");
+    let Some(out) = paste_into_zsh(&world, &folder, &block) else {
+        return;
+    };
 
     let calls = calls_so_far(&world);
     // SAFETY: getuid has no failure mode and touches no memory.
@@ -2772,6 +2816,93 @@ fn an_unplugged_disk_stops_the_restore_before_the_recorder_starts() {
 }
 
 #[test]
+fn a_backup_with_nothing_closed_does_not_leave_the_recorder_stopped() {
+    // There is nothing to restore, so the block stops before the recorder. Going on
+    // to its last line would not do: `install --apply` stops a recorder to start it.
+    for tool in ["launchctl", "systemctl"] {
+        let world = World::empty();
+        world.write_turns(1, 1024 * 1024);
+        let folder = world.base.join("dest");
+        ok(&world.backup(&folder));
+        fs::remove_dir_all(world.log()).expect("lost");
+
+        let restored = run_block(&world, &folder, &restore_block(MANUAL, tool), &[]);
+
+        assert!(!restored.out.status.success(), "{}", stdout(&restored.out));
+        assert!(
+            restored.left_the_recorder_alone(),
+            "{:?} {}",
+            restored.calls,
+            stderr(&restored.out)
+        );
+        assert!(
+            stdout(&restored.out).contains("nothing to restore"),
+            "the person has to see why it stopped: {}",
+            stdout(&restored.out)
+        );
+        assert!(!world.log().exists(), "nothing was made");
+    }
+}
+
+#[test]
+fn a_backup_with_nothing_closed_stops_cleanly_in_an_interactive_zsh() {
+    // A glob that matches nothing is an error there, so the block has to be gone
+    // before it reaches one, with the recorder as it found it.
+    for tool in ["launchctl", "systemctl"] {
+        let world = World::empty();
+        world.write_turns(1, 1024 * 1024);
+        let folder = world.base.join("my disk");
+        ok(&world.backup(&folder));
+        fs::remove_dir_all(world.log()).expect("lost");
+
+        let block = restore_block(MANUAL_KO, tool);
+        let Some(out) = paste_into_zsh(&world, &folder, &block) else {
+            return;
+        };
+
+        let said = stderr(&out);
+        let restored = Restored {
+            out,
+            calls: calls_so_far(&world),
+        };
+        assert!(
+            restored.left_the_recorder_alone(),
+            "{:?}\n{said}",
+            restored.calls
+        );
+        assert!(!said.contains("no matches found"), "{said}");
+        assert!(
+            stdout(&restored.out).contains("nothing to restore"),
+            "{}",
+            stdout(&restored.out)
+        );
+    }
+}
+
+#[test]
+fn a_backup_with_no_copy_left_stops_the_block_without_its_verify_line_too() {
+    // That line is left out on purpose to save what is left of a damaged backup.
+    // With nothing left at all, the recorder must still not be stopped for it.
+    let world = World::with_log();
+    let folder = world.base.join("dest");
+    ok(&world.backup(&folder));
+    for name in segment_names(&backup_log(&folder)) {
+        fs::remove_file(backup_log(&folder).join(name)).expect("rm");
+    }
+    fs::remove_dir_all(world.log()).expect("lost");
+
+    let restored = run_block(&world, &folder, &block_without_verify(), &[]);
+
+    assert!(!restored.out.status.success(), "{}", stdout(&restored.out));
+    assert!(
+        restored.left_the_recorder_alone(),
+        "{:?} {}",
+        restored.calls,
+        stderr(&restored.out)
+    );
+}
+
+#[test]
 fn a_damaged_backup_stops_the_restore_before_it_copies_anything() {
     let world = World::with_log();
     let (closed, _) = split_open(&world);
@@ -2807,13 +2938,8 @@ fn a_damaged_copy_can_still_be_restored_the_way_the_manual_says() {
     bytes[0] = b'z';
     fs::write(&copy, &bytes).expect("damage one line");
     fs::remove_dir_all(world.log()).expect("delete the log");
-    let block: String = restore_block(MANUAL, "launchctl")
-        .lines()
-        .filter(|line| !line.contains("--verify"))
-        .map(|line| format!("{line}\n"))
-        .collect();
 
-    let restored = run_block(&world, &folder, &block, &[]);
+    let restored = run_block(&world, &folder, &block_without_verify(), &[]);
 
     ok(&restored.out);
     assert!(restored.started_the_recorder());
