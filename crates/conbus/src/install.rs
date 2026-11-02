@@ -34,10 +34,44 @@ pub use opencode::{
 /// `install --managed` prints, so a managed copy and a per-user copy can only
 /// differ in the binary they name.
 pub fn hook_command(binary: &Path, harness: &str) -> String {
+    let program = shell_word(&binary.display().to_string());
     if harness == crate::cli::DEFAULT_HARNESS {
-        format!("{} hook", binary.display())
+        format!("{program} hook")
     } else {
-        format!("{} hook --harness {harness}", binary.display())
+        format!("{program} hook --harness {harness}")
+    }
+}
+
+/// `text` as one word to a shell, which is what every vendor hands a hook to. A
+/// path that needs nothing stays as it is, so a registration already on disk still
+/// matches and no vendor's settings get rewritten for nothing.
+fn shell_word(text: &str) -> String {
+    let plain = |c: char| !c.is_ascii() || c.is_ascii_alphanumeric() || "/._-+=@%:,".contains(c);
+    if text.chars().all(plain) {
+        text.to_string()
+    } else {
+        format!("'{}'", text.replace('\'', r"'\''"))
+    }
+}
+
+/// The program a registered command runs, and what follows its `hook`. Reads what
+/// [`shell_word`] writes, and an older unquoted registration too.
+fn split_hook_command(command: &str) -> Option<(String, &str)> {
+    let Some(mut rest) = command.trim_start().strip_prefix('\'') else {
+        let (program, arguments) = command.split_once(" hook")?;
+        return Some((program.trim().to_string(), arguments));
+    };
+    let mut program = String::new();
+    loop {
+        let (part, after) = rest.split_once('\'')?;
+        program.push_str(part);
+        match after.strip_prefix(r"\''") {
+            Some(more) => {
+                program.push('\'');
+                rest = more;
+            }
+            None => return Some((program, after.strip_prefix(" hook")?)),
+        }
     }
 }
 
@@ -164,11 +198,9 @@ pub fn merge(existing: &Value, events: &[&str], command: &str) -> (Value, Vec<Ch
 /// left pointing at an old checkout's build is still ours to report in
 /// `doctor` and still ours to take out in `uninstall`.
 pub fn is_conbus_hook(command: &str) -> bool {
-    command
-        .split_once(" hook")
-        .map(|(program, _)| program.trim())
-        .and_then(|program| Path::new(program).file_name())
-        .is_some_and(|name| name == "conbus")
+    split_hook_command(command)
+        .and_then(|(program, _)| Path::new(&program).file_name().map(|n| n == "conbus"))
+        .unwrap_or(false)
 }
 
 /// Whether a registration block already runs this command.
@@ -373,12 +405,12 @@ pub fn grok_registers(home: &Path, event: &str) -> bool {
 /// Whether a registered command runs a recorder binary that exists, with
 /// `--harness <harness>`.
 fn runs_as(command: &str, harness: &str) -> bool {
-    let Some((program, arguments)) = command.split_once(" hook") else {
+    let Some((program, arguments)) = split_hook_command(command) else {
         return false;
     };
     let mut words = arguments.split_whitespace();
     is_conbus_hook(command)
-        && Path::new(program.trim()).is_file()
+        && Path::new(&program).is_file()
         && words.any(|word| word == "--harness")
         && words.next() == Some(harness)
 }
@@ -1121,6 +1153,65 @@ mod tests {
         assert_eq!(text.matches("beforeSubmitPrompt").count(), 1);
         assert_eq!(text.matches("\"stop\"").count(), 1);
         assert!(text.contains("/opt/conbus hook --harness cursor"));
+    }
+
+    /// A stand-in `conbus` in a folder named `folder`, that prints its arguments.
+    fn a_conbus_under(folder: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let parent = dir.path().join(folder);
+        fs::create_dir(&parent).expect("mkdir");
+        let binary = parent.join("conbus");
+        crate::test_support::write_executable(&binary, "#!/bin/sh\necho \"$@\"\n");
+        (dir, binary)
+    }
+
+    #[test]
+    fn a_binary_under_a_folder_with_a_space_or_a_quote_runs_as_one_word() {
+        // Every vendor hands the command to a shell. Unquoted, a home folder with
+        // a space in it registered hooks that could never run, so nothing was
+        // recorded, and nothing said so.
+        for folder in ["first last", "it's mine", "a\"b", "$HOME", "back\\slash"] {
+            let (_dir, binary) = a_conbus_under(folder);
+            let command = hook_command(&binary, "codex");
+            let out = std::process::Command::new("/bin/sh")
+                .args(["-c", &command])
+                .output()
+                .expect("sh");
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout).trim(),
+                "hook --harness codex",
+                "{command}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(is_conbus_hook(&command), "{command}");
+            assert!(runs_as(&command, "codex"), "{command}");
+            assert!(!runs_as(&command, "grok"), "{command}");
+        }
+    }
+
+    #[test]
+    fn an_ordinary_path_stays_as_it_always_was() {
+        // Already registered this way on every machine, and a change would rewrite
+        // every vendor's settings for nothing.
+        for path in [
+            "/opt/conbus",
+            "/Users/x/.local/bin/conbus",
+            "/홈/유저/conbus",
+        ] {
+            let command = hook_command(Path::new(path), "codex");
+            assert_eq!(command, format!("{path} hook --harness codex"));
+        }
+    }
+
+    #[test]
+    fn a_registration_left_unquoted_is_still_ours_to_replace() {
+        assert!(is_conbus_hook("/opt/first last/.local/bin/conbus hook"));
+        assert!(is_conbus_hook(
+            "'/opt/first last/.local/bin/conbus' hook --harness codex"
+        ));
+        assert!(!is_conbus_hook(
+            "'/opt/first last/.local/bin/other' hook --harness codex"
+        ));
     }
 
     #[test]
