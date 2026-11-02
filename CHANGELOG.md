@@ -6,6 +6,33 @@ the entry says so when it does.
 
 ## [Unreleased]
 
+### Added
+
+- `conbus backup --to FOLDER` (experimental) copies closed log segments that are
+  not yet there into `FOLDER/conbus-backup/log/`, with a manifest of each one's
+  name, size and SHA-256, and says how many records are newer than the backup.
+  Each copy is read back before it gets its real name. On the same APFS volume
+  it is a clone, which costs almost no space, and it says so.
+  `conbus backup --verify --to FOLDER` rechecks the whole backup and names any
+  file that differs or is missing. It runs only when a person or their own
+  scheduler runs it: nothing in conbus does, because a hidden copy would outlive
+  someone deleting `~/.conbus` to remove their prompts.
+- `backup` refuses a folder inside the data root or holding it, a cloud-synced
+  folder (also through a symlink), `~/Desktop` and `~/Documents`, a folder whose
+  parent is missing, a folder under where this system mounts disks with no disk
+  mounted, one that held a backup and holds none now, a volume without room, and a
+  log that does not match what the folder holds. There is no override. Prompts and
+  replies are plain text at the destination, and the key that opens sealed tool
+  bodies is not copied. The first run to a folder says so, and manual section 11
+  has that and the restore, which is a documented block to paste rather than a
+  command.
+- `conbus doctor` has a `backup` line, read from `<root>/backup.json` alone: when
+  the last good run was, where to and how many segments, whether that is the
+  log's own disk or a network share, or `none: this log has one copy`.
+- `conbus uninstall` prints every folder a backup went to, from a list in
+  `backup.json` that gets each folder before the first copy lands there, because
+  those copies are plain text and nothing else says where they are.
+
 ## [1.0.0-rc.3] — 2026-11-01
 
 ### Fixed

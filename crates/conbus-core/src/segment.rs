@@ -346,6 +346,54 @@ mod tests {
     use crate::ids::BusId;
 
     #[test]
+    fn a_segment_name_is_only_ever_a_bare_file_name() {
+        assert!(SegmentLog::is_segment_name("segment-00000042.jsonl"));
+        for name in [
+            "../segment-00000042.jsonl",
+            "log/segment-00000042.jsonl",
+            "/segment-00000042.jsonl",
+            ".segment-00000042.jsonl.1.tmp",
+            "segment-abc.jsonl",
+            "segment-00000042.json",
+            "",
+        ] {
+            assert!(!SegmentLog::is_segment_name(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn counting_records_skips_what_is_already_held_and_a_torn_line() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut log = SegmentLog::open(dir.path(), Retention::default()).expect("open");
+        let bus_id = BusId::mint();
+        for text in ["one", "two", "three"] {
+            log.append(entry(bus_id, prompt(text))).expect("append");
+        }
+        drop(log);
+        let segment = dir.path().join("segment-00000000.jsonl");
+        let body = std::fs::read(&segment).expect("read");
+        let first_line = body.iter().position(|b| *b == b'\n').expect("a line") as u64 + 1;
+        let mut torn = OpenOptions::new()
+            .append(true)
+            .open(&segment)
+            .expect("open segment");
+        torn.write_all(br#"{"v":3,"seq":3,"ts":"2026-"#)
+            .expect("tear");
+        drop(torn);
+
+        assert_eq!(SegmentLog::count_records(&segment, 0).expect("count"), 3);
+        assert_eq!(
+            SegmentLog::count_records(&segment, first_line).expect("count"),
+            2
+        );
+        assert_eq!(
+            SegmentLog::count_records(&segment, 1 << 40).expect("count"),
+            0,
+            "past the end there is nothing newer"
+        );
+    }
+
+    #[test]
     fn a_new_log_is_readable_by_its_owner_only() {
         // The log holds prompts and replies. On macOS a home directory is
         // 0755, so a log written with the default umask was readable by every
@@ -1065,6 +1113,39 @@ pub struct CacheReport {
 }
 
 impl SegmentLog {
+    /// Every segment in `dir`, in append order. The last is the open one, the
+    /// only one a writer appends to; the rest are closed and never change.
+    pub fn segments(dir: impl AsRef<Path>) -> io::Result<Vec<PathBuf>> {
+        segment_paths(dir.as_ref())
+    }
+
+    /// Whether `name`, on its own, is what a segment file is called. For names
+    /// that come from outside the log directory, so `../segment-00000000.jsonl`
+    /// is not one.
+    pub fn is_segment_name(name: &str) -> bool {
+        let path = Path::new(name);
+        path.file_name().and_then(|file| file.to_str()) == Some(name)
+            && segment_index(path).is_some()
+    }
+
+    /// How many records `segment` holds past its first `skip` bytes. A line
+    /// with a sequence number is a record, as it is to `last_sequence`, whether
+    /// or not this build can read its event; a torn line is not.
+    pub fn count_records(segment: &Path, skip: u64) -> io::Result<u64> {
+        let mut file = File::open(segment)?;
+        file.seek(SeekFrom::Start(skip))?;
+        let mut reader = BufReader::new(file);
+        let mut records = 0;
+        let mut line = Vec::new();
+        while reader.read_until(b'\n', &mut line)? > 0 {
+            if serde_json::from_slice::<SequenceOnly>(&line).is_ok() {
+                records += 1;
+            }
+            line.clear();
+        }
+        Ok(records)
+    }
+
     /// The records a reader that never prints tool bodies sees — closed
     /// segments served from their sidecars, the newest parsed live, every
     /// record through `meta`. `cache = None`, or `CONBUS_NO_CACHE=1`, parses

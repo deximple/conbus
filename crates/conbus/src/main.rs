@@ -6,6 +6,7 @@ mod note;
 mod appserver;
 mod arena;
 mod backfill;
+mod backup;
 mod build_info;
 mod cli;
 mod code;
@@ -180,6 +181,7 @@ fn main() -> ExitCode {
                 backfill::run(paths, apply)
             }
         }),
+        Command::Backup { to, verify } => run(|paths| backup::run(paths, &to, verify)),
         Command::Doctor => run(report::doctor),
         Command::Status => run(report::status),
         Command::Quota => run(quota::run),

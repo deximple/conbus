@@ -22,7 +22,8 @@ below, and the participant sends it themselves.
 ## What it keeps, and where
 
 Everything is under one root: `$CONBUS_HOME`, else `$XDG_STATE_HOME/conbus`,
-else `~/.conbus`.
+else `~/.conbus`. The one exception is a backup the person makes
+([below](#a-backup-the-person-makes)).
 
 | Path | Holds | Mode |
 | --- | --- | --- |
@@ -31,6 +32,7 @@ else `~/.conbus`.
 | `conbus.sock` | the recorder's socket | `0600` |
 | `facts.jsonl`, `links.jsonl`, `takeover.json`, `quota/`, `drops.jsonl`, `daemon.log`, `chat-export/` | derived state, and the recorder's own messages | inside the `0700` root |
 | `policy.json` | the person's own `PreToolUse` rules, if they wrote any — off otherwise | inside the `0700` root |
+| `backup.json` | every folder a `conbus backup` has gone to, and the last good run: its folder, the time, segment and byte counts, and how that folder stands to the log; no log text | `0600`, inside the `0700` root |
 | `cache/meta/` | a derived read cache: the log's records with tool bodies replaced by SHA-256 digests (prompts and replies as in the log); deleting it loses nothing | directories `0700`, files `0600` |
 | `spool/` | hook requests waiting for a recorder that is restarting: retention applied before writing (tool bodies elided unless `full`), at most 1 MiB each and 16 MiB in all, deleted once ingested, never written where no recorder ever ran | directory `0700`, files `0600` |
 
@@ -99,6 +101,46 @@ Anything that leaves goes through a program the person already runs:
   resolves to is routable, so the organisation's HTTPS terminator — where
   authentication belongs — has to run on the same machine.
 
+## A backup the person makes
+
+`conbus backup --to FOLDER` is experimental and off until someone types it or
+puts it in their own scheduler. Nothing in conbus starts it: no recorder, hook
+or `install` path reaches it, because a hidden copy would outlive a person
+deleting `~/.conbus` to remove their prompts. It starts no process and opens no
+connection.
+
+- **What it writes.** Closed log segments and a manifest of their names, sizes
+  and SHA-256 digests, under `FOLDER/conbus-backup/` (directories `0700`, files
+  `0600`), and `backup.json` in the root. Only `log/`: not `policy.json`, the
+  facts, or anything else in the root.
+- **Prompts and replies are plain text at the destination,** and so are tool bodies
+  if the log was written under `CONBUS_RETENTION=full`. Modes do not protect an
+  external disk: macOS mounts those with ownership ignored, and exFAT has no modes.
+  Whoever holds an unencrypted disk can read the log. conbus does not know whether the
+  destination is encrypted.
+- **Sealed tool bodies stay sealed.** Under `encrypted_tools` they are sealed with
+  the Keychain key `log-kek`, which a backup does not copy, so on another machine
+  they stay unreadable.
+- **What it refuses, with no override.** A folder inside the root or holding it.
+  A folder under `~/Library/Mobile Documents`, `~/Library/CloudStorage`,
+  `~/Dropbox`, `~/Dropbox (…)`, `~/Google Drive` or `~/OneDrive*`, whether spelled
+  that way or reached through a symlink, and whether or not it exists yet. `~/Desktop`
+  and `~/Documents`, by name and without looking at them, because iCloud can sync them
+  and conbus cannot see that setting. A folder whose parent is missing, a folder under
+  `/Volumes` (or `/mnt`, `/media`, `/media/$USER` and `/run/media/$USER` on Linux) with
+  no disk mounted, or one that held a backup at its last run and holds none now, so an
+  unplugged disk fails rather than creating a look-alike folder on another disk.
+- **What that refusal cannot see.** It knows those names and nothing else, so another
+  sync tool is not refused, and choosing one sends plain text wherever that goes.
+  Encrypted cloud backup is not offered. A network share is not refused either: on a
+  Mac the run and `doctor` say the copy leaves this machine, and on Linux conbus cannot
+  tell.
+- **Same disk.** On the log's own volume, or another volume in its APFS container, the
+  run and `doctor` say it protects against deletion, not a failed disk. A separate
+  partition of the same physical disk is not flagged.
+- **Deleting the root does not delete a backup.** See
+  [Removing it](#removing-it).
+
 ## What it runs
 
 | Program | When |
@@ -112,6 +154,9 @@ Anything that leaves goes through a program the person already runs:
 | `/usr/bin/unzip` | reading a Claude.ai export dropped in `chat-export/` |
 
 ## What it changes outside its root
+
+`conbus backup --to FOLDER` writes under `FOLDER/conbus-backup/`, only when run,
+and creates `FOLDER` itself when its parent exists.
 
 `install --apply` works on these files:
 
@@ -213,11 +258,14 @@ Run `conbus uninstall --apply`, then `rm -rf ~/.conbus`. With
 key; its tool bodies were elided). On a managed Mac,
 remove the managed entries first and the system-wide binary last;
 [the fleet guide](fleet.md#7-taking-it-back-out) gives the order.
-`uninstall` touches neither.
+`uninstall` touches neither. A backup is not in the root, so neither command
+removes it. `conbus uninstall` prints every folder a backup went to, on record
+before the first copy landed there, and `rm -rf FOLDER/conbus-backup` removes each
+copy. Do that before removing the root, which takes that list with it.
 
 ## Known gaps
 
-- conbus does not encrypt prompts and replies at rest.
+- conbus does not encrypt prompts and replies at rest, in the log or in a backup.
 - Any process running as the person can write records to the socket. Such a
   process can read the log already.
 - `conbus usage --otlp` does not authenticate the collector: whatever listens

@@ -172,6 +172,12 @@ impl Paths {
         self.root.join("links.jsonl")
     }
 
+    /// The last good `conbus backup`: where it went, when, how much. `doctor`
+    /// answers from this alone and never touches the destination.
+    pub fn backup_record(&self) -> PathBuf {
+        self.root.join("backup.json")
+    }
+
     /// Last StatusLine `rate_limits` the vendor fed us, per harness.
     ///
     /// Derived, rebuildable, not a conversation record. Claude fills this
@@ -291,6 +297,7 @@ mod tests {
         assert_eq!(paths.facts(), Path::new("/tmp/bus/facts.jsonl"));
         assert_eq!(paths.policy(), Path::new("/tmp/bus/policy.json"));
         assert_eq!(paths.links(), Path::new("/tmp/bus/links.jsonl"));
+        assert_eq!(paths.backup_record(), Path::new("/tmp/bus/backup.json"));
         assert_eq!(
             paths.quota_cache("claude_code"),
             Path::new("/tmp/bus/quota/claude_code.json")

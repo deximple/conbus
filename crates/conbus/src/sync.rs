@@ -892,7 +892,7 @@ fn digest(body: &[u8]) -> String {
     hex(&Sha256::digest(body))
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     const ALPHA: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
