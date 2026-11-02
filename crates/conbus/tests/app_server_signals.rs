@@ -257,18 +257,26 @@ fn serving(case: &Case) -> Child {
         .env("CONBUS_CODEX_BIN", "/nonexistent/codex")
         .spawn()
         .expect("daemon");
-    let stamp = case.home.join("daemon.build");
-    let end = Instant::now() + Duration::from_secs(60);
-    while Instant::now() < end {
-        let text = std::fs::read_to_string(&stamp).unwrap_or_default();
-        if text.contains("serving") && text.contains(&format!("\"pid\":{}", daemon.id())) {
-            return daemon;
-        }
-        std::thread::sleep(Duration::from_millis(20));
+    if serves_within_a_minute(case, daemon.id()) {
+        return daemon;
     }
     let _ = daemon.kill();
     let _ = daemon.wait();
     panic!("the daemon never served");
+}
+
+/// Whether the daemon `pid` stamped itself serving.
+fn serves_within_a_minute(case: &Case, pid: u32) -> bool {
+    let stamp = case.home.join("daemon.build");
+    let end = Instant::now() + Duration::from_secs(60);
+    while Instant::now() < end {
+        let text = std::fs::read_to_string(&stamp).unwrap_or_default();
+        if text.contains("serving") && text.contains(&format!("\"pid\":{pid}")) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    false
 }
 
 /// A live Codex thread with a rollout, so a start's Codex pass brings the server up.
@@ -344,6 +352,132 @@ fn sigterm_to_a_starting_daemons_group_kills_a_wedged_server() {
 
     let _ = wait_for_exit(&mut daemon.0);
     assert_nothing_left(&pids);
+}
+
+#[test]
+fn a_repair_that_gives_up_takes_its_wedged_server_with_it() {
+    // The watchdog ends a `--prepare` child with `exit`, which runs no `Drop`, and the
+    // server is in a group of its own, so a server wedged at that moment stayed.
+    let case = a_case();
+    a_live_thread(&case);
+    let mut command = Command::new(bin());
+    command.arg("daemon").process_group(0);
+    env_for(&mut command, &case);
+    let mut daemon = DaemonGroup(
+        command
+            .env("CONBUS_TEST_PREPARE_LIMIT_MS", "8000")
+            // The server's own limit, which would otherwise end it first.
+            .env("CONBUS_GAP_BUDGET_MS", "120000")
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("daemon"),
+    );
+    let stderr = daemon.0.stderr.take().expect("stderr is piped");
+    let pids = wait_for_the_server(&case);
+
+    let served = serves_within_a_minute(&case, daemon.0.id());
+
+    drop(daemon);
+    let said = std::io::read_to_string(stderr).expect("stderr");
+    assert!(served, "the daemon never served:\n{said}");
+    assert!(
+        said.contains("gave up"),
+        "the watchdog did not fire:\n{said}"
+    );
+    assert_nothing_left(&pids);
+}
+
+fn parent_of(pid: i32) -> i32 {
+    let out = Command::new("/bin/ps")
+        .args(["-o", "ppid=", "-p", &pid.to_string()])
+        .output()
+        .expect("ps");
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse()
+        .expect("a parent")
+}
+
+fn chmod(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("chmod");
+}
+
+/// The prompts with this text the log holds.
+fn prompts_in_the_log(case: &Case, text: &str) -> usize {
+    std::fs::read_dir(case.home.join("log"))
+        .expect("log")
+        .filter_map(Result::ok)
+        .map(|entry| {
+            std::fs::read_to_string(entry.path())
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .filter(|record| record["prompt"]["text"] == text)
+                .count()
+        })
+        .sum()
+}
+
+#[test]
+fn a_hangup_after_a_repair_that_fell_back_lands_what_the_daemon_holds() {
+    // A `--prepare` child that fails has its repair run again in the daemon itself. A
+    // server that repair starts leaves its signal handler there for the daemon's life,
+    // and the daemon took back only SIGTERM and SIGINT, so a hangup ended it where it
+    // landed: what only memory held went, with no word of it.
+    let case = a_case();
+    a_live_thread(&case);
+    let segment = case.home.join("log/segment-00000000.jsonl");
+    std::fs::write(case.home.join("spool"), "").expect("nowhere for a copy");
+    chmod(&segment, 0o400);
+    let mut command = Command::new(bin());
+    command.arg("daemon").process_group(0);
+    env_for(&mut command, &case);
+    let mut daemon = DaemonGroup(command.stderr(Stdio::piped()).spawn().expect("daemon"));
+    let stderr = daemon.0.stderr.take().expect("stderr is piped");
+
+    // The first repair runs in a child, wedged on its server. It goes as a crash would,
+    // and the server is told to answer the repair that runs next.
+    let first = wait_for_the_server(&case);
+    let child = parent_of(first[0]);
+    std::fs::write(case.stub.join("answers"), "").expect("flag");
+    send(child as u32, libc::SIGTERM);
+    assert!(
+        serves_within_a_minute(&case, daemon.0.id()),
+        "the daemon never served"
+    );
+    let servers = pids_in(&case.stub).len() / 2;
+    for n in 0..5 {
+        a_record(
+            &case,
+            "claude_code",
+            &serde_json::json!({"session_id": "ea1d23e9-bb83-4df5-9a73-a6a12e138d85",
+                "hook_event_name": "UserPromptSubmit", "prompt": "only in memory",
+                "prompt_id": format!("h{n}"), "cwd": "/repo"}),
+        );
+    }
+    chmod(&segment, 0o600);
+
+    send(daemon.0.id(), libc::SIGHUP);
+
+    let status = wait_for_exit(&mut daemon.0);
+    let said = std::io::read_to_string(stderr).expect("stderr");
+    assert_ne!(
+        child,
+        daemon.0.id() as i32,
+        "the first repair ran in a child"
+    );
+    assert!(said.contains("running it in the daemon itself"), "{said}");
+    assert_eq!(
+        servers, 2,
+        "the repair in the daemon started its own server"
+    );
+    assert_eq!(
+        prompts_in_the_log(&case, "only in memory"),
+        5,
+        "every hook was answered, and the log would have taken them:\n{said}"
+    );
+    assert_eq!(status.signal(), Some(libc::SIGHUP), "{status:?}");
 }
 
 #[test]

@@ -710,10 +710,15 @@ fn a_long_spooled_entry_on_a_nearly_full_disk_is_no_outage_per_hook() {
 }
 
 /// Ask it to go, as launchd and systemd do, and say what it died of.
-fn ask_to_go(mut daemon: Daemon) -> Option<i32> {
+fn ask_to_go(daemon: Daemon) -> Option<i32> {
+    ask_to_go_with(daemon, libc::SIGTERM)
+}
+
+/// As [`ask_to_go`], with the signal named.
+fn ask_to_go_with(mut daemon: Daemon, signal: libc::c_int) -> Option<i32> {
     use std::os::unix::process::ExitStatusExt;
     // SAFETY: a plain kill(2) on a child this test still holds, so the pid is its.
-    unsafe { libc::kill(daemon.0.id() as libc::pid_t, libc::SIGTERM) };
+    unsafe { libc::kill(daemon.0.id() as libc::pid_t, signal) };
     daemon.0.wait().expect("wait").signal()
 }
 
@@ -755,6 +760,69 @@ fn a_sigterm_lands_what_the_log_would_take_before_it_goes() {
         "{}",
         drops(home.path())
     );
+}
+
+#[test]
+fn a_hangup_lands_what_the_log_would_take_before_it_goes() {
+    // A closed terminal, or a person's `kill -HUP`. It used to end the daemon where it
+    // landed, with what only memory held gone and no word of it.
+    let home = tempfile::tempdir().expect("tempdir");
+    let (daemon, segment) = only_in_memory(home.path(), 5);
+    chmod(&segment, 0o600);
+
+    let died_of = ask_to_go_with(daemon, libc::SIGHUP);
+
+    assert_eq!(
+        only_in_memory_lines(home.path()),
+        5,
+        "every hook was answered, and the log would have taken them"
+    );
+    assert_eq!(died_of, Some(libc::SIGHUP), "it still dies of the signal");
+    assert!(
+        !drops(home.path()).contains("could not land"),
+        "{}",
+        drops(home.path())
+    );
+}
+
+/// A daemon started as `nohup conbus daemon` starts it: with hangups ignored.
+fn start_ignoring_hangups(home: &Path) -> Daemon {
+    let child = Command::new("/bin/sh")
+        .args(["-c", "trap '' HUP; exec \"$0\" daemon", bin()])
+        .env("CONBUS_HOME", home)
+        .env("HOME", home)
+        .env("CONBUS_SKIP_LAUNCHCTL", "1")
+        .env("CONBUS_CODEX_BIN", "/nonexistent/codex")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("daemon with hangups ignored");
+    let daemon = Daemon(child);
+    let socket = home.join("conbus.sock");
+    until("it serves", || {
+        std::os::unix::net::UnixStream::connect(&socket).is_ok()
+    });
+    daemon
+}
+
+#[test]
+fn a_daemon_told_to_ignore_hangups_still_ignores_them() {
+    // `nohup conbus daemon` outlives its terminal, as it always did.
+    let home = tempfile::tempdir().expect("tempdir");
+    let mut daemon = start_ignoring_hangups(home.path());
+    // Answered from its loop, so the daemon has set up its signals by now.
+    prompt(home.path(), "p0", "before the hangup");
+
+    // SAFETY: a plain kill(2) on a child this test still holds.
+    unsafe { libc::kill(daemon.0.id() as libc::pid_t, libc::SIGHUP) };
+    std::thread::sleep(Duration::from_millis(500));
+    let alive = daemon.0.try_wait().expect("try_wait").is_none();
+    prompt(home.path(), "p1", "after the hangup");
+    stop(daemon);
+
+    assert!(alive, "it died of a hangup it was told to ignore");
+    assert_eq!(turns(home.path(), "p1"), 1, "it went on recording");
 }
 
 #[test]

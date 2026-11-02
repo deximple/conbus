@@ -216,14 +216,23 @@ outputs are not written** — only their size. See section 11 to change that.
 **Reading it back:**
 
 ```bash
-conbus log --tail 20                  # the last 20 records
-conbus log --bus-id 01a0c7f2          # one conversation, every leg it touched (a prefix is enough)
-conbus log --since 2026-09-20            # a date or any prefix of a timestamp
-conbus log --grep "migration"         # records whose text contains this
-conbus log --json                     # one JSON record per line, for scripts
-conbus log --reveal --bus-id 01a0c7f2 # decrypt sealed tool bodies (section 11)
-conbus log index                    # build the derived read cache under ~/.conbus/cache
+conbus log --tail 20
+conbus log --bus-id 01a0c7f2
+conbus log --since 2026-09-20
+conbus log --grep "migration"
+conbus log --json
+conbus log --reveal --bus-id 01a0c7f2
+conbus log index
 ```
+
+- `--tail 20` prints the last 20 records.
+- `--bus-id 01a0c7f2` prints one conversation, every leg it touched. A prefix of the
+  id is enough.
+- `--since` takes a date or any prefix of a timestamp.
+- `--grep "migration"` keeps the records whose text contains it.
+- `--json` prints one JSON record per line, for scripts.
+- `--reveal` decrypts sealed tool bodies (section 11).
+- `conbus log index` builds the derived read cache under `~/.conbus/cache`.
 
 Reads that never print a tool body run against a derived cache of digested
 records under `~/.conbus/cache/meta/`; it is rebuilt automatically on the first
@@ -327,9 +336,12 @@ what is under it and, for a repository, its worktrees wherever they are; and
 never a body.
 
 ```bash
-conbus progress --workspace .     # this checkout, the last 7 days
-conbus progress --days 30 --json  # every folder, a month
+conbus progress --workspace .
+conbus progress --days 30 --json
 ```
+
+The first shows this checkout over the last 7 days, and the second every folder over a
+month, as JSON.
 
 **Into your own monitoring:** `--otlp URL` sends those same rows, as
 OpenTelemetry metrics, to a collector on this Mac — the OpenTelemetry
@@ -338,10 +350,11 @@ Collector, Grafana Alloy and the Datadog Agent all listen on
 Grafana, Datadog, CloudWatch. Each count is a metric (`conbus.turns`,
 `conbus.stops` by `kind`, `conbus.tool.failures` and the rest, listed in
 [RFD 0002](rfd/0002-metadata-sync.md#the-pipe-the-same-rows-into-a-collector-the-person-runs)),
-labelled with the agent and attendance. Nothing is sent without the flag.
+labelled with the agent and attendance. Nothing is sent without the flag. This prints a
+closed day's rows and sends them:
 
 ```bash
-conbus usage --day 2026-09-22 --shareable --otlp http://127.0.0.1:4318   # print a closed day's rows, and send them
+conbus usage --day 2026-09-22 --shareable --otlp http://127.0.0.1:4318
 ```
 
 `--day` is the unit to send: yesterday, once, after it has closed. Each point
@@ -430,11 +443,16 @@ decided and how long it took.
 ### Hopping on purpose
 
 ```bash
-conbus hop                # preview: where would the current conversation go?
-conbus hop cursor         # preview a hop to Cursor
-conbus go cursor          # do it
-conbus hop --from 01a0c7f2 --to codex --apply   # a specific conversation
+conbus hop
+conbus hop cursor
+conbus go cursor
+conbus hop --from 01a0c7f2 --to codex --apply
 ```
+
+- `conbus hop` previews where the current conversation would go.
+- `conbus hop cursor` previews a hop to Cursor.
+- `conbus go cursor` does it.
+- `--from` with `--apply` hops a specific conversation.
 
 "The current conversation" is the one with the most recent turn on this Mac.
 Pass `--from` with a bus id (or its first characters) to choose another.
@@ -525,24 +543,34 @@ The recorder sees only what happened after it was installed. Earlier history
 can be recovered from the agents' own records:
 
 ```bash
-conbus backfill            # report what would be recovered
-conbus backfill --apply    # write it
+conbus backfill
+conbus backfill --apply
 ```
 
-This reads Claude Code's transcripts (`~/.claude/projects`) and Codex's threads
-(through Codex's own app-server), and files each session as a conversation
-marked as recovered. A session the recorder already saw live is not duplicated.
+The first reports what would be recovered, and the second writes it. This reads Claude
+Code's transcripts (`~/.claude/projects`) and Codex's threads (through Codex's own
+app-server), and files each session as a conversation marked as recovered. A session the
+recorder already saw live is not duplicated.
 
 `--apply` refuses while the recorder or its start-up repair holds the log, and holds
 it itself until done, because both would write to
-the same file. Stop it, backfill, start it again:
+the same file. Stop it, backfill, start it again. On macOS:
 
 ```bash
-launchctl bootout gui/$(id -u)/sh.conbus.daemon            # macOS
-systemctl --user disable --now sh.conbus.daemon.service   # Linux
+launchctl bootout gui/$(id -u)/sh.conbus.daemon
 conbus backfill --apply
-conbus install --apply     # starts the recorder again
+conbus install --apply
 ```
+
+On Linux:
+
+```bash
+systemctl --user disable --now sh.conbus.daemon.service
+conbus backfill --apply
+conbus install --apply
+```
+
+The last line starts the recorder again.
 
 **Missed turns** of live sessions — from times the recorder was down — are
 filled in automatically when it starts, from Claude Code's transcripts, Codex's
@@ -580,11 +608,11 @@ A fill takes a line stamped over a minute before its transcript was created for 
 from another conversation, as a fork's opening lines are, and leaves it out. A transcript
 moved by `cp`, `rsync -a` or across volumes has a new creation time, so almost every line
 in it reads that way and nothing in it is filled. `conbus backfill --gaps` says how many
-lines it set aside. To fill them anyway add `--include-older-lines`. Use it when you know
-a transcript was moved, and look at a dry run first: those lines may really be another
-conversation's copies. On a fork they are its parent's prompts, and you would see them
-come up as the fork's own turns. A record written to the log stays there. A turn id
-another conversation holds is still left out.
+lines it set aside. To fill them anyway add `--include-older-lines` (experimental). Use
+it when you know a transcript was moved, and look at a dry run first: those lines may
+really be another conversation's copies. On a fork they are its parent's prompts, and you
+would see them come up as the fork's own turns. A record written to the log stays there.
+A turn id another conversation holds is still left out.
 
 **Claude.ai conversations** have no hooks in the desktop app. Export your data
 from Claude.ai (Settings → Privacy → Export data) and drop the zip (or
@@ -662,18 +690,25 @@ its full size noted.
 
 The recorder runs under launchd on a Mac and systemd on Linux, so "where the
 recorder runs" is its plist or its unit. `conbus install --apply` keeps what
-you put there:
+you put there. On macOS, add it to the plist:
 
 ```bash
-# macOS
 /usr/libexec/PlistBuddy -c 'Add :EnvironmentVariables dict' \
   -c 'Add :EnvironmentVariables:CONBUS_RETENTION string encrypted_tools' \
   ~/Library/LaunchAgents/sh.conbus.daemon.plist
+```
 
-# Linux
-systemctl --user edit sh.conbus.daemon.service   # add Environment=CONBUS_RETENTION=…
+On Linux, this opens an override for the unit, where you add
+`Environment=CONBUS_RETENTION=…`:
 
-conbus install --apply   # reloads the recorder with it
+```bash
+systemctl --user edit sh.conbus.daemon.service
+```
+
+Then reload the recorder with it:
+
+```bash
+conbus install --apply
 ```
 
 The level applies from then on; what was written before stays as it was.
@@ -982,9 +1017,11 @@ seconds the recorder takes to start.
 ## 13. Uninstalling
 
 ```bash
-conbus uninstall          # what would be removed
-conbus uninstall --apply  # remove it
+conbus uninstall
+conbus uninstall --apply
 ```
+
+The first says what would be removed, and the second removes it.
 
 - Every hook entry that runs conbus comes out of every agent's settings, and
   nothing else does — your own hooks stay, including any in the same block.
@@ -1085,9 +1122,24 @@ extension's page into the client's `PLAYWRIGHT_MCP_EXTENSION_TOKEN`;
 vendors it does not ask `not checked`, so it does not say that those need no sign-in.
 A hop needs Codex and gh. Only agy's own quota line needs agy, so sign in there only
 if you use it. It also lists what conbus runs with nobody at the keyboard; recording
-needs no sign-in. `conbus auth --html` writes the same as one offline page, whose
-banner says which vendors it asked and which it did not, and `--html --open` opens
-that page. `--url` takes neither of those flags.
+needs no sign-in. `conbus auth --html` writes the same as one offline page, and
+`--html --open` opens that page. `--url` takes neither of those flags. The page's
+banner speaks only for what conbus needs, and only from the vendors that answered:
+
+- **Yellow**, `conbus needs a sign-in that is missing: …` — a vendor conbus needs said
+  it is signed out. Sign in to that one.
+- **Grey**, `conbus could not tell for: …` — conbus asked, and the vendor gave no
+  answer it could read: a `gh` that could not reach GitHub, say, or an `agy` that
+  failed. In the text output the same row reads `SKIP` and `its sign-in could not be
+  told`. That is not a sign-out, so do not sign in because of it; run the vendor
+  yourself to see why it did not answer. A vendor conbus does not need is named here
+  only when none of the vendors it asked answered.
+- **Grey**, `conbus asked nothing` — no vendor it can ask is installed.
+- **Green**, `of what conbus asked, nothing it needs is signed out` — anything else.
+
+Under the banner one line sorts the vendors into `asked`, `could not tell`, `not
+installed` and `not asked`. A vendor conbus does not need, such as `agy`, can be under
+`could not tell` while the banner is green.
 
 **A hop did not happen when a limit hit** — check `conbus status`: the rules
 line, the destination's quota, and whether the session was a program
@@ -1146,18 +1198,24 @@ is the directory `$HOME/.claude-NAME`, and `CLAUDE_CONFIG_DIR` tells `claude`
 which one it is. conbus supports exactly that — your own accounts, logged in
 through the vendor's own flow, switched only when you say so.
 
-```bash
-# 1. Create the profile and log in — the vendor's own flow, not ours:
-CLAUDE_CONFIG_DIR=$HOME/.claude-work claude
-/login
+1. Create the profile and log in, through the vendor's own flow, not ours. This
+   starts Claude Code on the profile's folder; type `/login` in it:
 
-# 2. Register the same hooks and StatusLine wrap into the profile's
-#    settings.json:
-conbus install --apply --profile work
+   ```bash
+   CLAUDE_CONFIG_DIR=$HOME/.claude-work claude
+   ```
 
-# 3. Run the profile:
-conbus run claude_code --profile work
-```
+2. Register the same hooks and StatusLine wrap into the profile's `settings.json`:
+
+   ```bash
+   conbus install --apply --profile work
+   ```
+
+3. Run the profile:
+
+   ```bash
+   conbus run claude_code --profile work
+   ```
 
 A profile name is `[a-z0-9-]+`. If `$HOME/.claude-NAME` does not exist yet,
 `install --profile` refuses and prints the login command — conbus never

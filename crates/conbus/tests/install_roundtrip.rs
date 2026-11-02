@@ -202,6 +202,46 @@ fn uninstall_on_a_machine_conbus_never_touched_changes_nothing() {
 }
 
 #[test]
+fn uninstall_names_the_log_where_xdg_state_home_put_it() {
+    // Every other command finds the log at `$XDG_STATE_HOME/conbus` when that is set.
+    // uninstall looked only at CONBUS_HOME and ~/.conbus, so it named no log here and
+    // left the spool it says it removes.
+    let machine = Machine::new();
+    let state = machine.home.join("state");
+    let root = state.join("conbus");
+    std::fs::create_dir_all(root.join("log")).expect("log");
+    std::fs::create_dir_all(root.join("spool")).expect("spool");
+    std::fs::write(root.join("spool/waiting.json"), "{}").expect("an entry");
+    let built = PathBuf::from(env!("CARGO_BIN_EXE_conbus"));
+
+    let out = Command::new(&built)
+        .args(["uninstall", "--apply"])
+        .env("HOME", &machine.home)
+        .env("XDG_STATE_HOME", &state)
+        // Never the runner's or the developer's launchd.
+        .env("CONBUS_SKIP_LAUNCHCTL", "1")
+        .env("CONBUS_OPENCODE_BIN", NOT_THERE)
+        .env_remove("CONBUS_HOME")
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("CODEX_HOME")
+        .output()
+        .expect("run conbus");
+    let said = String::from_utf8_lossy(&out.stdout);
+
+    assert!(out.status.success(), "{said}");
+    assert!(
+        said.contains(&format!("{} — kept", root.display())),
+        "{said}"
+    );
+    assert!(
+        said.contains("spool — removed (1 entry(ies) were waiting"),
+        "{said}"
+    );
+    assert!(!root.join("spool").exists(), "{said}");
+    assert!(root.join("log").is_dir(), "the log is kept");
+}
+
+#[test]
 fn install_registers_only_the_vendors_this_machine_has() {
     // Someone with only Claude Code must not get configuration directories
     // for four tools they never installed.

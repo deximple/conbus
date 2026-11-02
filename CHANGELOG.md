@@ -8,6 +8,13 @@ the entry says so when it does.
 
 ### Fixed
 
+- A recorder sent SIGHUP, as a closed terminal or `kill -HUP` sends it, now lands
+  what the log will take and says what it could not, as it does for SIGTERM. It used
+  to go at once, and a record only memory held went with no trace, also after a
+  start whose repair had to run in the recorder itself. A recorder started with
+  hangups ignored, as `nohup` starts it, still ignores them.
+- A start-up repair that gives up after two minutes now takes the Codex app-server
+  it was waiting on with it. One wedged at that moment was left running.
 - `doctor` no longer leaves an empty `segment-00000000.jsonl` in a log folder
   with no segments. It checked that a segment could be written by creating one,
   and a later restore with `cp -n` would keep that empty file over the real one.
@@ -208,6 +215,17 @@ the entry says so when it does.
 - Gap fill reads only regular files. A FIFO named like a transcript or an export
   blocked a start, or `conbus backfill`, for good. Anything else is skipped and
   counted as not read, and a link is not followed.
+- `conbus uninstall` now finds the log under `$XDG_STATE_HOME/conbus` when that is
+  set, as every other command does. It named no log there, and left the spool it
+  says it removes.
+- The shell examples in the README and the manuals can be pasted into zsh, the shell
+  a Mac opens. Interactive zsh has comments off, so a trailing `# ...` became
+  arguments to the command before it, and a line that was only a comment was a
+  command not found. What each line does is now said beside its block, and
+  `scripts/check-docs.sh` fails on a comment in one.
+- Both manuals now say what each `conbus auth --html` banner means, including the grey
+  `conbus could not tell for: …` and the `could not tell` list under it: a vendor that
+  gave no answer conbus could read, which is no reason to sign in.
 ### Added
 
 - `conbus auth` (experimental): for when a sign-in tab opens and you should not have
@@ -281,6 +299,12 @@ the entry says so when it does.
 - `conbus uninstall` prints every folder a backup went to, from a list in
   `backup.json` that gets each folder before the first copy lands there, because
   those copies are plain text and nothing else says where they are.
+
+### Changed
+
+- `conbus backfill --gaps --include-older-lines` is experimental: `--help`,
+  `docs/stability.md` and both manuals say so, and 1.x does not promise to keep it
+  as it is. On real transcripts it wrote a fork's parent turns into the fork.
 
 ## [1.0.0-rc.3] — 2026-11-01
 

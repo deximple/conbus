@@ -139,6 +139,18 @@ mod on_signal {
     /// to go on to.
     static INSTALLING: Mutex<()> = Mutex::new(());
 
+    /// Kill the group of every server alive now. Only atomics and `killpg`, so a signal
+    /// handler can call it.
+    pub fn kill_every_group() {
+        for slot in &GROUPS {
+            let group = slot.load(Ordering::SeqCst);
+            if group > 0 {
+                // SAFETY: `killpg` is async-signal-safe and takes no pointers.
+                unsafe { libc::killpg(group, libc::SIGKILL) };
+            }
+        }
+    }
+
     /// Only what is async-signal-safe: atomics, `killpg`, `sigaction` and `raise`.
     extern "C" fn kill_servers_and_go_on(signal: libc::c_int) {
         // SAFETY: each of these calls is async-signal-safe and takes either plain values
@@ -147,12 +159,7 @@ mod on_signal {
         unsafe {
             let errno = errno_location();
             let saved = *errno;
-            for slot in &GROUPS {
-                let group = slot.load(Ordering::SeqCst);
-                if group > 0 {
-                    libc::killpg(group, libc::SIGKILL);
-                }
-            }
+            kill_every_group();
             let before = SIGNALS
                 .iter()
                 .position(|known| *known == signal)
@@ -235,6 +242,12 @@ mod on_signal {
             }
         }
     }
+}
+
+/// Kill every server this process started and has not yet reaped, with whatever each one
+/// started, for a way out that runs no `Drop`: `process::exit` does not.
+pub fn kill_every_server() {
+    on_signal::kill_every_group();
 }
 
 /// Kill the server and whatever it started. An npm `codex` is a node script spawning

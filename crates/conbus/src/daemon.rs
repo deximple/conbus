@@ -1567,9 +1567,14 @@ fn prepare_limit() -> Duration {
 /// End this process when `limit` is up, whatever the rest of it is stuck in. Its
 /// parent says so, if it still has one: a note from here could block on the same
 /// thing that stopped everything else.
+///
+/// `exit` runs no `Drop`, and a Codex app-server that gap fill started has a process
+/// group of its own, so it would outlive this process. One wedged right now is the
+/// likeliest reason this fired, so every server still running goes first.
 fn give_up_after(limit: Duration) {
     std::thread::spawn(move || {
         std::thread::sleep(limit);
+        crate::appserver::kill_every_server();
         std::process::exit(PREPARE_GAVE_UP);
     });
 }
@@ -2037,14 +2042,26 @@ extern "C" fn note_the_signal(signal: libc::c_int) {
     GOING.store(signal, Ordering::Relaxed);
 }
 
-/// Hear SIGTERM and SIGINT rather than die of them where they land, so what only
-/// memory holds can still be said. The loop looks after every connection, and a
+/// Hear SIGTERM, SIGINT and SIGHUP rather than die of them where they land, so what
+/// only memory holds can still be said. The loop looks after every connection, and a
 /// poll in progress returns early because `SA_RESTART` is not set.
+///
+/// This replaces whatever handles them by now, so from here the daemon decides how it
+/// goes. A start-up repair that fell back to this process leaves behind the handler of
+/// any app-server it started, and that one ends the process without landing anything.
+/// A hangup someone asked to ignore, as `nohup` does, stays ignored.
 fn listen_for_shutdown() {
-    for signal in [libc::SIGTERM, libc::SIGINT] {
+    for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
         // SAFETY: the handler only stores to an atomic, which is async-signal-safe,
-        // and `action` is fully initialised before the call reads it.
+        // and both `sigaction` values are fully initialised before a call reads them.
         unsafe {
+            let mut before: libc::sigaction = std::mem::zeroed();
+            if signal == libc::SIGHUP
+                && libc::sigaction(signal, std::ptr::null(), &mut before) == 0
+                && before.sa_sigaction == libc::SIG_IGN
+            {
+                continue;
+            }
             let mut action: libc::sigaction = std::mem::zeroed();
             action.sa_sigaction = note_the_signal as *const () as usize;
             libc::sigemptyset(&mut action.sa_mask);

@@ -207,13 +207,21 @@ Codex는 새 훅을 승인받은 뒤에만 실행합니다. Codex를 한 번 켜
 **다시 읽기:**
 
 ```bash
-conbus log --tail 20                  # 마지막 20개 레코드
-conbus log --bus-id 01a0c7f2          # 대화 하나, 거쳐 간 모든 레그 (앞부분만 써도 됩니다)
-conbus log --since 2026-09-20         # 날짜, 또는 타임스탬프의 앞부분
-conbus log --grep "migration"         # 이 문자열이 들어간 레코드
-conbus log --json                     # 한 줄에 JSON 레코드 하나, 스크립트용
-conbus log --reveal --bus-id 01a0c7f2 # 봉인된 툴 본문 복호화 (11장)
+conbus log --tail 20
+conbus log --bus-id 01a0c7f2
+conbus log --since 2026-09-20
+conbus log --grep "migration"
+conbus log --json
+conbus log --reveal --bus-id 01a0c7f2
 ```
+
+- `--tail 20`은 마지막 20개 레코드를 보여 줍니다.
+- `--bus-id 01a0c7f2`는 대화 하나와 그 대화가 거쳐 간 모든 레그를 보여 줍니다. id는
+  앞부분만 써도 됩니다.
+- `--since`는 날짜, 또는 타임스탬프의 앞부분을 받습니다.
+- `--grep "migration"`은 이 문자열이 들어간 레코드만 남깁니다.
+- `--json`은 한 줄에 JSON 레코드 하나씩, 스크립트용으로 출력합니다.
+- `--reveal`은 봉인된 툴 본문을 복호화합니다(11장).
 
 **세어 보기:** `conbus usage`는 로그를 에이전트별로 무엇을 했는지로 접어 보여
 줍니다. 기본은 최근 7일이고, `--days 30`, `--since 2026-09-01`, 또는 끝난 하루
@@ -276,9 +284,11 @@ cost      not in this log: no hook payload carries tokens or prices
 하나씩 출력합니다. `usage`와 마찬가지로 숫자만 있고 본문은 없습니다.
 
 ```bash
-conbus progress --workspace .     # 이 체크아웃, 최근 7일
-conbus progress --days 30 --json  # 모든 폴더, 한 달
+conbus progress --workspace .
+conbus progress --days 30 --json
 ```
+
+첫 줄은 이 체크아웃의 최근 7일을, 둘째 줄은 모든 폴더의 한 달을 JSON으로 보여 줍니다.
 
 **내가 쓰는 모니터링으로:** `--otlp URL`은 같은 줄을 OpenTelemetry 메트릭으로 이
 Mac의 컬렉터에 보냅니다. OpenTelemetry Collector, Grafana Alloy, Datadog Agent는
@@ -287,9 +297,10 @@ Mac의 컬렉터에 보냅니다. OpenTelemetry Collector, Grafana Alloy, Datado
 `conbus.tool.failures` 등 — 전체 목록은
 [RFD 0002](rfd/0002-metadata-sync.md#the-pipe-the-same-rows-into-a-collector-the-person-runs)),
 에이전트와 사람 여부가 붙습니다. 이 플래그가 없으면 아무것도 보내지 않습니다.
+아래는 끝난 하루의 줄을 출력하고 보냅니다.
 
 ```bash
-conbus usage --day 2026-09-22 --shareable --otlp http://127.0.0.1:4318   # 끝난 하루의 줄을 출력하고 보냄
+conbus usage --day 2026-09-22 --shareable --otlp http://127.0.0.1:4318
 ```
 
 보내는 단위는 `--day`입니다. 끝난 어제를 한 번만 보내세요. 각 값은 그날 일어난
@@ -371,11 +382,16 @@ hop은 지금 대화를 다른 레그로 옮깁니다. conbus는 그 결정을 �
 ### 직접 hop하기
 
 ```bash
-conbus hop                # 미리보기: 지금 대화는 어디로 갈까?
-conbus hop cursor         # Cursor로 가는 hop 미리보기
-conbus go cursor          # 실행
-conbus hop --from 01a0c7f2 --to codex --apply   # 특정 대화
+conbus hop
+conbus hop cursor
+conbus go cursor
+conbus hop --from 01a0c7f2 --to codex --apply
 ```
+
+- `conbus hop`은 지금 대화가 어디로 갈지 미리 보여 줍니다.
+- `conbus hop cursor`는 Cursor로 가는 hop을 미리 보여 줍니다.
+- `conbus go cursor`는 그 hop을 실행합니다.
+- `--from`과 `--apply`를 함께 주면 특정 대화를 옮깁니다.
 
 "지금 대화"는 이 Mac에서 가장 최근 턴이 있었던 대화입니다. 다른 대화를 고르려면
 `--from`에 버스 id(또는 그 앞부분)를 넘기세요.
@@ -464,13 +480,14 @@ StatusLine이 마지막으로 언제 돌았는지 알려 줍니다. conbus는 �
 되살릴 수 있습니다.
 
 ```bash
-conbus backfill            # 무엇을 되살릴지 보고
-conbus backfill --apply    # 기록
+conbus backfill
+conbus backfill --apply
 ```
 
-Claude Code의 트랜스크립트(`~/.claude/projects`)와 Codex의 스레드(Codex 자신의
-app-server로)를 읽어, 세션마다 "되살린 것"으로 표시한 대화로 정리합니다. 레코더가
-이미 실시간으로 본 세션은 중복해서 만들지 않습니다.
+첫 줄은 무엇을 되살릴지 보고하고, 둘째 줄은 그것을 기록합니다. Claude Code의
+트랜스크립트(`~/.claude/projects`)와 Codex의 스레드(Codex 자신의 app-server로)를 읽어,
+세션마다 "되살린 것"으로 표시한 대화로 정리합니다. 레코더가 이미 실시간으로 본 세션은
+중복해서 만들지 않습니다.
 
 `--apply`는 레코더나 그 시작 복구가 로그를 쥐고 있는 동안에는 거부하고, 실행하는
 동안에는 스스로 쥐고 있습니다. 둘이 같은 파일에 쓰게 되기 때문입니다. 레코더를 멈추고, 백필하고, 다시 켜세요.
@@ -478,8 +495,10 @@ app-server로)를 읽어, 세션마다 "되살린 것"으로 표시한 대화로
 ```bash
 launchctl bootout gui/$(id -u)/sh.conbus.daemon
 conbus backfill --apply
-conbus install --apply     # 레코더를 다시 켭니다
+conbus install --apply
 ```
+
+마지막 줄이 레코더를 다시 켭니다.
 
 레코더가 꺼져 있던 동안 실시간 세션에서 **놓친 턴**은 레코더가 켜질 때 자동으로
 채워집니다. Claude Code 트랜스크립트, Codex 스레드, 채팅 내보내기에서 가져옵니다.
@@ -514,10 +533,10 @@ conbus install --apply     # 레코더를 다시 켭니다
 것으로 보고 채우지 않습니다. `cp`, `rsync -a`로 옮기거나 다른 볼륨으로 옮긴 트랜스크립트는
 생성 시각이 새로 찍혀 거의 모든 줄이 그렇게 보이므로 아무것도 채워지지 않습니다.
 `conbus backfill --gaps`는 이렇게 제쳐 둔 줄 수를 알려 줍니다. 그래도 채우려면
-`--include-older-lines`를 붙이세요. 트랜스크립트를 옮긴 것이 확실할 때 쓰고, 먼저 dry run을
-보세요. 그 줄이 정말 다른 대화의 복사본일 수 있습니다. 포크라면 부모의 프롬프트이고, 포크 자신의
-턴처럼 나타납니다. 로그에 쓴 레코드는 지울 수 없습니다. 다른 대화가 가진 턴 id는 이때도
-채우지 않습니다.
+`--include-older-lines`(experimental)를 붙이세요. 트랜스크립트를 옮긴 것이 확실할 때
+쓰고, 먼저 dry run을 보세요. 그 줄이 정말 다른 대화의 복사본일 수 있습니다. 포크라면 부모의
+프롬프트이고, 포크 자신의 턴처럼 나타납니다. 로그에 쓴 레코드는 지울 수 없습니다. 다른 대화가
+가진 턴 id는 이때도 채우지 않습니다.
 
 **Claude.ai 대화**는 데스크톱 앱에 훅이 없습니다. Claude.ai에서 데이터를
 내보내고(Settings → Privacy → Export data) 그 zip(또는 `conversations.json`)을
@@ -601,8 +620,10 @@ conbus arena link --from ~/src/shop --to ~/src/shop-admin
 /usr/libexec/PlistBuddy -c 'Add :EnvironmentVariables dict' \
   -c 'Add :EnvironmentVariables:CONBUS_RETENTION string encrypted_tools' \
   ~/Library/LaunchAgents/sh.conbus.daemon.plist
-conbus install --apply   # 그 값으로 레코더를 다시 띄움
+conbus install --apply
 ```
+
+마지막 줄이 그 값으로 레코더를 다시 띄웁니다.
 
 수준은 그때부터 적용되고, 그 전에 쓰인 기록은 그대로입니다.
 
@@ -897,9 +918,11 @@ conbus install --apply
 ## 13. 제거
 
 ```bash
-conbus uninstall          # 무엇을 지울지
-conbus uninstall --apply  # 지우기
+conbus uninstall
+conbus uninstall --apply
 ```
+
+첫 줄은 무엇을 지울지 보여 주고, 둘째 줄이 지웁니다.
 
 - conbus를 실행하는 훅 항목은 모든 에이전트 설정에서 빠지고, 다른 것은 빠지지
   않습니다. 같은 블록에 있던 여러분의 훅도 그대로 남습니다.
@@ -992,9 +1015,24 @@ conbus uninstall --apply  # 지우기
 `not checked`로 표시합니다. 즉 그 벤더들에 로그인이 필요 없다는 뜻이 아닙니다. hop에는
 Codex와 gh가 필요합니다. agy는 자기 쿼터 줄에만 쓰이므로, 쓰는 경우에만 로그인하세요.
 아무도 없을 때 conbus가 무엇을 실행하는지도 보여 줍니다. 기록에는 로그인이 필요
-없습니다. `conbus auth --html`은 같은 내용을 오프라인 한 장으로 쓰고, 그 배너는 어느
-벤더에 물었고 어느 벤더에 묻지 않았는지 알려 줍니다. `--html --open`이어야 그 페이지를
-엽니다. `--url`은 이 두 옵션과 함께 쓸 수 없습니다.
+없습니다. `conbus auth --html`은 같은 내용을 오프라인 한 장으로 쓰고, `--html --open`이어야
+그 페이지를 엽니다. `--url`은 이 두 옵션과 함께 쓸 수 없습니다. 페이지의 배너는 conbus에
+필요한 것만, 답한 벤더에게서 들은 것만으로 말합니다.
+
+- **노란색**, `conbus needs a sign-in that is missing: …` — conbus에 필요한 벤더가
+  로그아웃 상태라고 답했습니다. 그 벤더에 로그인하세요.
+- **회색**, `conbus could not tell for: …`(한국어 줄은 `conbus가 확인하지 못했습니다: …`)
+  — conbus가 물었지만 그 벤더가 읽을 수 있는 답을 주지 않았습니다. GitHub에 닿지 못한
+  `gh`나 실패한 `agy`가 그렇습니다. 텍스트 출력에서는 같은 행이 `SKIP`과
+  `its sign-in could not be told`로 나옵니다. 로그아웃이 아니므로 이것 때문에 로그인하지
+  마세요. 왜 답하지 않았는지는 그 벤더를 직접 실행해 보면 압니다. conbus에 필요 없는
+  벤더는 물어본 벤더가 하나도 답하지 않았을 때만 여기에 나옵니다.
+- **회색**, `conbus asked nothing` — 물어볼 수 있는 벤더가 설치돼 있지 않습니다.
+- **초록색**, `of what conbus asked, nothing it needs is signed out` — 그 밖의 경우입니다.
+
+배너 아래 한 줄은 벤더를 `asked`, `could not tell`, `not installed`, `not asked`로 나누고,
+한국어 줄은 `물어봄`, `확인 못 함`, `설치 안 됨`, `묻지 않음`으로 나눕니다. `agy`처럼
+conbus에 필요 없는 벤더는 `could not tell`에 있어도 배너가 초록색일 수 있습니다.
 
 **`nameless  <bus id> — N records…`** — 0.1.0 이전 빌드가 세션을 밝히지 않은
 이벤트를 공용 대화 하나 아래 묶었습니다. 0.1.0부터는 그런 이벤트를 거부합니다.
@@ -1055,17 +1093,24 @@ Claude Code는 여러 계정을 나란히 쓸 수 있습니다. 프로필 `NAME`
 쓸지 알려 줍니다. conbus는 정확히 그것만 지원합니다. 내 계정을, 벤더의 로그인 절차로
 로그인해서, 내가 말할 때만 바꿉니다.
 
-```bash
-# 1. 프로필을 만들고 로그인합니다. conbus가 아니라 벤더의 절차입니다:
-CLAUDE_CONFIG_DIR=$HOME/.claude-work claude
-/login
+1. 프로필을 만들고 로그인합니다. conbus가 아니라 벤더의 절차입니다. 아래 명령은
+   Claude Code를 프로필 폴더로 시작하고, 그 안에서 `/login`을 입력합니다.
 
-# 2. 같은 훅과 StatusLine 감싸기를 프로필의 settings.json에 등록합니다:
-conbus install --apply --profile work
+   ```bash
+   CLAUDE_CONFIG_DIR=$HOME/.claude-work claude
+   ```
 
-# 3. 프로필로 실행합니다:
-conbus run claude_code --profile work
-```
+2. 같은 훅과 StatusLine 감싸기를 프로필의 `settings.json`에 등록합니다.
+
+   ```bash
+   conbus install --apply --profile work
+   ```
+
+3. 프로필로 실행합니다.
+
+   ```bash
+   conbus run claude_code --profile work
+   ```
 
 프로필 이름은 `[a-z0-9-]+`입니다. `$HOME/.claude-NAME`이 아직 없으면
 `install --profile`은 거절하고 로그인 명령을 보여 줍니다. conbus는 그 디렉터리를

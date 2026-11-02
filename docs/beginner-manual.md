@@ -172,11 +172,13 @@ switch to grok
 터미널에서 같은 일:
 
 ```bash
-conbus hop cursor          # 미리보기. 지금 대화의 --to
-conbus go cursor           # 적용
+conbus hop cursor
+conbus go cursor
 conbus hop --from <bus_id> --to claude_code
 conbus hop --apply --from <bus_id> --to claude_code
 ```
+
+첫 줄은 지금 대화의 `--to` 미리보기이고, 둘째 줄이 적용이다.
 
 `--from`을 쓸 때는 **전체 `bus_id`**. 앞 몇 글자는 같은 초에 민트된 다른 대화와 겹친다.
 `--apply` 없이 치면 결정만 보여 준다.
@@ -188,9 +190,12 @@ hop은 Claude/Codex 양쪽 warm을 연다. Claude 쪽은 `--max-turns 0`이라 �
 
 채팅이 아니다. 숫자와 마지막 hop만 본다.
 
+`conbus status`는 규칙, 퀴터, hop 히스토리, 비용을 보여 주고, `conbus quota`는 Codex
+프로브, Claude StatusLine 캐시, 카탈로그를 보여 준다.
+
 ```bash
-conbus status          # 규칙, 퀴터, hop 히스토리, 비용
-conbus quota           # Codex 프로브 + Claude StatusLine 캐시 + 카탈로그
+conbus status
+conbus quota
 conbus log --tail 30
 conbus log --bus-id <bus_id> --tail 20
 conbus log --json --bus-id <bus_id> --tail 1
@@ -213,8 +218,13 @@ conbus backfill --gaps
 
 ```bash
 launchctl bootout "gui/$(id -u)/sh.conbus.daemon"
-# 소켓이 죽을 때까지 기다린다. 바로 --apply 하면 "daemon is listening"으로 거절된다.
-conbus backfill          # 미리보기
+```
+
+소켓이 죽을 때까지 기다린다. 바로 `--apply` 하면 "daemon is listening"으로 거절된다.
+그다음 첫 줄로 미리 보고, 둘째 줄로 쓰고, 셋째 줄로 데몬을 다시 올린다.
+
+```bash
+conbus backfill
 conbus backfill --apply
 launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/sh.conbus.daemon.plist
 ```
@@ -270,9 +280,11 @@ B에서 다음 프롬프트를 치면 팩에 `arena` 줄이 보인다. 이 에�
 ## 되돌리기
 
 ```bash
-conbus uninstall          # 무엇을 지울지 보고만
-conbus uninstall --apply  # 지운다
+conbus uninstall
+conbus uninstall --apply
 ```
+
+첫 줄은 무엇을 지울지 보고만 하고, 둘째 줄이 지운다.
 
 벤더 파일마다 conbus 훅 항목만 빠지고, 다른 훅은 그대로 남는다. StatusLine은 원래 명령으로 돌아가고, opencode 플러그인·grok 훅 파일·launchd 에이전트·`~/.local/bin/conbus`는 지워진다. 고친 파일 옆에는 `.conbus-uninstall-backup`이 남는다. Codex는 훅 신뢰를 위치로 기억하므로, conbus 뒤에 있던 훅이 앞으로 당겨지면 Codex가 그 훅을 다시 승인해 달라고 한다(uninstall이 미리 알려 준다).
 
