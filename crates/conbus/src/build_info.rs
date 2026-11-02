@@ -22,9 +22,19 @@ pub const BUILD: &str = env!("CONBUS_BUILD");
 /// The release this binary belongs to, from the workspace manifest.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// What `--version` prints: `0.1.0 (a1b2c3d4e)`.
+/// The version where `scripts/sign-release.sh` can read it from a binary it cannot
+/// run: the Linux packages, on a Mac. Strings run together in a release build, so the
+/// plain version cannot be told from a longer one, and `1.0.0` is inside `1.0.0-rc.3`.
+const VERSION_STAMP: &str = concat!("conbus-version ", env!("CARGO_PKG_VERSION"), ";");
+
+/// What `--version` prints: `0.1.0 (a1b2c3d4e)`. It reads the stamp, so the stamp is
+/// in every binary that can answer.
 pub fn describe() -> String {
-    format!("{VERSION} ({BUILD})")
+    let version = VERSION_STAMP
+        .strip_prefix("conbus-version ")
+        .and_then(|rest| rest.strip_suffix(';'))
+        .unwrap_or(VERSION);
+    format!("{version} ({BUILD})")
 }
 
 fn stamp_file(paths: &Paths) -> PathBuf {

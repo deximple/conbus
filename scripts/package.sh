@@ -52,8 +52,17 @@ esac
 version=$("$out/stage/conbus" --version | awk '{print $2}')
 echo "package.sh: conbus $version"
 
+# scripts/sign-release.sh reads this to check a binary it cannot run, so a build
+# without it should stop here, not at the release.
+LC_ALL=C grep -qaF "conbus-version $version;" "$out/stage/conbus" || {
+  echo "package.sh: the binary does not carry conbus-version $version;" >&2
+  exit 1
+}
+
 cp LICENSE README.md CHANGELOG.md "$out/stage/"
-tar -czf "$out/$asset" -C "$out/stage" conbus LICENSE README.md CHANGELOG.md
+# The owner fields go out to everyone who downloads this. The default records the
+# account that built it. This spelling means the same to BSD tar and to GNU tar.
+tar --owner=root:0 --group=root:0 -czf "$out/$asset" -C "$out/stage" conbus LICENSE README.md CHANGELOG.md
 case "$(uname -s)" in
   Darwin) (cd "$out" && shasum -a 256 "$asset" > "$asset.sha256") ;;
   *)      (cd "$out" && sha256sum "$asset" > "$asset.sha256") ;;

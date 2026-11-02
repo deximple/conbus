@@ -157,3 +157,17 @@ fn a_hook_whose_reader_went_away_does_not_fail_the_turn() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+#[test]
+fn the_binary_carries_the_stamp_the_release_script_looks_for() {
+    // scripts/sign-release.sh and scripts/package.sh read this from a binary they
+    // cannot run, and 1.0.0 alone is also inside 1.0.0-rc.3.
+    let binary = std::fs::read(env!("CARGO_BIN_EXE_conbus")).expect("read the binary");
+    let stamp = format!("conbus-version {};", env!("CARGO_PKG_VERSION"));
+    assert!(
+        binary
+            .windows(stamp.len())
+            .any(|window| window == stamp.as_bytes()),
+        "no {stamp} in the binary"
+    );
+}
