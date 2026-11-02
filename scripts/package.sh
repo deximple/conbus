@@ -60,9 +60,10 @@ LC_ALL=C grep -qaF "conbus-version $version;" "$out/stage/conbus" || {
 }
 
 cp LICENSE README.md CHANGELOG.md "$out/stage/"
+sh "$(dirname "$0")/third-party-notices.sh" >"$out/stage/THIRD_PARTY_NOTICES.txt"
 # The owner fields go out to everyone who downloads this. The default records the
 # account that built it. This spelling means the same to BSD tar and to GNU tar.
-tar --owner=root:0 --group=root:0 -czf "$out/$asset" -C "$out/stage" conbus LICENSE README.md CHANGELOG.md
+tar --owner=root:0 --group=root:0 -czf "$out/$asset" -C "$out/stage" conbus LICENSE THIRD_PARTY_NOTICES.txt README.md CHANGELOG.md
 case "$(uname -s)" in
   Darwin) (cd "$out" && shasum -a 256 "$asset" > "$asset.sha256") ;;
   *)      (cd "$out" && sha256sum "$asset" > "$asset.sha256") ;;
