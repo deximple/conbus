@@ -32,6 +32,10 @@ const CLOUD_PREFIXES: &[&str] = &["OneDrive", "Dropbox ("];
 /// on a real Mac, so a run for any other folder must not go near them.
 const SYNCABLE_FOLDERS: &[&str] = &["Desktop", "Documents"];
 
+/// How a Mac's system volume reaches its data volume. Everything a person has has a
+/// second name under here: `/System/Volumes/Data/Users/me` is `/Users/me`.
+const DATA_VOLUME: &[&str] = &["System", "Volumes", "Data"];
+
 /// What a run needs free beyond the bytes themselves. A clone still costs an
 /// inode and its extent records: under 1 KiB each on an APFS volume with nothing
 /// else writing, so this is margin. A copy can round each file up to a large
@@ -158,14 +162,15 @@ fn in_a_cloud_folder(folder: &Path, cloud: &Path) -> io::Error {
 /// names. Works for a folder that does not exist yet: a client installed tomorrow
 /// syncs what is already there.
 fn refuse_by_name(path: &Path, home: &Path) -> io::Result<()> {
+    let path = without_data_volume(path);
     let real_home = fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
-    for home in [home, real_home.as_path()] {
-        if let Some(cloud) = named_cloud_folder(path, home) {
-            return Err(in_a_cloud_folder(path, &cloud));
+    for home in [home, real_home.as_path()].map(without_data_volume) {
+        if let Some(cloud) = named_cloud_folder(&path, &home) {
+            return Err(in_a_cloud_folder(&path, &cloud));
         }
         if let Some(syncable) = SYNCABLE_FOLDERS
             .iter()
-            .find_map(|name| spelled_under(path, home, &[name]))
+            .find_map(|name| spelled_under(&path, &home, &[name]))
         {
             return Err(refuse(format!(
                 "{} is under {}. On a Mac iCloud can sync Desktop and Documents, conbus cannot \
@@ -178,6 +183,15 @@ fn refuse_by_name(path: &Path, home: &Path) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// `path` without the data volume's prefix, by its text alone.
+fn without_data_volume(path: &Path) -> PathBuf {
+    let root = Path::new("/");
+    match spelled_under(path, root, DATA_VOLUME) {
+        Some(_) => root.join(path.iter().skip(DATA_VOLUME.len() + 1).collect::<PathBuf>()),
+        None => path.to_path_buf(),
+    }
 }
 
 /// What `path` is, to the file system. Spelling is not good enough: the default
@@ -474,6 +488,32 @@ mod tests {
         }
         for name in ["Dropbox", "Dropboxes", "Dropbox-notes", "Drive", "하나"] {
             assert!(!has_cloud_prefix(OsStr::new(name)), "{name}");
+        }
+    }
+
+    #[test]
+    fn the_data_volumes_prefix_is_not_part_of_a_name() {
+        let home = Path::new("/nonexistent/home/me");
+        let data = Path::new("/System/Volumes/Data/nonexistent/home/me");
+        for path in [
+            data.join("Desktop/x"),
+            data.join("Documents"),
+            data.join("Dropbox/x"),
+            data.join("Library/CloudStorage"),
+            PathBuf::from("/system/volumes/DATA/nonexistent/home/me/documents"),
+        ] {
+            assert!(refuse_by_name(&path, home).is_err(), "{}", path.display());
+        }
+        assert!(refuse_by_name(&home.join("Desktop/x"), data).is_err());
+
+        for path in [
+            data.join("Documents-old"),
+            data.join("elsewhere"),
+            PathBuf::from("/System/Volumes/Data/elsewhere/Documents"),
+            PathBuf::from("/System/Volumes/Documents"),
+            PathBuf::from("/System/Volumes/Data"),
+        ] {
+            assert!(refuse_by_name(&path, home).is_ok(), "{}", path.display());
         }
     }
 

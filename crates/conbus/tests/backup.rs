@@ -2600,6 +2600,63 @@ fn a_run_for_another_folder_does_not_look_at_desktop_or_documents() {
 }
 
 #[test]
+fn only_the_compared_list_names_desktop_and_documents() {
+    // Declared once and compared once, so adding a stat of that list fails here.
+    let source = include_str!("../src/backup/destination.rs");
+    let code = source.split("#[cfg(test)]").next().expect("code");
+    assert_eq!(
+        code.matches("SYNCABLE_FOLDERS").count(),
+        2,
+        "declared once, compared once"
+    );
+    // Spelling a name out is the other way to stat one.
+    for name in ["\"Desktop\"", "\"Documents\""] {
+        assert_eq!(code.matches(name).count(), 1, "{name}");
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_firmlink_spelling_does_not_get_into_documents() {
+    let world = World::with_log();
+    let spelled = Path::new("/System/Volumes/Data")
+        .join(world.home.strip_prefix("/").expect("absolute"))
+        .join("Documents/backups");
+    fs::create_dir(world.home.join("Documents")).expect("dir");
+    let out = world.backup(&spelled);
+    assert!(!out.status.success(), "{}", stdout(&out));
+    refused(&out, "iCloud");
+    assert_eq!(
+        fs::read_dir(world.home.join("Documents"))
+            .expect("read")
+            .count(),
+        0
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_firmlink_spelling_is_refused_by_name_before_anything_looks() {
+    // Neither folder exists here, so these can only be refused for how they are
+    // spelled. Without that they would be told their parent does not exist.
+    let world = World::with_log();
+    let home = world.home.strip_prefix("/").expect("absolute");
+    let data = Path::new("/System/Volumes/Data").join(home);
+    let other_case = Path::new("/system/VOLUMES/data").join(home);
+    for folder in [
+        data.join("Desktop/x"),
+        data.join("Documents/a/b"),
+        data.join("documents"),
+        other_case.join("Desktop/x"),
+    ] {
+        refused(&world.backup(&folder), "iCloud");
+    }
+
+    // It is only a prefix: a folder merely next to those two goes ahead.
+    ok(&world.backup(&data.join("Documents-old")));
+}
+
+#[test]
 fn folders_merely_named_like_desktop_or_documents_are_not_refused() {
     let world = World::with_log();
     for folder in [
