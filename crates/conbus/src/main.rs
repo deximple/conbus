@@ -170,12 +170,17 @@ fn main() -> ExitCode {
         Command::Backfill {
             apply,
             gaps,
+            include_older_lines,
             chat_export,
         } => run(|paths| {
-            if let Some(export) = chat_export {
+            if include_older_lines && !gaps {
+                Err(std::io::Error::other(
+                    "--include-older-lines goes with --gaps",
+                ))
+            } else if let Some(export) = chat_export {
                 backfill::run_chat_export(paths, &export, apply)
             } else if gaps {
-                backfill::run_gaps(paths, apply)
+                backfill::run_gaps(paths, apply, include_older_lines)
             } else {
                 backfill::run(paths, apply)
             }

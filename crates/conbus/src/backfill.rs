@@ -12,8 +12,8 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use conbus_core::backfill::{
-    CLAUDE_CHAT_EXPORT, CLAUDE_TRANSCRIPT, CODEX_THREAD, Recovered, oldest_first,
-    parse_claude_chat_export, parse_claude_transcript, parse_claude_transcript_born,
+    CLAUDE_CHAT_EXPORT, CLAUDE_TRANSCRIPT, CODEX_THREAD, OLDER_THAN_ITS_FILE, Recovered,
+    oldest_first, parse_claude_chat_export, parse_claude_transcript, parse_claude_transcript_born,
     parse_codex_thread,
 };
 
@@ -131,17 +131,21 @@ pub fn run(paths: &Paths, apply: bool) -> io::Result<()> {
 /// fixture-protected parser, not the live hook path) is read only to find
 /// turns the log does not already hold, and those are appended to the
 /// conversation the recorder already bound.
-pub fn run_gaps(paths: &Paths, apply: bool) -> io::Result<()> {
+pub fn run_gaps(paths: &Paths, apply: bool, include_older_lines: bool) -> io::Result<()> {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .ok_or_else(|| io::Error::other("no HOME to read history from"))?;
     let transcripts = home.join(".claude").join("projects");
-    let outcome = fill_gaps(paths, &transcripts, apply, true)?;
+    let outcome = fill_gaps_with(paths, &transcripts, apply, true, include_older_lines)?;
 
     println!("history   {}", transcripts.display());
     println!(
         "gaps      {} conversation(s), {} turn(s), {} record(s)",
         outcome.gap_sessions, outcome.gap_turns, outcome.gap_records
+    );
+    println!(
+        "older     {}",
+        describe_older_lines(&outcome, include_older_lines)
     );
     match &outcome.codex_unavailable {
         Some(why) => println!("codex     history unavailable — {why}"),
@@ -157,6 +161,29 @@ pub fn run_gaps(paths: &Paths, apply: bool) -> io::Result<()> {
         println!("\nNothing was written. Re-run with --apply to record it, or restart the daemon.");
     }
     Ok(())
+}
+
+/// What `backfill --gaps` says about lines older than their own transcript: how many
+/// were set aside, the way to fill them, and what that risks.
+fn describe_older_lines(outcome: &Outcome, included: bool) -> String {
+    if included {
+        return "lines older than their file were read as its own, so what this fills may \
+                hold another conversation's copies"
+            .to_string();
+    }
+    let set_aside = outcome
+        .unread
+        .get(OLDER_THAN_ITS_FILE)
+        .copied()
+        .unwrap_or(0);
+    if set_aside == 0 {
+        return "0 lines older than their file set aside".to_string();
+    }
+    format!(
+        "{set_aside} line(s) older than their file set aside as copies; \
+         --include-older-lines fills from them too, and they may be another conversation's \
+         copies, so look at a dry run first"
+    )
 }
 
 /// Official Claude.ai / Desktop data export. Keeps the Chat conversation
@@ -566,6 +593,7 @@ fn append_gaps_at_start_in(
                     deadline,
                     read: &mut read,
                 }),
+                false,
             )?;
             n += outcome.gap_records;
             timing.not_regular += outcome.unread.get(NOT_REGULAR).copied().unwrap_or(0);
@@ -1358,11 +1386,18 @@ fn collect_rollout_mtimes(
 /// Refuses to write while a daemon is listening — the daemon fills the same gaps
 /// itself on restart. `codex` is a parameter for the reason it is one on
 /// [`recover`].
-pub fn fill_gaps(
+///
+/// With `include_older_lines` a line older than its own transcript is read as the file's
+/// own. A file moved by `cp`, `rsync -a` or across volumes has a new birth and almost
+/// every line older than it, and this is the one way to fill those. The id another
+/// conversation holds still decides, but a fork's copy of a turn nobody holds gets
+/// through: that is the risk a person takes by asking.
+pub fn fill_gaps_with(
     paths: &Paths,
     transcripts: &Path,
     apply: bool,
     codex: bool,
+    include_older_lines: bool,
 ) -> io::Result<Outcome> {
     if apply && std::os::unix::net::UnixStream::connect(paths.socket()).is_ok() {
         return Err(io::Error::other(format!(
@@ -1383,6 +1418,7 @@ pub fn fill_gaps(
         None,
         &mut elsewhere,
         None,
+        include_older_lines,
     )?;
     if codex {
         let mut timing = GapTiming::default();
@@ -1815,6 +1851,7 @@ fn append_gaps_files(
     since: Option<i64>,
     elsewhere: &mut Elsewhere<'_>,
     mut start: Option<StartFill<'_>>,
+    include_older_lines: bool,
 ) -> io::Result<Outcome> {
     let known = known_from(held.iter());
     let mut outcome = Outcome::default();
@@ -1884,7 +1921,8 @@ fn append_gaps_files(
             start.timing.claude_files += 1;
             start.timing.claude_bytes += text.len() as u64;
         }
-        let recovered = parse_claude_transcript_born(&text, stem, live_bus, born_at(file));
+        let born = born_at(file).filter(|_| !include_older_lines);
+        let recovered = parse_claude_transcript_born(&text, stem, live_bus, born);
         for (reason, count) in &recovered.skipped {
             *outcome.unread.entry(reason.clone()).or_default() += count;
         }
@@ -2376,6 +2414,15 @@ mod tests {
         .expect("append");
     }
 
+    fn fill_gaps(
+        paths: &Paths,
+        transcripts: &Path,
+        apply: bool,
+        codex: bool,
+    ) -> io::Result<Outcome> {
+        fill_gaps_with(paths, transcripts, apply, codex, false)
+    }
+
     fn append_gaps(
         transcripts: &Path,
         held: &[Record],
@@ -2390,6 +2437,7 @@ mod tests {
             since,
             &mut Elsewhere::new(spool.to_path_buf(), held),
             None,
+            false,
         )
     }
 

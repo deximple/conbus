@@ -525,10 +525,17 @@ is left alone for an hour so it holds up one start, not all of them. `conbus bac
 same gaps on demand without a deadline, for Claude Code and Codex, across all
 history; with `--apply` it too needs the recorder stopped, and once it has read every
 Codex thread the Codex range is done. Deleting `cache/` drops
-the remembered ranges — run `conbus backfill --gaps` after one. A fill takes a line
-stamped over a minute before its transcript was created for a copy from another
-conversation, as a fork's opening lines are, so a transcript copied or restored has
-only its newer lines read.
+the remembered ranges — run `conbus backfill --gaps` after one.
+
+A fill takes a line stamped over a minute before its transcript was created for a copy
+from another conversation, as a fork's opening lines are, and leaves it out. A transcript
+moved by `cp`, `rsync -a` or across volumes has a new creation time, so almost every line
+in it reads that way and nothing in it is filled. `conbus backfill --gaps` says how many
+lines it set aside. To fill them anyway add `--include-older-lines`. Use it when you know
+a transcript was moved, and look at a dry run first: those lines may really be another
+conversation's copies. On a fork they are its parent's prompts, and you would see them
+come up as the fork's own turns. A record written to the log stays there. A turn id
+another conversation holds is still left out.
 
 **Claude.ai conversations** have no hooks in the desktop app. Export your data
 from Claude.ai (Settings → Privacy → Export data) and drop the zip (or

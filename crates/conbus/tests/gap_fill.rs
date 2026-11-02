@@ -3109,3 +3109,126 @@ fn a_fork_inside_the_margin_with_its_first_hook_lost_records_neither_set_of_word
         show(&all)
     );
 }
+
+/// A live session whose file has a new birth, as `cp` or `rsync -a` gives it, and a turn
+/// in it the recorder missed.
+fn a_moved_transcript_with_a_missed_turn(home: &Path) {
+    let daemon = start(home);
+    hook(home, &prompt(S, "p0", "before"));
+    hook(home, &ended(S, "p0", "a0"));
+    stop(daemon);
+    transcript(
+        home,
+        S,
+        &[
+            aged(sdk_user(S, "p0", "before"), 7200),
+            aged(reply(S, "a0"), 7199),
+            aged(sdk_user(S, "p1", "a real turn the recorder missed"), 3600),
+            aged(reply(S, "its reply"), 3599),
+        ],
+    );
+}
+
+fn backfill_gaps_including_older_lines(home: &Path, apply: bool) -> (bool, String) {
+    let mut command = Command::new(bin());
+    command.args(["backfill", "--gaps", "--include-older-lines"]);
+    if apply {
+        command.arg("--apply");
+    }
+    env_for(&mut command, home);
+    let output = command.output().expect("backfill");
+    (
+        output.status.success(),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+    )
+}
+
+#[test]
+fn a_missed_turn_in_a_moved_transcript_is_named_and_filled_only_when_asked() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    a_moved_transcript_with_a_missed_turn(home);
+    let holds = |home: &Path| {
+        log_lines(home)
+            .iter()
+            .any(|record| record["vendor_turn_id"] == "p1")
+    };
+
+    let (ok, said) = backfill_gaps(home, Path::new("/nonexistent/codex"), true);
+    assert!(ok, "{said}");
+    assert!(!holds(home), "filled without being asked: {said}");
+    assert!(
+        said.contains("4 line(s) older than their file set aside"),
+        "{said}"
+    );
+    assert!(said.contains("--include-older-lines"), "{said}");
+    assert!(said.contains("another conversation's"), "{said}");
+
+    // A dry run shows it, and writes nothing.
+    let (ok, said) = backfill_gaps_including_older_lines(home, false);
+    assert!(ok, "{said}");
+    assert!(said.contains("1 turn(s), 2 record(s)"), "{said}");
+    assert!(!holds(home), "a dry run writes nothing");
+
+    let (ok, said) = backfill_gaps_including_older_lines(home, true);
+    assert!(ok, "{said}");
+    assert!(holds(home), "no way to fill it by hand: {said}");
+}
+
+#[test]
+fn a_start_never_includes_older_lines() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    a_moved_transcript_with_a_missed_turn(home);
+
+    stop(start(home));
+
+    assert!(
+        !log_lines(home)
+            .iter()
+            .any(|record| record["vendor_turn_id"] == "p1")
+    );
+}
+
+#[test]
+fn including_older_lines_still_leaves_a_turn_another_conversation_holds() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    a_recorded_fork(home);
+    transcript(
+        home,
+        CHILD,
+        &[
+            aged(sdk_user(CHILD, "pp", "the parent's prompt"), 7200),
+            aged(reply(CHILD, "the parent's reply"), 7199),
+            sdk_user(CHILD, "cc", "the fork's prompt"),
+            reply(CHILD, "the fork's reply"),
+        ],
+    );
+
+    let (ok, said) = backfill_gaps_including_older_lines(home, true);
+
+    assert!(ok, "{said}");
+    let under_fork = filled_under(&log_lines(home), "cc");
+    assert!(
+        under_fork.is_empty(),
+        "under the fork:\n{}",
+        show(&under_fork)
+    );
+    assert!(said.contains("1 turn another conversation holds"), "{said}");
+}
+
+#[test]
+fn the_flag_for_older_lines_only_goes_with_gaps() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut command = Command::new(bin());
+    command.args(["backfill", "--include-older-lines"]);
+    env_for(&mut command, dir.path());
+    let output = command.output().expect("backfill");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("goes with --gaps"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

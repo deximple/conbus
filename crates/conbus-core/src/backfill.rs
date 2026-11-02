@@ -279,6 +279,9 @@ pub fn parse_claude_transcript(text: &str, session: &str, bus_id: BusId) -> Reco
     parse_claude_transcript_born(text, session, bus_id, None)
 }
 
+/// How a line older than its own transcript is counted as not read.
+pub const OLDER_THAN_ITS_FILE: &str = "line older than its file";
+
 /// How long before a transcript was created one of its own lines can be stamped.
 ///
 /// The vendor stamps a line when it happens and can hold a new session's first
@@ -296,8 +299,9 @@ pub const OWN_LINE_MARGIN_SECS: i64 = 60;
 /// the file's birth is what tells: of those lines 67,689 are over this margin older
 /// than the later file, and none of the 39,756 in the earlier one is.
 ///
-/// Only a fill may use this. A file copied or restored has a new birth and every
-/// line older than it, which costs a fill the turns of that file it has not got and
+/// Only a fill may use this. A file moved by `cp`, `rsync -a` or across volumes has a
+/// new birth and almost every line older than it, which costs a fill the turns of that
+/// file it has not got, until a person asks for them with `--include-older-lines`, and
 /// would cost `backfill --apply` the whole file.
 pub fn parse_claude_transcript_born(
     text: &str,
@@ -346,7 +350,7 @@ pub fn parse_claude_transcript_born(
             .zip(at)
             .is_some_and(|(born, at)| born.seconds_since(at) > OWN_LINE_MARGIN_SECS)
         {
-            out.skip("line older than its file");
+            out.skip(OLDER_THAN_ITS_FILE);
             continue;
         }
         // Kept as the last one seen rather than the first: a transcript's

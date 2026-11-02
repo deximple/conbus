@@ -49,6 +49,9 @@ pub enum Command {
     Backfill {
         apply: bool,
         gaps: bool,
+        /// With `--gaps`: also fill from lines older than their own transcript, which
+        /// may be another conversation's copies.
+        include_older_lines: bool,
         /// Official Claude.ai / Desktop `conversations.json` or its zip.
         chat_export: Option<String>,
     },
@@ -208,7 +211,12 @@ where
             "daemon" => (&["--prepare"], &[], &[], 0),
             "install" => (&["--apply", "--managed"], &["--profile"], &[], 0),
             "uninstall" => (&["--apply"], &["--profile"], &[], 0),
-            "backfill" => (&["--apply", "--gaps"], &["--chat-export"], &[], 0),
+            "backfill" => (
+                &["--apply", "--gaps", "--include-older-lines"],
+                &["--chat-export"],
+                &[],
+                0,
+            ),
             "log" => (
                 &["--json", "--reveal"],
                 &["--bus-id", "--since", "--tail", "--grep"],
@@ -283,6 +291,7 @@ where
         "backfill" => Command::Backfill {
             apply: args.iter().any(|a| a == "--apply"),
             gaps: args.iter().any(|a| a == "--gaps"),
+            include_older_lines: args.iter().any(|a| a == "--include-older-lines"),
             chat_export: flag_value(&args, "--chat-export"),
         },
         "log" if args.get(1).map(String::as_str) == Some("index") => Command::LogIndex,
@@ -459,8 +468,10 @@ USAGE:
                                   it goes and the Codex and Cursor managed
                                   hooks on stderr; docs/fleet.md
     conbus uninstall [--apply]    take them all back out; the log is kept
-    conbus backfill [--apply] [--gaps] [--chat-export PATH]
-                                  recover history; --gaps fills missed turns of live sessions;
+    conbus backfill [--apply] [--gaps [--include-older-lines]] [--chat-export PATH]
+                                  recover history; --gaps fills missed turns of live sessions,
+                                  and --include-older-lines fills from lines older than their
+                                  file too, which may be another conversation's copies;
                                   --chat-export reads official Claude.ai conversations.json (or zip)
     conbus doctor                 report what is and is not wired up
     conbus status                 routing rules, quota, hop history, cost
@@ -856,6 +867,7 @@ mod tests {
             Command::Backfill {
                 apply: false,
                 gaps: false,
+                include_older_lines: false,
                 chat_export: None
             }
         );
@@ -864,6 +876,16 @@ mod tests {
             Command::Backfill {
                 apply: true,
                 gaps: true,
+                include_older_lines: false,
+                chat_export: None
+            }
+        );
+        assert_eq!(
+            parse(["backfill", "--gaps", "--include-older-lines"], None),
+            Command::Backfill {
+                apply: false,
+                gaps: true,
+                include_older_lines: true,
                 chat_export: None
             }
         );
@@ -875,6 +897,7 @@ mod tests {
             Command::Backfill {
                 apply: false,
                 gaps: false,
+                include_older_lines: false,
                 chat_export: Some("/tmp/conversations.json".into())
             }
         );
