@@ -289,8 +289,11 @@ pub const OLDER_THAN_ITS_FILE: &str = "line older than its file";
 /// How long before a transcript was created one of its own lines can be stamped.
 ///
 /// The vendor stamps a line when it happens and can hold a new session's first
-/// lines before the file exists. On 2,409 real transcripts the most that came to is
-/// 10.2 s, and the next file up is at 595 s.
+/// lines before the file exists. On real transcripts that is usually under 11 s, but this
+/// is not a bound: two real sessions fired their hook at a first line stamped 677 s and
+/// 286,937 s before their file was created. No margin separates those from a copy, so a
+/// turn like them with its hook lost is set aside like one, and only
+/// `backfill --gaps --include-older-lines` fills it.
 pub const OWN_LINE_MARGIN_SECS: i64 = 60;
 
 /// As [`parse_claude_transcript`], for a file whose creation time is known: a line
