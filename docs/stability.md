@@ -47,9 +47,15 @@ marks each one `(experimental)`.
   - `cache/gap-since`, `cache/gap-since-codex` and `cache/gap-read` are not
     derived. They hold the gap-fill ranges a start could not finish, for
     transcripts and for Codex threads, and how far each got. Deleting them means
-    those ranges are not resumed at the next start; `conbus backfill --gaps` still
-    fills them by hand. No record already written is lost.
+    those ranges are not resumed at the next start. `conbus backfill --gaps` fills
+    the same gaps by hand, except from a transcript moved by `cp`, `rsync -a` or
+    across volumes, which also needs `--include-older-lines` and has its risk
+    named in the manual. No record already written is lost.
+  - `cache/gap-held` says why a range is held, for `conbus doctor`. Deleting it
+    loses only that reason, until the next start finds it again.
   - `cache/chat-export-read` says which chat exports a start has read. Deleting
-    it means each is read once more, which writes nothing.
+    it means each is read once more at the next start, outside that start's time
+    budget. That writes nothing, and took 0.2 s for 1,000 conversations against a
+    log of a million records.
   - `spool/` holds hooks in transit, and a file there can be the only copy of
     its record. Deleting one loses that record.
