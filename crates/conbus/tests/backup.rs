@@ -2235,6 +2235,90 @@ fn doctor_counts_only_copies_that_are_there_and_says_what_is_lost() {
     );
 }
 
+#[test]
+fn a_copy_cut_to_nothing_is_not_counted_as_held() {
+    let world = World::with_log();
+    let (closed, _) = split_open(&world);
+    let folder = world.base.join("dest");
+    ok(&world.backup(&folder));
+    fs::remove_file(world.log().join(&closed[0])).expect("rm");
+    fs::write(backup_log(&folder).join(&closed[0]), b"").expect("cut");
+    let out = world.backup(&folder);
+    let said = stdout(&out);
+    assert!(!out.status.success() || said.contains(&closed[0]), "{said}");
+}
+
+#[test]
+fn a_copy_cut_down_with_its_segment_gone_is_lost_however_much_is_left() {
+    for left in [0, 1] {
+        let world = World::with_log();
+        let (closed, _) = split_open(&world);
+        let folder = world.base.join("dest");
+        ok(&world.backup(&folder));
+        let whole: u64 = manifest_rows(&folder)
+            .iter()
+            .filter(|(name, _)| **name != closed[0])
+            .map(|(_, (size, _))| size)
+            .sum();
+        fs::remove_file(world.log().join(&closed[0])).expect("rm");
+        File::options()
+            .write(true)
+            .open(backup_log(&folder).join(&closed[0]))
+            .expect("open")
+            .set_len(left)
+            .expect("cut");
+
+        let said = ok(&world.backup(&folder));
+
+        let there = closed.len() - 1;
+        assert!(
+            said.contains(&format!("holds {there} segment(s)")),
+            "{said}"
+        );
+        assert!(said.contains("LOST 1 segment(s)"), "{said}");
+        assert!(said.contains(&closed[0]), "{said}");
+        let record = world.record();
+        assert_eq!(record["segments"].as_u64(), Some(there as u64));
+        assert_eq!(record["bytes"].as_u64(), Some(whole));
+        assert_eq!(record["lost"].as_u64(), Some(1));
+        let line = world.doctor_line();
+        assert!(
+            line.contains(&format!("({there} segments, 1 lost)")),
+            "{line}"
+        );
+        assert_eq!(
+            world.verify(&folder).status.code(),
+            Some(1),
+            "--verify keeps naming it"
+        );
+    }
+}
+
+#[test]
+fn the_only_copy_lost_is_not_called_nothing_closed() {
+    let world = World::with_log();
+    let (closed, _) = split_open(&world);
+    for name in &closed[1..] {
+        fs::remove_file(world.log().join(name)).expect("rm");
+    }
+    let folder = world.base.join("dest");
+    ok(&world.backup(&folder));
+    fs::remove_file(world.log().join(&closed[0])).expect("rm");
+    fs::write(backup_log(&folder).join(&closed[0]), b"").expect("cut");
+
+    let said = ok(&world.backup(&folder));
+
+    assert!(said.contains("LOST 1 segment(s)"), "{said}");
+    assert!(!said.contains("nothing has closed"), "{said}");
+    let line = world.doctor_line();
+    assert!(
+        line.starts_with("backup    none: this log has one copy"),
+        "{line}"
+    );
+    assert!(line.contains("1 lost"), "{line}");
+    assert!(!line.contains("nothing had closed"), "{line}");
+}
+
 // ---- Where a backup went, for someone removing conbus ----
 
 #[test]

@@ -251,15 +251,15 @@ fn finish(paths: &Paths, log_dir: &Path, record: Record, run: Finished) -> io::R
 
     let there = held_sizes(&layout.log)?;
     let in_log: BTreeSet<String> = segments.iter().map(|path| file_name(path)).collect();
-    let held: Vec<&Row> = rows
-        .values()
-        .filter(|row| there.contains_key(&row.name))
-        .collect();
+    // A copy counts only at the size its row says. Any other is what is left of one,
+    // and once the log has lost that segment nothing here can mend it.
+    let whole = |row: &Row| there.get(&row.name) == Some(&row.size);
+    let held: Vec<&Row> = rows.values().filter(|row| whole(row)).collect();
     let bytes = held.iter().map(|row| row.size).sum();
     let lost: Vec<String> = rows
-        .keys()
-        .filter(|name| !there.contains_key(*name) && !in_log.contains(*name))
-        .cloned()
+        .values()
+        .filter(|row| !whole(row) && !in_log.contains(&row.name))
+        .map(|row| row.name.clone())
         .collect();
     let record = record.finished(LastRun {
         destination: folder.to_string(),
@@ -557,8 +557,8 @@ fn print_report(report: &Report) {
     );
     if !report.lost.is_empty() {
         println!(
-            "backup    LOST {} segment(s), gone from the log and from this backup: {}; --verify \
-             keeps naming them",
+            "backup    LOST {} segment(s), gone from the log with no whole copy in this backup: \
+             {}; --verify keeps naming them",
             report.lost.len(),
             some_of(report.lost)
         );
@@ -571,7 +571,7 @@ fn print_report(report: &Report) {
             some_of(report.unvouched)
         );
     }
-    if report.held == 0 {
+    if report.held == 0 && report.lost.is_empty() {
         println!("backup    nothing has closed yet: this log still has one copy");
     }
     println!(

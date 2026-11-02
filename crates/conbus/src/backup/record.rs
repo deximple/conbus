@@ -19,7 +19,7 @@ const ONE_COPY: &str = "backup    none: this log has one copy";
 pub(super) struct LastRun {
     pub destination: String,
     pub last_ok: Timestamp,
-    /// Copies that are really there, not rows in the manifest.
+    /// Whole copies that are really there, not rows in the manifest.
     pub segments: u64,
     pub bytes: u64,
     pub same_volume: bool,
@@ -27,7 +27,7 @@ pub(super) struct LastRun {
     pub same_disk: bool,
     #[serde(default)]
     pub network: bool,
-    /// Manifest rows gone from the backup and from the log too.
+    /// Manifest rows gone from the log with no whole copy in the backup.
     #[serde(default)]
     pub lost: u64,
 }
@@ -122,10 +122,11 @@ fn describe_record(record: &Record, now: Timestamp) -> String {
         };
     };
     if last.segments == 0 {
-        return format!(
-            "{ONE_COPY} ({} holds no segment yet: nothing had closed)",
-            last.destination
-        );
+        let holds = match last.lost {
+            0 => "no segment yet: nothing had closed".to_string(),
+            lost => format!("no whole segment: {} lost", grouped(lost)),
+        };
+        return format!("{ONE_COPY} ({} holds {holds})", last.destination);
     }
     let count = match last.segments {
         1 => "1 segment".to_string(),
