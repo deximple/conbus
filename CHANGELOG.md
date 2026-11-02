@@ -24,6 +24,9 @@ the entry says so when it does.
 - `conbus log | head -1` and the like no longer end in a panic. A command whose
   reader went away exits 141, as if SIGPIPE had ended it, and prints nothing. A
   hook that cannot print exits 0, because it must never fail the turn it answers.
+- `install` now quotes the binary's path in the hooks it registers when the path
+  needs it. With a space in the home folder, every hook failed to start, so nothing
+  was recorded. `conbus doctor` reported it, and nothing else did.
 
 ## [1.0.0-rc.3] — 2026-11-01
 
