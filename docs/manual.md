@@ -469,7 +469,7 @@ conbus quota
 | Leg | Where the number comes from |
 | --- | --- |
 | Codex | Codex's own app-server (`account/rateLimits/read`), for the whole account, including Codex.app |
-| agy | `agy -p /usage`, once `agy models` shows a login |
+| agy | `agy -p /usage`, run only by `conbus quota` and only once `agy models` shows a login; `doctor` and `status` show the cached reading |
 | Claude Code | the `rate_limits` Claude Code gives its StatusLine command |
 | Cursor, grok, opencode | nothing yet: their hooks carry no remaining-quota field |
 
@@ -479,12 +479,20 @@ and SDK sessions never run a StatusLine, so a reading can be days old; after
 it is and when the StatusLine last ran. conbus does not read Claude's
 credentials to ask for the number another way.
 
-**agy is read only when it is signed in.** With no login, `agy -p` opens a
-browser tab, and no time limit prevents that, so conbus runs `agy models` first.
-If that reports no login, `quota`, `doctor` and `status` say `AUTH_REQUIRED`; if
-it fails another way or runs out of time, they say `SKIP`. Either way `agy -p`
-does not run and there is no reading, and a hop goes on without one. To sign in,
-run `agy` in a terminal.
+**`conbus quota` reads agy, and only when it is signed in.** With no login, `agy
+-p` opens a browser tab, and no time limit prevents that, so `doctor`, `status` and
+the quota read behind a hop's decision do not run `agy`. `conbus quota` is a command
+a person ran: it runs `agy models` first and asks `agy -p /usage` only on a login,
+then caches the reading. With no login it says `AUTH_REQUIRED`, and when `agy models`
+fails another way or runs out of time it says `SKIP`. `conbus auth` asks too, with
+`agy models` alone and never `-p`.
+
+`doctor` and `status` show the cached reading with its age. Past 90 minutes they
+show no numbers and say `last read 2h ago, so the numbers are not counted`; with
+none, `no reading yet; conbus quota reads it`. A hop decides from the cache and goes
+on without a reading. A hop to `agy` that a person ordered and `conbus run` start
+`agy` itself as an interactive session, and an `agy` with no login asks for one
+there. To sign in, run `agy` in a terminal.
 
 ---
 

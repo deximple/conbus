@@ -86,10 +86,28 @@ Anything that leaves goes through a program the person already runs:
   log into a session of the person's own agent. That agent's vendor receives
   them as context. `CONBUS_BRIEFING=off` stops briefings. Hops and summaries
   happen only when triggered.
-- **Vendor CLIs and `gh`.** Quota comes from `agy models` and `agy -p /usage`,
-  `codex app-server` and Claude Code's status line. To decide a hop, conbus
-  asks `git` and `gh` about the folder's pull request. Each of these tools
-  uses its own login, which conbus never reads.
+- **Vendor CLIs and `gh`.** Quota comes from `codex app-server`, Claude Code's
+  status line, and for `agy` from `conbus quota`, a command the person runs: `agy
+  models`, then `agy -p /usage` once that shows a login. `doctor`, `status` and the
+  quota read behind a hop's decision use the reading it cached. A hop to `agy` that
+  the person ordered and `conbus run` start `agy` itself as an interactive session.
+  To decide a hop, conbus asks `git` and `gh` about the folder's pull request. Each
+  of these tools uses its own login, which conbus never reads.
+- **`conbus auth`.** It answers "whose sign-in page is this", and sends nothing
+  anywhere of its own. `conbus auth` and `--html` run `codex app-server` for its
+  limits read, `agy models` (never `-p`) and `gh auth status --json hosts`, of which
+  only each account's state and whether it is active are read. `--url` runs `lsof` and
+  `ps`, for a callback port on this machine only: `ps` is asked for process names, and
+  for a conbus process also its subcommand, and that one word is all that is kept. It
+  reads no vendor config and no browser storage. The address it is given can hold a
+  token: it stays in memory for that one run, only its scheme, host, callback
+  parameters and `client` are decoded, other values are only searched undecoded for
+  an address on this machine, and nothing of it is stored. No query value is printed
+  but a callback's port and, as the URL's claim, a `client` name that is plain: ASCII
+  letters, digits, dots, dashes, underscores and single spaces, up to 64 characters.
+  An address on the command line is in shell history, so `conbus auth --url -` reads
+  it from stdin, and the command warns otherwise. `--html` writes a `0600` page with a
+  policy that lets it load nothing and connect nowhere; vendor text in it is escaped.
 - **Listeners.** The first is the Unix socket above. The second,
   `conbus hook --inference-listen`, is off unless started. It takes Anthropic
   Inference-hook frames over plain HTTP on `127.0.0.1:8787`, always answers
@@ -106,9 +124,12 @@ Anything that leaves goes through a program the person already runs:
 | `launchctl` (macOS), `systemctl --user` (Linux) | `install` and `uninstall` load and unload the recorder's service |
 | `security` | only with `encrypted_tools` on macOS: to create and read the sealing key |
 | `/bin/sh -c` | to forward the person's own status-line command; `doctor` uses it to check that a registered hook command starts |
-| `codex app-server`, `claude`, `agy`, and the CLI `conbus run` or `warm` starts | quota reads, hops, `summary`, `run`, `warm` |
-| `open`, `osascript`, `cursor -n` | opening the window where a hop lands |
-| `git`, `gh` | deciding a hop |
+| `codex app-server`, `claude`, and the CLI `conbus run` or `warm` starts | quota reads, hops, `summary`, `run`, `warm`, `auth` |
+| `agy` | `conbus quota` (`agy models`, then `agy -p /usage` once signed in); `conbus auth` (`agy models`, never `-p`); `conbus run`; a hop to it on a person's order, through `osascript`. Automatic overflow lands only on Codex or Claude |
+| `opencode --version` | `doctor` and `install`: which OpenCode the plugin is written for |
+| `lsof`, `ps` | `conbus auth --url`: walk what listens on a callback port on this machine |
+| `open`, `osascript`, `cursor -n` | opening the window where a hop lands; `open` or `xdg-open` for `conbus auth --html --open`, on that flag only |
+| `git`, `gh` | deciding a hop; `gh auth status` for `conbus auth` |
 | `/usr/bin/unzip` | reading a Claude.ai export dropped in `chat-export/` |
 
 ## What it changes outside its root
@@ -151,7 +172,8 @@ to set.
 
 ## What it never does
 
-- Read, store or forward a vendor credential or token.
+- Read, store or forward a vendor credential or token. An address a person hands
+  to `conbus auth --url` can hold one; it is not decoded, printed or kept.
 - Change a vendor binary.
 - Write a trust record on the person's behalf: Codex asks about each hook.
 - Pool accounts or quota.
