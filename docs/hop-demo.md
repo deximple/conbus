@@ -25,20 +25,26 @@ Expected lines: `route hop to codex · displaced · rate_limit`,
 A chat line that is only an order (`이제 커서로 작업할거야`, `switch to grok`) is `--to` after the hook reply. Same from a terminal:
 
 ```bash
-conbus hop cursor           # preview, current conversation
-conbus go cursor            # apply
+conbus hop cursor
+conbus go cursor
 ```
+
+The first previews the hop for the current conversation; the second applies it.
 
 Cursor landing is official `cursor -n <workspace>`. The next Composer in that checkout binds the same `bus_id`. Claude and Codex still use bus-owned warms.
 
 ## Live hop (this machine)
 
 ```bash
-conbus hop                  # decide
-conbus hop --to codex       # directed; still a preview
+conbus hop
+conbus hop --to codex
 conbus hop --from <bus_id> --apply
-conbus run                  # same TTY
+conbus run
 ```
+
+In order: decide where the conversation would go; preview a directed hop, which
+still changes nothing; apply the hop for one conversation; and continue in the
+same terminal.
 
 `--apply` records through the daemon and opens or syncs bus-owned warms.
 It never injects into a thread the person opened. Codex hooks stay silent

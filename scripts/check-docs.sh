@@ -35,7 +35,7 @@ done
 # and what they do goes beside it. A `#` inside quotes, or one that does not start a
 # word, is not a comment: `${x##*/}`, `$#`, a URL's `#part`. A block that starts
 # with `#!` is a script's content, not something to paste, and keeps its comments.
-examples="README.md docs/manual.md docs/manual.ko.md docs/beginner-manual.md"
+examples="README.md docs/manual.md docs/manual.ko.md docs/beginner-manual.md docs/hop-demo.md"
 # shellcheck disable=SC2086 # the names have no spaces, and each is one argument
 comments=$(awk '
   function commented(line,    i, c, before) {
