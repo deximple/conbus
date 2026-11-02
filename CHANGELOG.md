@@ -37,6 +37,9 @@ the entry says so when it does.
   a person who gave an order during a restart gives it again. A quota stop that
   waited in the spool likewise starts no `hop --apply` on its own, however late it
   lands. The decision stays in the log, for `conbus hop` and the next briefing.
+- `usage` no longer counts a spool re-delivery twice in `records`. A second line
+  under one hook id adds one to `records` and one to `repeated`, as a twin
+  delivery does.
 
 ## [1.0.0-rc.3] — 2026-11-01
 
