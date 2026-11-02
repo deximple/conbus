@@ -33,6 +33,7 @@ const COMMANDS: &[&str] = &[
     "install",
     "uninstall",
     "backfill",
+    "backup",
     "doctor",
     "auth",
     "quota",

@@ -55,6 +55,12 @@ pub enum Command {
         /// Official Claude.ai / Desktop `conversations.json` or its zip.
         chat_export: Option<String>,
     },
+    /// Copy closed segments to a folder a person names, or with `verify`
+    /// recheck what is there. Only ever run by a person or their scheduler.
+    Backup {
+        to: String,
+        verify: bool,
+    },
     Doctor,
     /// Who needs a sign-in (never conbus itself), and for a URL that opened,
     /// whose page it is and which process asked. `--html` writes one
@@ -225,6 +231,7 @@ where
                 &[],
                 0,
             ),
+            "backup" => (&["--verify"], &["--to"], &[], 0),
             "log" => (
                 &["--json", "--reveal"],
                 &["--bus-id", "--since", "--tail", "--grep"],
@@ -302,6 +309,13 @@ where
             gaps: args.iter().any(|a| a == "--gaps"),
             include_older_lines: args.iter().any(|a| a == "--include-older-lines"),
             chat_export: flag_value(&args, "--chat-export"),
+        },
+        "backup" => match flag_value(&args, "--to").filter(|to| !to.is_empty()) {
+            Some(to) => Command::Backup {
+                to,
+                verify: args.iter().any(|a| a == "--verify"),
+            },
+            None => Command::UsageError("backup needs --to FOLDER".into()),
         },
         "log" if args.get(1).map(String::as_str) == Some("index") => Command::LogIndex,
         "log" => Command::Log {
@@ -502,6 +516,14 @@ USAGE:
                                   and --include-older-lines fills from lines older than their
                                   file too, which may be another conversation's copies;
                                   --chat-export reads official Claude.ai conversations.json (or zip)
+    conbus backup --to FOLDER     (experimental) copy closed segments not yet there
+                                  into FOLDER/conbus-backup and read them back;
+                                  run by you, never automatically; refuses a
+                                  cloud-synced folder; prompts and replies stay
+                                  plain text there; docs/manual.md section 11
+    conbus backup --verify --to FOLDER
+                                  (experimental) recheck the whole backup; names
+                                  any file that differs or is missing and exits 1
     conbus doctor                 report what is and is not wired up
     conbus auth [--url URL] [--html [PATH]] [--open]  (experimental)
                                   asks codex, agy and gh whether they are signed in
@@ -939,6 +961,34 @@ mod tests {
                 chat_export: Some("/tmp/conversations.json".into())
             }
         );
+    }
+
+    #[test]
+    fn backup_needs_a_folder_and_nothing_stands_in_for_one() {
+        assert_eq!(
+            parse(["backup", "--to", "/Volumes/My Disk"], None),
+            Command::Backup {
+                to: "/Volumes/My Disk".into(),
+                verify: false
+            }
+        );
+        assert_eq!(
+            parse(["backup", "--verify", "--to", "/tmp/x"], None),
+            Command::Backup {
+                to: "/tmp/x".into(),
+                verify: true
+            }
+        );
+        for args in [
+            &["backup"][..],
+            &["backup", "--verify"][..],
+            &["backup", "--to", ""][..],
+        ] {
+            assert!(
+                matches!(parse(args, None), Command::UsageError(_)),
+                "{args:?}"
+            );
+        }
     }
 
     #[test]

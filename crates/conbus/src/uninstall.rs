@@ -253,6 +253,28 @@ pub fn run(apply: bool, profile: Option<&str>) -> io::Result<()> {
             shell_quote(&root)
         );
     }
+    // Not under the root, so nothing above names them, and the record that does
+    // goes with the root. Read here, while there is a binary to read it.
+    if let Ok(paths) = conbus_core::paths::Paths::resolve() {
+        match crate::backup::left_behind(&paths) {
+            Ok(copies) => {
+                for copy in copies {
+                    println!(
+                        "{:<12} {} — kept, in plain text. Remove it yourself if you want it \
+                         gone: rm -rf {}",
+                        "backup",
+                        copy.display(),
+                        shell_quote(&copy)
+                    );
+                }
+            }
+            Err(err) => println!(
+                "{:<12} cannot say where backups went: {err}. Look in that file yourself before \
+                 removing it",
+                "backup"
+            ),
+        }
+    }
     if !changed {
         println!("\nNothing of conbus is registered here.");
     } else if !apply {
