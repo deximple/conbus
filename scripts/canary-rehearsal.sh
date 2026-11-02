@@ -597,6 +597,7 @@ code=0
 env -u CONBUS_HOME -u XDG_STATE_HOME -u CONBUS_CANARY_REHEARSAL HOME="$home" CONBUS_SKIP_LAUNCHCTL= \
     CONBUS_CANARY_TEST_REAL_HOME="$home" bash "$canary" start --from "$tmp/stage/conbus-good" >"$tmp/guard-empty.out" 2>&1 || code=$?
 expect 2 "$code" "an empty CONBUS_SKIP_LAUNCHCTL is no real path"
+expect_grep "the real swap needs the real HOME" "$tmp/guard-empty.out" "by the guard, before preflight"
 
 # The seam walks the real swap path, whose `install --apply` from a real binary would take the live recorder down
 # whatever HOME says: launchctl answers by uid. So it is for stand-ins only. Both sides refuse before anything moves.
@@ -2927,6 +2928,9 @@ expect_grep '^FAIL drops — 1 lost record' "$tmp/verdict-orphan-prompt.out" "an
 write_fake beef orphans "$tmp/stage/conbus-orphans"
 write_fake 01d old "$install_dir/conbus"
 rm -f "$rollback_bin" "$home/.install-called" "$home/.conbus/canary.json"
+cat >"$home/.conbus/drops.jsonl" <<'EOF'
+{"ts":"2026-10-30T09:00:00.000Z","reason":"socket closed early"}
+EOF
 daemon_boot beef 4264
 code=0; run_real start --from "$tmp/stage/conbus-orphans" >"$tmp/start-orphans.out" 2>&1 || code=$?
 expect 0 "$code" "a tool event with no prompt does not roll a swap back"
@@ -2945,7 +2949,9 @@ repeated_on() { # repeated_on <days ago> <count>; the codex row that day
     mv -f "$home/.usage-rows.new" "$home/.usage-rows"
 }
 verdict_fixture
-printf '{"day":"%s","harness":"codex","turns":3,"tool_calls":40,"tool_denials":0,"repeated":5000,"recovered":0}\n' "$(day_ago 40)" >>"$home/.usage-rows"
+for old_day in 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69; do
+    printf '{"day":"%s","harness":"codex","turns":3,"tool_calls":40,"tool_denials":0,"repeated":50,"recovered":0}\n' "$(day_ago "$old_day")" >>"$home/.usage-rows"
+done
 for d in 0 1 2 3 4 5 6; do repeated_on "$d" 5; done
 code=0; run verdict >"$tmp/verdict-repeated-sept.out" 2>&1 || code=$?
 expect 1 "$code" "a flood from before the 28 days does not hide a regression"
