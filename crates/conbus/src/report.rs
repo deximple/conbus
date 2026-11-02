@@ -1481,6 +1481,7 @@ pub fn doctor(paths: &Paths) -> io::Result<()> {
     println!("{}", meter.describe_cost());
     println!("{}", meter.describe_turns());
     println!("verdict   conbus verdict — 4-week dogfood score; open window is not a kill");
+    println!("auth      conbus needs no login of its own; see conbus auth");
     println!("{}", cursor_line(&scan.records));
     match route {
         Ok(line) => println!("route     {line}"),

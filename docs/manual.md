@@ -733,6 +733,49 @@ named no session under one shared conversation. 0.1.0 and later refuse such
 events; the old records stay in the log, which is append-only, and this line
 says what they are.
 
+**A sign-in tab opened and you do not know whose it is** — copy its address and
+run `pbpaste | conbus auth --url -` (on Linux, `wl-paste | conbus auth --url -`
+or `xclip -o -selection clipboard | conbus auth --url -`). Reading it from stdin
+keeps a token in the address out of your shell history, and out of the record of
+any agent that runs the command. A pipe must hold one line, because an address has
+no line breaks in it. `conbus auth --url "<URL>"` works too, and warns when the URL
+has a query. Nothing is stored, and no query value is printed but a callback's port
+and a plain `client` name, which is shown only as the URL's claim.
+
+It names the page from its scheme and host, and anything else is `unknown page`.
+When the page calls back to a port on this machine, it walks every process
+listening there up to the root. Then:
+
+- `conbus yes` — a conbus command is above what listens, and the page belongs to a
+  vendor conbus starts itself: Codex and the bridge its MCP servers open, agy, or
+  Claude. An address can name any port, so an unknown page never earns this.
+- `conbus no` — the chain goes up to an app or a person's session, with no conbus in
+  it. That covers the ancestry and no more, and the line after it says what a walk
+  cannot see: an app a hop opened hangs from launchd like any other. Every conbus
+  read starts `codex app-server`, and `conbus status` lists the hops.
+- `conbus cannot tell` — anything else, and it says what would tell. A listener
+  hanging straight from the root or a service manager (`launchd`, `init`, `systemd
+  --user`) reads this, and so does a chain whose top is neither an app nor a
+  session: a service and a server left behind by something that has exited look the
+  same from here. So does no listener or no port, a callback on another host or
+  through a custom scheme, one it does not read, and a walk that stopped short. A
+  listener under `conbus run` reads this too, because that is your own agent, not
+  conbus.
+
+`conbus auth` reads no vendor config. For the Playwright bridge, if the page says
+`Invalid token provided`, the token that client was given differs from the
+extension's in the Chrome profile it opened in: copy the token from the
+extension's page into the client's `PLAYWRIGHT_MCP_EXTENSION_TOKEN`;
+`PLAYWRIGHT_MCP_PROFILE_DIR_NAME` pins the profile.
+
+`conbus auth` alone asks Codex, agy and gh whether they are signed in, and marks the
+vendors it does not ask `not checked`, so it does not say that those need no sign-in.
+A hop needs Codex and gh. Only agy's own quota line needs agy, so sign in there only
+if you use it. It also lists what conbus runs with nobody at the keyboard; recording
+needs no sign-in. `conbus auth --html` writes the same as one offline page, whose
+banner says which vendors it asked and which it did not, and `--html --open` opens
+that page. `--url` takes neither of those flags.
+
 **A hop did not happen when a limit hit** — check `conbus status`: the rules
 line, the destination's quota, and whether the session was a program
 (unattended sessions never hop). `conbus hop` shows what it would decide now.
@@ -837,6 +880,7 @@ or `conbus run claude_code --profile NAME`.
 | `conbus install --managed` | Print the hooks block for Claude Code's managed settings (JSON on stdout) and where it goes; writes nothing ([Managed Macs](fleet.md)) |
 | `conbus uninstall [--apply] [--profile NAME]` | Take them all back out; the log is kept. `--profile` removes only `$HOME/.claude-NAME`'s registration |
 | `conbus doctor` | What is wired up and what is not |
+| `conbus auth [--url URL] [--html [PATH]] [--open]` | Asks Codex, agy and gh whether they are signed in (conbus itself needs no login) and says which it did not ask; `--url` says whose page a URL is and whether conbus is above what it calls back to, or that it cannot tell, and `--url -` reads the URL from stdin; `--html` writes one offline page, and `--open` with it opens that page (experimental) |
 | `conbus status` | Routing rules, quota, hop history, cost |
 | `conbus quota` | What each leg has left |
 | `conbus policy check` | The effective `policy.json` rules, or why there are none (section 15) |

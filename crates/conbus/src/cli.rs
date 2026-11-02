@@ -53,6 +53,14 @@ pub enum Command {
         chat_export: Option<String>,
     },
     Doctor,
+    /// Who needs a sign-in (never conbus itself), and for a URL that opened,
+    /// whose page it is and which process asked. `--html` writes one
+    /// self-contained page; `--open` opens it — explicit calls only.
+    Auth {
+        url: Option<String>,
+        html: Option<String>,
+        open: bool,
+    },
     /// Build the derived sidecars for every closed segment; writes only
     /// under `<root>/cache/`.
     LogIndex,
@@ -216,6 +224,7 @@ where
                 usize::MAX,
             ),
             "doctor" | "status" | "quota" | "verdict" => (&[], &[], &[], 0),
+            "auth" => (&["--open"], &["--url"], &["--html"], 0),
             "policy" => (&[], &["--harness", "--tool", "--input"], &[], usize::MAX),
             "hop" => (&["--apply", "--demo"], &["--from", "--to"], &[], usize::MAX),
             "go" => (&[], &["--from", "--to"], &[], usize::MAX),
@@ -297,6 +306,25 @@ where
             },
         },
         "doctor" => Command::Doctor,
+        "auth" => {
+            let url = flag_value(&args, "--url");
+            let html = args.iter().any(|a| a == "--html").then(|| {
+                flag_value(&args, "--html")
+                    .filter(|value| !value.starts_with('-'))
+                    .unwrap_or_default()
+            });
+            let open = args.iter().any(|a| a == "--open");
+            match (&url, &html, open) {
+                (Some(_), Some(_), _) | (Some(_), None, true) => Command::UsageError(
+                    "--url answers for one address, and --html and --open write and open the page; run them apart"
+                        .into(),
+                ),
+                (None, None, true) => {
+                    Command::UsageError("--open opens the page --html writes; use them together".into())
+                }
+                _ => Command::Auth { url, html, open },
+            }
+        }
         "status" => Command::Status,
         "quota" => Command::Quota,
         "policy" => Command::Policy {
@@ -392,7 +420,8 @@ fn usage_error(
             i += 1;
         } else if values.contains(&arg) {
             match args.get(i + 1) {
-                Some(next) if !next.starts_with('-') => i += 2,
+                // A lone `-` is a value: stdin, for the flags that read it.
+                Some(next) if next == "-" || !next.starts_with('-') => i += 2,
                 _ => return Some(format!("{arg} needs an argument")),
             }
         } else if optional.contains(&arg) {
@@ -463,6 +492,15 @@ USAGE:
                                   recover history; --gaps fills missed turns of live sessions;
                                   --chat-export reads official Claude.ai conversations.json (or zip)
     conbus doctor                 report what is and is not wired up
+    conbus auth [--url URL] [--html [PATH]] [--open]  (experimental)
+                                  asks codex, agy and gh whether they are signed in
+                                  (conbus itself needs no login), and says which it
+                                  did not ask; --url says whose page a URL is and
+                                  whether conbus is above what it calls back to, or
+                                  that it cannot tell; --url - reads the URL from
+                                  stdin, which keeps a token out of shell history;
+                                  --html writes one self-contained page, and --open
+                                  with it opens that page
     conbus status                 routing rules, quota, hop history, cost
     conbus quota                  Codex probe + Claude StatusLine cache + catalog
     conbus policy check           (experimental) the effective policy.json rules;
@@ -1035,6 +1073,49 @@ mod tests {
         };
 
         assert_eq!(filter.tail, None);
+    }
+
+    #[test]
+    fn auth_url_takes_an_address_or_a_dash_for_stdin() {
+        for value in ["https://x.example/", "-"] {
+            match parse(["auth", "--url", value], None) {
+                Command::Auth { url, .. } => assert_eq!(url.as_deref(), Some(value)),
+                other => panic!("{other:?}"),
+            }
+        }
+        for args in [&["auth", "--url"][..], &["auth", "--url", "--open"]] {
+            assert!(
+                matches!(parse(args, None), Command::UsageError(_)),
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn auth_refuses_flags_it_could_only_ignore() {
+        for args in [
+            &["auth", "--open"][..],
+            &["auth", "--url", "x", "--open"],
+            &["auth", "--url", "x", "--html"],
+            &["auth", "--url", "x", "--html", "p", "--open"],
+        ] {
+            assert!(
+                matches!(parse(args, None), Command::UsageError(_)),
+                "{args:?}"
+            );
+        }
+        for args in [
+            &["auth"][..],
+            &["auth", "--html"],
+            &["auth", "--html", "--open"],
+            &["auth", "--html", "p", "--open"],
+            &["auth", "--url", "x"],
+        ] {
+            assert!(
+                matches!(parse(args, None), Command::Auth { .. }),
+                "{args:?}"
+            );
+        }
     }
 
     #[test]
