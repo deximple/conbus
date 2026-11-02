@@ -1,11 +1,13 @@
 //! Whether conbus is above whatever a page calls back to.
 //!
-//! `no` needs positive evidence: a listener on a port of this machine, walked
-//! to the root, with no conbus on the way. Anything less is `cannot tell`, and
-//! says what would tell. Even a `no` covers the ancestry and nothing more, so it
-//! carries what a walk cannot see.
+//! `no` needs positive evidence: a listener on a port of this machine, walked up
+//! to something that vouches for itself, with no conbus on the way. `yes` needs a
+//! conbus command above that listener and a page of a vendor conbus runs, because
+//! an address can name any port. Anything less is `cannot tell`, and says what would
+//! tell. Even a `no` covers the ancestry and nothing more, so it carries what a walk
+//! cannot see.
 
-use super::ancestry::{self, Holders, Listener, Stopped};
+use super::ancestry::{self, ConbusProcess, Holders, Listener, Stopped};
 use super::url::Callback;
 
 /// What was measured about the vendor programs conbus starts on its own, and
@@ -36,11 +38,12 @@ fn look(callback: &Callback) -> Looked {
     }
 }
 
-/// The `process` lines and the verdict for a page's callbacks.
-pub(super) fn describe(callbacks: &[Callback]) -> Vec<String> {
+/// The `process` lines and the verdict for a page's callbacks. `conbus_runs_it`:
+/// the page belongs to a vendor conbus starts as its own child.
+pub(super) fn describe(callbacks: &[Callback], conbus_runs_it: bool) -> Vec<String> {
     let looked: Vec<Looked> = callbacks.iter().map(look).collect();
     let mut lines = process_lines(&looked);
-    lines.extend(verdict_lines(&looked));
+    lines.extend(verdict_lines(&looked, conbus_runs_it));
     lines
 }
 
@@ -85,31 +88,106 @@ fn process_line(looked: &Looked) -> Vec<String> {
     }
 }
 
-fn verdict_lines(looked: &[Looked]) -> Vec<String> {
-    if let Some((port, pid)) = looked.iter().find_map(under_conbus) {
-        return vec![format!(
-            "conbus    yes: a process named conbus is in the ancestry of pid {pid}, which listens on port {port}"
-        )];
+fn verdict_lines(looked: &[Looked], conbus_runs_it: bool) -> Vec<String> {
+    let found: Vec<Above> = looked
+        .iter()
+        .flat_map(|looked| conbus_above(looked, conbus_runs_it))
+        .collect();
+    if let Some(yes) = found.iter().find_map(Above::yes) {
+        return vec![yes];
+    }
+    if let Some(why) = found.first().and_then(Above::why_not_yes) {
+        return vec![format!("conbus    cannot tell: {why}")];
     }
     if let Some(why) = why_it_cannot_tell(looked) {
         return vec![format!("conbus    cannot tell: {why}")];
     }
     vec![
-        "conbus    no: every listener lsof sees on the callback's port was walked to the root, and none has conbus above it"
+        "conbus    no: every listener lsof sees on the callback's port was walked up to an app or a session, and none has conbus above it"
             .into(),
         format!("limit     {LIMIT}"),
         format!("measured  {MEASURED}"),
     ]
 }
 
-fn under_conbus(looked: &Looked) -> Option<(u16, u32)> {
+/// A listener with a process named conbus in its chain, and what that comes to.
+struct Above {
+    port: u16,
+    pid: u32,
+    kind: AboveKind,
+}
+
+enum AboveKind {
+    /// The conbus command it names, over a page of a vendor conbus runs.
+    Command(String),
+    /// `conbus run`: the agent under it is the person's own.
+    TheirAgent,
+    /// The listener is conbus: `conbus hook --inference-listen` on a known port.
+    ItsOwnListener,
+    /// `ps` would not say which command the conbus process is.
+    CommandUnread,
+    /// conbus runs nothing that asks for this page.
+    PageNotOurs,
+}
+
+fn conbus_above(looked: &Looked, conbus_runs_it: bool) -> Vec<Above> {
     let Looked::Port(port, Holders::Listeners(listeners)) = looked else {
-        return None;
+        return Vec::new();
     };
     listeners
         .iter()
-        .find(|listener| listener.under_conbus())
-        .map(|listener| (*port, listener.pid))
+        .filter_map(|listener| above(*port, listener, conbus_runs_it))
+        .collect()
+}
+
+fn above(port: u16, listener: &Listener, conbus_runs_it: bool) -> Option<Above> {
+    let nearest = listener.conbus.first()?;
+    let run = |process: &&ConbusProcess| process.command.as_deref() == Some("run");
+    let unread = |process: &&ConbusProcess| process.command.is_none();
+    let (pid, kind) = if nearest.pid == listener.pid {
+        (nearest.pid, AboveKind::ItsOwnListener)
+    } else if let Some(process) = listener.conbus.iter().find(run) {
+        (process.pid, AboveKind::TheirAgent)
+    } else if let Some(process) = listener.conbus.iter().find(unread) {
+        (process.pid, AboveKind::CommandUnread)
+    } else if !conbus_runs_it {
+        (nearest.pid, AboveKind::PageNotOurs)
+    } else {
+        let command = nearest.command.clone().unwrap_or_default();
+        (nearest.pid, AboveKind::Command(command))
+    };
+    Some(Above { port, pid, kind })
+}
+
+impl Above {
+    fn yes(&self) -> Option<String> {
+        let AboveKind::Command(command) = &self.kind else {
+            return None;
+        };
+        Some(format!(
+            "conbus    yes: `conbus {command}` (pid {}) is above what listens on port {}, and it runs the vendor this page belongs to",
+            self.pid, self.port
+        ))
+    }
+
+    fn why_not_yes(&self) -> Option<String> {
+        let (port, pid) = (self.port, self.pid);
+        match self.kind {
+            AboveKind::Command(_) => None,
+            AboveKind::TheirAgent => Some(format!(
+                "what listens on port {port} runs under `conbus run` (pid {pid}), so it is your own agent, not conbus, and conbus does not know what it asked for"
+            )),
+            AboveKind::ItsOwnListener => Some(format!(
+                "conbus itself listens on port {port} (pid {pid}), and it has no sign-in of its own to call back to. An address can name any port, so this one says nothing about who opened the page"
+            )),
+            AboveKind::CommandUnread => Some(format!(
+                "a process named conbus (pid {pid}) is above what listens on port {port}, and `ps` would not say which command it is. Looking again while the page still waits would tell"
+            )),
+            AboveKind::PageNotOurs => Some(format!(
+                "a conbus process (pid {pid}) is above what listens on port {port}, but conbus runs nothing that asks for this page. An address can name any port, so the port alone says nothing about who opened it; {HOPS}"
+            )),
+        }
+    }
 }
 
 /// The first thing that keeps this from being a `no`.

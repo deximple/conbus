@@ -263,7 +263,8 @@ fn describe_url(url: &str) -> String {
     }
 
     let callbacks = address.as_ref().map(Address::callbacks).unwrap_or_default();
-    for line in verdict::describe(&callbacks) {
+    let conbus_runs_it = page.is_some_and(|page| page.conbus_runs_it);
+    for line in verdict::describe(&callbacks, conbus_runs_it) {
         out.push_str(&line);
         out.push('\n');
     }

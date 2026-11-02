@@ -23,6 +23,25 @@ impl ProcessTable {
         processes: &[(u32, u32, &str)],
         groups: &[(u32, u32)],
     ) -> Self {
+        Self::build(listeners, processes, groups, &[])
+    }
+
+    /// As [`ProcessTable::new`], with the command line of each pid in `commands`
+    /// named. Any other reads as `<name> quota`.
+    fn with_commands(
+        listeners: &[u32],
+        processes: &[(u32, u32, &str)],
+        commands: &[(u32, &str)],
+    ) -> Self {
+        Self::build(listeners, processes, &[], commands)
+    }
+
+    fn build(
+        listeners: &[u32],
+        processes: &[(u32, u32, &str)],
+        groups: &[(u32, u32)],
+        commands: &[(u32, &str)],
+    ) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         let lsof_calls = dir.path().join("lsof.calls");
         let pids: String = listeners.iter().map(|pid| format!("{pid}\n")).collect();
@@ -44,10 +63,20 @@ impl ProcessTable {
                 format!("  {pid}) echo '{ppid} {group} {name}' ;;\n")
             })
             .collect();
+        let command_arms: String = processes
+            .iter()
+            .map(|(pid, _, name)| {
+                let command = commands
+                    .iter()
+                    .find(|(member, _)| member == pid)
+                    .map_or(format!("{name} quota"), |(_, command)| command.to_string());
+                format!("  {pid}) echo '{command}' ;;\n")
+            })
+            .collect();
         support::write_executable(
             &dir.path().join("ps"),
             &format!(
-                "#!/bin/sh\nwhile [ $# -gt 1 ]; do shift; done\ncase $1 in\n{arms}  *) exit 1 ;;\nesac\n"
+                "#!/bin/sh\nwant=$2\nwhile [ $# -gt 1 ]; do shift; done\nif [ \"$want\" = args= ]; then\ncase $1 in\n{command_arms}  *) exit 1 ;;\nesac\nexit 0\nfi\ncase $1 in\n{arms}  *) exit 1 ;;\nesac\n"
             ),
         );
         warmed(&dir.path().join("lsof"));
@@ -214,7 +243,8 @@ fn only_the_name_of_the_binary_makes_a_process_conbus() {
         let table = ProcessTable::new(
             &[50],
             &[
-                (50, 60, name),
+                (50, 55, "node"),
+                (55, 60, name),
                 (60, 1, "/Applications/Some.app/Contents/MacOS/Some"),
                 (1, 0, "/sbin/launchd"),
             ],
@@ -455,7 +485,7 @@ fn conbus_above_one_callback_is_yes_whatever_another_says() {
     let remote = "https%3A%2F%2Fanother.example%3A1%2F";
 
     let stdout = table.ask(&format!(
-        "https://x.example/?redirect_uri={remote}&callback={local}"
+        "https://accounts.google.com/o/oauth2/auth?redirect_uri={remote}&callback={local}"
     ));
 
     assert!(
@@ -808,4 +838,213 @@ fn an_app_that_lost_its_own_parent_is_not_a_no() {
         verdict_of(&stdout).starts_with("conbus    cannot tell:"),
         "{stdout}"
     );
+}
+
+#[test]
+fn a_page_nobody_vouches_for_does_not_earn_a_yes_from_a_port_it_named() {
+    let table = ProcessTable::new(
+        &[50],
+        &[
+            (50, 40, "node"),
+            (40, 30, "claude"),
+            (30, 1, "conbus"),
+            (1, 0, "/sbin/launchd"),
+        ],
+    );
+    let stdout =
+        table.ask("https://evil.example/login?redirect_uri=http%3A%2F%2F127.0.0.1%3A3000%2F");
+    assert!(stdout.starts_with("this      unknown page"), "{stdout}");
+    assert!(
+        !verdict_of(&stdout).starts_with("conbus    yes:"),
+        "{stdout}"
+    );
+}
+
+/// What listens hangs from a conbus command, which hangs from an app.
+const UNDER_A_CONBUS_READ: &[(u32, u32, &str)] = &[
+    (50, 40, "node"),
+    (40, 30, "codex"),
+    (30, 20, "conbus"),
+    (20, 1, "/Applications/Some.app/Contents/MacOS/Some"),
+    (1, 0, "/sbin/launchd"),
+];
+
+/// A page with its callback on `port`.
+fn page_calling_back(page: &str, port: u16) -> String {
+    format!("{page}?redirect_uri=http%3A%2F%2F127.0.0.1%3A{port}%2F")
+}
+
+#[test]
+fn a_vendor_conbus_runs_under_a_conbus_command_is_yes_and_names_the_command() {
+    for page in [
+        "https://accounts.google.com/o/oauth2/auth",
+        "https://auth.openai.com/oauth/authorize",
+        "https://console.anthropic.com/",
+        "https://claude.ai/login",
+        "chrome-extension://mmlmfjhmonkocbjadbfplnigmagldckm/connect.html",
+    ] {
+        let table = ProcessTable::new(&[50], UNDER_A_CONBUS_READ);
+        let stdout = table.ask(&page_calling_back(page, 55407));
+        let said = verdict_of(&stdout);
+        assert!(said.starts_with("conbus    yes:"), "{page}: {stdout}");
+        assert!(said.contains("`conbus quota`"), "{page}: {stdout}");
+    }
+}
+
+#[test]
+fn a_page_for_a_vendor_conbus_does_not_run_that_way_is_not_a_yes() {
+    // conbus runs `gh` for a lookup, and opens Cursor and Grok without being their
+    // parent. None of those can be what asked through a process under conbus.
+    for page in [
+        "https://github.com/login/oauth/authorize",
+        "https://cursor.com/loginDeepControl",
+        "https://accounts.x.ai/sign-in",
+        "https://evil.example/login",
+    ] {
+        let table = ProcessTable::new(&[50], UNDER_A_CONBUS_READ);
+        let stdout = table.ask(&page_calling_back(page, 55407));
+        let said = verdict_of(&stdout);
+        assert!(
+            said.starts_with("conbus    cannot tell:"),
+            "{page}: {stdout}"
+        );
+        assert!(said.contains("can name any port"), "{page}: {stdout}");
+    }
+}
+
+#[test]
+fn a_listener_under_conbus_run_belongs_to_the_person_s_own_agent() {
+    for page in [
+        "https://claude.ai/login",
+        "https://accounts.google.com/o/oauth2/auth",
+        "https://evil.example/login",
+    ] {
+        let table = ProcessTable::with_commands(
+            &[50],
+            &[
+                (50, 40, "node"),
+                (40, 30, "claude"),
+                (30, 20, "conbus"),
+                (20, 1, "/Applications/Some.app/Contents/MacOS/Some"),
+                (1, 0, "/sbin/launchd"),
+            ],
+            &[(
+                30,
+                "/home/someone/.local/bin/conbus run claude_code --profile work",
+            )],
+        );
+        let stdout = table.ask(&page_calling_back(page, 55407));
+        let said = verdict_of(&stdout);
+        assert!(
+            said.starts_with("conbus    cannot tell:"),
+            "{page}: {stdout}"
+        );
+        assert!(said.contains("`conbus run`"), "{page}: {stdout}");
+        assert!(said.contains("your own agent"), "{page}: {stdout}");
+        assert!(
+            !stdout.contains("--profile") && !stdout.contains("work"),
+            "{stdout}"
+        );
+    }
+}
+
+#[test]
+fn conbus_run_anywhere_above_outranks_a_nearer_conbus_command() {
+    let table = ProcessTable::with_commands(
+        &[50],
+        &[
+            (50, 45, "node"),
+            (45, 40, "conbus"),
+            (40, 30, "claude"),
+            (30, 1, "conbus"),
+            (1, 0, "/sbin/launchd"),
+        ],
+        &[(45, "conbus quota"), (30, "conbus run claude_code")],
+    );
+
+    let stdout = table.ask(&page_calling_back("https://claude.ai/login", 55407));
+
+    assert!(verdict_of(&stdout).contains("`conbus run`"), "{stdout}");
+}
+
+#[test]
+fn conbus_s_own_listener_is_not_a_yes() {
+    // `conbus hook --inference-listen` sits on a port anyone can name.
+    let table = ProcessTable::with_commands(
+        &[50],
+        &[
+            (50, 40, "conbus"),
+            (40, 1, "/Applications/Some.app/Contents/MacOS/Some"),
+            (1, 0, "/sbin/launchd"),
+        ],
+        &[(50, "conbus hook --inference-listen")],
+    );
+
+    let stdout = table.ask(&page_calling_back(
+        "https://accounts.google.com/o/oauth2/auth",
+        8787,
+    ));
+
+    let said = verdict_of(&stdout);
+    assert!(said.starts_with("conbus    cannot tell:"), "{stdout}");
+    assert!(said.contains("conbus itself listens"), "{stdout}");
+}
+
+#[test]
+fn a_conbus_whose_command_cannot_be_read_is_not_a_yes() {
+    for command in ["", "conbus", "conbus --odd", "/bin/sh -c conbus"] {
+        let table = ProcessTable::with_commands(&[50], UNDER_A_CONBUS_READ, &[(30, command)]);
+        let stdout = table.ask(&page_calling_back("https://claude.ai/login", 55407));
+        let said = verdict_of(&stdout);
+        assert!(
+            said.starts_with("conbus    cannot tell:"),
+            "{command:?}: {stdout}"
+        );
+        assert!(said.contains("which command"), "{command:?}: {stdout}");
+    }
+}
+
+#[test]
+fn a_real_listener_under_a_real_conbus_run_is_not_a_yes() {
+    if !have_lsof_and_ps() {
+        return;
+    }
+    let root = tempfile::tempdir().expect("tempdir");
+    let agent_dir = tempfile::tempdir().expect("tempdir");
+    let agent = agent_dir.path().join("claude");
+    support::write_executable(&agent, LISTENING_CODEX);
+    let mut run = conbus(root.path())
+        .args(["run", "claude_code"])
+        .env("CONBUS_CLAUDE_BIN", &agent)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("run conbus run");
+    let port_file = agent_dir.path().join("port");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let port = loop {
+        if let Ok(text) = std::fs::read_to_string(&port_file) {
+            break text.trim().parse::<u16>().expect("port");
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the stand-in agent never listened"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+
+    let output = conbus(root.path())
+        .args([
+            "auth",
+            "--url",
+            &page_calling_back("https://claude.ai/login", port),
+        ])
+        .output()
+        .expect("run auth --url");
+    std::fs::write(agent_dir.path().join("stop"), "").expect("stop");
+    run.wait().expect("conbus run ends with its agent");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(verdict_of(&stdout).contains("`conbus run`"), "{stdout}");
 }

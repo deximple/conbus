@@ -2,7 +2,8 @@
 //!
 //! Names only. A process's arguments can hold anything, so they are never asked
 //! for, and a directory is dropped from a name because it can hold a person's
-//! home.
+//! home. The one exception is a conbus process's own subcommand: `conbus run` and
+//! `conbus quota` mean different things here, and that word is all that is kept.
 
 use std::collections::HashSet;
 use std::process::Command;
@@ -19,6 +20,14 @@ pub(super) struct Listener {
     pub chain: Vec<String>,
     /// Why the walk did not reach the root with the ancestry whole, when it did not.
     pub stopped: Option<Stopped>,
+    /// Each conbus process in the chain, nearest first.
+    pub conbus: Vec<ConbusProcess>,
+}
+
+/// A process named conbus, and which command it is, if `ps` would say.
+pub(super) struct ConbusProcess {
+    pub pid: u32,
+    pub command: Option<String>,
 }
 
 /// Why a walk cannot say that nothing above a listener is conbus.
@@ -36,12 +45,6 @@ pub(super) enum Stopped {
         name: String,
         over: String,
     },
-}
-
-impl Listener {
-    pub fn under_conbus(&self) -> bool {
-        self.chain.iter().any(|name| is_conbus(name))
-    }
 }
 
 /// What `lsof` said about a port.
@@ -156,10 +159,19 @@ fn walk(pid: u32) -> Listener {
         Some(why) => Some(Stopped::Lost(why)),
         None => top_of_the_chain(&steps),
     };
+    let conbus = steps
+        .iter()
+        .filter(|(_, process)| is_conbus(&process.name))
+        .map(|(pid, _)| ConbusProcess {
+            pid: *pid,
+            command: conbus_command(*pid),
+        })
+        .collect();
     Listener {
         pid,
         chain: steps.into_iter().map(|(_, process)| process.name).collect(),
         stopped,
+        conbus,
     }
 }
 
@@ -179,6 +191,27 @@ fn top_of_the_chain(steps: &[(u32, Process)]) -> Option<Stopped> {
         pid: *pid,
         name: top.name.clone(),
         over: steps[manager].1.name.clone(),
+    })
+}
+
+/// Which conbus command `pid` is. This process's own arguments are asked for, and
+/// only the word after the binary is kept.
+fn conbus_command(pid: u32) -> Option<String> {
+    let mut ps = Command::new("ps");
+    ps.args(["-o", "args=", "-p", &pid.to_string()]);
+    let output = crate::code::output_within(ps, ASK_WITHIN).ok()?;
+    command_word(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// `/path to/conbus run claude_code` gives `run`. A word that is not a plain
+/// subcommand gives nothing, because guessing here is how a `yes` goes wrong.
+fn command_word(line: &str) -> Option<String> {
+    let words: Vec<&str> = line.split_whitespace().collect();
+    words.windows(2).find_map(|pair| {
+        let name = pair[0].rsplit('/').next()?;
+        let plain = !pair[1].starts_with('-')
+            && pair[1].bytes().all(|b| b.is_ascii_lowercase() || b == b'-');
+        (is_conbus(name) && plain).then(|| pair[1].to_string())
     })
 }
 
@@ -235,6 +268,26 @@ mod tests {
         assert_eq!(parse_ps_line("7 x name"), None);
         assert_eq!(parse_ps_line("7 8 /"), None);
         assert_eq!(parse_ps_line(""), None);
+    }
+
+    #[test]
+    fn only_a_conbus_command_s_own_word_comes_back() {
+        for (line, word) in [
+            ("conbus quota", Some("quota")),
+            ("/a b/conbus run claude_code --profile work", Some("run")),
+            (
+                "/tmp/conbus dir/conbus-next hook --inference-listen",
+                Some("hook"),
+            ),
+            ("conbus", None),
+            ("conbus --version", None),
+            ("conbus Run", None),
+            ("/bin/sh -c conbus", None),
+            ("notconbus quota", None),
+            ("", None),
+        ] {
+            assert_eq!(command_word(line).as_deref(), word, "{line}");
+        }
     }
 
     #[test]
