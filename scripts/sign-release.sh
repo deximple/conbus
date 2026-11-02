@@ -124,6 +124,8 @@ check_release() {
     [ -s "$work/check/$name" ] || missing="$missing $name"
   done
   [ -z "$missing" ] || refuse "it is missing$missing"
+  # Every checksum before any contents: GNU tar fails on a tarball with bytes after
+  # its end where BSD tar does not, and a torn package should say it is torn.
   for name in $required; do
     case $name in
       *.sha256)
@@ -132,6 +134,10 @@ check_release() {
         (cd "$work/check" && shasum -a 256 -c "$name" >/dev/null 2>&1) ||
           refuse "${name%.sha256} does not match the checksum beside it"
         ;;
+    esac
+  done
+  for name in $required; do
+    case $name in
       *.tar.gz)
         tar -xOzf "$work/check/$name" conbus >"$work/check-binary" 2>/dev/null ||
           refuse "$name holds no conbus"
