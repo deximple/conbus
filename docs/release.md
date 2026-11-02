@@ -142,7 +142,8 @@ the budgets it ran under: `CONBUS_CANARY_RSS_MB`, `CONBUS_CANARY_DOCTOR_MS`,
 one with where it came from, and the environment still wins. A window started by an
 older script has none of this recorded, and exits 4 on `drops` and `log-files`.
 
-`start` exits 1 when it rolled back and 2 when it refused before anything moved.
+`start` exits 1 when it rolled back, or when it found no candidate or install to swap.
+It exits 2 when it refused before anything moved.
 `start` and `rollback` exit 3 when the rollback could not be verified, and say which
 check it was. `restart` exits 1 when the daemon never served.
 

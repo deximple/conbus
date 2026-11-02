@@ -13,7 +13,8 @@
 #   be judged. It names what is open, and that is neither a fail nor a pass.
 #   --idle is your answer to "was this harness or day idle, or not recorded?". The
 #   question names what to pass, and a PASS prints the answer.
-#   start exits 1 when it rolled back, 2 when it refused before anything moved.
+#   start exits 1 when it rolled back or found no candidate or install to swap, and
+#   2 when it refused before anything moved.
 #   start and rollback exit 3 when the rollback could not be verified.
 #   restart exits 1 when the daemon never served.
 #
@@ -2775,7 +2776,7 @@ case $sub in
         ;;
 
     "" | -h | --help | help)
-        sed -n '3,19p' "$0" | sed 's/^# \{0,1\}//'
+        sed -n '3,20p' "$0" | sed 's/^# \{0,1\}//'
         ;;
     *)
         refuse "unknown subcommand: $sub (preflight|status|verdict|start|restart|rollback)"
