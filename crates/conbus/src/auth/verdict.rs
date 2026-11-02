@@ -15,9 +15,9 @@ pub(super) const MEASURED: &str = "on Codex 0.166, `initialize`, `account/rateLi
 logged in` and no `open`. `thread/start` and `thread/resume` (a warm hop) and `thread/turns/list` \
 (gap fill) are unmeasured";
 
-const LIMIT: &str = "this walk cannot see a server that outlived what started it and leads its own \
-process group, or an app a hop opened with `open` or `osascript`: both hang from the root. Every \
-conbus read starts `codex app-server`, and `conbus status` lists the hops";
+const LIMIT: &str = "this walk says nothing about an app a hop opened with `open` or `osascript`: \
+any app hangs from launchd, whoever opened it. Every conbus read starts `codex app-server`, and \
+`conbus status` lists the hops";
 
 const HOPS: &str = "`conbus status` lists the hops, which can open an app";
 
@@ -69,7 +69,10 @@ fn process_line(looked: &Looked) -> Vec<String> {
             .map(|listener| {
                 let stopped = match &listener.stopped {
                     Some(Stopped::Lost(why)) => format!(" (stopped: {why})"),
-                    Some(Stopped::Orphan(pid)) => format!(" (pid {pid} lost its parent)"),
+                    Some(Stopped::HeldByManager { .. }) => " (a manager, not a client)".to_string(),
+                    Some(Stopped::Unvouched { pid, .. }) => {
+                        format!(" (nothing says who started pid {pid})")
+                    }
                     None => String::new(),
                 };
                 format!(
@@ -141,8 +144,11 @@ fn stopped_short(listener: &Listener) -> Option<String> {
             "the walk from pid {} ended before the root: {why}. Looking again while the page still waits would tell",
             listener.pid
         )),
-        Stopped::Orphan(pid) => Some(format!(
-            "pid {pid} hangs from the root without leading its own process group, so what started it has exited and no walk can reach it. `ps -o lstart= -p {pid}` says when it started, to hold against the hops `conbus status` lists; every conbus read starts `codex app-server`"
+        Stopped::HeldByManager { pid, name } => Some(format!(
+            "{name} (pid {pid}) holds the port itself, which says nothing about who asked; {HOPS}"
+        )),
+        Stopped::Unvouched { pid, name, over } => Some(format!(
+            "{name} (pid {pid}) hangs directly from {over}, so nothing above it says who started it: {over} may run it as a service, or what started it may have exited. `ps -o lstart= -p {pid}` says when it started, to hold against the hops `conbus status` lists; every conbus read starts `codex app-server`"
         )),
     }
 }

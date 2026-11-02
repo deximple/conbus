@@ -112,9 +112,9 @@ fn no_takes_a_listener_walked_all_the_way_to_the_root() {
 
 #[test]
 fn no_says_what_a_walk_cannot_see() {
-    // A process that outlived what started it hangs from the root, and so does
-    // an app `open` started: neither shows who asked. And every conbus read
-    // starts `codex app-server`, so "starts no server" was false as written.
+    // An app `open` started hangs from launchd like any other, so an ancestry says
+    // nothing about it. And every conbus read starts `codex app-server`, so "starts
+    // no server" was false as written.
     let table = ProcessTable::new(&[4242], CODEX_TREE);
 
     let stdout = table.ask(&bridge_url(55407));
@@ -124,7 +124,12 @@ fn no_says_what_a_walk_cannot_see() {
         .lines()
         .find(|line| line.starts_with("limit "))
         .unwrap_or_else(|| panic!("no limit line: {stdout}"));
-    for word in ["outlived", "`open`", "`osascript`", "`codex app-server`"] {
+    for word in [
+        "`open`",
+        "`osascript`",
+        "`codex app-server`",
+        "`conbus status`",
+    ] {
         assert!(limit.contains(word), "{word} in {limit}");
     }
     let measured = stdout
@@ -206,7 +211,14 @@ fn only_the_name_of_the_binary_makes_a_process_conbus() {
         ("/home/someone/conbus/bin/node", false),
         ("/tmp/conbus-work/node", false),
     ] {
-        let table = ProcessTable::new(&[50], &[(50, 1, name), (1, 0, "/sbin/launchd")]);
+        let table = ProcessTable::new(
+            &[50],
+            &[
+                (50, 60, name),
+                (60, 1, "/Applications/Some.app/Contents/MacOS/Some"),
+                (1, 0, "/sbin/launchd"),
+            ],
+        );
         let stdout = table.ask(&bridge_url(55407));
         let want = if yes {
             "conbus    yes:"
@@ -368,7 +380,7 @@ fn a_listener_that_outlived_what_started_it_is_not_a_no() {
         verdict_of(&stdout).starts_with("conbus    cannot tell:"),
         "{stdout}"
     );
-    assert!(stdout.contains("has exited"), "{stdout}");
+    assert!(stdout.contains("may have exited"), "{stdout}");
     assert!(
         stdout.contains("`conbus status`"),
         "what would tell: {stdout}"
@@ -385,7 +397,7 @@ fn a_helper_of_a_live_parent_needs_no_group_of_its_own() {
         &[
             (50, 40, "node"),
             (40, 30, "npm"),
-            (30, 1, "Codex"),
+            (30, 1, "/Applications/Codex.app/Contents/MacOS/Codex"),
             (1, 0, "/sbin/launchd"),
         ],
         &[(50, 30), (40, 30)],
@@ -619,4 +631,181 @@ fn a_real_listener_is_walked_to_the_root() {
         .unwrap_or_else(|| panic!("{stdout}"));
     assert!(process.contains(&format!(": {shown}")), "{stdout}");
     assert!(!stdout.contains("nothing lsof sees"), "{stdout}");
+}
+
+#[test]
+fn a_server_in_its_own_group_left_behind_by_codex_is_not_a_no() {
+    // codex-rs/rmcp-client starts stdio MCP servers with ProcessMode::NewGroup.
+    let table = ProcessTable::new(
+        &[4242],
+        &[(4242, 1, "/opt/node/bin/node"), (1, 0, "/sbin/launchd")],
+    );
+    let stdout = table.ask(&bridge_url(55407));
+    assert!(
+        verdict_of(&stdout).starts_with("conbus    cannot tell:"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn an_orphan_adopted_by_a_user_service_manager_is_not_a_no() {
+    let table = ProcessTable::with_groups(
+        &[5000],
+        &[
+            (5000, 1200, "node"),
+            (1200, 1, "systemd"),
+            (1, 0, "systemd"),
+        ],
+        &[(5000, 4000)],
+    );
+    let stdout = table.ask(&bridge_url(55407));
+    assert!(
+        verdict_of(&stdout).starts_with("conbus    cannot tell:"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn lsof_is_asked_for_listeners_only() {
+    // guard: passes at head
+    let table = ProcessTable::new(&[4242], CODEX_TREE);
+    table.ask(&bridge_url(55407));
+    assert!(
+        table.lsof_calls().contains("-sTCP:LISTEN"),
+        "{}",
+        table.lsof_calls()
+    );
+}
+
+#[test]
+fn a_listener_hanging_from_a_manager_reads_cannot_tell_even_as_a_group_leader() {
+    // Whatever it leads, nothing above it says who started it.
+    for tree in [
+        &[(50, 1, "/sbin/launchd-child"), (1, 0, "/sbin/launchd")][..],
+        &[
+            (50, 1, "/Applications/Some.app/Contents/MacOS/Some"),
+            (1, 0, "/sbin/launchd"),
+        ][..],
+        &[(50, 1, "server"), (1, 0, "/sbin/init")][..],
+        &[
+            (50, 1200, "server"),
+            (1200, 1, "systemd"),
+            (1, 0, "systemd"),
+        ][..],
+        &[(1, 0, "/sbin/launchd")][..],
+    ] {
+        let listener = tree[0].0;
+        let table = ProcessTable::new(&[listener], tree);
+        let stdout = table.ask(&bridge_url(55407));
+        assert!(
+            verdict_of(&stdout).starts_with("conbus    cannot tell:"),
+            "{tree:?}: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn a_chain_whose_top_nothing_vouches_for_is_not_a_no() {
+    // The real shape of a server Codex left behind: the listener has a parent, and
+    // that parent is what lost its own. npm leads its group, as Codex starts it.
+    for tree in [
+        &[(50, 40, "node"), (40, 1, "npm"), (1, 0, "/sbin/launchd")][..],
+        &[
+            (50, 40, "node"),
+            (40, 30, "sh"),
+            (30, 1, "npm"),
+            (1, 0, "/sbin/launchd"),
+        ][..],
+        &[
+            (50, 40, "node"),
+            (40, 1200, "npm"),
+            (1200, 1, "systemd"),
+            (1, 0, "systemd"),
+        ][..],
+        // A command-line tool inside an app bundle is not the app.
+        &[
+            (50, 40, "node"),
+            (40, 1, "/Applications/Codex.app/Contents/Resources/codex"),
+            (1, 0, "/sbin/launchd"),
+        ][..],
+        // Python's own framework build runs from a bundle of that name.
+        &[
+            (50, 40, "node"),
+            (
+                40,
+                1,
+                "/opt/Python.framework/Resources/Python.app/Contents/MacOS/Python",
+            ),
+            (1, 0, "/sbin/launchd"),
+        ][..],
+    ] {
+        let table = ProcessTable::new(&[50], tree);
+        let stdout = table.ask(&bridge_url(55407));
+        assert!(
+            verdict_of(&stdout).starts_with("conbus    cannot tell:"),
+            "{tree:?}: {stdout}"
+        );
+        assert!(
+            stdout.contains("`conbus status`"),
+            "what would tell: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn a_chain_up_to_a_person_s_app_or_session_can_be_a_no() {
+    for tree in [
+        CODEX_TREE,
+        &[
+            (50, 40, "node"),
+            (40, 30, "-zsh"),
+            (30, 20, "login"),
+            (
+                20,
+                1,
+                "/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal",
+            ),
+            (1, 0, "/sbin/launchd"),
+        ][..],
+        &[
+            (50, 40, "node"),
+            (40, 30, "bash"),
+            (30, 1, "sshd"),
+            (1, 0, "systemd"),
+        ][..],
+        &[
+            (50, 40, "node"),
+            (40, 30, "bash"),
+            (30, 1200, "tmux: server"),
+            (1200, 1, "systemd"),
+            (1, 0, "systemd"),
+        ][..],
+    ] {
+        let listener = tree[0].0;
+        let table = ProcessTable::new(&[listener], tree);
+        let stdout = table.ask(&bridge_url(55407));
+        assert!(
+            verdict_of(&stdout).starts_with("conbus    no:"),
+            "{tree:?}: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn an_app_that_lost_its_own_parent_is_not_a_no() {
+    // A helper inside a bundle, daemonised away from its app: the group gives it away.
+    let table = ProcessTable::with_groups(
+        &[50],
+        &[
+            (50, 40, "node"),
+            (40, 1, "/Applications/Some.app/Contents/MacOS/Some"),
+            (1, 0, "/sbin/launchd"),
+        ],
+        &[(40, 39)],
+    );
+    let stdout = table.ask(&bridge_url(55407));
+    assert!(
+        verdict_of(&stdout).starts_with("conbus    cannot tell:"),
+        "{stdout}"
+    );
 }

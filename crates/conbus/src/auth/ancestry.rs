@@ -25,10 +25,17 @@ pub(super) struct Listener {
 pub(super) enum Stopped {
     /// `ps` could not say, or said something impossible.
     Lost(String),
-    /// This pid hangs from the root and does not lead its own process group, so
-    /// what started it has exited. launchd and systemd start group leaders, and a
-    /// process keeps the group it was started in when its parent goes.
-    Orphan(u32),
+    /// A root or a service manager holds the port itself.
+    HeldByManager { pid: u32, name: String },
+    /// The last process before a root or a service manager is nothing that vouches
+    /// for itself, so what started it may be gone. A process whose parent exits is
+    /// handed to one of those, and it may lead its own group: Codex starts its MCP
+    /// servers that way.
+    Unvouched {
+        pid: u32,
+        name: String,
+        over: String,
+    },
 }
 
 impl Listener {
@@ -43,6 +50,29 @@ pub(super) enum Holders {
     Nothing,
     CouldNotAsk(String),
 }
+
+/// What adopts a process whose parent has gone, besides the root itself. `systemd`
+/// is the user manager too: the recorder runs under one on Linux.
+const MANAGERS: &[&str] = &["launchd", "init", "systemd"];
+
+/// What a person's session hangs from, on a machine with no app bundles to go by.
+/// conbus starts none of these, and anything else at the top of a chain reads
+/// `cannot tell`, so this list can only be too short in the safe direction.
+const SESSION_HOSTS: &[&str] = &[
+    "sshd",
+    "login",
+    "tmux",
+    "tmux: server",
+    "screen",
+    "gnome-terminal-",
+    "konsole",
+    "xterm",
+];
+
+/// An app's own main binary. A tool kept in the bundle's resources is not the app,
+/// and Python's framework build runs every script from a bundle of its own.
+const APP_MAIN_BINARY: &str = ".app/Contents/MacOS/";
+const NOT_AN_APP: &[&str] = &["Python"];
 
 /// A binary called conbus, or one of its staged and renamed builds. Only the
 /// binary's own name counts: a directory named conbus does not make a page ours.
@@ -81,38 +111,75 @@ struct Process {
     parent: u32,
     group: u32,
     name: String,
+    /// Run from an app bundle's main binary.
+    app: bool,
+}
+
+impl Process {
+    fn adopts(&self) -> bool {
+        self.parent == 0 || MANAGERS.contains(&self.name.as_str())
+    }
+
+    /// Something conbus does not start, so a chain that ends here has a real top.
+    /// It must lead its own group as well: what launchd and systemd start does, and
+    /// a process keeps the group it was started in when its parent goes.
+    fn vouches_for_itself(&self, pid: u32) -> bool {
+        self.group == pid
+            && ((self.app && !NOT_AN_APP.contains(&self.name.as_str()))
+                || SESSION_HOSTS.contains(&self.name.as_str()))
+    }
 }
 
 /// From `pid` to the root. Nothing limits the depth; a pid seen twice ends the
 /// walk, so `ps` answering in a loop cannot hold it.
 fn walk(pid: u32) -> Listener {
-    let mut chain = Vec::new();
+    let mut steps = Vec::new();
     let mut seen = HashSet::new();
     let mut at = pid;
-    let mut below_root = None;
-    let stopped = loop {
+    let lost = loop {
         if !seen.insert(at) {
-            break Some(Stopped::Lost(format!("pid {at} is its own ancestor")));
+            break Some(format!("pid {at} is its own ancestor"));
         }
         match process(at) {
-            Err(why) => break Some(Stopped::Lost(why)),
+            Err(why) => break Some(why),
             Ok(process) => {
-                chain.push(process.name);
-                if process.parent == 0 {
-                    break below_root
-                        .filter(|(child, group)| child != group)
-                        .map(|(child, _)| Stopped::Orphan(child));
+                let parent = process.parent;
+                steps.push((at, process));
+                if parent == 0 {
+                    break None;
                 }
-                below_root = Some((at, process.group));
-                at = process.parent;
+                at = parent;
             }
         }
     };
+    let stopped = match lost {
+        Some(why) => Some(Stopped::Lost(why)),
+        None => top_of_the_chain(&steps),
+    };
     Listener {
         pid,
-        chain,
+        chain: steps.into_iter().map(|(_, process)| process.name).collect(),
         stopped,
     }
+}
+
+/// `no` needs a chain that ends in something that vouches for itself. What hangs
+/// straight from a root or a service manager may be a service or may be an orphan,
+/// and from here the two look the same.
+fn top_of_the_chain(steps: &[(u32, Process)]) -> Option<Stopped> {
+    let manager = steps.iter().position(|(_, process)| process.adopts())?;
+    let Some((pid, top)) = manager.checked_sub(1).and_then(|top| steps.get(top)) else {
+        let (pid, holder) = &steps[manager];
+        return Some(Stopped::HeldByManager {
+            pid: *pid,
+            name: holder.name.clone(),
+        });
+    };
+    (manager == 1 || !top.vouches_for_itself(*pid)).then(|| Stopped::Unvouched {
+        pid: *pid,
+        name: top.name.clone(),
+        over: steps[manager].1.name.clone(),
+    })
 }
 
 /// What `ps` says of `pid`, or why it says nothing.
@@ -134,6 +201,7 @@ fn parse_ps_line(line: &str) -> Option<Process> {
         parent: parent.parse().ok()?,
         group: group.parse().ok()?,
         name: super::shown(name),
+        app: comm.contains(APP_MAIN_BINARY),
     })
 }
 
@@ -148,7 +216,8 @@ mod tests {
             Some(Process {
                 parent: 501,
                 group: 77,
-                name: "Some App".to_string()
+                name: "Some App".to_string(),
+                app: true,
             })
         );
         assert_eq!(
@@ -156,7 +225,8 @@ mod tests {
             Some(Process {
                 parent: 0,
                 group: 1,
-                name: "launchd".to_string()
+                name: "launchd".to_string(),
+                app: false,
             })
         );
         assert_eq!(parse_ps_line("7"), None);
