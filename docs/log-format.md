@@ -2,8 +2,9 @@
 
 The log is the source of truth. It is a directory of append-only JSONL
 segments under the data root, `log/segment-00000000.jsonl` and up, rolled at
-8 MiB. Everything else conbus keeps — the daemon's state, `cache/`, any index —
-is derived from it and can be rebuilt from it.
+8 MiB. The daemon's state, `cache/meta/` and any index are derived from it and
+can be rebuilt from it. `spool/` is the one thing that can hold a record the log
+does not have yet ([what is safe to delete](stability.md#what-counts-as-breaking)).
 
 ## A line
 
