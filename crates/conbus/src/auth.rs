@@ -60,12 +60,14 @@ const BRIDGE_FIX: &str = "fix       copy the token from the extension's page int
 enum Standing {
     /// Not a vendor: what the row says of conbus itself.
     Note,
-    /// Asked, and nothing conbus needs stands in the way.
+    /// Asked and answered, and nothing conbus needs stands in the way.
     Asked,
     /// Asked, and something conbus needs is signed out.
     SignedOut,
     /// Asked, and something conbus needs could not be told.
     CannotTell,
+    /// Asked, and no answer came from a vendor nothing conbus needs depends on.
+    NoAnswer,
     /// Not on this machine, so there is nothing to ask.
     NotInstalled,
     /// Never asked: this says nothing either way.
@@ -108,28 +110,24 @@ enum Answer {
     Failed(String),
 }
 
-/// `conbus_needs` is whether a feature depends on this vendor. One that does not
-/// says what it found in its row and leaves the banner alone: a person should not
-/// sign in for nothing.
+/// `conbus_needs` is whether a feature depends on this vendor. What one that does
+/// not says never turns the banner yellow, since a person should not sign in for
+/// nothing; when it says nothing, that is no answer either.
 fn asked_row(
     name: &'static str,
     needed_for: &'static str,
     answer: Answer,
     conbus_needs: bool,
 ) -> Row {
-    let if_needed = |standing| {
-        if conbus_needs {
-            standing
-        } else {
-            Standing::Asked
-        }
+    let if_needed = |needed, not_needed| {
+        if conbus_needs { needed } else { not_needed }
     };
     let (status, why, standing) = match answer {
         Answer::SignedIn => ("signed in".to_string(), needed_for, Standing::Asked),
         Answer::SignedOut(words) => (
             words.to_string(),
             needed_for,
-            if_needed(Standing::SignedOut),
+            if_needed(Standing::SignedOut, Standing::Asked),
         ),
         Answer::Failed(failure) if not_installed(&failure) => (
             "not installed".to_string(),
@@ -139,7 +137,7 @@ fn asked_row(
         Answer::Failed(failure) => (
             format!("SKIP — {}", shown(&failure)),
             CANNOT_BE_TOLD,
-            if_needed(Standing::CannotTell),
+            if_needed(Standing::CannotTell, Standing::NoAnswer),
         ),
     };
     Row {
@@ -202,7 +200,7 @@ fn codex_row() -> Row {
 }
 
 /// `agy models` only — never `-p`, which opens OAuth when logged out. Nothing
-/// conbus needs depends on it, so whatever it says, the banner stays out of it.
+/// conbus needs depends on it, so nothing it says turns the banner yellow.
 fn agy_row() -> Row {
     let answer =
         match crate::quota::agy_signed_in(&crate::quota::agy_binary(), Duration::from_secs(5)) {

@@ -664,6 +664,7 @@ fn the_banner_names_what_it_is_yellow_or_grey_about() {
     let (_gh_in_dir, gh_in) = fake_gh(0);
     let html = page_with(&[("CONBUS_CODEX_BIN", &broken), ("CONBUS_GH", &gh_in)]);
     assert!(html.contains("could not tell for: codex<"), "{html}");
+    assert!(html.contains("asked: gh · could not tell: codex"), "{html}");
 }
 
 #[test]
@@ -683,6 +684,25 @@ fn a_signed_out_agy_is_told_not_to_sign_in_for_nothing() {
 }
 
 #[test]
+fn a_vendor_that_gave_no_answer_is_not_counted_as_fine() {
+    // agy asked and failing, nothing else installed: nothing answered, so nothing
+    // here can be green, and agy is not "asked" as if it had said something.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let agy = dir.path().join("agy");
+    support::write_executable(&agy, "#!/bin/sh\nexit 3\n");
+    warmed(&agy);
+
+    let html = page_with(&[("CONBUS_AGY_BIN", agy.as_path())]);
+
+    assert_eq!(banner(&html), "neutral", "{html}");
+    assert!(html.contains("could not tell for: agy<"), "{html}");
+    assert!(html.contains("could not tell: agy"), "{html}");
+    assert!(html.contains("확인 못 함: agy"), "{html}");
+    assert!(!html.contains("asked: agy"), "{html}");
+    assert!(!html.contains("nothing it needs is signed out"), "{html}");
+}
+
+#[test]
 fn a_broken_agy_does_not_turn_the_banner_either() {
     let dir = tempfile::tempdir().expect("tempdir");
     let agy = dir.path().join("agy");
@@ -699,4 +719,7 @@ fn a_broken_agy_does_not_turn_the_banner_either() {
 
     assert_eq!(banner(&html), "ok", "{html}");
     assert!(html.contains("<tr><td>agy</td><td>SKIP"), "{html}");
+    // Green speaks for what answered, and says agy did not.
+    assert!(html.contains("asked: codex, gh"), "{html}");
+    assert!(html.contains("could not tell: agy"), "{html}");
 }

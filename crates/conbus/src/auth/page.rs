@@ -28,13 +28,15 @@ fn escape(text: &str) -> String {
 }
 
 /// The banner's class and its two languages. It speaks only for what conbus needs
-/// right now and only from what it asked: yellow for a needed sign-in that is
-/// missing, grey when a needed vendor could not be told or nothing could be asked.
-/// A vendor conbus does not depend on, one not installed and one not asked change
-/// none of this, and `asked_and_not` says which were which.
+/// right now and only from what answered: yellow for a needed sign-in that is
+/// missing, grey when a needed vendor could not be told or nothing answered at all.
+/// A vendor conbus does not depend on never turns it yellow, one not installed and
+/// one not asked change none of this, and `asked_and_not` says which were which.
 fn banner(rows: &[Row]) -> (&'static str, String, String) {
     let missing = names(rows, |standing| standing == Standing::SignedOut);
     let unknown = names(rows, |standing| standing == Standing::CannotTell);
+    let unanswered = names(rows, |standing| standing == Standing::NoAnswer);
+    let answered = !names(rows, |standing| standing == Standing::Asked).is_empty();
     if !missing.is_empty() {
         (
             "warn",
@@ -42,12 +44,10 @@ fn banner(rows: &[Row]) -> (&'static str, String, String) {
             format!("conbus에 필요한 로그인이 없습니다: {missing}"),
         )
     } else if !unknown.is_empty() {
-        (
-            "neutral",
-            format!("conbus could not tell for: {unknown}"),
-            format!("conbus가 확인하지 못했습니다: {unknown}"),
-        )
-    } else if names(rows, |standing| standing == Standing::Asked).is_empty() {
+        could_not_tell(&unknown)
+    } else if !answered && !unanswered.is_empty() {
+        could_not_tell(&unanswered)
+    } else if !answered {
         (
             "neutral",
             "conbus asked nothing: no vendor it can ask is installed".to_string(),
@@ -62,6 +62,14 @@ fn banner(rows: &[Row]) -> (&'static str, String, String) {
     }
 }
 
+fn could_not_tell(names: &str) -> (&'static str, String, String) {
+    (
+        "neutral",
+        format!("conbus could not tell for: {names}"),
+        format!("conbus가 확인하지 못했습니다: {names}"),
+    )
+}
+
 fn names(rows: &[Row], matches: impl Fn(Standing) -> bool) -> String {
     let matching: Vec<&str> = rows
         .iter()
@@ -71,19 +79,16 @@ fn names(rows: &[Row], matches: impl Fn(Standing) -> bool) -> String {
     matching.join(", ")
 }
 
-/// `asked: codex, gh · not installed: agy · not asked: claude, …`, with the labels
-/// given, leaving out what is empty.
-fn asked_and_not(rows: &[Row], labels: [&str; 3]) -> String {
-    let asked = |standing| {
-        matches!(
-            standing,
-            Standing::Asked | Standing::SignedOut | Standing::CannotTell
-        )
-    };
+/// `asked: codex · could not tell: agy · not installed: gh · not asked: claude, …`,
+/// with the labels given, leaving out what is empty. Asked is what answered.
+fn asked_and_not(rows: &[Row], labels: [&str; 4]) -> String {
+    let answered = |s| matches!(s, Standing::Asked | Standing::SignedOut);
+    let untold = |s| matches!(s, Standing::CannotTell | Standing::NoAnswer);
     let parts = [
-        (labels[0], names(rows, asked)),
-        (labels[1], names(rows, |s| s == Standing::NotInstalled)),
-        (labels[2], names(rows, |s| s == Standing::NotChecked)),
+        (labels[0], names(rows, answered)),
+        (labels[1], names(rows, untold)),
+        (labels[2], names(rows, |s| s == Standing::NotInstalled)),
+        (labels[3], names(rows, |s| s == Standing::NotChecked)),
     ];
     let said: Vec<String> = parts
         .iter()
@@ -113,8 +118,11 @@ fn render(rows: &[Row]) -> String {
         })
         .collect();
     let (banner_class, banner_en, banner_ko) = banner(rows);
-    let asked_en = asked_and_not(rows, ["asked", "not installed", "not asked"]);
-    let asked_ko = asked_and_not(rows, ["물어봄", "설치 안 됨", "묻지 않음"]);
+    let asked_en = asked_and_not(
+        rows,
+        ["asked", "could not tell", "not installed", "not asked"],
+    );
+    let asked_ko = asked_and_not(rows, ["물어봄", "확인 못 함", "설치 안 됨", "묻지 않음"]);
     let now = Timestamp::now();
     format!(
         r##"<!doctype html>
