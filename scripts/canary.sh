@@ -571,9 +571,12 @@ say_spool() {
 # this log's real history shows each of them to be:
 #   lost        a record that did not land. A build that spools only writes these
 #               when the spool refused too. Fails at any count, known or not.
-#               Includes an orphaned tool or prompt event: real content with no
-#               conversation to go in, and `the recorder stopped with records it
-#               could not land` (#158), whose detail says how many.
+#               Includes an orphaned prompt: real content with no conversation to
+#               go in, and `the recorder stopped with records it could not land`
+#               (#158), whose detail says how many.
+#   orphan      a tool event or permission ask whose session never got a prompt. Lost
+#               too, but at a known rate from before the swap (14 of 39 past windows
+#               have one), so it is judged on its own line against that rate.
 #   gap         the adapter has no mapping for an event (`no mapping`, `no
 #               adapter`), or a payload that does not parse as what it expects
 #               (`missing field ... at line N column M`): the vendor moved, and the
@@ -635,6 +638,7 @@ function drop_class(r, d) {
     if (starts(r, "no conversation for this session") || starts(r, "spooled hook still has no conversation")) {
         if (drop_event(d) ~ /^([Ss]ession_?[Ee]nd(ed)?|([Ss]ubagent)?[Ss]top|turn_ended|[Nn]otification|notified)$/)
             return "ghost"
+        if (drop_event(d) ~ /^([Pp]re|[Pp]ost)[Tt]ool|^tool_|^[Pp]ermission/) return "orphan"
         return "lost"
     }
     if (starts(r, "no daemon on ") || starts(r, "could not send the record:") ||
@@ -839,7 +843,7 @@ drop_table() { # drop_table <since> <end of the swap window> <file>...
                 return
             }
             if (c == "gap") key = drop_gap_name(d_reason)
-            else if (c == "ghost" || c == "sessionless" || c == "held") { key = d_detail; sub(/ \(fields:.*/, "", key); sub(/ for session .*/, "", key) }
+            else if (c == "ghost" || c == "sessionless" || c == "held" || c == "orphan") { key = d_detail; sub(/ \(fields:.*/, "", key); sub(/ for session .*/, "", key) }
             else if (c == "lost" && index(d_detail, " for session ")) key = drop_event(d_detail) ": " d_reason
             else if (c == "lost" && d_detail != "") key = d_reason " (" d_detail ")"
             else key = d_reason
@@ -912,6 +916,7 @@ verdict_drops() {
     n_sessionless=$(row_value "$dt_rows" total_sessionless)
     n_payload=$(row_value "$dt_rows" total_payload)
     n_held=$(row_value "$dt_rows" total_held)
+    n_orphan=$(row_value "$dt_rows" total_orphan)
     n_bad=$(row_value "$dt_rows" bad)
     n_lines=$(row_value "$dt_rows" lines)
     first_rotated=$(row_value "$dt_rows" first_rotated)
@@ -969,7 +974,7 @@ verdict_drops() {
     [ "$restart_drops" -eq 0 ] || faults="$faults, $restart_drops drop(s) during planned restarts"
 
     shown=$((${n_ghost:-0} + ${n_sessionless:-0} + ${n_payload:-0}))
-    tally="${n_lines:-0} line(s) since $since: $swap_exempted expected swap-window, $shown not lost, $restart_drops on planned restarts"
+    tally="${n_lines:-0} line(s) since $since: $swap_exempted expected swap-window, $shown not lost, ${n_orphan:-0} on orphan-tools, $restart_drops on planned restarts"
     if [ -n "$faults" ]; then
         line FAIL drops "${faults#, } ($tally)${open:+$open}"
     elif [ -n "$open" ]; then
@@ -1010,6 +1015,69 @@ verdict_log_outages() {
     fi
     line PASS log-outages "${held_floor}${n_held:-0} time(s) the log refused writes since $since and every record waited and landed"
     row_value "$dt_rows" "item held" | sort | sed 's/^/  /'
+}
+
+# Orphan tool lines in the 28 days before the swap, each line once, from every drop log
+# beside this one: the live file, its rotated generation, and what an operator archived.
+# Prints "<lines> <oldest time any of them reach>".
+orphan_baseline() { # orphan_baseline <from> <to>
+    ob_from=$1 ob_to=$2
+    set --
+    for ob_file in "$root"/drops*.jsonl; do
+        if [ -f "$ob_file" ] && [ -r "$ob_file" ]; then set -- "$@" "$ob_file"; fi
+    done
+    [ $# -gt 0 ] || { echo "0 "; return 0; }
+    LC_ALL=C awk -v from="$ob_from" -v to="$ob_to" "$drop_awk_lib"'
+        seen[$0]++ { next }
+        {
+            drop_split($0)
+            for (f = 1; f <= n_frag; f++) {
+                if (!drop_whole(frag[f])) continue
+                drop_parse(frag[f])
+                if (d_ts == "" || d_reason == "") continue
+                if (oldest == "" || d_ts < oldest) oldest = d_ts
+                if (d_ts > from && !(d_ts > to) && drop_class(d_reason, d_detail) == "orphan") n++
+            }
+        }
+        END { print n + 0, oldest }' "$@"
+}
+
+# A tool event whose session never got a prompt is lost, and has been at a known rate
+# since long before this build, so a week is not failed for having one. It fails when
+# the rate is clearly above that: three times the 28 days before the swap, and never
+# under 100 lines, so that a quiet month cannot make the next stray one a fault. What
+# that leaves: up to the limit, real tool events can go this way unfailed, only shown.
+orphan_floor=100
+verdict_orphan_tools() {
+    if [ -n "$dt_problem" ]; then
+        line UNCHECKED orphan-tools "the drop log could not be read:$dt_problem"
+        return
+    fi
+    vo_swap=$(ts_epoch "${recorded_swap:-$since}")
+    vo_from=$(perl -MPOSIX=strftime -e 'print strftime("%Y-%m-%dT%H:%M:%S.000Z", gmtime($ARGV[0] - 28 * 86400))' "$vo_swap")
+    read -r vo_base vo_oldest <<<"$(orphan_baseline "$vo_from" "${recorded_swap:-$since}")"
+    vo_oldest_epoch=""
+    [ -z "${vo_oldest:-}" ] || vo_oldest_epoch=$(ts_epoch "$vo_oldest")
+    read -r vo_limit vo_rate vo_before vo_covered <<<"$(awk -v n="${n_orphan:-0}" -v base="$vo_base" -v swap="$vo_swap" \
+        -v from="$(ts_epoch "$since")" -v now="$(date +%s)" -v oldest="$vo_oldest_epoch" -v floor="$orphan_floor" '
+        BEGIN {
+            days = (now - from) / 86400
+            if (days < 1) days = 1
+            covered = 28
+            if (oldest != "" && (swap - oldest) / 86400 < 28) covered = (swap - oldest) / 86400
+            if (covered < 1) covered = 1
+            before = base / covered
+            limit = 3 * before * days
+            if (limit < floor) limit = floor
+            printf "%d %.1f %.1f %d\n", limit + 0.999, n / days, before, covered
+        }')"
+    vo_said="${held_floor}${n_orphan:-0} tool event(s) lost with no prompt from their session since $since, $vo_rate/day; $vo_before/day in the $vo_covered days before the swap"
+    if [ "${n_orphan:-0}" -gt "$vo_limit" ]; then
+        line FAIL orphan-tools "$vo_said; over the limit of $vo_limit (3× that rate, at least $orphan_floor)"
+    else
+        line PASS orphan-tools "$vo_said; fails over $vo_limit (3× that rate, at least $orphan_floor)"
+    fi
+    row_value "$dt_rows" "item orphan" | sort | sed 's/^/  /'
 }
 
 # 4. Activity. Only what the log holds can be read here, so the questions are:
@@ -2128,6 +2196,7 @@ case $sub in
         #    usage rows taken above.
         verdict_drops
         verdict_log_outages
+        verdict_orphan_tools
         verdict_disk
 
         if [ -n "$window_problem" ]; then
@@ -2551,7 +2620,7 @@ case $sub in
                     swap) swap_window_drops=$((swap_window_drops + 1)) ;;
                     # A spool drained at the first boot writes these; none is a
                     # lost record, and none should undo a healthy swap.
-                    ghost | sessionless | payload | elided | held) ;;
+                    ghost | sessionless | payload | elided | held | orphan) ;;
                     *)
                         if ! LC_ALL=C grep -qxF "$r" "$before_drops"; then
                             fail_reason="new drop reason(s) since the swap: $r"

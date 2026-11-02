@@ -111,6 +111,7 @@ usage_rows() { # usage_rows <first-iso> <harness>...
 #   slowvendor — a vendor CLI missed doctor's 2 s, so its version is not known
 #   slowonly  — the same, and no hook line that runs
 #   mismatch  — a plugin written for a major this vendor does not load
+#   orphans   — its `install --apply` writes a tool event that has no conversation
 #   refusing  — doctor says the recorder is holding what the log refuses, right now
 #   lowdisk   — doctor's 10% warning, which this Mac is always under
 #   eventgap  — hooks run, but a registered hook misses events
@@ -160,6 +161,8 @@ write_fake() {
             install_body='touch "$HOME/.install-called"; now=$(perl -MTime::HiRes=gettimeofday -MPOSIX=strftime -e "(\$s,\$u)=gettimeofday; printf \"%s.%03dZ\", strftime(\"%Y-%m-%dT%H:%M:%S\", gmtime(\$s)), int(\$u/1000)"); printf "{\"ts\":\"%s\",\"reason\":\"tool bodies elided, not sealed\",\"detail\":\"7 tool event(s)\"}\n{\"ts\":\"%s\",\"reason\":\"the log refused writes for a while\",\"detail\":\"7 record(s) waited and landed, 0 could not be kept, since 2026-11-01T00:00:00.000Z: No space left on device (os error 28)\"}\n" "$now" "$now" >> "$HOME/.conbus/drops.jsonl"' ;;
         lostlines) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "hooks     claude_code  runs — x"'
             install_body='touch "$HOME/.install-called"; now=$(perl -MTime::HiRes=gettimeofday -MPOSIX=strftime -e "(\$s,\$u)=gettimeofday; printf \"%s.%03dZ\", strftime(\"%Y-%m-%dT%H:%M:%S\", gmtime(\$s)), int(\$u/1000)"); printf "{\"ts\":\"%s\",\"reason\":\"the recorder stopped with records it could not land\",\"detail\":\"2 record(s) lost\"}\n{\"ts\":\"%s\",\"reason\":\"the log refused writes for a while and records may be lost\",\"detail\":\"3 record(s) waited and landed, 1 could not be kept, since 2026-11-01T00:00:00.000Z: No space left on device (os error 28)\"}\n" "$now" "$now" >> "$HOME/.conbus/drops.jsonl"' ;;
+        orphans) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "hooks     claude_code  runs — x"'
+            install_body='touch "$HOME/.install-called"; printf "{\"ts\":\"%s\",\"reason\":\"no conversation for this session; the daemon has no binding for it (no prompt from this session has reached it)\",\"detail\":\"PreToolUse for session 01a06306\"}\n" "$(perl -MTime::HiRes=gettimeofday -MPOSIX=strftime -e "(\$s,\$u)=gettimeofday; printf \"%s.%03dZ\", strftime(\"%Y-%m-%dT%H:%M:%S\", gmtime(\$s)), int(\$u/1000)")" >> "$HOME/.conbus/drops.jsonl"' ;;
         knowndrop) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "hooks     claude_code  runs — x"'
             install_body='touch "$HOME/.install-called"; printf "{\"ts\":\"%s\",\"reason\":\"socket closed early\"}\n" "$(perl -MTime::HiRes=gettimeofday -MPOSIX=strftime -e "(\$s,\$u)=gettimeofday; printf \"%s.%03dZ\", strftime(\"%Y-%m-%dT%H:%M:%S\", gmtime(\$s)), int(\$u/1000)")" >> "$HOME/.conbus/drops.jsonl"' ;;
         notokens) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "hooks     claude_code  runs — x"' ;;
@@ -1037,6 +1040,11 @@ verdict_fixture() { # verdict_fixture [swapped-iso] [restarts-json]
     usage_rows "$(iso_after "$fx_swapped" -$((14 * DAY)))" claude_code codex >"$home/.usage-rows"
 }
 
+state_with() { # state_with <flat key> <value>: canary.json with that field changed
+    sed -E "s#\"$1\":\"[^\"]*\"#\"$1\":\"$2\"#" "$home/.conbus/canary.json" >"$home/.conbus/canary.json.new"
+    mv -f "$home/.conbus/canary.json.new" "$home/.conbus/canary.json"
+}
+
 # The candidate again under another persona, with the recorded hash kept true.
 install_persona() { # install_persona <persona>
     write_fake beef "$1" "$install_dir/conbus"
@@ -1063,7 +1071,7 @@ code=0
 run verdict >"$tmp/verdict.out" 2>&1 || code=$?
 if [ "$code" != 0 ]; then cat "$tmp/verdict.out" >&2; fi
 expect 0 "$code" "verdict exits 0 on a completed clean window"
-for name in build hooks recorder-serving restarts reboots unreadable log-files disk drops log-outages tool-bodies harness-activity twins-repeated \
+for name in build hooks recorder-serving restarts reboots unreadable log-files disk drops log-outages orphan-tools tool-bodies harness-activity twins-repeated \
     usage-parity rss-budget time-budget serving-budget policy sync operator-feel; do
     grep -qE "^(PASS|FAIL|UNCHECKED) $name " "$tmp/verdict.out"
     expect 0 $? "verdict prints a $name line"
@@ -1273,12 +1281,12 @@ expect_grep '1× session_ended' "$tmp/verdict-ghost.out" "by event"
 expect_grep '^  rule: a lost record or adapter gap fails at any count' "$tmp/verdict-ghost.out" "and the standard is printed for a person to argue with"
 expect_no_grep '01a0630' "$tmp/verdict-ghost.out" "without a session id"
 verdict_fixture
-drop_line 3600 'spooled hook still has no conversation (orphan)' 'tool_use for session 01a06304'
+drop_line 3600 'spooled hook still has no conversation (orphan)' 'turn_started for session 01a06304'
 code=0
 run verdict >"$tmp/verdict-orphan.out" 2>&1 || code=$?
-expect 1 "$code" "a tool event with no conversation is a lost record"
+expect 1 "$code" "a prompt with no conversation is a lost record"
 expect_grep '^FAIL drops — 1 lost record' "$tmp/verdict-orphan.out" "and is counted as one"
-expect_grep '1× tool_use: spooled hook' "$tmp/verdict-orphan.out" "by event"
+expect_grep '1× turn_started: spooled hook' "$tmp/verdict-orphan.out" "by event"
 expect_no_grep '01a0630' "$tmp/verdict-orphan.out" "without a session id"
 
 # A payload that names no session is the vendor's, per the plan: shown, and it
@@ -2812,6 +2820,95 @@ drop_line 3600 'the log refused writes for a while and records may be lost' '3 r
 code=0; run verdict >"$tmp/verdict-disk-lost.out" 2>&1 || code=$?
 expect 1 "$code" "an outage that lost records fails"
 expect_no_grep '^PASS disk' "$tmp/verdict-disk-lost.out" "and disk does not read as fine beside it"
+
+# A tool event from a session that never got a prompt. A known loss at a known rate, true on 14 of 39 past windows and
+# no regression: on its own line with its rate, and failing only when that rate is clearly above what it was.
+orphan_lines() { # orphan_lines <file> <count> <seconds ago>; real wording, one line each, sessions apart
+    perl -MPOSIX=strftime -e '
+        my ($n, $ago) = @ARGV;
+        my $ts = strftime("%Y-%m-%dT%H:%M:%S.000Z", gmtime(time - $ago));
+        my $i = 0;
+        print qq({"ts":"$ts","reason":"no conversation for this session; the daemon has no binding for it (no prompt from this session has reached it)","detail":"PreToolUse for session ) . sprintf("%08x", $i++) . qq("}\n) for 1 .. $n;' "$2" "$3" >>"$1"
+}
+old_line() { printf '{"ts":"%s","reason":"socket closed early"}\n' "$(iso_ago $((40 * DAY)))" >>"$1"; }
+verdict_fixture
+orphan_lines "$home/.conbus/drops.jsonl" 3 3600
+drop_line 3500 'spooled hook still has no conversation (orphan)' 'tool_requested for session 01a06304'
+code=0; run verdict >"$tmp/verdict-orphans.out" 2>&1 || code=$?
+expect 0 "$code" "a few tool events with no prompt do not fail a week"
+expect_grep '^PASS orphan-tools — 4 tool event(s) lost' "$tmp/verdict-orphans.out" "they are counted on their own line"
+expect_grep '^PASS orphan-tools.*/day' "$tmp/verdict-orphans.out" "with the rate"
+expect_grep '^PASS drops' "$tmp/verdict-orphans.out" "and drops is not where they fail"
+expect_no_grep '01a06304\|for session' "$tmp/verdict-orphans.out" "without a session id"
+verdict_fixture
+code=0; run verdict >"$tmp/verdict-noorphans.out" 2>&1 || code=$?
+expect_grep '^PASS orphan-tools — 0 tool event(s) lost' "$tmp/verdict-noorphans.out" "a window with none says so"
+# Above the floor, with nothing before the swap to explain it.
+verdict_fixture
+orphan_lines "$home/.conbus/drops.jsonl" 101 3600
+code=0; run verdict >"$tmp/verdict-orphans-many.out" 2>&1 || code=$?
+expect 1 "$code" "a hundred and one with no history fails"
+expect_grep '^FAIL orphan-tools — 101 tool event(s) lost' "$tmp/verdict-orphans-many.out" "by name"
+expect_grep 'over the limit of 100' "$tmp/verdict-orphans-many.out" "and says the limit"
+verdict_fixture
+orphan_lines "$home/.conbus/drops.jsonl" 100 3600
+code=0; run verdict >/dev/null 2>&1 || code=$?
+expect 0 "$code" "a hundred is at the floor"
+# The same count, against a history that had as many: a baseline from the live log, and only from before the swap.
+verdict_fixture
+: >"$home/.pre"
+old_line "$home/.pre"
+orphan_lines "$home/.pre" 300 $((10 * DAY))
+cat "$home/.conbus/drops.jsonl" >>"$home/.pre"
+cat "$home/.pre" >"$home/.conbus/drops.jsonl"
+rm -f "$home/.pre"
+state_with drops_file "$(drops_identity)"
+orphan_lines "$home/.conbus/drops.jsonl" 150 3600
+code=0; run verdict >"$tmp/verdict-orphans-base.out" 2>&1 || code=$?
+expect 0 "$code" "a rate no higher than before the swap is not a regression"
+expect_grep '^PASS orphan-tools — 150 tool event(s) lost.*10.7/day in the 28 days before the swap' "$tmp/verdict-orphans-base.out" "and the baseline is said"
+orphan_lines "$home/.conbus/drops.jsonl" 250 3600
+code=0; run verdict >"$tmp/verdict-orphans-above.out" 2>&1 || code=$?
+expect 1 "$code" "over three times that rate is"
+# The baseline comes from what the file was rotated or archived to as well, once each.
+verdict_fixture
+old_line "$home/.conbus/drops.1.jsonl"
+orphan_lines "$home/.conbus/drops.1.jsonl" 150 $((10 * DAY))
+orphan_lines "$home/.conbus/drops.capped-20261025.jsonl" 150 $((12 * DAY))
+cat "$home/.conbus/drops.capped-20261025.jsonl" >"$home/.conbus/drops.capped-copy.jsonl"
+orphan_lines "$home/.conbus/drops.jsonl" 150 3600
+code=0; run verdict >"$tmp/verdict-orphans-archive.out" 2>&1 || code=$?
+rm -f "$home/.conbus/drops.capped-20261025.jsonl" "$home/.conbus/drops.capped-copy.jsonl"
+expect 0 "$code" "rotated and archived logs count toward the baseline"
+expect_grep '10.7/day in the 28 days before the swap' "$tmp/verdict-orphans-archive.out" "each line once"
+# A flood older than four weeks does not inflate it.
+verdict_fixture
+orphan_lines "$home/.conbus/drops.capped-20261025.jsonl" 5000 $((60 * DAY))
+orphan_lines "$home/.conbus/drops.jsonl" 150 3600
+code=0; run verdict >"$tmp/verdict-orphans-old.out" 2>&1 || code=$?
+rm -f "$home/.conbus/drops.capped-20261025.jsonl"
+expect 1 "$code" "a flood before the 28 days is not the baseline"
+# Prompts stay lost at any count.
+verdict_fixture
+drop_line 3600 'no conversation for this session; the daemon has no binding for it (no prompt from this session has reached it)' 'UserPromptSubmit for session 01a06305'
+code=0; run verdict >"$tmp/verdict-orphan-prompt.out" 2>&1 || code=$?
+expect 1 "$code" "a prompt with no conversation is a lost record at any count"
+expect_grep '^FAIL drops — 1 lost record' "$tmp/verdict-orphan-prompt.out" "and counted as one"
+# start does not roll back over one. A planned restart does count it: a restart that loses its bindings makes these.
+write_fake beef orphans "$tmp/stage/conbus-orphans"
+write_fake 01d old "$install_dir/conbus"
+rm -f "$rollback_bin" "$home/.install-called" "$home/.conbus/canary.json"
+daemon_boot beef 4264
+code=0; run_real start --from "$tmp/stage/conbus-orphans" >"$tmp/start-orphans.out" 2>&1 || code=$?
+expect 0 "$code" "a tool event with no prompt does not roll a swap back"
+cat >"$home/.conbus/canary.json" <<EOF
+{"swapped":"$(iso_ago $((7 * DAY)))","prev_build":"01d","candidate_build":"beef","candidate_sha256":"x","restarts":[]}
+EOF
+write_fake beef orphans "$install_dir/conbus"
+daemon_boot beef 4265
+code=0; run_real restart >"$tmp/restart-orphans.out" 2>&1 || code=$?
+expect 0 "$code" "planned restart with one"
+expect_grep '"new_drops":1' "$home/.conbus/canary.json" "it counts against the restart"
 
 # A real build under this throwaway HOME would ask an agy that is not signed
 # in, and a build older than the sign-in check opens a browser tab doing it.
