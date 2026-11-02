@@ -16,7 +16,9 @@ use serde::{Deserialize, Serialize};
 /// It protects upgrades from v1 onward, and not this one: a daemon built before
 /// this field existed ignores it, so the first deploy still needs the daemon
 /// restarted by hand. `the_wire_shape_is_pinned_to_the_protocol_version` below
-/// is what stops the constant falling behind the struct.
+/// is what stops the constant falling behind the struct. A new event kind is a
+/// change of shape too, though nothing pins that; a daemon treats a request it
+/// cannot parse at this version the same way, as coming from a newer build.
 pub const PROTOCOL_VERSION: u32 = 6;
 
 /// What `doctor` asks a running daemon, as one line on its socket.

@@ -71,6 +71,11 @@ the entry says so when it does.
   record. A hop nobody followed up used to hold it for ever, and an unrelated prompt
   days later bound to the conversation for good. A hop followed up after a day gets
   a fresh id.
+- A newer hook's new event kind now waits in the spool for a daemon that can read
+  it, as `docs/log-format.md` always said. It used to be refused as unreadable and
+  dropped live, and deleted from the spool. It waits up to seven days and then goes
+  with a drop line, as does an entry from a newer protocol, which used to wait for
+  ever.
 - A log that refuses a write, as a full disk or a read-only segment does, no
   longer destroys the record. The daemon holds it in memory, up to 16 MiB, and the
   hook spools a copy if it can. The record lands once, in arrival order, when the
