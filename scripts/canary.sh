@@ -3,7 +3,7 @@
 #
 #   scripts/canary.sh preflight [--evidence DIR]
 #   scripts/canary.sh status
-#   scripts/canary.sh verdict [--since <ts>]
+#   scripts/canary.sh verdict [--since <ts>] [--idle <harness|day>[,...]]
 #   scripts/canary.sh start --from <candidate-binary>
 #   scripts/canary.sh restart
 #   scripts/canary.sh rollback
@@ -49,6 +49,8 @@
 #     refuses its arguments, 3 while the 7-day window is still open, and 4
 #     when the window is over but an item other than operator-feel could not
 #     be judged. Exit 4 is neither a fail nor a pass; it names what is open.
+#     --idle is the operator's answer to the one question a log cannot settle,
+#     "was this harness or day idle, or not recorded?"; a PASS prints it.
 #   - preflight fails on doctor's `disk` warning unless
 #     CONBUS_CANARY_DISK_WARN_OK=1 downgrades it to WARN.
 #   - every rollback — the automatic one after a failed start and the
@@ -857,6 +859,145 @@ verdict_drops() {
     fi
 }
 
+# 4. Activity. Only what the log holds can be read here, so the questions are:
+# which days have no record at all, which harness used before the swap has none
+# since, and how much of what is here the recorder saw itself. A usage row has no
+# record total, only counts and `recovered`. Recovered turns carry no tool calls
+# and two or more records each, so a row with tool calls, or more counted than
+# recovered, holds something the recorder saw; on the real log every harness-day
+# from before the recorder existed reads as recovered-only by this test.
+verdict_activity() {
+    if [ -n "$window_problem" ]; then
+        line UNCHECKED harness-activity "$window_problem"
+        return
+    fi
+    va_closed=""
+    va_day=$since_day
+    va_guard=0
+    while [ "$va_day" \< "$today_utc" ] && [ "$va_guard" -lt 370 ]; do
+        va_closed="$va_closed $va_day"
+        va_day=$(next_day "$va_day") || break
+        va_guard=$((va_guard + 1))
+    done
+    # The two weeks before the swap decide who counts as "active before it". A
+    # harness last used in September is not news.
+    va_lookback=$(perl -MTime::Local -MPOSIX=strftime -e '
+        my ($y, $m, $d) = $ARGV[0] =~ /^(\d+)-(\d+)-(\d+)/;
+        print strftime("%Y-%m-%d", gmtime(timegm(0, 0, 0, $d, $m - 1, $y) - 14 * 86400))' "$since_day")
+    va_rows=$({
+        printf '%s\n' "$usage_json" | sed 's/^/B /'
+        printf '%s\n' "$window_json" | sed 's/^/W /'
+    } | LC_ALL=C awk -v closed="$va_closed" -v lb="$va_lookback" -v sd="$since_day" '
+        function num(key,    re) {
+            re = "\"" key "\":[0-9]+"
+            if (!match($0, re)) return 0
+            return substr($0, RSTART + length(key) + 3, RLENGTH - length(key) - 3) + 0
+        }
+        function str(key,    re) {
+            re = "\"" key "\":\"[^\"]*\""
+            if (!match($0, re)) return ""
+            return substr($0, RSTART + length(key) + 4, RLENGTH - length(key) - 5)
+        }
+        function saw_live(    counted, rec) {
+            rec = num("recovered")
+            counted = num("turns") + num("limit_stops") + num("account_stops") + num("vendor_errors") + \
+                num("request_faults") + num("other_stops") + num("user_stops") + num("subagents") + \
+                num("tool_calls") + num("tool_denials") + num("permission_asks") + num("briefings") + num("hops")
+            return rec == 0 || num("tool_calls") > 0 || counted > rec
+        }
+        {
+            d = str("day"); h = str("harness")
+            if (d == "" || h == "") next
+            if ($1 == "B") {
+                if (d >= lb && d <= sd && saw_live()) {
+                    active_before[h] = 1
+                    if (d < sd && !((h, d) in before_day)) { before_day[h, d] = 1; before_days[h]++ }
+                }
+                next
+            }
+            any_row = 1
+            day_seen[d] = 1
+            harness_seen[h] = 1
+            recovered[h] += num("recovered")
+            turns[h] += num("turns")
+            tools[h] += num("tool_calls")
+            if (saw_live()) {
+                day_live[d] = 1
+                if (!((h, d) in live_day)) { live_day[h, d] = 1; live_days[h]++ }
+            }
+        }
+        END {
+            n = split(closed, days, " ")
+            for (i = 1; i <= n; i++)
+                if (!(days[i] in day_seen)) empty = empty " " days[i]
+            for (d in day_seen)
+                if (!(d in day_live)) recovered_days = recovered_days " " d
+            for (h in active_before)
+                if (!(h in harness_seen)) silent = silent " " h
+            for (h in harness_seen) {
+                if (live_days[h] == 0 && (h in active_before)) only_recovered = only_recovered " " h ":" recovered[h]
+                if (before_days[h] == 14) {
+                    missed = ""
+                    for (i = 1; i <= n; i++)
+                        if ((days[i] in day_seen) && !((h, days[i]) in live_day)) missed = missed "," days[i]
+                    if (missed != "") streak = streak " " h ":" substr(missed, 2)
+                }
+                printf "table %s: the recorder saw it on %d of %d day(s) (%d turn(s), %d tool call(s)); gap fill recovered %d record(s)\n",
+                    h, live_days[h], n + 1, turns[h], tools[h], recovered[h]
+            }
+            printf "any %d\nempty%s\nrecovered_days%s\nsilent%s\nonly_recovered%s\nstreak%s\n",
+                any_row, empty, recovered_days, silent, only_recovered, streak
+        }')
+
+    if [ "$(row_value "$va_rows" any)" != 1 ]; then
+        line UNCHECKED harness-activity \
+            "no record since $since — nothing recorded to judge, and no answer from a person changes that"
+        return
+    fi
+    va_faults="" va_open="" va_answered=""
+    for pair in $(row_value "$va_rows" only_recovered); do
+        va_faults="$va_faults; ${pair%%:*}: used since the swap, but only gap fill has it (${pair#*:} record(s)) — the recorder saw none of it"
+    done
+    va_list=$(row_value "$va_rows" recovered_days)
+    if [ -n "$va_list" ]; then
+        va_faults="$va_faults; only gap fill has these day(s), the recorder saw nothing on them: $va_list"
+    fi
+    va_ask() { # va_ask <name> <question>; the answer from --idle, or an open item
+        if is_idle "$1"; then
+            va_answered="$va_answered $1"
+            operator_answers="$operator_answers $1"
+        else
+            va_open="$va_open; $2"
+        fi
+    }
+    for va_item in $(row_value "$va_rows" empty); do
+        va_ask "$va_item" "no record at all on $va_item — idle, or the recorder down?"
+    done
+    for va_item in $(row_value "$va_rows" silent); do
+        va_ask "$va_item" "$va_item recorded in the two weeks before the swap and not since — not used, or not recorded?"
+    done
+    for pair in $(row_value "$va_rows" streak); do
+        va_ask "${pair%%:*}" "${pair%%:*} recorded on all 14 days before the swap and not on ${pair#*:} — not used, or not recorded?"
+    done
+
+    va_answer=${va_answered:+; on the operator\'s word, idle:$va_answered}
+    if [ -n "$va_faults" ]; then
+        line FAIL harness-activity "${va_faults#; }${va_open}${va_answer}"
+    elif [ -n "$va_open" ]; then
+        line UNCHECKED harness-activity "${va_open#; } — answer with --idle <harness|day>, by name${va_answer}"
+    else
+        line PASS harness-activity "every closed day has records and every harness active before the swap has some since${va_answer}"
+    fi
+    printf '%s\n' "$va_rows" | sed -n 's/^table /  /p' | sort
+}
+
+is_idle() { # is_idle <harness or day>
+    case ",$idle," in
+        *,"$1",*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 # YYYY-MM-DD -> the next YYYY-MM-DD, on macOS or GNU date.
 next_day() {
     if [ "$(uname -s)" = Darwin ]; then
@@ -1074,6 +1215,7 @@ sub=${1:-}
 from=""
 evidence=""
 since=""
+idle=""
 while [ $# -gt 0 ]; do
     case $1 in
         --live) refuse "--live is gone — a rehearsal is CONBUS_CANARY_REHEARSAL=1 under a throwaway HOME" ;;
@@ -1090,6 +1232,11 @@ while [ $# -gt 0 ]; do
         --since)
             [ $# -ge 2 ] || refuse "--since wants a timestamp"
             since=$2
+            shift
+            ;;
+        --idle)
+            [ $# -ge 2 ] || refuse "--idle wants a harness or a day"
+            idle="$idle,$2"
             shift
             ;;
         *) refuse "unknown argument: $1" ;;
@@ -1156,6 +1303,12 @@ case $sub in
         # tr exit non-zero on one invalid byte under a UTF-8 locale, and `set -e`
         # would end the verdict on the line a bad byte sits on.
         export LC_ALL=C
+        for answer in $(printf '%s' "$idle" | tr ',' ' '); do
+            case $answer in
+                [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ;;
+                *[!a-z_]*) refuse "--idle '$answer' is not a harness or a YYYY-MM-DD day" ;;
+            esac
+        done
         fails=0
         unchecked=""
         line() { # line <PASS|FAIL|UNCHECKED> <name> <detail>
@@ -1207,6 +1360,8 @@ case $sub in
         [ -n "$since" ] ||
             die "no --since, no canary.json, no daemon.build stamp — nothing to bound the window with"
         since_day=${since:0:10}
+        today_utc=$(date -u +%Y-%m-%d)
+        operator_answers=""
         say "window: since $since"
 
         [ -x "$bin" ] || die "no installed conbus at $bin — verdict needs its reads"
@@ -1317,52 +1472,7 @@ case $sub in
                 "${elided_total:-0} tool event(s) elided, not sealed — within 1% of $window_tool_calls tool call(s)"
         fi
 
-        # 4. Per-harness activity: usage --json rows give every (day,
-        #    harness) with records. A harness that misses a day some other
-        #    harness recorded on cannot be told idle from lost — UNCHECKED
-        #    with the gap named.
-        if [ -n "$usage_problem" ]; then
-            line UNCHECKED harness-activity "$usage_problem"
-        else
-            activity=$(echo "$usage_json" | awk -v s="$since_day" '
-                {
-                    day = ""; h = ""
-                    if (match($0, /"day":"[^"]*"/)) day = substr($0, RSTART + 7, RLENGTH - 8)
-                    if (match($0, /"harness":"[^"]*"/)) h = substr($0, RSTART + 11, RLENGTH - 12)
-                    if (day == "" || h == "") next
-                    if (day >= s) {
-                        wh[h SUBSEP day] = 1; active[h] = 1; wdays[day] = 1
-                    } else {
-                        before[h] = 1
-                    }
-                }
-                END {
-                    nwdays = 0; for (d in wdays) nwdays++
-                    gaps = ""; silent = ""
-                    for (h in active) {
-                        have = 0
-                        for (d in wdays) if (wh[h, d]) have++
-                        if (have < nwdays) gaps = gaps " " h
-                    }
-                    for (h in before) if (!(h in active)) silent = silent " " h
-                    printf "gaps:%s\nsilent:%s\ndays:%d\n", gaps, silent, nwdays
-                }')
-            gaps=$(echo "$activity" | sed -n 's/^gaps: //p')
-            silent=$(echo "$activity" | sed -n 's/^silent: //p')
-            nwdays=$(echo "$activity" | sed -n 's/^days://p')
-            if [ "${nwdays:-0}" -eq 0 ]; then
-                # No day in the window has a row: "every harness on all 0 days"
-                # would be true of a recorder that never wrote a line.
-                line UNCHECKED harness-activity \
-                    "usage --json has no rows since $since_day — nothing recorded to judge${silent:+; silent:$silent}"
-            elif [ -z "$gaps" ]; then
-                line PASS harness-activity \
-                    "every active harness recorded on all $nwdays active day(s)${silent:+; silent:$silent}"
-            else
-                line UNCHECKED harness-activity \
-                    "day-gap(s) on:$gaps — idle vs lost needs the operator${silent:+; silent:$silent}"
-            fi
-        fi
+        verdict_activity
 
         # 5. twins and `repeated` growth vs the pre-swap baseline, same rows.
         if [ -z "$usage_problem" ]; then
@@ -1396,7 +1506,6 @@ case $sub in
         # 6. usage-parity: every closed UTC day in the window, the rollback
         #    binary's usage --json --day D against the candidate's, with
         #    the documented tokens_* keys stripped.
-        today_utc=$(date -u +%Y-%m-%d)
         if [ ! -x "$rollback_bin" ]; then
             line FAIL usage-parity "no $rollback_bin — the 0.2.8 side of the parity is missing"
         else
@@ -1596,7 +1705,11 @@ case $sub in
             printf '%s' "$unchecked" | sed 's/^/canary:   /'
             exit 4
         fi
-        say "verdict: PASS — every item judged; operator-feel is still yours to answer"
+        if [ -n "$operator_answers" ]; then
+            say "verdict: PASS — on the operator's word that these were idle:$operator_answers; operator-feel is still yours to answer"
+        else
+            say "verdict: PASS — every item judged; operator-feel is still yours to answer"
+        fi
         exit 0
         ;;
 

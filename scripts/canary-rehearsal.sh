@@ -1198,6 +1198,171 @@ run verdict >"$tmp/verdict-elided-garbled.out" 2>&1 || code=$?
 expect 4 "$code" "a detail that does not carry a count is not a pass"
 expect_grep '^UNCHECKED tool-bodies' "$tmp/verdict-elided-garbled.out" "and says the count is not known"
 
+# --- activity -----------------------------------------------------------------
+
+day_ago() { iso_ago $(($1 * DAY)) | cut -c1-10; }
+usage_row() { # usage_row <day> <harness> [turns] [tool_calls] [recovered]
+    printf '{"day":"%s","harness":"%s","turns":%s,"tool_calls":%s,"tool_denials":0,"repeated":0,"recovered":%s}\n' \
+        "$1" "$2" "${3:-3}" "${4:-40}" "${5:-0}"
+}
+keep_rows_except() { # keep_rows_except <grep -E pattern on the raw row>
+    grep -Ev "$1" "$home/.usage-rows" >"$home/.usage-rows.new" || true
+    mv -f "$home/.usage-rows.new" "$home/.usage-rows"
+}
+
+# A day with no record at all is visible, whichever day it is. The recorder
+# stopping on day 2 used to score "all 2 active days".
+verdict_fixture
+empty_day=$(day_ago 3)
+keep_rows_except "\"day\":\"$empty_day\""
+code=0
+run verdict >"$tmp/verdict-emptyday.out" 2>&1 || code=$?
+expect 4 "$code" "a closed day with no record at all is not a pass"
+expect_grep "^UNCHECKED harness-activity.*no record at all on $empty_day" "$tmp/verdict-emptyday.out" "the day is named"
+# The operator can answer that one, and the pass says it rests on the answer.
+code=0
+run verdict --idle "$empty_day" >"$tmp/verdict-emptyday-idle.out" 2>&1 || code=$?
+expect 0 "$code" "the operator can answer that the day was idle"
+expect_grep "^PASS harness-activity.*on the operator's word, idle: $empty_day" "$tmp/verdict-emptyday-idle.out" "the item names the answer"
+expect_grep "verdict: PASS — on the operator's word that these were idle: $empty_day" "$tmp/verdict-emptyday-idle.out" "and so does the outcome"
+code=0
+run verdict --idle 'cursor;rm' >/dev/null 2>&1 || code=$?
+expect 2 "$code" "--idle takes only a harness or a day"
+# Today is not over, so no row for it yet is no question.
+verdict_fixture
+keep_rows_except "\"day\":\"$(day_ago 0)\""
+code=0
+run verdict >"$tmp/verdict-notoday.out" 2>&1 || code=$?
+expect 0 "$code" "today having no row yet is not an empty day"
+
+# Rows on the first two days only: what a recorder that stopped looks like.
+verdict_fixture
+for gone in 1 2 3 4 5 6 0; do keep_rows_except "\"day\":\"$(day_ago "$gone")\""; done
+code=0
+run verdict >"$tmp/verdict-stopped.out" 2>&1 || code=$?
+expect 4 "$code" "a recorder that stopped on day 2 is not a pass"
+expect_grep "no record at all on $(day_ago 1)" "$tmp/verdict-stopped.out" "the silent days are named"
+
+# Nothing at all since the swap: no answer from a person turns that into evidence.
+verdict_fixture
+awk -v s="$(iso_after "$fx_swapped" 0 | cut -c1-10)" 'match($0, /"day":"[^"]*"/) && substr($0, RSTART + 7, 10) < s' \
+    "$home/.usage-rows" >"$home/.usage-rows.new"
+mv -f "$home/.usage-rows.new" "$home/.usage-rows"
+code=0
+run verdict --idle claude_code,codex >"$tmp/verdict-nothing.out" 2>&1 || code=$?
+expect 4 "$code" "no record since the swap cannot be answered away"
+expect_grep '^UNCHECKED harness-activity — no record since' "$tmp/verdict-nothing.out" "and it says so"
+
+# A harness used before the swap and silent since cannot sit on a PASS line.
+verdict_fixture
+usage_row "$(day_ago 10)" cursor >>"$home/.usage-rows"
+code=0
+run verdict >"$tmp/verdict-silent.out" 2>&1 || code=$?
+expect 4 "$code" "a harness silent since the swap is not a pass"
+expect_grep '^UNCHECKED harness-activity.*cursor recorded in the two weeks before the swap' "$tmp/verdict-silent.out" "it is named as a question"
+code=0
+run verdict --idle cursor >"$tmp/verdict-silent-idle.out" 2>&1 || code=$?
+expect 0 "$code" "the operator can answer that it was not used"
+expect_grep "idle: cursor" "$tmp/verdict-silent-idle.out" "and the answer is printed"
+# Last used a month ago is not news.
+verdict_fixture
+usage_row "$(day_ago 40)" cursor >>"$home/.usage-rows"
+code=0
+run verdict >"$tmp/verdict-silent-old.out" 2>&1 || code=$?
+expect 0 "$code" "a harness last used long before the swap is not asked about"
+
+# The swap day's rows hold whatever ran before the swap. Only the read cut at
+# the swap itself says whether a harness has run since.
+verdict_fixture
+grep -v '"harness":"grok"' "$home/.usage-rows" >"$home/.usage-window"
+usage_row "$(iso_after "$fx_swapped" 0 | cut -c1-10)" grok >>"$home/.usage-rows"
+code=0
+run verdict >"$tmp/verdict-swapday.out" 2>&1 || code=$?
+expect 4 "$code" "a harness whose only rows predate the swap on the swap day is silent"
+expect_grep 'grok recorded in the two weeks before the swap' "$tmp/verdict-swapday.out" "and named"
+
+# A harness that recorded every day for two weeks and then misses a day is a
+# question. One that comes and goes is not: on the real log that is most weeks.
+verdict_fixture
+keep_rows_except "\"day\":\"$(day_ago 3)\",\"harness\":\"codex\""
+code=0
+run verdict >"$tmp/verdict-streak.out" 2>&1 || code=$?
+expect 4 "$code" "an every-day harness missing a closed day is not a pass"
+expect_grep "codex recorded on all 14 days before the swap and not on $(day_ago 3)" "$tmp/verdict-streak.out" "it is named"
+code=0
+run verdict --idle codex >/dev/null 2>&1 || code=$?
+expect 0 "$code" "and the operator can answer it"
+verdict_fixture
+for gone in 11 12 13; do keep_rows_except "\"day\":\"$(day_ago "$gone")\",\"harness\":\"codex\""; done
+keep_rows_except "\"day\":\"$(day_ago 3)\",\"harness\":\"codex\""
+code=0
+run verdict >"$tmp/verdict-comesgoes.out" 2>&1 || code=$?
+expect 0 "$code" "a harness that comes and goes may miss a day"
+expect_grep '^  codex: the recorder saw it on' "$tmp/verdict-comesgoes.out" "its days are still shown"
+
+# Records gap fill recovered are not records the recorder saw. A week of nothing
+# but recovered rows used to read "all 8 active days".
+verdict_fixture
+awk -v s="$(iso_after "$fx_swapped" 0 | cut -c1-10)" 'match($0, /"day":"[^"]*"/) && substr($0, RSTART + 7, 10) >= s' \
+    "$home/.usage-rows" |
+    sed -E 's/"harness":"claude_code","turns":3,"tool_calls":40,"tool_denials":0,"repeated":0,"recovered":0/"harness":"claude_code","turns":3,"tool_calls":0,"tool_denials":0,"repeated":0,"recovered":9/' \
+        >"$home/.usage-window"
+code=0
+run verdict >"$tmp/verdict-recovered.out" 2>&1 || code=$?
+expect 1 "$code" "a harness only gap fill has is a fail"
+expect_grep '^FAIL harness-activity.*claude_code: used since the swap, but only gap fill has it' "$tmp/verdict-recovered.out" "it is named"
+code=0
+run verdict --idle claude_code >"$tmp/verdict-recovered-idle.out" 2>&1 || code=$?
+expect 1 "$code" "its transcripts prove it was used, so no answer clears it"
+expect_grep '^  claude_code: the recorder saw it on 0 of' "$tmp/verdict-recovered.out" "seen and recovered are shown apart"
+
+# A whole day only gap fill has: the recorder saw nothing while work went on.
+verdict_fixture
+outage=$(day_ago 3)
+sed -E "/\"day\":\"$outage\"/s/\"tool_calls\":40,\"tool_denials\":0,\"repeated\":0,\"recovered\":0/\"tool_calls\":0,\"tool_denials\":0,\"repeated\":0,\"recovered\":9/" \
+    "$home/.usage-rows" >"$home/.usage-rows.new"
+mv -f "$home/.usage-rows.new" "$home/.usage-rows"
+code=0
+run verdict >"$tmp/verdict-outageday.out" 2>&1 || code=$?
+expect 1 "$code" "a day only gap fill has is a fail"
+expect_grep "^FAIL harness-activity.*the recorder saw nothing on them: *$outage" "$tmp/verdict-outageday.out" "the day is named"
+
+# A harness that only ever arrives by export or gap fill is not a dead hook.
+verdict_fixture
+usage_row "$(day_ago 2)" claude_chat 3 0 9 >>"$home/.usage-rows"
+code=0
+run verdict >"$tmp/verdict-chat.out" 2>&1 || code=$?
+expect 0 "$code" "a harness never seen live before the swap can be recovered-only"
+expect_grep '^  claude_chat: the recorder saw it on 0 of' "$tmp/verdict-chat.out" "and is shown as what it is"
+
+# The audit's combined case: 6,000 drops of known reasons, records on two days
+# of eight, and silent harnesses. All of it together used to end in `verdict: PASS`.
+combined_fixture() {
+    verdict_fixture
+    keep_next=$(iso_after "$fx_swapped" "$DAY" | cut -c1-10)
+    awk -v b="$keep_next" 'match($0, /"day":"[^"]*"/) && substr($0, RSTART + 7, 10) <= b' \
+        "$home/.usage-rows" >"$home/.usage-rows.new"
+    mv -f "$home/.usage-rows.new" "$home/.usage-rows"
+    for silent_harness in cursor grok; do
+        usage_row "$(iso_after "$fx_swapped" -$((3 * DAY)) | cut -c1-10)" "$silent_harness" >>"$home/.usage-rows"
+    done
+    drop_line $((9 * DAY)) "$1"
+    perl -e 'my ($r, $t) = @ARGV; print "{\"reason\":\"$r\",\"ts\":\"$t\"}\n" x 6000' "$1" "$(iso_ago 3600)" >>"$home/.conbus/drops.jsonl"
+}
+combined_fixture 'no daemon on /x/sock: Connection refused (os error 61)'
+code=0
+run verdict >"$tmp/verdict-combined.out" 2>&1 || code=$?
+expect 1 "$code" "the audit's combined case fails"
+expect_grep '^FAIL drops — 6000 lost' "$tmp/verdict-combined.out" "on its 6,000 lost records"
+expect_grep '^UNCHECKED harness-activity.*no record at all on' "$tmp/verdict-combined.out" "its empty days are named"
+expect_grep 'cursor recorded in the two weeks before the swap' "$tmp/verdict-combined.out" "its silent harnesses are named"
+expect_no_grep 'verdict: PASS' "$tmp/verdict-combined.out" "and nothing about it reads as a pass"
+combined_fixture 'the hook payload names no session; an empty id would merge unrelated sessions into one conversation'
+code=0
+run verdict >"$tmp/verdict-combined-noise.out" 2>&1 || code=$?
+expect 4 "$code" "the same case with only vendor noise is still not a pass"
+expect_grep '^UNCHECKED drops.*over the limit' "$tmp/verdict-combined-noise.out" "its flood is named"
+
 # C0 — verdict items that could pass over a blind input say UNCHECKED.
 # A daemon.log whose every start line predates the swap cannot prove
 # anything about restarts inside the window.
