@@ -52,7 +52,10 @@
 #     its measurements, and exits 1 if the daemon never served. `verdict` bounds its window by the recorded swap
 #     time unless --since overrides it; its budgets come from
 #     CONBUS_CANARY_TAIL_MS / _USAGE_MS / _DOCTOR_MS / _SERVING_MS /
-#     _RSS_MB / _WINDOW_DAYS, defaulting to the plan's M3 targets.
+#     _RSS_MB / _WINDOW_DAYS, defaulting to the plan's M3 targets. `start` stores
+#     the RSS and doctor budgets, the serving limit and CONBUS_CANARY_DISK_WARN_OK
+#     in canary.json, and the verdict reads them back and prints them, so a later
+#     shell cannot forget them. The environment still wins, and says so.
 #   - `verdict` exits 0 on a completed pass, 1 when an item fails, 2 when it
 #     refuses its arguments, 3 while the 7-day window is still open, and 4
 #     when the window is over but an item other than operator-feel could not
@@ -2173,6 +2176,27 @@ case $sub in
         today_utc=$(date -u +%Y-%m-%d)
         operator_answers=""
         say "window: since $since"
+        read_budget() { # read_budget <state key> <environment variable> <value now>
+            budget_stored=$(state_get "$1" || true)
+            budget_value=$3
+            budget_from="default"
+            if [ -n "${!2:-}" ]; then
+                budget_from="from the environment"
+            elif [ -n "$budget_stored" ]; then
+                { is_count "$budget_stored" && [ "$budget_stored" -ge 1 ]; } ||
+                    refuse "canary.json $1='$budget_stored' is not a positive integer"
+                budget_value=$budget_stored
+                budget_from="stored at start"
+            fi
+        }
+        read_budget rss_mb CONBUS_CANARY_RSS_MB "$rss_budget_mb"
+        rss_budget_mb=$budget_value rss_from=$budget_from
+        read_budget doctor_ms CONBUS_CANARY_DOCTOR_MS "$doctor_ms_budget"
+        doctor_ms_budget=$budget_value doctor_from=$budget_from
+        read_budget serving_limit CONBUS_CANARY_SERVING_LIMIT "$serving_limit"
+        serving_limit=$budget_value
+        disk_accepted=$(state_get disk_warn_ok || true)
+        say "budgets: recorder RSS $rss_budget_mb MB ($rss_from), doctor $doctor_ms_budget ms ($doctor_from); disk warning accepted at start: $([ "$disk_accepted" = 1 ] && echo yes || echo no)"
 
         [ -x "$bin" ] || die "no installed conbus at $bin — verdict needs its reads"
 
@@ -2625,6 +2649,10 @@ case $sub in
         # taken away. One that does not exist yet could vanish unseen, so it does now.
         (umask 077; : >>"$drops_log") 2>/dev/null || true
         state_extra=",\"drops_file\":\"$(file_identity "$drops_log")\",\"log_files\":\"$(log_segments | awk 'NR == 1 { first = $1 } { last = $1; n++ } END { printf "%d:%s:%s", n, first, last }')\""
+        # The budgets this window runs on stay with it. A verdict a week later comes
+        # from another shell, and a forgotten RSS budget has failed a healthy week twice.
+        state_extra="$state_extra,\"rss_mb\":\"$rss_budget_mb\",\"doctor_ms\":\"$doctor_ms_budget\",\"disk_warn_ok\":\"${CONBUS_CANARY_DISK_WARN_OK:-}\",\"serving_limit\":\"$serving_limit\""
+        say "budgets stored: recorder RSS $rss_budget_mb MB, doctor $doctor_ms_budget ms, serving limit $serving_limit s, disk warning accepted: ${CONBUS_CANARY_DISK_WARN_OK:-no}"
         # A rotation can rename drops.jsonl mid-swap, so "drops since now"
         # is a timestamp cut across both generations, not a line offset.
         before_ts=$(now_iso_ms)

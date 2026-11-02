@@ -3060,6 +3060,53 @@ daemon_boot beef 4266
 code=0; CONBUS_CANARY_BLACKOUT="$blackout_other,$blackout_other 00:00-23:59 UTC" run start --from "$tmp/stage/conbus-good" >/dev/null 2>&1 || code=$?
 expect 0 "$code" "one that does not hold today does not"
 
+# The budgets a window was started with stay with it. A verdict run a week later from another shell forgot them twice.
+run_nobudget() { # the way an operator's later shell runs it: nothing from `start` left in the environment
+    home_is_throwaway
+    env -u CONBUS_HOME -u XDG_STATE_HOME -u CONBUS_CANARY_RSS_MB -u CONBUS_CANARY_DOCTOR_MS -u CONBUS_CANARY_DISK_WARN_OK -u CONBUS_CANARY_SERVING_LIMIT \
+        HOME="$home" CONBUS_SKIP_LAUNCHCTL=1 CONBUS_CANARY_REHEARSAL=1 ${LATER_SHELL_SET:-} \
+        CONBUS_CANARY_TAIL_MS=20000 CONBUS_CANARY_USAGE_MS=20000 \
+        bash "$canary" "$@"
+}
+write_fake 01d old "$install_dir/conbus"; rm -f "$rollback_bin" "$home/.conbus/canary.json"
+daemon_boot beef 4267
+code=0
+CONBUS_CANARY_RSS_MB=650 DOCTOR_MS=5000 CONBUS_CANARY_DISK_WARN_OK=1 SERVING_LIMIT=40 run start --from "$tmp/stage/conbus-good" >"$tmp/start-budgets.out" 2>&1 || code=$?
+expect 0 "$code" "start with budgets for this machine"
+expect_grep '"rss_mb":"650"' "$home/.conbus/canary.json" "stores the RSS budget"
+expect_grep '"doctor_ms":"5000"' "$home/.conbus/canary.json" "and the doctor budget"
+expect_grep '"disk_warn_ok":"1"' "$home/.conbus/canary.json" "and the disk warning it accepted"
+expect_grep '"serving_limit":"40"' "$home/.conbus/canary.json" "and the serving limit restarts are judged with"
+expect_grep 'budgets stored: recorder RSS 650 MB, doctor 5000 ms' "$tmp/start-budgets.out" "and says so"
+code=0; run restart >/dev/null 2>&1 || code=$?
+expect_grep '"rss_mb":"650"' "$home/.conbus/canary.json" "and a restart keeps them"
+# Read back, and said, with no environment at all.
+verdict_fixture
+state_add() { sed -E "s/,\"restarts\":/,\"$1\":\"$2\",\"restarts\":/" "$home/.conbus/canary.json" >"$home/.conbus/canary.json.new"; mv -f "$home/.conbus/canary.json.new" "$home/.conbus/canary.json"; }
+state_add rss_mb 1
+state_add doctor_ms 20000
+state_add disk_warn_ok 1
+code=0; run_nobudget verdict >"$tmp/verdict-stored.out" 2>&1 || code=$?
+expect 1 "$code" "a stored budget is the budget"
+expect_grep '^FAIL rss-budget.*> 1 MB' "$tmp/verdict-stored.out" "the stored RSS budget judged it"
+expect_grep 'budgets: recorder RSS 1 MB (stored at start), doctor 20000 ms (stored at start)' "$tmp/verdict-stored.out" "and the stored values are printed"
+expect_grep 'disk warning accepted at start: yes' "$tmp/verdict-stored.out" "the disk answer too"
+# The environment still wins, and says it did.
+code=0; LATER_SHELL_SET=CONBUS_CANARY_RSS_MB=650 run_nobudget verdict >"$tmp/verdict-stored-env.out" 2>&1 || code=$?
+expect 0 "$code" "the environment overrides what is stored"
+expect_grep 'recorder RSS 650 MB (from the environment)' "$tmp/verdict-stored-env.out" "and is named as the source"
+# Junk in the file is refused like junk in the environment.
+verdict_fixture
+state_add rss_mb lots
+code=0; run_nobudget verdict >"$tmp/verdict-stored-junk.out" 2>&1 || code=$?
+expect 2 "$code" "a stored budget that is not a number is refused"
+expect_grep "canary.json rss_mb='lots'" "$tmp/verdict-stored-junk.out" "by name"
+# A window started before budgets were stored runs on the defaults, and says that.
+verdict_fixture
+code=0; run_nobudget verdict >"$tmp/verdict-stored-none.out" 2>&1 || code=$?
+expect_grep 'recorder RSS 256 MB (default)' "$tmp/verdict-stored-none.out" "defaults are named as defaults"
+expect_grep 'disk warning accepted at start: no' "$tmp/verdict-stored-none.out" "and no answer is no"
+
 # A real build under this throwaway HOME would ask an agy that is not signed
 # in, and a build older than the sign-in check opens a browser tab doing it.
 expect_file "$tmp/agy-bin.seen" "the fakes saw doctor run"
