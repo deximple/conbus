@@ -6,6 +6,16 @@ the entry says so when it does.
 
 ## [Unreleased]
 
+### Fixed
+
+- `doctor` no longer leaves an empty `segment-00000000.jsonl` in a log folder
+  with no segments. It checked that a segment could be written by creating one,
+  and a later restore with `cp -n` would keep that empty file over the real one.
+- A `cache/meta` sidecar now also has to match its segment's write time, so a
+  segment changed without changing length is read again. Before, a damaged
+  segment could read as healthy, and a restored one could keep reporting damage
+  it no longer had.
+
 ## [1.0.0-rc.3] — 2026-11-01
 
 ### Fixed

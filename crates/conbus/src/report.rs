@@ -114,8 +114,12 @@ fn select<'a>(records: &'a [Record], filter: &LogFilter) -> Vec<&'a Record> {
 /// segment refuses every record, and it fails while a daemon holding an open
 /// handle keeps recording fine.
 ///
-/// Deliberately does not create the log directory. A diagnostic that repairs
-/// what it is measuring cannot report on it.
+/// With no segment yet the writer's first act is to create one, so there the
+/// directory is what decides, and the probe creates a file and takes it away.
+///
+/// Deliberately leaves nothing behind, neither the log directory nor an empty
+/// segment. A diagnostic that repairs what it is measuring cannot report on it,
+/// and an empty segment is what a restore with `cp -n` keeps over the real one.
 fn appendable(paths: &Paths) -> io::Result<()> {
     let dir = paths.log_dir();
     if !dir.exists() {
@@ -125,11 +129,15 @@ fn appendable(paths: &Paths) -> io::Result<()> {
         ));
     }
     let segment = SegmentLog::current_segment(&dir)?;
+    if segment.exists() {
+        return OpenOptions::new().append(true).open(&segment).map(|_| ());
+    }
+    let probe = dir.join(format!(".appendable-{}.tmp", std::process::id()));
     OpenOptions::new()
-        .create(true)
+        .create_new(true)
         .append(true)
-        .open(&segment)
-        .map(|_| ())
+        .open(&probe)?;
+    std::fs::remove_file(&probe)
 }
 
 fn describe_appendable(result: &io::Result<()>) -> String {

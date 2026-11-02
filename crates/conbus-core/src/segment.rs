@@ -899,6 +899,7 @@ struct SidecarHeader {
     schema: u32,
     segment: String,
     bytes: u64,
+    modified_ns: u64,
     records: u64,
     first_ts: Option<String>,
     last_ts: Option<String>,
@@ -919,20 +920,32 @@ fn sidecar_path(cache: &Path, segment: &Path) -> PathBuf {
     )
 }
 
+/// A segment's length and last write time. The length alone misses a change
+/// that keeps it: damage in place, or a good copy restored over a damaged one.
+fn fingerprint(segment: &Path) -> io::Result<(u64, u64)> {
+    let file = std::fs::metadata(segment)?;
+    let modified = file
+        .modified()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(io::Error::other)?;
+    Ok((file.len(), modified.as_nanos() as u64))
+}
+
 /// A sidecar only answers for the exact file it was built from: this build's
-/// version and schema, the same name, and a length that has not changed. The
-/// newest segment never has one — it can still grow.
+/// version and schema, the same name, and a length and write time that have not
+/// changed. The newest segment never has one — it can still grow.
 fn read_sidecar(cache: &Path, segment: &Path) -> Option<(Vec<Record>, Vec<Defect>)> {
     let text = std::fs::read_to_string(sidecar_path(cache, segment)).ok()?;
     let mut lines = text.lines();
     let header: SidecarHeader = serde_json::from_str(lines.next()?).ok()?;
-    let bytes = std::fs::metadata(segment).ok()?.len();
+    let (bytes, modified_ns) = fingerprint(segment).ok()?;
     let name = segment.file_name()?.to_str()?;
     if header.sidecar != 1
         || header.conbus != env!("CARGO_PKG_VERSION")
         || header.schema != SCHEMA_VERSION
         || header.segment != name
         || header.bytes != bytes
+        || header.modified_ns != modified_ns
     {
         return None;
     }
@@ -973,7 +986,7 @@ fn write_sidecar(cache: &Path, segment: &Path, records: &[Record], defects: &[De
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(cache, std::fs::Permissions::from_mode(0o700));
         }
-        let bytes = std::fs::metadata(segment)?.len();
+        let (bytes, modified_ns) = fingerprint(segment)?;
         let name = segment
             .file_name()
             .and_then(|name| name.to_str())
@@ -985,6 +998,7 @@ fn write_sidecar(cache: &Path, segment: &Path, records: &[Record], defects: &[De
             schema: SCHEMA_VERSION,
             segment: name.clone(),
             bytes,
+            modified_ns,
             records: records.len() as u64,
             first_ts: records.first().map(|r| r.ts.to_string()),
             last_ts: records.last().map(|r| r.ts.to_string()),

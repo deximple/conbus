@@ -1147,6 +1147,56 @@ fn doctor_reports_a_log_it_cannot_append_to() {
     );
 }
 
+/// `doctor`, on a root whose log folder exists and holds no segment.
+fn doctor_on_an_empty_log_folder(home: &Path) -> String {
+    let doctor = Command::new(bin())
+        .arg("doctor")
+        .env("CONBUS_AGY_BIN", NOT_THERE)
+        .env("CONBUS_CODEX_BIN", NOT_THERE)
+        .env("CONBUS_HOME", home)
+        .output()
+        .expect("doctor");
+    String::from_utf8_lossy(&doctor.stdout).into_owned()
+}
+
+#[test]
+fn doctor_leaves_nothing_behind_in_an_empty_log_folder() {
+    // A stray `rm` of every segment, then `doctor`, the natural first move. An
+    // empty segment-00000000.jsonl left by the probe is what a `cp -n` restore
+    // then keeps over the real one.
+    let home = tempfile::tempdir().expect("tempdir");
+    let log = home.path().join("log");
+    std::fs::create_dir(&log).expect("mkdir");
+
+    let out = doctor_on_an_empty_log_folder(home.path());
+
+    assert!(out.contains("writable  appendable"), "{out}");
+    let left: Vec<_> = std::fs::read_dir(&log)
+        .expect("read")
+        .map(|entry| entry.expect("entry").file_name())
+        .collect();
+    assert!(left.is_empty(), "doctor left {left:?}");
+}
+
+#[test]
+fn doctor_reports_an_empty_log_folder_no_segment_can_be_made_in() {
+    // With no segment yet, the writer's first act is to create one, so here the
+    // directory's rights are the ones that decide.
+    let home = tempfile::tempdir().expect("tempdir");
+    let log = home.path().join("log");
+    std::fs::create_dir(&log).expect("mkdir");
+    let mut readonly = std::fs::metadata(&log).expect("meta").permissions();
+    readonly.set_readonly(true);
+    std::fs::set_permissions(&log, readonly).expect("chmod");
+
+    let out = doctor_on_an_empty_log_folder(home.path());
+
+    assert!(
+        out.contains("NOT APPENDABLE"),
+        "a folder that refuses a segment read as healthy: {out}"
+    );
+}
+
 /// A whole conversation, so the next session in that checkout has something to
 /// be told about.
 fn conversation(home: &Path, session: &str, cwd: &str, prompts: &[&str]) {
