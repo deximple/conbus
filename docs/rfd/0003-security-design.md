@@ -284,3 +284,7 @@ None of this is built before an Enterprise buyer asks for it.
 No service is hosted before the gates: V1's three pilots, and at least
 $1k/month signed. RFD 0002's contract stands as written, apart from the one
 field this RFD adds to the envelope, `revision` (D4).
+
+*Note, 2026-11-03.* V1 will not run. The operator made the E1–E3 ladder in
+[`docs/saas-strategy.md`](../saas-strategy.md) the live gate (O7), so a host waits
+for the ladder, V2 and the $1k a month signed.

@@ -9,7 +9,11 @@ still the local tool. The host waits for the gates in the plan — reach,
 problem, value, and money that has moved — and for an operator decision; do not
 start it in the turn that writes or changes the choice. The reach gate (V0,
 the desk count) passed on 2026-10-09: at least six of the first thirty
-reachable organisations met the buyer profile. The sync **client**
+reachable organisations met the buyer profile. On 2026-11-03 the operator settled
+which gates are live (O7): the E1–E3 ladder in `docs/saas-strategy.md`, then V2.
+The twelve interviews (V1) will not run. E1's release is the `v1.0.0` tag, and E1
+is due one week after `v1.0.0` is published and the landing page is live, whichever
+is later, with the two posts after 1.0. The sync **client**
 ships in 0.2.9 (`docs/sync-client-plan.md`, implemented against the drafts);
 RFD 0002 and RFD 0003 stay drafts until accepted together, a service still
 needs that acceptance first, and no field they do not name may be sent.
