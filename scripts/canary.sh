@@ -991,6 +991,77 @@ verdict_activity() {
     printf '%s\n' "$va_rows" | sed -n 's/^table /  /p' | sort
 }
 
+# Is what ran this window still what the window judges? Read back from the files
+# themselves: `start` stamps the candidate, and nothing after it checked.
+verdict_build() {
+    cand_build=$(state_get candidate_build || true)
+    cand_sha=$(state_get candidate_sha256 || true)
+    rolled=$(state_get rolled_back || true)
+    if [ -z "$cand_build" ]; then
+        line UNCHECKED build "canary.json names no candidate — nothing says which build this window judges"
+        return
+    fi
+    vb_faults="" vb_open=""
+    if [ -n "$rolled" ]; then
+        vb_faults="$vb_faults; rolled back at $rolled — this window no longer judges the candidate"
+    fi
+    vb_installed=$("$bin" --version 2>&1 | sed -n 's/.*(\([0-9a-f]*\)).*/\1/p' || true)
+    if [ "$vb_installed" != "$cand_build" ]; then
+        vb_faults="$vb_faults; the installed binary is build ${vb_installed:-unknown}, the candidate is $cand_build"
+    fi
+    vb_sha=$(shasum -a 256 "$bin" 2>/dev/null | awk '{ print $1 }' || true)
+    if [ -z "$cand_sha" ]; then
+        vb_open="canary.json names no candidate sha256"
+    elif [ "$vb_sha" != "$cand_sha" ]; then
+        vb_faults="$vb_faults; the installed binary's sha256 is not the candidate's"
+    fi
+    vb_running=$(sed -n 's/.*"build":"\([^"]*\)".*/\1/p' "$stamp" 2>/dev/null || true)
+    if [ "$vb_running" != "$cand_build" ]; then
+        vb_faults="$vb_faults; the daemon's stamp names build ${vb_running:-none}, the candidate is $cand_build"
+    fi
+    if [ -n "$doctor_failed" ]; then
+        vb_open="${vb_open:+$vb_open; }$doctor_failed"
+    else
+        vb_doctor=$(printf '%s\n' "$doctor_out" | grep -E 'DIFFERS|the stamp is stale|^recorder  starting' || true)
+        if [ -n "$vb_doctor" ]; then
+            vb_faults="$vb_faults; doctor says: $(printf '%s\n' "$vb_doctor" | sed -n '1p' | cut -c1-160)"
+        fi
+    fi
+    if [ -n "$vb_faults" ]; then
+        line FAIL build "${vb_faults#; }"
+    elif [ -n "$vb_open" ]; then
+        line UNCHECKED build "the binary and stamp name the candidate, and it could not be confirmed: $vb_open"
+    else
+        line PASS build "the installed binary and the running daemon are candidate $cand_build (sha256 agrees); never rolled back"
+    fi
+}
+
+# The lines doctor prints that mean a vendor's events will not reach the recorder.
+# `not installed here` is a vendor this machine does not have, not a broken hook.
+hook_problems() { # hook_problems <doctor output>
+    printf '%s\n' "$1" | awk '
+        /^hooks / && !/ runs / && !/ not installed here/ { print; next }
+        /^events / && /MISSING/ { print; next }
+        /^ +(NOT TRUSTED|MODIFIED)/ { print }'
+}
+
+verdict_hooks() {
+    if [ -n "$doctor_failed" ]; then
+        line UNCHECKED hooks "$doctor_failed"
+        return
+    fi
+    vh_bad=$(hook_problems "$doctor_out")
+    vh_runs=$(printf '%s\n' "$doctor_out" | grep -c '^hooks .* runs ' || true)
+    if [ -n "$vh_bad" ]; then
+        line FAIL hooks "$(printf '%s\n' "$vh_bad" | sed -n '1p' | sed -E 's/  +/ /g' | cut -c1-170)"
+        printf '%s\n' "$vh_bad" | sed -n '2,$p' | sed -E 's/  +/ /g; s/^ */  /' | cut -c1-170
+    elif [ "$vh_runs" -eq 0 ]; then
+        line UNCHECKED hooks "doctor names no hook that runs here — nothing is registered to record"
+    else
+        line PASS hooks "$vh_runs hook line(s) runs; what that proves: the command starts and answers, or for cursor and opencode that it is registered. harness-activity is the proof that vendors fire them"
+    fi
+}
+
 is_idle() { # is_idle <harness or day>
     case ",$idle," in
         *,"$1",*) return 0 ;;
@@ -1368,6 +1439,24 @@ case $sub in
         noise_limit=${CONBUS_CANARY_NOISE_MAX:-2000}
         is_uint "$noise_limit" || refuse "CONBUS_CANARY_NOISE_MAX='$noise_limit' is not a number"
 
+        # One doctor for every item that reads it. Each doctor starts Codex's
+        # app-server two or three times, so items do not get their own.
+        doctor_t0=$(perl -MTime::HiRes=time -e 'printf "%d", time()*1000')
+        doctor_rc=0
+        doctor_out=$(run_doctor 2>/dev/null) || doctor_rc=$?
+        doctor_first_ms=$(($(perl -MTime::HiRes=time -e 'printf "%d", time()*1000') - doctor_t0))
+        doctor_failed=""
+        if [ "$doctor_rc" -eq 142 ]; then
+            doctor_failed="doctor did not answer inside ${doctor_limit_s}s"
+        elif [ "$doctor_rc" -ne 0 ]; then
+            doctor_failed="doctor exited $doctor_rc"
+        elif ! grep -q '^socket' <<<"$doctor_out"; then
+            doctor_failed="doctor printed no socket line"
+        fi
+
+        verdict_build
+        verdict_hooks
+
         # 1. Unplanned recorder restarts: daemon start lines after since,
         #    minus the swap's own boot and each planned restart — each of
         #    those is one `install --apply`, one boot.
@@ -1408,8 +1497,7 @@ case $sub in
                 "$daemon_log" | tail -1)
         fi
         if [ -z "$unreadable" ]; then
-            count_out=$(run_doctor 2>/dev/null || true)
-            unreadable=$(echo "$count_out" |
+            unreadable=$(echo "$doctor_out" |
                 sed -n 's/^log.* \([0-9][0-9]*\) unreadable line(s)/\1/p' | tail -1)
         fi
         case ${unreadable:-x} in
@@ -1585,10 +1673,12 @@ case $sub in
         # re-read starts its vendor probes again. So a read that makes its budget
         # is read once; one that does not gets two more, and the median judges.
         # A wedge still trips it, a spike does not.
-        judge_read() { # judge_read <budget ms> <cmd...> — echoes "<ms> <exit status>"
-            judge_budget=$1
-            shift
-            read -r judge_ms judge_rc <<<"$(measure "$@")"
+        judge_read() { # judge_read <budget ms> <first ms> <first status> <cmd...> — echoes "<ms> <exit status>"
+            judge_budget=$1 judge_ms=$2 judge_rc=$3
+            shift 3
+            if [ "$judge_ms" = - ]; then
+                read -r judge_ms judge_rc <<<"$(measure "$@")"
+            fi
             if [ "$judge_rc" -eq 0 ] && [ "$judge_ms" -gt "$judge_budget" ]; then
                 judge_again=$(for _ in 1 2; do measure "$@"; done)
                 judge_ms=$(printf '%s\n%s\n' "$judge_ms" "$judge_again" | awk '{ print $1 }' | sort -n | sed -n '2p')
@@ -1596,9 +1686,9 @@ case $sub in
             fi
             echo "$judge_ms $judge_rc"
         }
-        read -r t_tail rc_tail <<<"$(judge_read "$tail_ms_budget" "$bin" log --tail 1)"
-        read -r t_usage rc_usage <<<"$(judge_read "$usage_ms_budget" "$bin" usage --days 7)"
-        read -r t_doctor rc_doctor <<<"$(judge_read "$doctor_ms_budget" run_doctor)"
+        read -r t_tail rc_tail <<<"$(judge_read "$tail_ms_budget" - - "$bin" log --tail 1)"
+        read -r t_usage rc_usage <<<"$(judge_read "$usage_ms_budget" - - "$bin" usage --days 7)"
+        read -r t_doctor rc_doctor <<<"$(judge_read "$doctor_ms_budget" "$doctor_first_ms" "$doctor_rc" run_doctor)"
         tb_failed=""
         [ "$rc_tail" -eq 0 ] || tb_failed="$tb_failed log --tail(exit $rc_tail)"
         [ "$rc_usage" -eq 0 ] || tb_failed="$tb_failed usage(exit $rc_usage)"
@@ -1612,6 +1702,9 @@ case $sub in
         [ "$t_tail" -gt "$tail_ms_budget" ] && tb_bad="$tb_bad tail(${t_tail}>${tail_ms_budget})"
         [ "$t_usage" -gt "$usage_ms_budget" ] && tb_bad="$tb_bad usage(${t_usage}>${usage_ms_budget})"
         [ "$t_doctor" -gt "$doctor_ms_budget" ] && tb_bad="$tb_bad doctor(${t_doctor}>${doctor_ms_budget})"
+        # A cap lower than the budget must not turn a doctor that never answered
+        # into one that answered in time.
+        [ "$rc_doctor" -eq 142 ] && tb_bad="$tb_bad doctor(no answer inside ${doctor_limit_s}s)"
         if [ -n "$tb_failed" ]; then
             # A read that fails fast beats any budget and proves none of them.
             line UNCHECKED time-budget "a failing read cannot be timed:$tb_failed"
