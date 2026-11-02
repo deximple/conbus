@@ -29,7 +29,8 @@ pub const CLAUDE_TRANSCRIPT: &str = "claude_transcript";
 /// What one transcript yielded.
 #[derive(Debug, Default)]
 pub struct Recovered {
-    /// The vendor's session id, from the lines themselves.
+    /// The vendor's session id: the file's name for a transcript, the thread's
+    /// own id for a Codex thread.
     pub vendor_session_id: Option<String>,
     /// The checkout the conversation happened in, from the lines themselves.
     pub workspace: Option<String>,
@@ -118,8 +119,18 @@ fn text_of(content: &serde_json::Value) -> Option<String> {
 /// That is an assumption rather than a fact — assistant lines carry no
 /// `promptId`, unlike user lines, so there is nothing to join on. It held in
 /// every transcript sampled.
-pub fn parse_claude_transcript(text: &str, bus_id: BusId) -> Recovered {
-    let mut out = Recovered::default();
+///
+/// `session` is the id the file is named for, and only its own lines are read.
+/// A transcript can open on another session's lines: a Claude Desktop
+/// continuation starts with its parent's history, stamped with the parent's
+/// `sessionId` (14 of 2,392 real files, 21,920 such `user` lines, always before
+/// the file's own first line). Those turns belong to the parent's conversation
+/// and are already in the parent's own file.
+pub fn parse_claude_transcript(text: &str, session: &str, bus_id: BusId) -> Recovered {
+    let mut out = Recovered {
+        vendor_session_id: Some(session.to_string()),
+        ..Recovered::default()
+    };
     let mut open: Option<OpenTurn> = None;
     let mut harness_version: Option<String> = None;
 
@@ -135,8 +146,9 @@ pub fn parse_claude_transcript(text: &str, bus_id: BusId) -> Recovered {
             out.skip("sidechain");
             continue;
         }
-        if out.vendor_session_id.is_none() {
-            out.vendor_session_id.clone_from(&line.session_id);
+        if line.session_id.as_deref().is_some_and(|id| id != session) {
+            out.skip("line of another session");
+            continue;
         }
         // Kept as the last one seen rather than the first: a transcript's
         // opening lines are bookkeeping that carries no `cwd`, and a session
@@ -655,7 +667,7 @@ mod tests {
 "#;
 
     fn parsed() -> Recovered {
-        parse_claude_transcript(TRANSCRIPT, BusId::mint())
+        parse_claude_transcript(TRANSCRIPT, "S1", BusId::mint())
     }
 
     /// The turn records, without the session record that now heads a recovered
@@ -807,6 +819,7 @@ mod tests {
         // whole deferral design exists to avoid.
         let out = parse_claude_transcript(
             r#"{"type":"queue-operation","sessionId":"S9","cwd":"/tmp"}"#,
+            "S9",
             BusId::mint(),
         );
 
@@ -860,7 +873,7 @@ mod tests {
             "{not json at all",
         );
 
-        let out = parse_claude_transcript(&damaged, BusId::mint());
+        let out = parse_claude_transcript(&damaged, "S1", BusId::mint());
 
         assert_eq!(turns(&out).len(), 4, "the conversation must survive");
         assert_eq!(out.skipped.get("unreadable json"), Some(&1));
@@ -873,10 +886,72 @@ mod tests {
             r#"{"type":"user","sessionId":"S1","isSidechain":true,"timestamp":"2026-07-28T15:39:00.000Z","promptId":"P9","message":{"role":"user","content":"a subagent prompt"}}"#
         );
 
-        let out = parse_claude_transcript(&with_sidechain, BusId::mint());
+        let out = parse_claude_transcript(&with_sidechain, "S1", BusId::mint());
 
         assert_eq!(turns(&out).len(), 4);
         assert_eq!(out.skipped.get("sidechain"), Some(&1));
+    }
+
+    /// A continuation: the parent's lines first, under the parent's id.
+    const FORK: &str = r#"
+{"type":"user","sessionId":"PARENT","timestamp":"2026-10-01T00:00:00.000Z","version":"2.1.200","cwd":"/parent/checkout","entrypoint":"claude-desktop","promptId":"P0","message":{"role":"user","content":"the parent's prompt"}}
+{"type":"assistant","sessionId":"PARENT","timestamp":"2026-10-01T00:00:01.000Z","version":"2.1.200","message":{"role":"assistant","content":[{"type":"text","text":"the parent's reply"}]}}
+{"type":"user","sessionId":"CHILD","timestamp":"2026-11-01T00:00:00.000Z","version":"2.1.316","cwd":"/child/checkout","entrypoint":"cli","promptId":"C0","message":{"role":"user","content":"the fork's prompt"}}
+"#;
+
+    #[test]
+    fn lines_of_another_session_do_not_become_this_sessions_turns() {
+        let out = parse_claude_transcript(FORK, "CHILD", BusId::mint());
+
+        assert_eq!(out.vendor_session_id.as_deref(), Some("CHILD"));
+        let started: Vec<&Entry> = turns(&out)
+            .into_iter()
+            .filter(|e| matches!(e.event, Event::TurnStarted { .. }))
+            .collect();
+        assert_eq!(started.len(), 1);
+        assert_eq!(
+            started[0].vendor_turn_id.as_ref().map(VendorTurnId::as_str),
+            Some("C0")
+        );
+        assert_eq!(out.skipped.get("line of another session"), Some(&2));
+    }
+
+    #[test]
+    fn a_forks_records_name_the_fork_and_nothing_of_the_parent() {
+        // A parent's stamp under the fork would bind the parent's session to
+        // the fork on the next restore, and its old time would move the fork's
+        // last activity backwards.
+        let out = parse_claude_transcript(FORK, "CHILD", BusId::mint());
+
+        assert!(out.entries.iter().all(|entry| {
+            entry.source.vendor_session_id.as_deref() == Some("CHILD")
+                && entry.source.workspace.as_deref() == Some("/child/checkout")
+                && entry.source.harness_version.as_deref() == Some("2.1.316")
+                && entry.observed_at.map(|t| t.to_string()).as_deref()
+                    == Some("2026-11-01T00:00:00.000Z")
+        }));
+        assert_eq!(out.entrypoint.as_ref().map(Entrypoint::as_str), Some("cli"));
+    }
+
+    #[test]
+    fn a_file_holding_only_another_sessions_lines_recovers_nothing() {
+        let out = parse_claude_transcript(FORK, "SOMEONE-ELSE", BusId::mint());
+
+        assert!(out.entries.is_empty());
+        assert_eq!(out.skipped.get("line of another session"), Some(&3));
+    }
+
+    #[test]
+    fn a_line_that_names_no_session_is_read_as_the_files_own() {
+        // Nothing says it belongs elsewhere, and bookkeeping lines of this
+        // shape are common.
+        let out = parse_claude_transcript(
+            r#"{"type":"user","timestamp":"2026-11-01T00:00:00.000Z","promptId":"P1","message":{"role":"user","content":"a prompt"}}"#,
+            "S1",
+            BusId::mint(),
+        );
+
+        assert_eq!(turns(&out).len(), 1);
     }
 }
 

@@ -122,6 +122,10 @@ the entry says so when it does.
   reported success and nothing could ever read it, even after a restart. It now
   checks that the file is still at its name before each write, and starts again
   at that name if not.
+- Gap fill and `backfill` no longer copy a parent conversation into its fork. A
+  transcript's session is its file name, and lines naming another session are
+  counted as not read. Before this, a Claude Desktop continuation that changed
+  near a restart could gain every turn of its parent under its own `bus_id`.
 
 ## [1.0.0-rc.3] — 2026-11-01
 
