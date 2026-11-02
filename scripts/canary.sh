@@ -2193,7 +2193,11 @@ case $sub in
         fi
 
         # 3. Drops, then what the same lines say about tool bodies. Both read the
-        #    usage rows taken above.
+        #    usage rows taken above. 1% of very few is nothing: 12 of 112 is a restart on
+        #    a quiet day. So it takes a minimum, and on a quiet machine a body that is
+        #    elided every time still shows as most of them.
+        elided_min=100
+        elided_min_half=20
         verdict_drops
         verdict_log_outages
         verdict_orphan_tools
@@ -2205,32 +2209,47 @@ case $sub in
         elif [ "${elided_bad:-0}" -gt 0 ]; then
             line UNCHECKED tool-bodies \
                 "$elided_bad elided line(s) do not read '<N> tool event(s)' — the count is not known"
-        elif [ $((${elided_total:-0} * 100)) -gt "$window_tool_calls" ]; then
+        elif [ $((${elided_total:-0} * 100)) -gt "$window_tool_calls" ] && {
+            [ "${elided_total:-0}" -ge "$elided_min" ] ||
+                { [ "${elided_total:-0}" -ge "$elided_min_half" ] && [ $((${elided_total:-0} * 2)) -gt "$window_tool_calls" ]; }
+        }; then
             line FAIL tool-bodies \
                 "${elided_total:-0} tool event(s) elided, not sealed — more than 1% of $window_tool_calls tool call(s); a spool elides tens per restart, a Keychain that will not answer elides them all"
         else
             line PASS tool-bodies \
-                "${elided_total:-0} tool event(s) elided, not sealed — within 1% of $window_tool_calls tool call(s)"
+                "${elided_total:-0} tool event(s) elided, not sealed, of $window_tool_calls tool call(s) — fails over 1% from $elided_min of them, or over half from $elided_min_half"
         fi
 
         verdict_activity
 
         # 5. twins and `repeated` growth vs the pre-swap baseline, same rows.
         if [ -z "$usage_problem" ]; then
-            rep_result=$(echo "$usage_json" | awk -v s="$since_day" '
+            # By day, as a median against the 28 days before the swap. A mean over all
+            # history made one month in September the baseline for ever, and a large
+            # regression passed under it. One bad day is a burst and stays a total:
+            # days of 102, 22 and 17 sit among medians of 0 on the real log.
+            rep_result=$(echo "$usage_json" | awk -v s="$since_day" -v lb="$(perl -MTime::Local -MPOSIX=strftime -e '
+                my ($y, $m, $d) = $ARGV[0] =~ /^(\d+)-(\d+)-(\d+)/;
+                print strftime("%Y-%m-%d", gmtime(timegm(0, 0, 0, $d, $m - 1, $y) - 28 * 86400))' "$since_day")" '
+                function median(by,    v, n, i, j, x, d) {
+                    n = 0
+                    for (d in by) v[++n] = by[d]
+                    if (!n) return 0
+                    for (i = 2; i <= n; i++) { x = v[i]; for (j = i - 1; j >= 1 && v[j] > x; j--) v[j + 1] = v[j]; v[j + 1] = x }
+                    return n % 2 ? v[(n + 1) / 2] : (v[n / 2] + v[n / 2 + 1]) / 2
+                }
                 {
                     day = ""
                     if (match($0, /"day":"[^"]*"/)) day = substr($0, RSTART + 7, RLENGTH - 8)
                     if (match($0, /"repeated":[0-9]+/)) rep = substr($0, RSTART + 11, RLENGTH - 11) + 0
                     else rep = 0
-                    if (day >= s) { wr += rep; wd[day] = 1 } else { br += rep; bd[day] = 1 }
+                    if (day >= s) { wr += rep; wd[day] += rep }
+                    else if (day >= lb) { br += rep; bd[day] += rep }
                 }
                 END {
+                    wm = median(wd); bm = median(bd)
                     wdays = 0; for (d in wd) wdays++
-                    bdays = 0; for (d in bd) bdays++
-                    wrate = wdays ? wr / wdays : 0
-                    brate = bdays ? br / bdays : 0
-                    printf "%s %.4f %.4f %d %d %d", (wdays ? (wrate <= brate ? "PASS" : "FAIL") : "UNCHECKED"), wrate, brate, wr, br, wdays
+                    printf "%s %s %s %d %d %d", (wdays ? (wm <= bm + 2 ? "PASS" : "FAIL") : "UNCHECKED"), wm, bm, wr, br, wdays
                 }')
             set -- $rep_result
             if [ "$1" = UNCHECKED ]; then
@@ -2238,7 +2257,7 @@ case $sub in
                     "usage --json has no rows since $since_day — nothing to compare"
             else
                 line "$1" twins-repeated \
-                    "repeated/day $2 since vs $3 before ($4 vs $5 total)"
+                    "repeated per day, median $2 since vs $3 in the 28 days before ($4 vs $5 total); fails when the median rises by more than 2, so one burst does not"
             fi
         else
             line UNCHECKED twins-repeated "$usage_problem"

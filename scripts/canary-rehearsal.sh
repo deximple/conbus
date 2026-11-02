@@ -1654,20 +1654,6 @@ run verdict >"$tmp/verdict-elided-high.out" 2>&1 || code=$?
 expect 1 "$code" "elided bodies above 1% of tool calls fail"
 expect_grep '^FAIL tool-bodies — 100000 tool event(s)' "$tmp/verdict-elided-high.out" "the item that failed says so"
 expect_grep '^PASS drops' "$tmp/verdict-elided-high.out" "and it is tool-bodies that fails, not drops"
-# 1% exactly is within it, one more is not. One day holds all the tool calls.
-verdict_fixture
-sed -E 's/"tool_calls":[0-9]+/"tool_calls":0/' "$home/.usage-rows" >"$home/.usage-rows.new"
-printf '{"day":"%s","harness":"codex","turns":3,"tool_calls":100,"tool_denials":0,"repeated":0,"recovered":0,"tokens_input":1}\n' \
-    "$(iso_ago $((2 * DAY)) | cut -c1-10)" >>"$home/.usage-rows.new"
-mv -f "$home/.usage-rows.new" "$home/.usage-rows"
-elided_line 1
-code=0
-run verdict >"$tmp/verdict-elided-1pct.out" 2>&1 || code=$?
-expect_grep '^PASS tool-bodies — 1 tool event' "$tmp/verdict-elided-1pct.out" "exactly 1% is within the limit"
-elided_line 1
-code=0
-run verdict >"$tmp/verdict-elided-over.out" 2>&1 || code=$?
-expect_grep '^FAIL tool-bodies — 2 tool event' "$tmp/verdict-elided-over.out" "more than 1% is not"
 # Both generations count, and a count that cannot be read cannot pass.
 verdict_fixture
 cat "$home/.conbus/drops.jsonl" >"$home/.conbus/drops.1.jsonl"
@@ -1684,18 +1670,6 @@ run verdict >"$tmp/verdict-elided-nousage.out" 2>&1 || code=$?
 rm -f "$home/.usage-fail"
 expect 4 "$code" "no tool-call count is not a pass"
 expect_grep '^UNCHECKED tool-bodies — 3 tool event' "$tmp/verdict-elided-nousage.out" "tool-bodies says why"
-# The count that matters is the window's. A busy month before the swap must not
-# dilute a week in which every tool body was elided.
-verdict_fixture
-awk -v s="$(iso_after "$fx_swapped" 0 | cut -c1-10)" 'match($0, /"day":"[^"]*"/) && substr($0, RSTART + 7, 10) >= s' \
-    "$home/.usage-rows" | sed -E 's/"tool_calls":[0-9]+/"tool_calls":0/' >"$home/.usage-window"
-printf '{"day":"%s","harness":"codex","turns":3,"tool_calls":100,"tool_denials":0,"repeated":0,"recovered":0}\n' \
-    "$(iso_ago $((2 * DAY)) | cut -c1-10)" >>"$home/.usage-window"
-elided_line 2
-code=0
-run verdict >"$tmp/verdict-elided-window.out" 2>&1 || code=$?
-expect_grep '^FAIL tool-bodies — 2 tool event.*of 100 tool call' "$tmp/verdict-elided-window.out" "the limit is 1% of the tool calls since the swap"
-rm -f "$home/.usage-window"
 # A row that names no tool_calls is a count not read, not a count of zero.
 verdict_fixture
 sed -E 's/"tool_calls":[0-9]+,//' "$home/.usage-rows" >"$home/.usage-rows.new"
@@ -1710,6 +1684,49 @@ code=0
 run verdict >"$tmp/verdict-elided-garbled.out" 2>&1 || code=$?
 expect 4 "$code" "a detail that does not carry a count is not a pass"
 expect_grep '^UNCHECKED tool-bodies' "$tmp/verdict-elided-garbled.out" "and says the count is not known"
+
+# 1% of very few is nothing: 12 of 112 failed a week over a dozen elided bodies. It takes a minimum, and a Keychain that
+# will not answer still shows, as most of what was there.
+elided_of() { # elided_of <tool calls in the window> <elided>
+    verdict_fixture
+    sed -E 's/"tool_calls":[0-9]+/"tool_calls":0/' "$home/.usage-rows" >"$home/.usage-rows.new"
+    printf '{"day":"%s","harness":"codex","turns":3,"tool_calls":%s,"tool_denials":0,"repeated":0,"recovered":0,"tokens_input":1}\n' \
+        "$(iso_ago $((2 * DAY)) | cut -c1-10)" "$1" >>"$home/.usage-rows.new"
+    mv -f "$home/.usage-rows.new" "$home/.usage-rows"
+    elided_line "$2"
+}
+elided_of 112 12
+code=0; run verdict >"$tmp/verdict-elided-few.out" 2>&1 || code=$?
+expect 0 "$code" "12 of 112 is not worth failing a week"
+expect_grep '^PASS tool-bodies — 12 tool event(s)' "$tmp/verdict-elided-few.out" "it is shown"
+elided_of 5000 99
+code=0; run verdict >"$tmp/verdict-elided-99.out" 2>&1 || code=$?
+expect_grep '^PASS tool-bodies — 99 tool event' "$tmp/verdict-elided-99.out" "over 1% and under the minimum of 100 passes"
+elided_of 5000 100
+code=0; run verdict >"$tmp/verdict-elided-100.out" 2>&1 || code=$?
+expect_grep '^FAIL tool-bodies — 100 tool event' "$tmp/verdict-elided-100.out" "over 1% at the minimum fails"
+elided_of 10000 100
+code=0; run verdict >"$tmp/verdict-elided-1pct.out" 2>&1 || code=$?
+expect_grep '^PASS tool-bodies — 100 tool event' "$tmp/verdict-elided-1pct.out" "exactly 1% is within the limit"
+elided_of 10000 101
+code=0; run verdict >"$tmp/verdict-elided-over.out" 2>&1 || code=$?
+expect_grep '^FAIL tool-bodies — 101 tool event' "$tmp/verdict-elided-over.out" "more than 1% is not"
+elided_of 39 20
+code=0; run verdict >"$tmp/verdict-elided-half.out" 2>&1 || code=$?
+expect_grep '^FAIL tool-bodies — 20 tool event' "$tmp/verdict-elided-half.out" "over half of a quiet week fails: a Keychain that will not answer"
+elided_of 20 19
+code=0; run verdict >"$tmp/verdict-elided-19.out" 2>&1 || code=$?
+expect_grep '^PASS tool-bodies — 19 tool event' "$tmp/verdict-elided-19.out" "and under 20 of them says nothing yet"
+# The count that matters is the window's. A busy month before the swap must not dilute a week in which most were elided.
+verdict_fixture
+awk -v s="$(iso_after "$fx_swapped" 0 | cut -c1-10)" 'match($0, /"day":"[^"]*"/) && substr($0, RSTART + 7, 10) >= s' \
+    "$home/.usage-rows" | sed -E 's/"tool_calls":[0-9]+/"tool_calls":0/' >"$home/.usage-window"
+printf '{"day":"%s","harness":"codex","turns":3,"tool_calls":100,"tool_denials":0,"repeated":0,"recovered":0}\n' \
+    "$(iso_ago $((2 * DAY)) | cut -c1-10)" >>"$home/.usage-window"
+elided_line 60
+code=0; run verdict >"$tmp/verdict-elided-window.out" 2>&1 || code=$?
+expect_grep '^FAIL tool-bodies — 60 tool event.*of 100 tool call' "$tmp/verdict-elided-window.out" "the limit is on the tool calls since the swap"
+rm -f "$home/.usage-window"
 
 # --- activity -----------------------------------------------------------------
 
@@ -2909,6 +2926,32 @@ daemon_boot beef 4265
 code=0; run_real restart >"$tmp/restart-orphans.out" 2>&1 || code=$?
 expect 0 "$code" "planned restart with one"
 expect_grep '"new_drops":1' "$home/.conbus/canary.json" "it counts against the restart"
+
+# repeated: a median, so one busy month does not hide a regression and one bad day does not make one.
+repeated_on() { # repeated_on <days ago> <count>; the codex row that day
+    sed -E "/\"day\":\"$(day_ago "$1")\",\"harness\":\"codex\"/s/\"repeated\":[0-9]+/\"repeated\":$2/" "$home/.usage-rows" >"$home/.usage-rows.new"
+    mv -f "$home/.usage-rows.new" "$home/.usage-rows"
+}
+verdict_fixture
+printf '{"day":"%s","harness":"codex","turns":3,"tool_calls":40,"tool_denials":0,"repeated":5000,"recovered":0}\n' "$(day_ago 40)" >>"$home/.usage-rows"
+for d in 0 1 2 3 4 5 6; do repeated_on "$d" 5; done
+code=0; run verdict >"$tmp/verdict-repeated-sept.out" 2>&1 || code=$?
+expect 1 "$code" "a flood from before the 28 days does not hide a regression"
+expect_grep '^FAIL twins-repeated' "$tmp/verdict-repeated-sept.out" "it is named"
+verdict_fixture
+repeated_on 3 102
+code=0; run verdict >"$tmp/verdict-repeated-burst.out" 2>&1 || code=$?
+expect 0 "$code" "one bad day is a burst, not a regression"
+expect_grep '^PASS twins-repeated.*102' "$tmp/verdict-repeated-burst.out" "and its total is still shown"
+verdict_fixture
+for d in 9 10 11 12 13 14 15 16 17 18 19 20 21; do repeated_on "$d" 3; done
+for d in 0 1 2 3 4 5 6; do repeated_on "$d" 5; done
+code=0; run verdict >/dev/null 2>&1 || code=$?
+expect 0 "$code" "two a day above the baseline's median is within it"
+for d in 0 1 2 3 4 5 6; do repeated_on "$d" 6; done
+code=0; run verdict >"$tmp/verdict-repeated-three.out" 2>&1 || code=$?
+expect 1 "$code" "three a day above it is not"
+expect_grep '^FAIL twins-repeated.*median 6' "$tmp/verdict-repeated-three.out" "and the medians are shown"
 
 # A real build under this throwaway HOME would ask an agy that is not signed
 # in, and a build older than the sign-in check opens a browser tab doing it.
