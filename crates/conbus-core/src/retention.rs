@@ -116,6 +116,24 @@ pub fn elide_tool_bodies(event: &Event) -> Event {
     }
 }
 
+/// Whether a tool event's body went missing: withheld, with something in it.
+pub fn elided_tool_body(event: &Event) -> bool {
+    let elided = |body: &Body| matches!(body, Body::Elided { bytes } if *bytes > 0);
+    match event {
+        Event::ToolRequested { input, .. }
+        | Event::PermissionAsked { input, .. }
+        | Event::ToolDenied { input, .. } => elided(input),
+        Event::ToolUse { input, outcome, .. } => {
+            elided(input)
+                || match outcome {
+                    ToolOutcome::Succeeded { output } => elided(output),
+                    ToolOutcome::Failed { error, .. } => elided(error),
+                }
+        }
+        _ => false,
+    }
+}
+
 fn clip_bodies(event: &Event) -> Event {
     map_bodies(event, clip)
 }
@@ -264,6 +282,24 @@ mod tests {
             },
             ..tool_use(Body::kept(""), Body::kept(""))
         }
+    }
+
+    #[test]
+    fn a_tool_body_counts_as_elided_only_if_it_held_something() {
+        let elided = Body::Elided { bytes: 7 };
+        let empty = Body::Elided { bytes: 0 };
+        let kept = Body::kept("o");
+        let with = |input: Body, output: Body| tool_use(input, output).event;
+
+        assert!(elided_tool_body(&with(elided.clone(), kept.clone())));
+        assert!(elided_tool_body(&with(kept.clone(), elided)));
+        assert!(!elided_tool_body(&with(empty.clone(), kept.clone())));
+        assert!(!elided_tool_body(&with(kept.clone(), empty)));
+        assert!(!elided_tool_body(&with(kept.clone(), kept)));
+        assert!(
+            !elided_tool_body(&turn_started(Body::Elided { bytes: 7 }).event),
+            "a prompt is not a tool body"
+        );
     }
 
     #[test]

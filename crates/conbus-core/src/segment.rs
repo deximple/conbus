@@ -247,6 +247,11 @@ impl SegmentLog {
         self.next_seq
     }
 
+    /// What this log was opened to leave on disk.
+    pub fn retention(&self) -> Retention {
+        self.retention
+    }
+
     /// Append one event. Returns the sequence number it was written under, or
     /// `None` when retention withheld it.
     /// Returns the record as it reached disk — redacted, sequenced and stamped

@@ -324,9 +324,9 @@ pub fn run_in(
     match result {
         Ok(reply) => Ok(answered(reply)),
         Err(dropped) => {
-            // Zero loss across restarts: a failure a restart explains is
-            // written to the spool and still answered silently — it is not a
-            // drop, because nothing was lost.
+            // A failure a restart explains is written to the spool and still
+            // answered silently. It is not a drop, because the record will land.
+            // Its tool bodies may not: see `spool`.
             if spoolable(&dropped.reason)
                 && let Ok(reply) = spool(paths, &request)
             {
@@ -383,6 +383,12 @@ fn held_by_the_daemon(reason: &str) -> bool {
 /// tool body before the request lands — the spool holds what the retention
 /// already decided may reach disk. Returns the silent reply the turn still
 /// gets; `Err` leaves the original drop path to run.
+///
+/// Under `encrypted_tools` that loses the body, and the daemon reports it when
+/// the record lands. Sealing here instead would mean reading the key in a hook:
+/// the only way to it is `security`, which on a locked Keychain can put a dialog
+/// on the person's screen, and a hook would do that per tool call. A key kept in
+/// a file is ruled out (`AGENTS.md`).
 fn spool(paths: &conbus_core::paths::Paths, request: &Request) -> Result<String, ()> {
     let stamp = std::fs::read_to_string(paths.root().join("daemon.build"))
         .ok()

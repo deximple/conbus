@@ -42,6 +42,40 @@ const STDERR_EVERY: Duration = Duration::from_secs(60);
 /// and the individual lines are not.
 const CAP_BYTES: u64 = 4 * 1024 * 1024;
 
+/// The reason for tool bodies that reached the log elided under
+/// `encrypted_tools`. These are counted rather than logged one by one: a line's
+/// detail is [`seals_detail`]'s, and it stands for that many.
+pub const LOST_SEALS: &str = "tool bodies elided, not sealed";
+
+/// What a [`LOST_SEALS`] line says after its reason.
+pub fn seals_detail(count: u64) -> String {
+    format!("{count} tool event(s)")
+}
+
+/// The reason for records a daemon was asked to stop with, the log having refused
+/// them and nothing on disk having a copy.
+pub const STOPPED_HOLDING: &str = "the recorder stopped with records it could not land";
+
+/// What a [`STOPPED_HOLDING`] line says after its reason.
+pub fn stopped_detail(count: u64) -> String {
+    format!("{count} record(s) lost")
+}
+
+/// How many drops one line of the log stands for.
+fn drops_in(reason: &str, value: &serde_json::Value) -> usize {
+    let suffix = match reason {
+        LOST_SEALS => " tool event(s)",
+        STOPPED_HOLDING => " record(s) lost",
+        _ => return 1,
+    };
+    value
+        .get("detail")
+        .and_then(|detail| detail.as_str())
+        .and_then(|detail| detail.strip_suffix(suffix))
+        .and_then(|count| count.parse().ok())
+        .unwrap_or(1)
+}
+
 fn drops_file(paths: &Paths) -> std::path::PathBuf {
     paths.root().join("drops.jsonl")
 }
@@ -179,8 +213,8 @@ pub struct Summary {
     pub capped: bool,
     pub last: Option<(String, String)>,
     /// Standing drops grouped to a reason family, most frequent first —
-    /// because "29 orphans" is a restart's footprint and "1 adapter gap" is a
-    /// vendor schema that moved, and a bare count cannot tell them apart.
+    /// because "29 orphans" is a prompt hook that did not fire and "1 adapter gap"
+    /// is a vendor schema that moved, and a bare count cannot tell them apart.
     pub reasons: Vec<(Reason, usize)>,
 }
 
@@ -201,11 +235,12 @@ fn classify(reason: &str) -> &'static str {
     if reason.starts_with("no conversation for this session")
         || reason.starts_with("spooled hook still has no conversation")
     {
-        // The binding dies with the daemon that minted it, and an event for a
-        // session whose prompt the recorder never saw cannot start one. A
-        // restart mid-turn looks exactly like this; Cursor's split hooks made
-        // 4,229 of them on 2026-09-08 before its tool-call proof existed.
-        "orphan — a session the recorder never bound (restart mid-turn, or a prompt that never arrived)"
+        // Bindings come back from the log, so a restart does not cause this.
+        // An event for a session whose prompt the recorder never saw cannot
+        // start a conversation: a tool event waits a day for that prompt and a
+        // turn's or session's end does not wait. Cursor's split hooks made 4,229
+        // of them on 2026-09-08 before its tool-call proof existed.
+        "orphan — a session no prompt has bound (its prompt hook never reached the recorder)"
     } else if reason.starts_with("no mapping for hook event") {
         // The vendor's schema moved ahead of this build's adapter.
         "adapter gap — the vendor published an event this build does not know"
@@ -241,6 +276,8 @@ pub fn summary(paths: &Paths) -> Summary {
     };
     let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
     let mut transient = 0;
+    // A line that stands for more than one drop, past the one line it is.
+    let mut beyond_one_each = 0;
     // First-seen order per family gloss, so identical reasons merge and
     // different ones under one family stay one row.
     let mut families: Vec<(&'static str, String, usize)> = Vec::new();
@@ -266,19 +303,21 @@ pub fn summary(paths: &Paths) -> Summary {
             continue;
         }
         let gloss = classify(reason);
+        let drops = drops_in(reason, &value);
+        beyond_one_each += drops.saturating_sub(1);
         match families
             .iter_mut()
             // One row per family — the first-seen text speaks for it; only
             // the unclassified `other` family still splits on exact text.
             .find(|(g, t, _)| *g == gloss && (*g != "other" || t == reason))
         {
-            Some((_, _, n)) => *n += 1,
-            None => families.push((gloss, reason.to_string(), 1)),
+            Some((_, _, n)) => *n += drops,
+            None => families.push((gloss, reason.to_string(), drops)),
         }
     }
     families.sort_by_key(|a| std::cmp::Reverse(a.2));
     Summary {
-        count: lines.len(),
+        count: lines.len() + beyond_one_each,
         transient,
         capped: text.len() as u64 >= CAP_BYTES,
         last,
@@ -485,7 +524,7 @@ mod tests {
         let summary = summary(&paths);
         let rendered = describe(&summary);
         // Every standing reason is named once, with its count, and a short
-        // meaning — the difference between "the bus restarted mid-turn" and
+        // meaning — the difference between "a prompt hook did not fire" and
         // "the vendor's schema moved" is the difference between noise and an
         // adapter that needs an update.
         assert!(rendered.contains("3×"), "{rendered}");
@@ -494,6 +533,97 @@ mod tests {
         assert!(rendered.contains("adapter"), "{rendered}");
         // The transient one is still folded into its own count, not a reason.
         assert!(rendered.contains("1 transient connection"), "{rendered}");
+    }
+
+    #[test]
+    fn an_orphan_is_not_put_down_to_a_restart() {
+        // Bindings come back from the log, so a restart stopped causing these.
+        // Telling a person it did sends them looking in the wrong place.
+        for reason in [
+            "no conversation for this session; the daemon has no binding for it",
+            "spooled hook still has no conversation (orphan)",
+        ] {
+            let family = classify(reason);
+            assert!(family.starts_with("orphan"), "{family}");
+            assert!(family.contains("prompt hook"), "{family}");
+            assert!(!family.contains("restart"), "{family}");
+        }
+    }
+
+    #[test]
+    fn lost_seals_are_reported_as_what_the_lines_counted_not_as_lines() {
+        let dir = home();
+        let paths = paths_at(dir.path());
+        for count in [3_000, 40_000] {
+            append(
+                &paths,
+                &Dropped::new(LOST_SEALS).with_detail(seals_detail(count)),
+            );
+        }
+        append(&paths, &Dropped::new("no mapping for hook event \"A\""));
+
+        let summary = summary(&paths);
+
+        assert_eq!(summary.count, 43_001);
+        assert_eq!(summary.reasons[0].0.text, LOST_SEALS);
+        assert_eq!(summary.reasons[0].1, 43_000);
+        let rendered = describe(&summary);
+        assert!(rendered.contains("43001 recorded"), "{rendered}");
+        assert!(
+            rendered.contains("43000× tool bodies elided, not sealed"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn records_a_recorder_stopped_with_are_reported_as_what_the_line_counted() {
+        let dir = home();
+        let paths = paths_at(dir.path());
+        append(
+            &paths,
+            &Dropped::new(STOPPED_HOLDING).with_detail(stopped_detail(18)),
+        );
+
+        let summary = summary(&paths);
+
+        assert_eq!(summary.count, 18);
+        let rendered = describe(&summary);
+        assert!(
+            rendered.contains("18× the recorder stopped with records it could not land"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_lost_seal_line_that_names_no_count_is_one() {
+        // The shape a build of this branch wrote before the count, and anything
+        // else that does not read: it is still at least one drop.
+        let dir = home();
+        let paths = paths_at(dir.path());
+        append(
+            &paths,
+            &Dropped::new(LOST_SEALS).with_detail("tool_requested for session ea1d23e9"),
+        );
+        append(&paths, &Dropped::new(LOST_SEALS));
+
+        let summary = summary(&paths);
+
+        assert_eq!(summary.count, 2);
+        assert_eq!(summary.reasons[0].1, 2);
+    }
+
+    #[test]
+    fn a_count_in_another_reasons_detail_is_not_read_as_one() {
+        let dir = home();
+        let paths = paths_at(dir.path());
+        append(
+            &paths,
+            &Dropped::new("something else").with_detail("9 tool event(s)"),
+        );
+
+        let summary = summary(&paths);
+
+        assert_eq!(summary.count, 1);
     }
 
     #[test]
