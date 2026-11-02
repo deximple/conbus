@@ -39,6 +39,10 @@ mkdir -p "$install_dir" "$tmp/stage" "$home/.conbus" \
 #   stuckboot — doctor stamps the daemon build, then never answers: the
 #               rollback-verify path can pass the stamp check and still
 #               hang on the agreeing-doctor check
+#   nousage   — usage answers nothing: a parity of emptiness must not pass
+#   flap      — doctor sleeps on its first call, then answers fast: a
+#               single-shot time budget flakes where a median does not
+#   polfail   — `policy check` exits 1: a file that cannot be a policy
 write_fake() {
     tag=$1
     persona=${2:-silent}
@@ -62,13 +66,17 @@ write_fake() {
         notokens) doctor='echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "hooks     claude_code  runs — x"' ;;
         stuck) doctor='sleep 3600' ;;
         stuckboot) doctor='printf "{\"build\":\"'"$tag"'\",\"pid\":$$,\"started\":\"2026-11-01T10:00:00.000Z\",\"serving\":\"2026-11-01T10:00:04.000Z\"}\n" > "$HOME/.conbus/daemon.build"; sleep 3600' ;;
+        flap) doctor='n=$(cat "$HOME/.flap" 2>/dev/null || echo 0); echo $((n + 1)) > "$HOME/.flap"; [ "$n" = 0 ] && sleep 3; echo "socket    $HOME/.conbus/conbus.sock — listening"; echo "daemon    build '"$tag"' pid 9999 since 2026-11-01T10:00:00.000Z"; echo "log       5 record(s), 1 conversation(s), 0 unreadable line(s)"' ;;
     esac
+    policy_body=':'
+    [ "$persona" = polfail ] && policy_body='exit 1'
     usage_rows='        echo "{\"day\":\"2026-10-30\",\"harness\":\"claude_code\",\"tool_denials\":0,\"repeated\":0,\"tokens_input\":1}"
         echo "{\"day\":\"2026-10-31\",\"harness\":\"codex\",\"tool_denials\":0,\"repeated\":0,\"tokens_output\":2}"
         echo "{\"day\":\"2026-11-01\",\"harness\":\"codex\",\"tool_denials\":0,\"repeated\":0,\"tokens_output\":3}"'
     [ "$persona" = notokens ] && usage_rows='        echo "{\"day\":\"2026-10-30\",\"harness\":\"claude_code\",\"tool_denials\":0,\"repeated\":0}"
         echo "{\"day\":\"2026-10-31\",\"harness\":\"codex\",\"tool_denials\":0,\"repeated\":0}"
         echo "{\"day\":\"2026-11-01\",\"harness\":\"codex\",\"tool_denials\":0,\"repeated\":0}"'
+    [ "$persona" = nousage ] && usage_rows='        :'
     cat >"$path" <<EOF
 #!/bin/sh
 case "\$1" in doctor|quota|status) echo "\${CONBUS_AGY_BIN:-unset}" >>"$tmp/agy-bin.seen" ;; esac
@@ -79,6 +87,7 @@ case "\$1" in
     usage)
 $usage_rows
         ;;
+    policy) $policy_body ;;
     install) $install_body ;;
     *) echo "fake-$tag: \$*" ;;
 esac
@@ -793,6 +802,76 @@ expect 1 "$code" "a new drop reason in the rotated generation is caught"
 expect_grep 'a fault after the rotation' "$tmp/verdict-rotated.out" \
     "the post-rotation reason is named"
 rm -f "$home/.conbus/drops.1.jsonl"
+
+# C0 — verdict items that could pass over a blind input say UNCHECKED.
+# A daemon.log whose every start line predates the swap cannot prove
+# anything about restarts inside the window.
+verdict_fixture
+cat >"$home/.conbus/canary.json" <<EOF
+{"swapped":"$past","prev_build":"01d","candidate_build":"beef","candidate_sha256":"x","restarts":[]}
+EOF
+cat >"$home/.conbus/daemon.log" <<EOF
+2026-10-15T09:00:00.000Z conbus daemon: 01d: socket /x/sock log /x/log (10 record(s), 0 unreadable)
+EOF
+code=0
+run verdict >"$tmp/verdict-nostarts.out" 2>&1 || code=$?
+expect 0 "$code" "an unchecked restarts line does not fail the verdict"
+expect_grep '^UNCHECKED restarts' "$tmp/verdict-nostarts.out" \
+    "a log that does not reach the swap cannot pass restarts"
+if grep -q '^PASS restarts' "$tmp/verdict-nostarts.out"; then
+    echo "rehearsal: FAIL: a pre-swap-only daemon.log passed restarts" >&2
+    exit 1
+fi
+
+# A parity of emptiness: both binaries answering nothing "agree" on every
+# closed day — that proved nothing. Rows with no day inside the window
+# leave twins nothing to compare either.
+verdict_fixture
+write_fake beef nousage "$install_dir/conbus"
+write_fake 01d nousage "$rollback_bin"
+cat >"$home/.conbus/canary.json" <<EOF
+{"swapped":"$past","prev_build":"01d","candidate_build":"beef","candidate_sha256":"x","restarts":[]}
+EOF
+code=0
+run verdict >"$tmp/verdict-blind.out" 2>&1 || code=$?
+expect 0 "$code" "unchecked parity and twins do not fail the verdict"
+expect_grep '^UNCHECKED usage-parity' "$tmp/verdict-blind.out" \
+    "two empties do not pass parity"
+expect_grep '^UNCHECKED twins-repeated' "$tmp/verdict-blind.out" \
+    "no in-window rows do not pass twins-repeated"
+
+# A policy file that cannot be a policy decides nothing: zero counted
+# denials over it is not a pass.
+verdict_fixture
+write_fake beef polfail "$install_dir/conbus"
+cat >"$home/.conbus/canary.json" <<EOF
+{"swapped":"$past","prev_build":"01d","candidate_build":"beef","candidate_sha256":"x","restarts":[]}
+EOF
+echo 'this is not a policy' >"$home/.conbus/policy.json"
+code=0
+run verdict >"$tmp/verdict-polfail.out" 2>&1 || code=$?
+expect 1 "$code" "a policy file that cannot decide fails the verdict"
+expect_grep '^FAIL policy' "$tmp/verdict-polfail.out" \
+    "the unparseable policy is the named failure"
+rm -f "$home/.conbus/policy.json"
+
+# time-budget: one over-budget doctor run out of three is a spike, not a
+# wedge — the median judges, so the verdict passes and doctor ran 3x.
+# run_doctor polls on half-second ticks, so even an instant doctor reads
+# ~500 ms; the budget must sit above that floor.
+verdict_fixture
+write_fake beef flap "$install_dir/conbus"
+cat >"$home/.conbus/canary.json" <<EOF
+{"swapped":"$past","prev_build":"01d","candidate_build":"beef","candidate_sha256":"x","restarts":[]}
+EOF
+code=0
+env -u CONBUS_HOME -u XDG_STATE_HOME HOME="$home" CONBUS_SKIP_LAUNCHCTL=1 \
+    CONBUS_CANARY_REHEARSAL=1 CONBUS_CANARY_DOCTOR_MS=2000 \
+    bash "$canary" verdict >"$tmp/verdict-median.out" 2>&1 || code=$?
+expect 0 "$code" "one slow doctor out of three does not fail the verdict"
+expect_grep '^PASS time-budget' "$tmp/verdict-median.out" \
+    "the median of three passes the time budget"
+expect 3 "$(cat "$home/.flap")" "doctor was measured three times"
 
 # Inside the window the verdict is "incomplete", not a pass.
 cat >"$home/.conbus/canary.json" <<EOF

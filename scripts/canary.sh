@@ -921,7 +921,14 @@ case $sub in
         planned=$(state_restart_count)
         unplanned=$((starts - 1 - planned))
         [ "$unplanned" -lt 0 ] && unplanned=0
-        if [ -f "$daemon_log" ]; then
+        if [ -f "$daemon_log" ] && [ "$starts" -eq 0 ]; then
+            # The swap itself boots once: a log that names no start since
+            # the swap was rotated or truncated underneath it — counting
+            # unplanned restarts against a window the log cannot see is
+            # checking nothing.
+            line UNCHECKED restarts \
+                "$daemon_log names no start since $since — the log does not reach back to the swap"
+        elif [ -f "$daemon_log" ]; then
             if [ "$unplanned" -eq 0 ]; then
                 line PASS restarts \
                     "0 unplanned daemon start(s) since $since ($starts seen: 1 swap + $planned planned)"
@@ -1078,11 +1085,16 @@ case $sub in
                     bdays = 0; for (d in bd) bdays++
                     wrate = wdays ? wr / wdays : 0
                     brate = bdays ? br / bdays : 0
-                    printf "%s %.4f %.4f %d %d", (wrate <= brate ? "PASS" : "FAIL"), wrate, brate, wr, br
+                    printf "%s %.4f %.4f %d %d %d", (wdays ? (wrate <= brate ? "PASS" : "FAIL") : "UNCHECKED"), wrate, brate, wr, br, wdays
                 }')
             set -- $rep_result
-            line "$1" twins-repeated \
-                "repeated/day $2 since vs $3 before ($4 vs $5 total)"
+            if [ "$1" = UNCHECKED ]; then
+                line UNCHECKED twins-repeated \
+                    "usage --json has no rows since $since_day — nothing to compare"
+            else
+                line "$1" twins-repeated \
+                    "repeated/day $2 since vs $3 before ($4 vs $5 total)"
+            fi
         else
             line UNCHECKED twins-repeated "usage --json gave no rows"
         fi
@@ -1096,6 +1108,7 @@ case $sub in
         else
             strip='s/"tokens_[a-z_]*":[0-9]*,?//g; s/,\}/}/g; s/,]/]/g'
             parity_bad=""
+            parity_seen=0
             d=$since_day
             guard=0
             while [ "$d" \< "$today_utc" ] && [ "$guard" -lt 370 ]; do
@@ -1104,10 +1117,16 @@ case $sub in
                 if [ "$old" != "$new" ]; then
                     parity_bad="$parity_bad $d"
                 fi
+                [ -n "$old$new" ] && parity_seen=$((parity_seen + 1))
                 d=$(next_day "$d")
                 guard=$((guard + 1))
             done
-            if [ -z "$parity_bad" ]; then
+            if [ "$parity_seen" -eq 0 ]; then
+                # Two binaries that both answer nothing "agree" on every
+                # day: a parity of emptiness proves nothing.
+                line UNCHECKED usage-parity \
+                    "no closed day produced rows on either side — nothing was compared"
+            elif [ -z "$parity_bad" ]; then
                 line PASS usage-parity "closed days agree (tokens_* stripped)"
             else
                 line FAIL usage-parity "usage differs on:$parity_bad"
@@ -1140,7 +1159,10 @@ case $sub in
         }
         t_tail=$(measure "$bin" log --tail 1)
         t_usage=$(measure "$bin" usage --days 7)
-        t_doctor=$(measure run_doctor)
+        # Doctor probes vendors and the disk: under a load spike one read
+        # outlives the budget and a healthy canary read FAIL. Judge it by
+        # the median of three — a wedge still trips it, a spike does not.
+        t_doctor=$(for _ in 1 2 3; do measure run_doctor; done | sort -n | sed -n '2p')
         tb_bad=""
         [ "$t_tail" -gt "$tail_ms_budget" ] && tb_bad="$tb_bad tail(${t_tail}>${tail_ms_budget})"
         [ "$t_usage" -gt "$usage_ms_budget" ] && tb_bad="$tb_bad usage(${t_usage}>${usage_ms_budget})"
@@ -1173,9 +1195,13 @@ case $sub in
             line UNCHECKED serving-budget "no daemon.build stamp"
         fi
 
-        # 9. Policy decisions: the file absent means none can be made.
+        # 9. Policy decisions: the file absent means none can be made. A
+        #    file that cannot be a policy decides nothing — zero counted
+        #    denials would read as a pass over a guard that never ran.
         if [ ! -f "$root/policy.json" ]; then
             line PASS policy "no policy.json — 0 decisions possible"
+        elif ! "$bin" policy check >/dev/null 2>&1; then
+            line FAIL policy "policy.json cannot be a policy — it decides nothing"
         elif [ -z "$usage_json" ]; then
             line UNCHECKED policy "policy.json present but usage --json gave no rows"
         else
