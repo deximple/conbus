@@ -33,6 +33,8 @@ marks each one `(experimental)`.
 - `verdict`
 - `hook --inference-listen`
 - `backup`, with the manifest it writes at the destination and its record in the data root
+- `backfill --gaps --include-older-lines`, which can write another conversation's copied
+  turns into the one it fills
 
 ## What counts as breaking
 

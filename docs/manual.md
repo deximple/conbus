@@ -580,11 +580,11 @@ A fill takes a line stamped over a minute before its transcript was created for 
 from another conversation, as a fork's opening lines are, and leaves it out. A transcript
 moved by `cp`, `rsync -a` or across volumes has a new creation time, so almost every line
 in it reads that way and nothing in it is filled. `conbus backfill --gaps` says how many
-lines it set aside. To fill them anyway add `--include-older-lines`. Use it when you know
-a transcript was moved, and look at a dry run first: those lines may really be another
-conversation's copies. On a fork they are its parent's prompts, and you would see them
-come up as the fork's own turns. A record written to the log stays there. A turn id
-another conversation holds is still left out.
+lines it set aside. To fill them anyway add `--include-older-lines` (experimental). Use
+it when you know a transcript was moved, and look at a dry run first: those lines may
+really be another conversation's copies. On a fork they are its parent's prompts, and you
+would see them come up as the fork's own turns. A record written to the log stays there.
+A turn id another conversation holds is still left out.
 
 **Claude.ai conversations** have no hooks in the desktop app. Export your data
 from Claude.ai (Settings → Privacy → Export data) and drop the zip (or

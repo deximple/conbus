@@ -513,8 +513,9 @@ USAGE:
     conbus uninstall [--apply]    take them all back out; the log is kept
     conbus backfill [--apply] [--gaps [--include-older-lines]] [--chat-export PATH]
                                   recover history; --gaps fills missed turns of live sessions,
-                                  and --include-older-lines fills from lines older than their
-                                  file too, which may be another conversation's copies;
+                                  and --include-older-lines (experimental) fills from lines
+                                  older than their file too, which may be another
+                                  conversation's copies;
                                   --chat-export reads official Claude.ai conversations.json (or zip)
     conbus backup --to FOLDER     (experimental) copy closed segments not yet there
                                   into FOLDER/conbus-backup and read them back;

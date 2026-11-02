@@ -292,6 +292,12 @@ the entry says so when it does.
   `backup.json` that gets each folder before the first copy lands there, because
   those copies are plain text and nothing else says where they are.
 
+### Changed
+
+- `conbus backfill --gaps --include-older-lines` is experimental: `--help`,
+  `docs/stability.md` and both manuals say so, and 1.x does not promise to keep it
+  as it is. On real transcripts it wrote a fork's parent turns into the fork.
+
 ## [1.0.0-rc.3] — 2026-11-01
 
 ### Fixed
