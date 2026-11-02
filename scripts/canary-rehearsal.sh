@@ -416,6 +416,7 @@ say() { printf 'rehearsal: %s\n' "$*"; }
 # A stand-in for the running recorder, named so `ps` shows `conbus daemon` the way
 # the real one reads, answering a line that is not a request the way the real one
 # does. <socket>.silent makes it hold connections and never reply: a wedged daemon.
+# <socket>.garbage makes it reply with something that is not the protocol.
 mkdir -p "$tmp/recorder"
 cat >"$tmp/recorder/conbus" <<'EOF'
 #!/usr/bin/perl
@@ -428,7 +429,7 @@ while (my $client = $server->accept) {
     if (-e "$path.silent") { push @held, $client; next; }
     $client->autoflush(1);
     my $line = <$client>;
-    print $client qq({"status":"failed","error":"unreadable request"}\n);
+    print $client (-e "$path.garbage" ? "hello\n" : qq({"status":"failed","error":"unreadable request"}\n));
     close $client;
 }
 EOF
@@ -3142,6 +3143,41 @@ write_fake beef slowlog "$tmp/stage/conbus-slowlog"
 write_fake 01d old "$install_dir/conbus"; rm -f "$rollback_bin" "$home/.conbus/canary.json"
 code=0; run preflight --from "$tmp/stage/conbus-slowlog" >"$tmp/preflight-slowlog.out" 2>&1 || code=$?
 expect_grep '^PASS round-trip' "$tmp/preflight-slowlog.out" "a record that lands a moment late still landed"
+
+# Each of these once survived having the check it covers taken out.
+# Any reply is not an answer: a stand-in on the socket that says something else is no recorder.
+verdict_fixture
+touch "$home/.conbus/conbus.sock.garbage"
+code=0; CONBUS_CANARY_PROBE_S=1 run verdict >"$tmp/verdict-garbage.out" 2>&1 || code=$?
+rm -f "$home/.conbus/conbus.sock.garbage"
+expect 1 "$code" "a socket that answers something other than the protocol fails"
+expect_grep '^FAIL recorder-serving.*did not answer' "$tmp/verdict-garbage.out" "as no answer"
+# Only a change of protocol is a swap's refusal. The same version on both sides is a daemon refusing its own hook.
+verdict_fixture "$(iso_ago 120)"
+drop_line 100 'the daemon refused the record: this daemon speaks protocol v6; the hook speaks v6. Restart the daemon.'
+code=0; run verdict >"$tmp/verdict-sameproto.out" 2>&1 || code=$?
+expect 1 "$code" "a refusal between the same protocol is not the swap's, even inside its 60 s"
+expect_grep '^FAIL drops — 1 lost record' "$tmp/verdict-sameproto.out" "and is counted as lost"
+# A row with more counted than recovered holds something the recorder saw, tool calls or not.
+verdict_fixture
+sed -E 's/"harness":"codex","turns":3,"tool_calls":40,"tool_denials":0,"repeated":0,"recovered":0/"harness":"codex","turns":12,"tool_calls":0,"tool_denials":0,"repeated":0,"recovered":9/' \
+    "$home/.usage-rows" >"$home/.usage-rows.new"
+mv -f "$home/.usage-rows.new" "$home/.usage-rows"
+code=0; run verdict >"$tmp/verdict-counted-live.out" 2>&1 || code=$?
+expect 0 "$code" "turns beyond what gap fill recovered count as seen, with no tool calls"
+expect_grep '^  codex: the recorder saw it on [1-9]' "$tmp/verdict-counted-live.out" "and the table says so"
+# The two weeks before the swap decide who counts as active. Twenty days before it is not news.
+verdict_fixture
+usage_row "$(day_ago 28)" cursor >>"$home/.usage-rows"
+code=0; run verdict >"$tmp/verdict-lookback.out" 2>&1 || code=$?
+expect 0 "$code" "a harness last used twenty days before the swap is not asked about"
+expect_no_grep 'cursor recorded' "$tmp/verdict-lookback.out" "not by name either"
+
+# A tear with no time and nothing after it is the newest thing in the file.
+verdict_fixture
+printf '{"ts":"2026-1' >>"$home/.conbus/drops.jsonl"
+code=0; run verdict >/dev/null 2>&1 || code=$?
+expect 4 "$code" "a tear at the end of the file, with no time, leaves drops open"
 
 # A real build under this throwaway HOME would ask an agy that is not signed
 # in, and a build older than the sign-in check opens a browser tab doing it.
