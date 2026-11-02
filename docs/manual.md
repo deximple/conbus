@@ -235,6 +235,12 @@ next daemon drains it and deletes the file. `doctor` shows `spool` when
 entries wait. Spooled records carry `hook_id` and `spooled_at`, so a
 re-delivered event counts once.
 
+A tool call whose session has no conversation yet waits there too, for up to a
+day, for the prompt that binds it; its session's next prompt is usually what does.
+If none comes it goes with a line in `drops.jsonl`, and so do the oldest once
+those events pass 8 MiB of the spool. `doctor`'s `spool` line counts them while
+they wait.
+
 A log that refuses a write, as a full disk or a read-only segment does, need not
 lose the record. The daemon holds it in memory, up to 16 MiB, and the hook spools a
 copy if there is room. It lands once, in arrival order, when the log takes writes

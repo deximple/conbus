@@ -343,8 +343,8 @@ pub fn run_in(
 }
 
 /// The failures a later daemon can put right: nothing to connect to, a reply
-/// that never came or could not be read, a session whose binding died with
-/// the old daemon, a refusal that names the protocol or could not read the
+/// that never came or could not be read, a session whose prompt has not arrived
+/// yet, a refusal that names the protocol or could not read the
 /// request — a newer hook can wait for a daemon that speaks it — or a log that
 /// would not take the record, such as a full disk. Any other refusal or a
 /// retention `Withheld` is a real decision, and the drop stands.
@@ -566,16 +566,17 @@ fn send(
         Ok(Response::Failed { error }) => {
             Err(format!("the daemon refused the record: {error}").into())
         }
-        // Not written, and the caller has to hear about it. An orphan is the
-        // normal shape of a daemon restart mid-turn: the session is unbound, so
-        // the rest of that turn belongs to no conversation. Reporting it is the
+        // Not written, and the caller has to hear about it. An orphan is a
+        // session no prompt has bound, so the turn belongs to no conversation
+        // yet. Bindings come back from the log, so a restart does not cause this
+        // any more: its prompt hook never reached the daemon. Reporting it is the
         // difference between a known gap and a turn that quietly disappears.
         // The reason is the throttle key and stays fixed; the detail names
         // the event and the session — identifiers the log already holds in
         // full — so a ghost session's end can be told from a lost tool call
         // when the drop log is read back.
         Ok(Response::Orphaned) => Err(Dropped::new(
-            "no conversation for this session; the daemon has no binding for it              (a restart mid-turn looks exactly like this)",
+            "no conversation for this session; the daemon has no binding for it (no prompt from this session has reached it)",
         )
         .with_detail(format!(
             "{hook_event_name} for session {}",
