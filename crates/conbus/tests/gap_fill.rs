@@ -9,6 +9,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
+mod support;
+
 const PARENT: &str = "9b24e37f-0000-4000-8000-000000000001";
 const CHILD: &str = "437e9522-0000-4000-8000-000000000002";
 const S: &str = "ea1d23e9-bb83-4df5-9a73-a6a12e138d85";
@@ -73,8 +75,12 @@ fn stop(mut daemon: Child) {
 }
 
 fn hook(home: &Path, payload: &str) {
+    hook_as(home, "claude_code", payload);
+}
+
+fn hook_as(home: &Path, harness: &str, payload: &str) {
     let mut command = Command::new(bin());
-    command.args(["hook", "--harness", "claude_code"]);
+    command.args(["hook", "--harness", harness]);
     env_for(&mut command, home);
     let mut child = command
         .stdin(Stdio::piped())
@@ -473,4 +479,246 @@ fn a_prompt_whose_hook_was_lost_is_filled_without_a_second_ending() {
         .filter(|record| record["event"] == "turn_ended")
         .count();
     assert_eq!((started, endings), (1, 1), "\n{}", show(&all));
+}
+
+fn spooled(home: &Path) -> usize {
+    std::fs::read_dir(home.join("spool"))
+        .map(|dir| {
+            dir.filter_map(Result::ok)
+                .filter(|entry| entry.path().extension().is_some_and(|x| x == "json"))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+fn drained(home: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline && spooled(home) > 0 {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(spooled(home), 0, "the spool never drained");
+}
+
+#[test]
+fn a_turn_spooled_during_a_restart_is_written_once() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let daemon = start(home);
+    hook(home, &prompt(S, "p0", "before"));
+    hook(home, &ended(S, "p0", "a0"));
+    stop(daemon);
+    hook(home, &prompt(S, "p1", "during"));
+    hook(home, &ended(S, "p1", "a1"));
+    assert_eq!(spooled(home), 2);
+    transcript(
+        home,
+        S,
+        &[
+            user(S, "p0", "before"),
+            reply(S, "a0"),
+            user(S, "p1", "during"),
+            reply(S, "a1"),
+        ],
+    );
+
+    let daemon = start(home);
+    drained(home);
+    stop(daemon);
+
+    let turn: Vec<Value> = log_lines(home)
+        .into_iter()
+        .filter(|record| {
+            record["vendor_turn_id"] == "p1" || record["assistant_message"]["text"] == "a1"
+        })
+        .collect();
+    assert_eq!(
+        turn.len(),
+        2,
+        "one start and one end, got:\n{}",
+        show(&turn)
+    );
+    assert!(
+        turn.iter().all(|record| record["hook_id"].is_string()),
+        "the hook's records are the stronger fact:\n{}",
+        show(&turn)
+    );
+}
+
+#[test]
+fn a_turn_still_running_at_a_restart_gets_no_ending_from_its_partial_text() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let daemon = start(home);
+    hook(home, &prompt(S, "p0", "before"));
+    stop(daemon);
+    hook(home, &prompt(S, "p1", "still running"));
+    transcript(
+        home,
+        S,
+        &[
+            user(S, "p0", "before"),
+            user(S, "p1", "still running"),
+            reply(S, "Let me look at that first."),
+        ],
+    );
+
+    let daemon = start(home);
+    drained(home);
+    stop(daemon);
+
+    let endings: Vec<Value> = log_lines(home)
+        .into_iter()
+        .filter(|record| record["event"] == "turn_ended")
+        .collect();
+    assert!(
+        endings.is_empty(),
+        "the vendor has not stopped this turn:\n{}",
+        show(&endings)
+    );
+}
+
+#[test]
+fn a_stop_spooled_for_a_lost_prompt_leaves_the_ending_to_the_drain() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let daemon = start(home);
+    hook(home, &prompt(S, "p0", "before"));
+    stop(daemon);
+    // Its prompt hook was lost, and only the `Stop` reached the spool.
+    hook(home, &ended(S, "p1", "a1"));
+    transcript(
+        home,
+        S,
+        &[
+            user(S, "p0", "before"),
+            user(S, "p1", "only the transcript holds this prompt"),
+            reply(S, "a1"),
+        ],
+    );
+
+    let daemon = start(home);
+    drained(home);
+    stop(daemon);
+
+    let all = log_lines(home);
+    let filled: Vec<&Value> = all
+        .iter()
+        .filter(|record| record["vendor_turn_id"] == "p1" && record["event"] == "turn_started")
+        .collect();
+    let endings: Vec<&Value> = all
+        .iter()
+        .filter(|record| record["event"] == "turn_ended")
+        .collect();
+    assert_eq!(filled.len(), 1, "{}", show(&all));
+    assert_eq!(endings.len(), 1, "{}", show(&all));
+    assert!(endings[0]["hook_id"].is_string(), "{}", show(&all));
+}
+
+#[test]
+fn a_spool_file_nobody_can_read_does_not_stop_the_fill() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let daemon = start(home);
+    hook(home, &prompt(S, "p0", "before"));
+    stop(daemon);
+    std::fs::create_dir_all(home.join("spool")).expect("spool");
+    std::fs::write(home.join("spool/garbage.json"), "{not a request").expect("garbage");
+    transcript(
+        home,
+        S,
+        &[
+            user(S, "p0", "before"),
+            user(S, "p1", "missed"),
+            reply(S, "a1"),
+        ],
+    );
+
+    let daemon = start(home);
+    drained(home);
+    stop(daemon);
+
+    assert!(
+        log_lines(home)
+            .iter()
+            .any(|record| record["vendor_turn_id"] == "p1"),
+        "the missed turn was not filled"
+    );
+}
+
+const THREAD: &str = "01a19463-cbd4-7b50-b819-000000000abc";
+
+fn codex_prompt(turn: &str, text: &str) -> String {
+    json!({"session_id": THREAD, "hook_event_name": "UserPromptSubmit", "prompt": text,
+           "turn_id": turn, "cwd": "/repo", "model": "m", "permission_mode": "default",
+           "transcript_path": null})
+    .to_string()
+}
+
+/// A rollout on disk, so the Codex pass asks about the thread.
+fn codex_rollout(home: &Path) {
+    let dir = home.join(".codex/sessions/2026/11/01");
+    std::fs::create_dir_all(&dir).expect("dir");
+    std::fs::write(
+        dir.join(format!("rollout-2026-11-01T00-00-00-{THREAD}.jsonl")),
+        "{}\n",
+    )
+    .expect("rollout");
+}
+
+#[test]
+fn the_codex_pass_does_not_write_a_spooled_turn_twice() {
+    // It also lists t2, which nothing spooled: filling it shows the pass ran, and
+    // a Codex that could not start would pass this for the wrong reason.
+    const LISTS_TWO_TURNS: &str = r#"#!/usr/bin/env python3
+import json, sys
+def turn(i, said, reply):
+    return {"id":i,"items":[{"type":"userMessage","content":[{"type":"text","text":said}]},{"type":"agentMessage","text":reply}],
+            "status":"completed","startedAt":1788368800,"completedAt":1788368801}
+for line in sys.stdin:
+    try: msg = json.loads(line)
+    except Exception: continue
+    m = msg.get("method"); i = msg.get("id")
+    if m == "initialize": print(json.dumps({"jsonrpc":"2.0","id":i,"result":{"userAgent":"fake"}}), flush=True)
+    elif m == "thread/turns/list":
+        data = [turn("t1", "during", "a1"), turn("t2", "only the thread holds this", "a2")]
+        print(json.dumps({"jsonrpc":"2.0","id":i,"result":{"data":data,"nextCursor":None}}), flush=True)
+"#;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let stub = tempfile::tempdir().expect("stub");
+    let fake = stub.path().join("codex");
+    support::write_executable(&fake, LISTS_TWO_TURNS);
+    let daemon = start(home);
+    hook_as(home, "codex", &codex_prompt("t0", "before"));
+    stop(daemon);
+    hook_as(home, "codex", &codex_prompt("t1", "during"));
+    codex_rollout(home);
+
+    let daemon = wait_serving(
+        home,
+        daemon_command(home)
+            .env("CONBUS_CODEX_BIN", &fake)
+            .spawn()
+            .expect("daemon"),
+    );
+    drained(home);
+    stop(daemon);
+
+    let all = log_lines(home);
+    let started = |id: &str| {
+        all.iter()
+            .filter(|record| record["vendor_turn_id"] == id && record["event"] == "turn_started")
+            .count()
+    };
+    assert_eq!(started("t2"), 1, "the pass ran:\n{}", show(&all));
+    assert_eq!(started("t1"), 1, "\n{}", show(&all));
+    let t1: Vec<&Value> = all
+        .iter()
+        .filter(|record| record["vendor_turn_id"] == "t1")
+        .collect();
+    assert!(
+        t1.iter().all(|record| record["hook_id"].is_string()),
+        "\n{}",
+        show(&all)
+    );
 }
