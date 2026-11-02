@@ -1414,11 +1414,16 @@ fn used_up_a_budget(file: &Path) -> String {
 /// What a cut range has read at this length is done, and what is left stays oldest
 /// first, so a parent still reaches a turn before its fork's copy does. Only a file
 /// that used a whole budget up goes behind the rest: if it also keeps growing, it would
-/// use every budget up and nothing behind it would ever be read.
-fn files_left_to_read(to_read: &mut Vec<(&PathBuf, &str, BusId)>, read: &ReadSoFar) {
+/// use every budget up and nothing behind it would ever be read. One that has stopped
+/// growing loses that mark, or it would go behind a fork of it the next time it grew.
+fn files_left_to_read(to_read: &mut Vec<(&PathBuf, &str, BusId)>, read: &mut ReadSoFar) {
     to_read.retain(|(file, ..)| {
-        !fs::metadata(file)
-            .is_ok_and(|meta| read.is_current(&file.to_string_lossy(), meta.len() as i64))
+        let current = fs::metadata(file)
+            .is_ok_and(|meta| read.is_current(&file.to_string_lossy(), meta.len() as i64));
+        if current {
+            read.forget(&used_up_a_budget(file));
+        }
+        !current
     });
     to_read.sort_by_key(|(file, ..)| read.knows(&used_up_a_budget(file)));
 }
@@ -2079,8 +2084,8 @@ fn append_gaps_files(
         let born = born(file);
         (born.is_none(), born)
     });
-    if let Some(read) = start.as_ref().map(|start| &*start.read) {
-        files_left_to_read(&mut to_read, read);
+    if let Some(start) = start.as_mut() {
+        files_left_to_read(&mut to_read, start.read);
     }
     let targets: Vec<(&str, BusId)> = to_read.iter().map(|&(_, stem, bus)| (stem, bus)).collect();
     let grouped = records_of(held, &targets);
@@ -2145,6 +2150,10 @@ fn append_gaps_files(
             start.read.note(&file.to_string_lossy(), text.len() as i64);
         }
         read_last = Some(file.as_path());
+    }
+    // Set here only if the last file was read and the list ended, so it held nothing up.
+    if let (Some(start), Some(last)) = (start.as_mut(), read_last) {
+        start.read.forget(&used_up_a_budget(last));
     }
     Ok(outcome)
 }
@@ -4430,7 +4439,7 @@ for line in sys.stdin:
         .collect()
     }
 
-    fn order_left(files: &[(PathBuf, &'static str)], read: &ReadSoFar) -> Vec<&'static str> {
+    fn order_left(files: &[(PathBuf, &'static str)], read: &mut ReadSoFar) -> Vec<&'static str> {
         let bus = BusId::mint();
         let mut to_read: Vec<(&PathBuf, &str, BusId)> = files
             .iter()
@@ -4462,7 +4471,7 @@ for line in sys.stdin:
             fs::metadata(&files[1].0).expect("meta").len() as i64,
         );
 
-        assert_eq!(order_left(&files, &read), [files[0].1, files[2].1]);
+        assert_eq!(order_left(&files, &mut read), [files[0].1, files[2].1]);
     }
 
     #[test]
@@ -4476,9 +4485,63 @@ for line in sys.stdin:
         read.note(&used_up_a_budget(&files[0].0), 1);
 
         assert_eq!(
-            order_left(&files, &read),
+            order_left(&files, &mut read),
             [files[1].1, files[2].1, files[0].1]
         );
+    }
+
+    #[test]
+    fn a_file_that_stopped_growing_loses_its_mark_for_using_up_a_budget() {
+        // Left marked, it would go behind a fork of it whenever it next grew, for as long
+        // as anything held a range.
+        let home = tempfile::tempdir().expect("tempdir");
+        let files = files_of_a_held_range(&home.path().join("-repo"));
+        let mut read = ReadSoFar::default();
+        read.note(
+            &files[0].0.to_string_lossy(),
+            fs::metadata(&files[0].0).expect("meta").len() as i64,
+        );
+        read.note(&used_up_a_budget(&files[0].0), 1);
+
+        assert_eq!(order_left(&files, &mut read), [files[1].1, files[2].1]);
+
+        assert!(!read.knows(&used_up_a_budget(&files[0].0)));
+    }
+
+    #[test]
+    fn a_file_read_last_with_time_left_loses_its_mark_for_using_up_a_budget() {
+        // There is no next file to clear it, and the unreadable one keeps the range held.
+        let machine = machine();
+        let home = tempfile::tempdir().expect("tempdir");
+        let project = home.path().join(".claude/projects/-repo");
+        let marked = "aaaaaaaa-0000-4000-8000-000000000001";
+        let unreadable = "bbbbbbbb-0000-4000-8000-000000000003";
+        fs::create_dir_all(&project).expect("dir");
+        a_missed_turn(&project, marked, "a turn");
+        fs::write(project.join(format!("{unreadable}.jsonl")), b"\xff\xfe\n").expect("write");
+        let now = Timestamp::now();
+        live_at(&machine, now, marked);
+        live_at(&machine, now, unreadable);
+        let file = project.join(format!("{marked}.jsonl"));
+        let marker = machine.paths.cache_dir().join("gap-read");
+        let mut read = ReadSoFar::default();
+        read.note(&used_up_a_budget(&file), 1);
+        read.save(&machine.paths, &marker);
+        let mut log =
+            SegmentLog::open(machine.paths.log_dir(), Retention::default()).expect("open");
+
+        append_gaps_at_start_in(
+            &machine.paths,
+            &held(&machine),
+            &mut log,
+            std::time::Duration::from_secs(60),
+            Some(home.path()),
+        )
+        .expect("fill");
+
+        let read = ReadSoFar::load(&marker);
+        assert!(read.knows(&file.to_string_lossy()), "it was read");
+        assert!(!read.knows(&used_up_a_budget(&file)));
     }
 
     #[test]
