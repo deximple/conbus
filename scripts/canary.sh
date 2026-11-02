@@ -221,15 +221,17 @@ is_stand_in() { # is_stand_in <binary>
 # that launchctl be skipped. CONBUS_CANARY_TEST_REAL_HOME is the
 # rehearsal's seam into the real code path: honoured only when it is the same
 # throwaway HOME the script sees, which by construction is not the passwd home,
-# and when the binaries are stand-ins. Naming the passwd home through it can never
-# launder a real swap. Set at all counts as asked, empty too, because that is how
-# the binary reads it.
+# and when the binaries are stand-ins: the installed one, the candidate, and the
+# rollback copy, whose `install --apply` a rollback runs. Naming the passwd home
+# through it can never launder a real swap. Set at all counts as asked, empty too,
+# because that is how the binary reads it.
 is_real_env() {
     [ -z "${CONBUS_SKIP_LAUNCHCTL+set}" ] || return 1
     is_passwd_home && return 0
     [ -n "${CONBUS_CANARY_TEST_REAL_HOME:-}" ] || return 1
     [ "$CONBUS_CANARY_TEST_REAL_HOME" -ef "$HOME" ] || return 1
     is_stand_in "$bin" || return 1
+    [ ! -e "$rollback_bin" ] || is_stand_in "$rollback_bin" || return 1
     [ -z "${from:-}" ] || is_stand_in "$from"
 }
 

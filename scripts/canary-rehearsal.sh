@@ -622,6 +622,25 @@ expect 2 "$code" "the seam refuses an installed binary that is a real one"
 expect_grep "the real swap needs the real HOME" "$tmp/guard-native-bin.out" "by the guard, before preflight"
 cp -p "$stand_in_copy" "$install_dir/conbus"
 
+# The seam walks the real rollback path too: a real binary as the rollback copy would get `install --apply` with
+# launchctl live. So the rollback copy has to be a stand-in as well, and it is refused by the guard, not later.
+write_fake 01d old "$install_dir/conbus"
+cp -p "$install_dir/conbus" "$tmp/stand-in-copy2"; cp /usr/bin/true "$rollback_bin"
+code=0
+env -u CONBUS_HOME -u XDG_STATE_HOME -u CONBUS_SKIP_LAUNCHCTL -u CONBUS_CANARY_REHEARSAL HOME="$home" \
+    CONBUS_CANARY_TEST_REAL_HOME="$home" CONBUS_AGY_BIN="$tmp/agy-no-login" CONBUS_CANARY_SERVING_LIMIT=1 \
+    bash "$canary" rollback >"$tmp/guard-native-rollback.out" 2>&1 || code=$?
+expect 2 "$code" "the seam refuses a rollback copy that is a real binary"
+expect_grep "the real swap needs the real HOME" "$tmp/guard-native-rollback.out" "before anything moves"
+expect "conbus 0.0.0-01d (01d)" "$("$install_dir/conbus" --version)" "and the installed binary is where it was"
+code=0
+env -u CONBUS_HOME -u XDG_STATE_HOME -u CONBUS_SKIP_LAUNCHCTL -u CONBUS_CANARY_REHEARSAL HOME="$home" \
+    CONBUS_CANARY_TEST_REAL_HOME="$home" CONBUS_AGY_BIN="$tmp/agy-no-login" CONBUS_CANARY_SERVING_LIMIT=1 \
+    bash "$canary" start --from "$tmp/stage/conbus-good" >"$tmp/guard-native-rollback-start.out" 2>&1 || code=$?
+expect 2 "$code" "and a start with one there, though start would replace it"
+expect_grep "the real swap needs the real HOME" "$tmp/guard-native-rollback-start.out" "by the guard too"
+cp -p "$tmp/stand-in-copy2" "$install_dir/conbus"; write_fake 01d old "$rollback_bin"
+
 # The test seam only accepts a throwaway HOME that names itself.
 code=0
 env -u CONBUS_HOME -u XDG_STATE_HOME -u CONBUS_SKIP_LAUNCHCTL \
