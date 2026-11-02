@@ -564,7 +564,13 @@ fn a_real_listener_under_a_real_conbus_is_yes() {
 }
 
 /// A stand-in `codex app-server` that starts a server of its own and exits, leaving
-/// it behind: what a read looks like when the vendor's server outlives it.
+/// it behind: what a read looks like when the vendor's server outlives it. The
+/// server starts a session of its own, as Codex starts its MCP servers
+/// (codex-rs/rmcp-client, `ProcessMode::NewGroup`), so it leads its own group like
+/// any service: the shape the first orphan check missed. A listener still in the
+/// group of what started it is pinned by the tables in
+/// `a_listener_that_outlived_what_started_it_is_not_a_no` and
+/// `an_app_that_lost_its_own_parent_is_not_a_no`.
 const CODEX_LEAVING_A_SERVER: &str = r#"#!/usr/bin/env python3
 import os, socket, subprocess, sys
 here = os.path.dirname(os.path.abspath(__file__))
@@ -581,32 +587,18 @@ deadline = time.time() + 30
 while time.time() < deadline and not os.path.exists(os.path.join(here, "stop")):
     time.sleep(0.05)
 """
-subprocess.Popen([sys.executable, "-c", server, here], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+subprocess.Popen([sys.executable, "-c", server, here], start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 "#;
 
 #[test]
 fn a_real_server_left_behind_by_a_read_is_not_a_no() {
-    left_behind_is_not_a_no(CODEX_LEAVING_A_SERVER);
-}
-
-#[test]
-fn a_real_server_in_its_own_group_left_behind_by_a_read_is_not_a_no() {
-    // How Codex really starts an MCP server, and the shape the first orphan check
-    // missed: it leads its own group, like any service.
-    left_behind_is_not_a_no(&CODEX_LEAVING_A_SERVER.replace(
-        "stdin=subprocess.DEVNULL,",
-        "start_new_session=True, stdin=subprocess.DEVNULL,",
-    ));
-}
-
-fn left_behind_is_not_a_no(stand_in: &str) {
     if !have_lsof_and_ps() {
         return;
     }
     let root = tempfile::tempdir().expect("tempdir");
     let codex_dir = tempfile::tempdir().expect("tempdir");
     let codex = codex_dir.path().join("codex");
-    support::write_executable(&codex, stand_in);
+    support::write_executable(&codex, CODEX_LEAVING_A_SERVER);
     let quota = conbus(root.path())
         .arg("quota")
         .env("CONBUS_CODEX_BIN", &codex)
