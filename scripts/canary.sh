@@ -61,6 +61,11 @@
 # over a binary a running daemon has mapped.
 set -euo pipefail
 
+# Under pipefail a reader that leaves early (`grep -q`, `head`) can cost its writer
+# a SIGPIPE, and the pipeline then reads as failed however the match came out: a
+# healthy daemon as "not answering", a swap rolled back. So grep -q reads a
+# here-string, and a first line comes from `sed -n '1p'`, which reads to the end.
+
 say() { printf 'canary: %s\n' "$*"; }
 die() { say "$*" >&2; exit 1; }
 refuse() { say "$*" >&2; exit 2; }
@@ -444,11 +449,11 @@ verify_rollback() {
         say "ROLLBACK NOT VERIFIED — doctor did not answer inside ${doctor_limit_s}s; run 'canary.sh status'"
         exit 3
     fi
-    if echo "$doctor_out" | grep -q 'DIFFERS'; then
+    if grep -q 'DIFFERS' <<<"$doctor_out"; then
         say "ROLLBACK NOT VERIFIED — doctor reports a different build; run 'canary.sh status'"
         exit 3
     fi
-    if ! echo "$doctor_out" | grep -q 'listening'; then
+    if ! grep -q 'listening' <<<"$doctor_out"; then
         say "ROLLBACK NOT VERIFIED — the daemon is not listening; run 'canary.sh status'"
         exit 3
     fi
@@ -464,12 +469,12 @@ check_doctor() {
     [ "$doctor_rc" -eq 142 ] &&
         say "doctor: no answer inside ${doctor_limit_s}s (cap)"
     echo "$doctor_out" | grep -E '^(socket|daemon|recorder|hardening)' || true
-    if echo "$doctor_out" | grep -q 'DIFFERS'; then
+    if grep -q 'DIFFERS' <<<"$doctor_out"; then
         say "doctor: the answering daemon is a different build —"
         say "  check \`canary.sh status\`, or roll back: canary.sh rollback"
         return 1
     fi
-    if echo "$doctor_out" | grep -q 'listening'; then
+    if grep -q 'listening' <<<"$doctor_out"; then
         say "doctor: socket listening"
         return 0
     fi
@@ -486,7 +491,7 @@ check_doctor() {
 
 state_get() { # state_get <dotted key> — flat fields only
     [ -f "$state_file" ] || return 1
-    sed -n "s/.*\"$1\":\"\\([^\"]*\\)\".*/\\1/p" "$state_file" | head -1
+    sed -n "s/.*\"$1\":\"\\([^\"]*\\)\".*/\\1/p" "$state_file" | sed -n '1p'
 }
 
 state_restart_count() {
@@ -511,7 +516,7 @@ state_write() { # state_write <swapped> <prev> <cand> <sha> <restarts-json-array
 
 state_restarts_json() { # echoes the restarts array as stored, [] when absent
     [ -f "$state_file" ] || { echo '[]'; return; }
-    sed -n 's/.*"restarts":\(\[.*\]\).*/\1/p' "$state_file" | head -1
+    sed -n 's/.*"restarts":\(\[.*\]\).*/\1/p' "$state_file" | sed -n '1p'
 }
 
 state_add_restart() { # state_add_restart <ts> <serving_ms|-> <new_drops>
@@ -666,8 +671,8 @@ do_preflight() {
                 ;;
             *) check 0 disk "${disk_line:-no disk line}" ;;
         esac
-        if echo "$doctor_out" | grep -q 'DIFFERS'; then
-            check 1 daemon-build "$(echo "$doctor_out" | grep 'DIFFERS' | head -1)"
+        if grep -q 'DIFFERS' <<<"$doctor_out"; then
+            check 1 daemon-build "$(grep 'DIFFERS' <<<"$doctor_out" | sed -n '1p')"
         else
             check 0 daemon-build "no DIFFERS"
         fi
@@ -679,7 +684,7 @@ do_preflight() {
     evidence_dir=${evidence:-./evidence}
     if [ -d "$evidence_dir" ]; then
         for i in 1 2 3 4 5; do
-            found=$(cd "$evidence_dir" && { ls "s$i"* "S$i"* 2>/dev/null || true; } | head -1)
+            found=$(cd "$evidence_dir" && { ls "s$i"* "S$i"* 2>/dev/null || true; } | sed -n '1p')
             if [ -n "$found" ]; then
                 check 0 "evidence-s$i" "$evidence_dir/$found"
             elif [ -n "$evidence" ]; then
@@ -979,7 +984,7 @@ case $sub in
                 }
                 END { print n + 0; for (r in after) if (!(r in before)) print r }
             ')
-            drop_count=$(echo "$new_reasons" | head -1)
+            drop_count=$(sed -n '1p' <<<"$new_reasons")
             new_reasons=$(echo "$new_reasons" | tail -n +2 | LC_ALL=C sort)
             s_epoch=$(ts_epoch "$since")
             swap_exempted=0
@@ -1362,13 +1367,15 @@ case $sub in
             doctor_out=$(run_doctor) || doctor_rc=$?
             if [ "$doctor_rc" -eq 142 ]; then
                 fail_reason="doctor did not answer inside ${doctor_limit_s}s"
-            elif echo "$doctor_out" | grep -q 'DIFFERS'; then
+            elif grep -q 'DIFFERS' <<<"$doctor_out"; then
                 fail_reason="the answering daemon is a different build than $cand_build"
-            elif ! echo "$doctor_out" | grep -q 'listening'; then
+            elif ! grep -q 'listening' <<<"$doctor_out"; then
                 fail_reason="the daemon is not answering after the swap"
-            elif echo "$doctor_out" | grep '^hooks' | grep -qv ' runs '; then
-                bad_hooks=$(echo "$doctor_out" | grep '^hooks' | grep -v ' runs ' | head -1)
-                fail_reason="a hook is not 'runs': ${bad_hooks#hooks     }"
+            else
+                bad_hooks=$(awk '/^hooks / && !/ runs /' <<<"$doctor_out" | sed -n '1p')
+                if [ -n "$bad_hooks" ]; then
+                    fail_reason="a hook is not 'runs': ${bad_hooks#hooks     }"
+                fi
             fi
         fi
 
