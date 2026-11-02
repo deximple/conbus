@@ -16,7 +16,9 @@
 //!   normal case. `writeln!` on an unbuffered `File` issues a syscall per
 //!   formatting fragment, which interleaves at JSON-token granularity and
 //!   shreds the file. One `write_all` of one complete line is atomic on an
-//!   `O_APPEND` regular file.
+//!   `O_APPEND` regular file. A full disk can still cut a line short, so a drop
+//!   that finds the file ending mid-line starts on a fresh one, in that same write,
+//!   or the next reason would be glued to the torn text and read as nothing.
 //! - **Rotated, never rewritten.** Trimming means a read-modify-write racing
 //!   those same appenders, and it makes the count a lie. The file only grows,
 //!   and at the cap it is renamed whole to `drops.1.jsonl` — overwriting the
@@ -32,7 +34,7 @@
 //!   behind "the daemon is down".
 
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::time::{Duration, SystemTime};
 
 use conbus_core::clock::Timestamp;
@@ -190,13 +192,21 @@ fn close_to_owner(_path: &std::path::Path) {}
 /// A new log is 0600 from the moment it exists.
 fn open_for_append(file: &std::path::Path) -> std::io::Result<fs::File> {
     let mut options = OpenOptions::new();
-    options.create(true).append(true);
+    options.create(true).read(true).append(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
     options.open(file)
+}
+
+/// Whether the file ends part way through a line. An empty file does not. Two hooks
+/// that both find a torn end each start a fresh line, which leaves a blank one, and a
+/// blank line is skipped when the log is read.
+fn ends_mid_line(file: &mut fs::File) -> bool {
+    let mut last = [0u8; 1];
+    file.seek(SeekFrom::End(-1)).is_ok() && file.read_exact(&mut last).is_ok() && last[0] != b'\n'
 }
 
 fn append(paths: &Paths, dropped: &Dropped) {
@@ -220,7 +230,12 @@ fn append(paths: &Paths, dropped: &Dropped) {
     if let Some(detail) = &dropped.detail {
         entry["detail"] = serde_json::Value::String(detail.clone());
     }
-    let mut line = entry.to_string();
+    let mut line = if ends_mid_line(&mut handle) {
+        String::from("\n")
+    } else {
+        String::new()
+    };
+    line.push_str(&entry.to_string());
     line.push('\n');
     let _ = handle.write_all(line.as_bytes());
 }
@@ -834,6 +849,70 @@ mod tests {
 
         assert!(rotate_lock(&paths).exists());
         assert!(!rotated_file(&paths).exists());
+    }
+
+    #[test]
+    fn a_torn_line_in_the_live_file_does_not_swallow_the_next_reason() {
+        let dir = home();
+        let paths = paths_at(dir.path());
+        fs::write(
+            drops_file(&paths),
+            b"{\"ts\":\"2026-11-02T00:00:00.000Z\",\"reason\":\"old\",\"detail\":\"cut sho",
+        )
+        .expect("torn");
+
+        append(&paths, &Dropped::new("no mapping for hook event \"New\""));
+
+        let summary = summary(&paths);
+        assert!(
+            summary
+                .reasons
+                .iter()
+                .any(|(reason, _)| reason.text.contains("New")),
+            "{summary:?}"
+        );
+        assert!(summary.last.is_some(), "{summary:?}");
+    }
+
+    #[test]
+    fn a_line_ending_where_it_should_gets_nothing_added() {
+        // The usual case: one line per drop, and no blank line between them.
+        let dir = home();
+        let paths = paths_at(dir.path());
+
+        append(&paths, &Dropped::new("first"));
+        append(&paths, &Dropped::new("second"));
+
+        let text = fs::read_to_string(drops_file(&paths)).expect("log");
+        assert_eq!(text.lines().count(), 2, "{text}");
+        assert!(!text.contains("\n\n"), "{text}");
+        assert!(text.ends_with('\n'), "{text}");
+    }
+
+    #[test]
+    fn the_fresh_line_after_a_torn_one_is_still_one_write() {
+        // Everything goes out in one write, so a racing hook cannot land between the
+        // line break and the line. What this can pin from here: the torn text is
+        // kept, the new line is whole, and an empty file gets no blank first line.
+        let dir = home();
+        let paths = paths_at(dir.path());
+        fs::write(drops_file(&paths), b"").expect("empty");
+
+        append(&paths, &Dropped::new("into an empty file"));
+
+        let text = fs::read_to_string(drops_file(&paths)).expect("log");
+        assert!(text.starts_with('{'), "{text}");
+
+        fs::write(drops_file(&paths), b"{\"cut sho").expect("torn");
+        append(&paths, &Dropped::new("whole"));
+
+        let text = fs::read_to_string(drops_file(&paths)).expect("log");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "{\"cut sho", "{text}");
+        assert!(
+            serde_json::from_str::<serde_json::Value>(lines[1]).is_ok(),
+            "{text}"
+        );
     }
 
     #[test]
