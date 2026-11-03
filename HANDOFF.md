@@ -232,7 +232,9 @@ Argued through four review rounds; the reasoning is in the plan.
     thread id before the underscore. A by-hand fill asks every thread, and on
     clones of this machine's log and `~/.codex` it found the same two missing
     turns with and without the fix, with a 463-turn thread of this kind among
-    those asked. On 2026-11-04 two of 1,900 rollouts were named this way.
+    those asked. On 2026-11-04, 20 of 3,421 rollouts were named this way, for 8
+    threads, and 17 of the 20 were `.jsonl.zst`: a continuation file is
+    compressed too.
   - `initialize` and `thread/turns/list` start no MCP server; `thread/start`
     does.
   - With stdin closed, the server exits 0 within 0.1 s, and its MCP child goes

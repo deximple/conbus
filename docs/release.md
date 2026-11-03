@@ -207,14 +207,37 @@ builds by version and hash.
 
 An older build's start-up gap fill: up to rc.3, the gap fill a start runs copies a parent
 conversation's turns into its fork and writes a spooled turn twice, and the log keeps
-both. So before the script loads rc.2 or rc.3 (a rollback, or a `restart` of one), it
-sets `CONBUS_GAP_BUDGET_MS=0` in the launchd plist. That build's start then fills
-nothing and leaves its range in `cache/gap-since`, and its `install --apply` keeps the
-value for every restart and reboot after it. Before a candidate from rc.4 on is loaded,
-`start` takes a 0 out again, and the candidate's own start fills the range. A budget
-someone set stays for a fixed build. 0.2.x and rc.1 have no switch, and a rollback to
-one says so. `preflight` and `status` show the switch. Only the script's own
-subcommands set it: a restart or reboot of rc.3 by any other way still runs its fill.
+both.
+
+- **Loading rc.2 or rc.3.** Before a rollback, or a `restart` of one of those builds,
+  the script sets `CONBUS_GAP_BUDGET_MS=0` in the launchd plist.
+- **The rollback itself.** A real rollback stops the job before the old binary goes
+  back. Otherwise a relaunch in between would start it with the candidate's
+  environment.
+- **What that build then does.** Its start fills nothing and leaves its range in
+  `cache/gap-since`. Its `install --apply` keeps the value for every restart and reboot
+  after it.
+- **Limit: transcripts.** The switch needs a transcript under `~/.claude/projects`. With
+  none, rc.2 and rc.3 never reach the check. They read the chat export folder with no
+  limit and delete `cache/gap-since`.
+- **Limit: the spool drain.** The switch stops only the gap fill. rc.3's spool drain
+  still runs at every start.
+- **Loading rc.4 or later.** `start` and `restart` take a 0 out first, so the build's
+  own start fills the range. A budget someone set stays for a fixed build.
+- **0.2.x and rc.1.** They have no switch, and a rollback to one says so.
+- **Seeing it.** `preflight` and `status` show the switch.
+
+Until the script has set it, a restart or reboot of rc.3 runs its fill. That is the case
+on a recorder that has run rc.3 since its swap.
+
+Once set, the 0 stays through reboots and through every `install --apply`. That includes
+a fixed build loaded any way other than `start` or `restart`. Such a build then puts off
+every start's fill, and `doctor` only shows the held range. Take the 0 out before that
+`install --apply`:
+
+```sh
+plutil -remove EnvironmentVariables.CONBUS_GAP_BUDGET_MS ~/Library/LaunchAgents/sh.conbus.daemon.plist
+```
 
 What the verdict cannot see, so a PASS does not rule it out:
 

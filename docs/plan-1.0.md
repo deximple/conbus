@@ -332,7 +332,7 @@ AGENTS.md의 "SQLite는 파생" 항목에 사이드카와 스풀을 추가해 �
 
 **롤백이 가는 곳**: `start`는 그 순간 설치된 바이너리를 `conbus.rollback`으로 복사하고, 이전 창이 남긴 복사본은 바꾼다. 그래서 자동 롤백과 `canary.sh rollback` 모두 교체 직전에 돌던 빌드로 돌아간다. `usage-parity`의 기준 복사본은 먼저 만들어지므로 `--parity`로 기존 `conbus.rollback`을 지정할 수 있다. `preflight`와 `start`는 롤백 대상과 비교 기준을 버전과 해시로 출력한다.
 
-**이전 빌드의 시작 gap fill**: rc.3까지의 시작 gap fill은 fork 대화에 부모 대화의 턴을 복사하고 스풀된 턴을 두 번 쓴다. 로그는 둘 다 지울 수 없다. 그래서 스크립트가 rc.2나 rc.3을 다시 올리기 전에(롤백, 그 빌드의 `restart`) launchd plist에 `CONBUS_GAP_BUDGET_MS=0`을 넣는다. 그 빌드는 시작할 때 아무것도 쓰지 않고 범위를 `cache/gap-since`에 남기며, 그 빌드의 `install --apply`가 값을 옮기므로 이후 재시작과 재부팅에도 남는다. rc.4 이후의 후보를 올리기 전에 `start`가 0을 다시 빼고, 후보의 시작이 그 범위를 채운다. 0.2.x와 rc.1에는 스위치가 없어 말만 한다. 스크립트 밖에서 rc.3을 재시작하거나 재부팅하면 여전히 그 gap fill이 돈다.
+**이전 빌드의 시작 gap fill**: rc.3까지의 시작 gap fill은 fork 대화에 부모 대화의 턴을 복사하고 스풀된 턴을 두 번 쓴다. 로그는 둘 다 지울 수 없다. 그래서 스크립트가 rc.2나 rc.3을 다시 올리기 전에(롤백, 그 빌드의 `restart`) launchd plist에 `CONBUS_GAP_BUDGET_MS=0`을 넣는다. 실제 롤백은 옛 바이너리를 제자리에 옮기기 전에 job을 먼저 내린다. 그 사이의 재기동이 후보의 환경으로 옛 빌드를 띄우지 않게 하려는 것이다. 그 빌드는 시작할 때 아무것도 쓰지 않고 범위를 `cache/gap-since`에 남긴다. 그 빌드의 `install --apply`가 값을 옮기므로 이후 재시작과 재부팅에도 남는다. rc.4 이후의 빌드를 올리기 전에는 `start`와 `restart`가 0을 다시 빼고, 그 빌드의 시작이 범위를 채운다. 0.2.x와 rc.1에는 스위치가 없어 말만 한다. 한계는 셋이다. 스위치는 gap fill만 멈추고, rc.3의 스풀 드레인은 매 시작에 돈다. `~/.claude/projects`에 transcript가 하나도 없으면 rc.2와 rc.3은 0에서도 멈추지 않고 `cache/gap-since`를 지운다. 스크립트가 넣기 전에는(rc.3 교체 이후의 라이브처럼) 재시작이나 재부팅이 그 gap fill을 돌린다. 한 번 넣은 0은 재부팅과 모든 `install --apply`에 남는다. 그래서 `start`나 `restart`가 아닌 길로 고친 빌드를 올리기 전에는 0을 직접 뺀다(`docs/release.md`).
 
 **롤백 검증**: 복사본이 스스로 말하는 빌드를 기준으로, 새 pid의 스탬프, 소켓, `doctor`의 `listening`을 serving 제한 안에서 기다린다. 복사본은 교체되는 빌드보다 오래된 것일 수 있다. 어느 확인이 실패했는지 말하고 exit 3으로 끝나며, `install --apply` 실패는 그렇다고 말한다.
 
