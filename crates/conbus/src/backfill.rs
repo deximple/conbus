@@ -4111,6 +4111,37 @@ for line in sys.stdin:
         );
     }
 
+    /// A thread whose own file was compressed long ago and whose newest file is a
+    /// continuation is dated by the continuation, and its session id is never asked.
+    #[test]
+    fn a_continuation_file_dates_its_thread() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let thread: BusId = SESSION.parse().expect("uuid");
+        let session: BusId = "0199aaaa-bbbb-7ccc-8ddd-eeeeffff0001"
+            .parse()
+            .expect("uuid");
+        let day = home
+            .path()
+            .join("sessions")
+            .join("2026")
+            .join("11")
+            .join("03");
+        rollout(
+            &day,
+            &format!("rollout-2026-10-21T10-00-00-{thread}.jsonl.zst"),
+            1_000,
+        );
+        rollout(
+            &day,
+            &format!("rollout-2026-11-03T10-00-00-{thread}_{session}.jsonl"),
+            9_000,
+        );
+        let bound = HashSet::from([thread, session]);
+        let asked = codex_threads_touched_since_in(home.path(), &bound, 5_000, &mut 0, &mut 0)
+            .expect("sessions dir read");
+        assert_eq!(asked, vec![(thread, 9_000)]);
+    }
+
     #[test]
     fn only_codex_threads_touched_since_the_cutoff_are_asked() {
         let home = tempfile::tempdir().expect("tempdir");
