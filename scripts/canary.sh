@@ -16,7 +16,7 @@
 #   start exits 1 when it rolled back or found no candidate or install to swap, and
 #   2 when it refused before anything moved.
 #   start and rollback exit 3 when the rollback could not be verified.
-#   restart exits 1 when the daemon never served.
+#   restart exits 1 when the daemon never served, and 2 when it refused before reloading.
 #
 # status and verdict are read-only. preflight makes the plist backup, a copy; with
 # --from it also prebuilds the candidate's cache/ next to the live log, a rebuildable
@@ -82,6 +82,14 @@
 #     is must write a daemon.build stamp with a new pid and doctor must listen
 #     with no DIFFERS, within the serving limit, else the script exits 3 and
 #     says which it was. An `install --apply` that failed says that.
+#   - before each load (start, restart, rollback, and start's automatic rollback)
+#     the plist's start-up gap fill switch is set for the build being loaded. Up to
+#     rc.3 the gap fill a start runs writes records the log cannot take back, so rc.2
+#     and rc.3 are loaded with CONBUS_GAP_BUDGET_MS=0 and their range waits in
+#     cache/gap-since. From rc.4 on, a 0 left there comes out first, and the build
+#     fills that range. 0.2.x and rc.1 have no switch, and the script says so. start
+#     and restart refuse (exit 2) when the switch has to change and cannot; a rollback
+#     says so and goes on.
 #   - every doctor call is capped at CONBUS_CANARY_DOCTOR_LIMIT seconds
 #     (default 120): an old build's vendor probes are unbounded, and a
 #     wedged one must fail the check it is in — not hang it. A cap hit in
@@ -108,6 +116,9 @@ rollback_bin=$install_dir/conbus.rollback
 # usage-parity's baseline, kept apart from the rollback copy: a rollback uses that up.
 parity_bin=$install_dir/conbus.parity
 new_bin=$install_dir/conbus.new
+# The launchd plist the recorder runs from. `install --apply` rewrites it and keeps
+# its EnvironmentVariables.
+launchd_plist=$HOME/Library/LaunchAgents/$daemon_label.plist
 
 # Every check must describe the install and data root the managed daemon
 # sees. launchd never inherits a shell's CONBUS_HOME/XDG_STATE_HOME, so
@@ -560,6 +571,87 @@ rollback_reload() { # rollback_reload <mode>
     if ! reregister_daemon "$1" && [ "$1" = real ]; then
         say "ROLLBACK NOT VERIFIED — the binary is back, and 'conbus install --apply' failed, so what is running is not known; run 'canary.sh status'"
         exit 3
+    fi
+}
+
+# --- start-up gap fill of the build being loaded ------------------------------
+
+# Every start fills gaps from the vendors' transcripts. Up to rc.3 that fill copies a
+# parent conversation's turns into its fork and writes a spooled turn twice (fixed in
+# rc.4), and an append-only log keeps both. A rollback starts such a build again, and
+# so does every restart and reboot after it. rc.2 and rc.3 read CONBUS_GAP_BUDGET_MS:
+# at 0 their start fills nothing and leaves its range in cache/gap-since, which a fixed
+# build's start fills. Their `install --apply` keeps the plist's environment, so the
+# value holds until a fixed build is loaded, and then it comes out. 0.2.x and rc.1
+# have no such switch. A budget someone set stays for a fixed build; an older build
+# gets 0 over it.
+gap_switch=EnvironmentVariables.CONBUS_GAP_BUDGET_MS
+
+version_of() { # version_of <binary>: what it says it is, like 1.0.0-rc.3; empty when it does not run
+    "$1" --version 2>/dev/null | awk 'NR == 1 { print $2 }' || true
+}
+
+gap_fill_fixed() { # gap_fill_fixed <version>: true from rc.4 on
+    case $1 in
+        0.* | 1.0.0-rc.[123]) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+gap_switch_value() { # what the plist gives CONBUS_GAP_BUDGET_MS; empty when it gives nothing
+    [ -f "$launchd_plist" ] || return 0
+    plutil -extract "$gap_switch" raw -o - "$launchd_plist" 2>/dev/null || true
+}
+
+# Before `install --apply` loads <binary>: set the switch for it. Returns 1 only when
+# the plist had to change and could not.
+match_gap_switch() { # match_gap_switch <binary> <who is asking>
+    gs_version=$(version_of "$1")
+    gs_value=$(gap_switch_value)
+    if gap_fill_fixed "$gs_version"; then
+        [ "$gs_value" = 0 ] || return 0
+        if plutil -remove "$gap_switch" "$launchd_plist"; then
+            say "$2: took CONBUS_GAP_BUDGET_MS=0 out of $launchd_plist; ${gs_version:-this build} fills gaps at start, from cache/gap-since"
+            return 0
+        fi
+        say "$2: could not take CONBUS_GAP_BUDGET_MS=0 out of $launchd_plist"
+        return 1
+    fi
+    case $gs_version in
+        1.0.0-rc.[23]) ;;
+        *)
+            say "$2: ${gs_version:-this build} fills gaps at start the way rc.4 fixed, and has no switch to stop it"
+            return 0
+            ;;
+    esac
+    [ "$gs_value" = 0 ] && return 0
+    if [ ! -f "$launchd_plist" ]; then
+        say "$2: no $launchd_plist, so $gs_version fills gaps at start the way rc.4 fixed"
+        return 0
+    fi
+    if { plutil -extract EnvironmentVariables xml1 -o /dev/null "$launchd_plist" 2>/dev/null ||
+        plutil -insert EnvironmentVariables -dictionary "$launchd_plist"; } &&
+        plutil -replace "$gap_switch" -string 0 "$launchd_plist"; then
+        say "$2: start-up gap fill is off for $gs_version (CONBUS_GAP_BUDGET_MS=0 in $launchd_plist); its range waits in cache/gap-since for a fixed build"
+        return 0
+    fi
+    say "$2: could not set CONBUS_GAP_BUDGET_MS=0 in $launchd_plist, so $gs_version fills gaps at start the way rc.4 fixed"
+    return 1
+}
+
+# What the next load of the installed build does at start, for preflight and status:
+# "<check level> <text>".
+gap_fill_state() {
+    gst_version=$(version_of "$bin")
+    gst_value=$(gap_switch_value)
+    if [ "$gst_value" = 0 ]; then
+        echo "2 off: CONBUS_GAP_BUDGET_MS=0 in $launchd_plist. start takes it out for a candidate from rc.4 on, which fills the range waiting in cache/gap-since"
+    elif ! gap_fill_fixed "$gst_version"; then
+        echo "2 ${gst_version:-the installed build} fills gaps at start the way rc.4 fixed, so a restart or a reboot before the swap runs it"
+    elif [ -n "$gst_value" ]; then
+        echo "0 on, with CONBUS_GAP_BUDGET_MS=$gst_value from $launchd_plist"
+    else
+        echo "0 on"
     fi
 }
 
@@ -1934,6 +2026,10 @@ do_preflight() {
     else
         check 1 parity-baseline "$parity_source does not run, so usage-parity would have nothing to compare against"
     fi
+    if [ -x "$bin" ]; then
+        gap_state=$(gap_fill_state)
+        check "${gap_state%% *}" gap-fill-at-start "${gap_state#* }"
+    fi
 
     # The launchd plist (or systemd unit on Linux), backed up beside
     # itself so a bad merge has an undo. Under a rehearsal HOME the file
@@ -2108,6 +2204,10 @@ case $sub in
         fi
         if [ -f "$parity_bin" ]; then
             say "parity: $(describe_build "$parity_bin")"
+        fi
+        if [ -x "$bin" ]; then
+            gap_state=$(gap_fill_state)
+            say "gap fill at start: ${gap_state#* }"
         fi
         if [ -f "$stamp" ]; then
             say "daemon stamp: $(cat "$stamp")"
@@ -2595,6 +2695,8 @@ case $sub in
         mode=$(swap_mode restart)
         [ -f "$state_file" ] ||
             die "no $state_file — a canary window starts with 'start'"
+        match_gap_switch "$bin" restart ||
+            refuse "restart: the start-up gap fill switch in $launchd_plist could not be set for the installed build — not restarting"
         old_stamp_pid=""
         if [ -f "$stamp" ]; then
             old_stamp_pid=$(sed -n 's/.*"pid":\([0-9]*\).*/\1/p' "$stamp")
@@ -2717,6 +2819,13 @@ case $sub in
         # Stage the candidate beside the target first, then swap names.
         cp "$from" "$new_bin"
         chmod 755 "$new_bin"
+        # The candidate's own start fills the range an older build left waiting. Set
+        # last, so that nothing between this and the swap can leave the switch out
+        # under the build installed now.
+        if ! match_gap_switch "$new_bin" start; then
+            rm -f "$new_bin"
+            refuse "start: the start-up gap fill switch in $launchd_plist could not be set for the candidate — not swapping"
+        fi
         mv -f "$new_bin" "$bin"
         say "swapped $bin: $old_version -> $cand_version ($mode)"
 
@@ -2797,6 +2906,8 @@ case $sub in
                 "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
             say "rolled back $bin to $("$bin" --version 2>&1 || echo unknown)"
             say_spool
+            # A rollback has to happen, so a switch that could not be set is said, not fatal.
+            match_gap_switch "$bin" rollback || true
             rollback_reload "$mode"
             verify_rollback "$restored_build" "$cand_pid" "$mode"
             die "start failed: $fail_reason (rolled back automatically)"
@@ -2828,6 +2939,7 @@ case $sub in
         mv -f "$rollback_bin" "$bin"
         restored_build=$(build_of "$bin")
         say "rolled back $bin to $("$bin" --version 2>&1 || echo unknown) ($mode)"
+        match_gap_switch "$bin" rollback || true
         rollback_reload "$mode"
         verify_rollback "$restored_build" "$cand_pid" "$mode"
         say_spool

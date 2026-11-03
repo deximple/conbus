@@ -205,6 +205,17 @@ being replaced. It is copied first, so `--parity ~/.local/bin/conbus.rollback` c
 against an older copy before `start` replaces it. `preflight` and `start` print both
 builds by version and hash.
 
+An older build's start-up gap fill: up to rc.3, the gap fill a start runs copies a parent
+conversation's turns into its fork and writes a spooled turn twice, and the log keeps
+both. So before the script loads rc.2 or rc.3 (a rollback, or a `restart` of one), it
+sets `CONBUS_GAP_BUDGET_MS=0` in the launchd plist. That build's start then fills
+nothing and leaves its range in `cache/gap-since`, and its `install --apply` keeps the
+value for every restart and reboot after it. Before a candidate from rc.4 on is loaded,
+`start` takes a 0 out again, and the candidate's own start fills the range. A budget
+someone set stays for a fixed build. 0.2.x and rc.1 have no switch, and a rollback to
+one says so. `preflight` and `status` show the switch. Only the script's own
+subcommands set it: a restart or reboot of rc.3 by any other way still runs its fill.
+
 What the verdict cannot see, so a PASS does not rule it out:
 
 - A drop log truncated back to its size at the swap. It is the same file with the same
@@ -221,7 +232,8 @@ by one rotation reads as evidence rotated away, and gives exit 4.
 `start` exits 1 when it rolled back, or when it found no candidate or install to swap.
 It exits 2 when it refused before anything moved.
 `start` and `rollback` exit 3 when the rollback could not be verified, and say which
-check it was. `restart` exits 1 when the daemon never served.
+check it was. `restart` exits 1 when the daemon never served, and 2 when it refused
+before reloading.
 
 ## Operator decisions
 
