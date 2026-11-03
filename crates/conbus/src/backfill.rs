@@ -1527,12 +1527,28 @@ fn codex_threads_touched_since_in(
 
 /// `rollout-<stamp>-<thread-id>.jsonl[.zst]` → the thread id: the last 36
 /// characters of the stem, a uuid.
+///
+/// A thread that goes on in a new file names it
+/// `rollout-<stamp>-<thread-id>_<session-id>.jsonl` and compresses the one before
+/// (codex-cli 0.166.0). `thread/list` lists each of those files under the thread
+/// id, hooks name the thread id, and asking for the session id gets "list_turns is
+/// not supported yet". So the thread is the id before the underscore: read as the
+/// session, the thread's newest file never counted for it, and a start never asked
+/// for a thread that was still going.
 fn rollout_thread_id(name: &str) -> Option<BusId> {
     let stem = name
         .strip_suffix(".jsonl.zst")
         .or_else(|| name.strip_suffix(".jsonl"))?;
     let stem = stem.strip_prefix("rollout-")?;
-    stem.get(stem.len().saturating_sub(36)..)?.parse().ok()
+    let last_uuid =
+        |text: &str| -> Option<BusId> { text.get(text.len().saturating_sub(36)..)?.parse().ok() };
+    if let Some(at) = stem.len().checked_sub(37)
+        && stem.as_bytes()[at] == b'_'
+        && let Some(thread) = last_uuid(&stem[..at])
+    {
+        return Some(thread);
+    }
+    last_uuid(stem)
 }
 
 /// Latest mtime per thread id under `dir`, recursing no deeper than `depth`
@@ -4080,6 +4096,19 @@ for line in sys.stdin:
         );
         assert_eq!(rollout_thread_id("rollout-not-a-thread.jsonl"), None);
         assert_eq!(rollout_thread_id("notes.txt"), None);
+        // A thread that went on in a new file: the thread, not the file's session.
+        let session = "0199aaaa-bbbb-7ccc-8ddd-eeeeffff0001";
+        assert_eq!(
+            rollout_thread_id(&format!(
+                "rollout-2026-10-25T19-23-12-{SESSION}_{session}.jsonl"
+            )),
+            Some(id)
+        );
+        // Before an underscore that is not a uuid, the name reads as it always did.
+        assert_eq!(
+            rollout_thread_id(&format!("rollout-2026-10-25T19-23-12-x_{SESSION}.jsonl")),
+            Some(id)
+        );
     }
 
     #[test]

@@ -226,11 +226,13 @@ Argued through four review rounds; the reasoning is in the plan.
     thread id, and hooks name the thread id. Asking for the session id gets
     `-32601 list_turns is not supported yet`, which `is_unknown_method` skips
     without holding the range.
-  - **Open:** `rollout_thread_id` reads such a name as the session, the last 36
-    characters. So the thread's newest file never counts for it, and a start
-    never asks for a thread that is still going: turns its hooks missed stay
-    missed. Nothing wrong is written. On 2026-11-04 two of 1,900 rollouts were
-    named this way.
+  - `rollout_thread_id` read such a name as the session, the last 36
+    characters, until rc.4. So the thread's newest file never counted for it,
+    and a start never asked for a thread that was still going. It now reads the
+    thread id before the underscore. A by-hand fill asks every thread, and on
+    clones of this machine's log and `~/.codex` it found the same two missing
+    turns with and without the fix, with a 463-turn thread of this kind among
+    those asked. On 2026-11-04 two of 1,900 rollouts were named this way.
   - `initialize` and `thread/turns/list` start no MCP server; `thread/start`
     does.
   - With stdin closed, the server exits 0 within 0.1 s, and its MCP child goes
