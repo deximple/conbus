@@ -311,8 +311,10 @@ hand, and `conbus auth`, which says whose sign-in page just opened. Run
 - `scripts/canary.sh` loads rc.2 and rc.3 with their start-up gap fill off. A
   rollback to one of them, and every restart and reboot after it, starts with
   `CONBUS_GAP_BUDGET_MS=0` in the launchd plist, and their range waits in
-  `cache/gap-since` for a fixed build. A candidate from rc.4 on has that 0 taken
-  out before it is swapped in. `preflight` and `status` show the switch.
+  `cache/gap-since` for a fixed build. A real rollback stops the job before the old
+  binary goes back, so no relaunch in between starts it without the switch. A
+  candidate from rc.4 on has that 0 taken out before it is swapped in. `preflight`
+  and `status` show the switch.
 
 ### Known limits
 

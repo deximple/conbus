@@ -89,7 +89,8 @@
 #     cache/gap-since. From rc.4 on, a 0 left there comes out first, and the build
 #     fills that range. 0.2.x and rc.1 have no switch, and the script says so. start
 #     and restart refuse (exit 2) when the switch has to change and cannot; a rollback
-#     says so and goes on.
+#     says so and goes on. A real rollback stops the job before the old binary goes
+#     back, so that no relaunch in between starts it with the candidate's environment.
 #   - every doctor call is capped at CONBUS_CANARY_DOCTOR_LIMIT seconds
 #     (default 120): an old build's vendor probes are unbounded, and a
 #     wedged one must fail the check it is in — not hang it. A cap hit in
@@ -565,6 +566,18 @@ verify_rollback() {
     say "rollback verified: $restored pid $rb_pid listening"
 }
 
+# Before a rollback puts the old binary back. A KeepAlive relaunch between that and the
+# reload would start the restored build with the environment launchd loaded for the
+# candidate, which has no gap fill switch. So the job stops first, and the restored
+# build's `install --apply` bootstraps it again. Only under the passwd home: launchctl
+# answers by uid, not by HOME, so the rehearsal's seam must never reach it.
+stop_before_rollback() { # stop_before_rollback <mode>
+    [ "$1" = real ] && is_passwd_home || return 0
+    if launchctl bootout "gui/$(id -u)/$daemon_label" 2>/dev/null; then
+        say "stopped $daemon_label before the rollback, so no relaunch starts the restored build with the candidate's environment"
+    fi
+}
+
 # The reload after a rollback. A failed one has nothing to verify: the old daemon may
 # never have stopped, and waiting for a stamp would only blame the wrong thing.
 rollback_reload() { # rollback_reload <mode>
@@ -591,9 +604,9 @@ version_of() { # version_of <binary>: what it says it is, like 1.0.0-rc.3; empty
     "$1" --version 2>/dev/null | awk 'NR == 1 { print $2 }' || true
 }
 
-gap_fill_fixed() { # gap_fill_fixed <version>: true from rc.4 on
+gap_fill_fixed() { # gap_fill_fixed <version>: true from rc.4 on, false when not known
     case $1 in
-        0.* | 1.0.0-rc.[123]) return 1 ;;
+        '' | 0.* | 1.0.0-rc.[123]) return 1 ;;
         *) return 0 ;;
     esac
 }
@@ -619,8 +632,12 @@ match_gap_switch() { # match_gap_switch <binary> <who is asking>
     fi
     case $gs_version in
         1.0.0-rc.[23]) ;;
+        '')
+            say "$2: $1 does not say its version, so the gap fill switch in $launchd_plist is left as it is"
+            return 0
+            ;;
         *)
-            say "$2: ${gs_version:-this build} fills gaps at start the way rc.4 fixed, and has no switch to stop it"
+            say "$2: $gs_version fills gaps at start the way rc.4 fixed, and has no switch to stop it"
             return 0
             ;;
     esac
@@ -644,6 +661,14 @@ match_gap_switch() { # match_gap_switch <binary> <who is asking>
 gap_fill_state() {
     gst_version=$(version_of "$bin")
     gst_value=$(gap_switch_value)
+    case $gst_version in
+        '')
+            echo "2 the installed build does not say its version, so what its start fills is not known"
+            return 0
+            ;;
+        # No switch in these: a 0 in the plist changes nothing for them.
+        0.* | 1.0.0-rc.1) gst_value="" ;;
+    esac
     if [ "$gst_value" = 0 ]; then
         echo "2 off: CONBUS_GAP_BUDGET_MS=0 in $launchd_plist. start takes it out for a candidate from rc.4 on, which fills the range waiting in cache/gap-since"
     elif ! gap_fill_fixed "$gst_version"; then
@@ -2899,6 +2924,7 @@ case $sub in
                 cand_pid=$(sed -n 's/.*"pid":\([0-9]*\).*/\1/p' "$stamp")
             fi
             restored_build=$(build_of "$rollback_bin")
+            stop_before_rollback "$mode"
             mv -f "$rollback_bin" "$bin"
             # The rollback happened whether or not it boots — record it
             # before verification, which exits 3 when it cannot confirm.
@@ -2936,6 +2962,7 @@ case $sub in
             old_stamp_pid=$(sed -n 's/.*"pid":\([0-9]*\).*/\1/p' "$stamp")
         fi
         cand_pid=$old_stamp_pid
+        stop_before_rollback "$mode"
         mv -f "$rollback_bin" "$bin"
         restored_build=$(build_of "$bin")
         say "rolled back $bin to $("$bin" --version 2>&1 || echo unknown) ($mode)"

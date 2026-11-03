@@ -40,7 +40,13 @@ cat "$tmp/boot/reboots" 2>/dev/null
 echo
 echo "wtmp begins Wed Oct 15 14:44"
 EOF
-chmod 755 "$tmp/boot/sysctl" "$tmp/boot/last"
+# launchctl answers by uid, not by HOME: a real one reached from here would take the
+# live recorder down. This one only writes down that it was asked, and nothing may ask.
+cat >"$tmp/boot/launchctl" <<EOF
+#!/bin/sh
+echo "\$*" >>"$tmp/launchctl.calls"
+EOF
+chmod 755 "$tmp/boot/sysctl" "$tmp/boot/last" "$tmp/boot/launchctl"
 echo 1577836800 >"$tmp/boot/boottime"
 PATH="$tmp/boot:$PATH"
 export PATH
@@ -3403,6 +3409,25 @@ code=0; run rollback >"$tmp/gap-noswitch.out" 2>&1 || code=$?
 expect 0 "$code" "a rollback to a build with no switch still happens"
 expect unset "$(plist_env CONBUS_GAP_BUDGET_MS)" "and leaves the plist alone"
 expect_grep 'has no switch to stop it' "$tmp/gap-noswitch.out" "and says what it cannot stop"
+# A 0 left under a build with no switch changes nothing for it, and status says so.
+write_plist CONBUS_GAP_BUDGET_MS 0
+write_fake 01d old "$install_dir/conbus" 0.2.9
+code=0; run status >"$tmp/gap-status-noswitch.out" 2>&1 || code=$?
+expect_grep 'gap fill at start: 0.2.9 fills gaps at start the way rc.4 fixed' "$tmp/gap-status-noswitch.out" \
+    "a 0 under 0.2.9 is not called off"
+# A build that does not say its version is not taken for a fixed one: the 0 stays.
+write_fake 01d old "$install_dir/conbus" 1.0.0-rc.4
+sed -i '' 's/^    --version) echo .*$/    --version) ;;/' "$install_dir/conbus"
+cat >"$home/.conbus/canary.json" <<EOF
+{"swapped":"$(iso_ago 3600)","prev_build":"01d","candidate_build":"beef","candidate_sha256":"x","restarts":[]}
+EOF
+code=0; run restart >"$tmp/gap-noversion.out" 2>&1 || code=$?
+expect 0 "$code" "a restart of a build that says no version"
+expect 0 "$(plist_env CONBUS_GAP_BUDGET_MS)" "leaves the 0 where it is"
+expect_grep 'does not say its version' "$tmp/gap-noversion.out" "and says why"
+code=0; run status >"$tmp/gap-status-noversion.out" 2>&1 || code=$?
+expect_grep 'gap fill at start: the installed build does not say its version' "$tmp/gap-status-noversion.out" \
+    "status does not guess either"
 write_fake 01d old "$install_dir/conbus"
 rm -f "$rollback_bin" "$home/.conbus/canary.json"
 : >"$plist"
@@ -3417,5 +3442,8 @@ expect 0 "$(grep -cv '^/usr/bin/false$' "$tmp/agy-bin.seen")" "no doctor in a re
 : >"$tmp/agy-bin.seen"
 real_path_agy=$tmp/agy-signed-in run_real status >/dev/null 2>&1 || true
 expect_grep "^$tmp/agy-signed-in\$" "$tmp/agy-bin.seen" "a signed-in agy stays for doctor on the real path"
+
+# Every run above went through the fake launchctl first on PATH, and none may have asked it.
+expect_absent "$tmp/launchctl.calls" "no rehearsal run reached launchctl"
 
 echo "rehearsal: all checks passed"
