@@ -545,16 +545,16 @@ Measured at 1.0 (2026-11-01, a 10 GB real log; `docs/plan-1.0.md`):
 1.0 is cut from `docs/plan-1.0.md`; its progress table at the end says what
 landed, what was measured and what was cut. What is left needs a person:
 
-1. **rc.4, its canary, and the release.** `v1.0.0-rc.3` was swapped onto the
+1. **The canary on rc.5, and the release.** `v1.0.0-rc.3` was swapped onto the
    live recorder on 2026-11-01. The pre-release sweep's PRs were reviewed and
    merged in order as the 1.0 candidate (#188), with the fixes after it in #189
    and the version in #190, all merged by 2026-11-03. Those change the recorder
    path, so the verdict that decides `v1.0.0` comes from a new seven-day canary
    (`docs/plan-1.0.md` §7).
    - **rc.4.** `v1.0.0-rc.4` was tagged on 2026-11-04 KST and built no Linux
-     package. Its musl tests caught a fault: musl's standard library cannot read a
-     file's birth, so a start's gap fill no longer set apart a copied transcript's
-     old lines.
+     package. Its musl tests caught a fault: Rust's standard library reads a file's
+     birth only in a glibc build. So in the musl packages, gap fill could not set
+     apart a copied transcript's old lines, and it read files in path order.
    - **rc.5.** It carries the fix, and the pull request checks now run the suite on
      the musl targets as well.
    - **What is left:** tag and sign `v1.0.0-rc.5` and start the canary on it (O2).
@@ -563,7 +563,7 @@ landed, what was measured and what was cut. What is left needs a person:
    - **First run of the stable path.** The stable release path, a draft upload and
      then publishing it, runs on GitHub for the first time at `v1.0.0`.
 
-   Until rc.4 is swapped in, every start of the live recorder runs rc.3's
+   Until rc.5 is swapped in, every start of the live recorder runs rc.3's
    start-up gap fill, which copies a parent conversation's turns into its fork
    and writes a spooled turn twice; the log cannot take either back. So the
    recorder is not restarted and the machine not rebooted before the swap.
