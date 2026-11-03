@@ -6,6 +6,19 @@ the entry says so when it does.
 
 ## [Unreleased]
 
+## [1.0.0-rc.5] — 2026-11-03
+
+rc.4 with one fix to the Linux packages. Everything rc.4 lists below is in it.
+
+### Fixed
+
+- On Linux, a start's gap fill again sets apart the old lines of a copied or moved
+  transcript. The packages are musl builds. musl's standard library cannot read a
+  file's birth time, so every line counted as its file's own, and a start filled a
+  copy's old turns. conbus now asks `statx` for the birth itself. Its tests caught
+  this on the rc.4 tag, so that tag built no Linux package. The pull request checks
+  now run the suite on the musl targets too.
+
 ## [1.0.0-rc.4] — 2026-11-03
 
 The candidate the 1.0 canary runs on. Most of it keeps records through trouble: a

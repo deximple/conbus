@@ -1,6 +1,6 @@
 # conbus manual
 
-This manual describes **conbus 1.0.0-rc.4** on macOS and Linux. For the short version, read
+This manual describes **conbus 1.0.0-rc.5** on macOS and Linux. For the short version, read
 the [README](../README.md); for what changed between releases, the
 [CHANGELOG](../CHANGELOG.md). 한국어: [manual.ko.md](manual.ko.md)
 
