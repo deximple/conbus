@@ -40,7 +40,13 @@ cat "$tmp/boot/reboots" 2>/dev/null
 echo
 echo "wtmp begins Wed Oct 15 14:44"
 EOF
-chmod 755 "$tmp/boot/sysctl" "$tmp/boot/last"
+# launchctl answers by uid, not by HOME: a real one reached from here would take the
+# live recorder down. This one only writes down that it was asked, and nothing may ask.
+cat >"$tmp/boot/launchctl" <<EOF
+#!/bin/sh
+echo "\$*" >>"$tmp/launchctl.calls"
+EOF
+chmod 755 "$tmp/boot/sysctl" "$tmp/boot/last" "$tmp/boot/launchctl"
 echo 1577836800 >"$tmp/boot/boottime"
 PATH="$tmp/boot:$PATH"
 export PATH
@@ -132,10 +138,11 @@ usage_rows() { # usage_rows <first-iso> <harness>...
 #   flap      — doctor sleeps on its first call, then answers fast: a
 #               single-shot time budget flakes where a median does not
 #   polfail   — `policy check` exits 1: a file that cannot be a policy
-write_fake() {
+write_fake() { # write_fake <tag> <persona> <path> [<version>]
     tag=$1
     persona=${2:-silent}
     path=$3
+    version=${4:-0.0.0-$tag}
     install_body='touch "$HOME/.install-called"'
     case $persona in
         old) install_body='touch "$HOME/.install-called"; printf "{\"build\":\"'"$tag"'\",\"pid\":$$,\"started\":\"2026-11-01T10:00:00.000Z\",\"serving\":\"2026-11-01T10:00:04.000Z\"}\n" > "$HOME/.conbus/daemon.build"'
@@ -208,7 +215,7 @@ write_fake() {
 $rotates_note
 case "\$1" in doctor|quota|status) echo "\${CONBUS_AGY_BIN:-unset}" >>"$tmp/agy-bin.seen" ;; esac
 case "\$1" in
-    --version) echo "conbus 0.0.0-$tag ($tag)" ;;
+    --version) echo "conbus $version ($tag)" ;;
     doctor) $doctor ;;
     log)
         case "\$2" in
@@ -242,7 +249,11 @@ case "\$1" in
         exit 0
         ;;
     policy) $policy_body ;;
-    install) $install_body ;;
+    install)
+        # What launchd would start this build with: the plist's gap fill switch, now.
+        echo "\$(plutil -extract EnvironmentVariables.CONBUS_GAP_BUDGET_MS raw -o - "\$HOME/Library/LaunchAgents/sh.conbus.daemon.plist" 2>/dev/null || echo unset)" >>"\$HOME/.install-gap-switch"
+        $install_body
+        ;;
     *) echo "fake-$tag: \$*" ;;
 esac
 EOF
@@ -3292,6 +3303,135 @@ code=0; run verdict >"$tmp/verdict-chat-and-cursor.out" 2>&1 || code=$?
 expect 4 "$code" "a harness with a hook still is"
 expect_grep 'answer with --idle cursor$' "$tmp/verdict-chat-and-cursor.out" "and only that one"
 
+# --- the start-up gap fill switch -------------------------------------------
+
+# Up to rc.3 the gap fill a start runs writes records an append-only log cannot take
+# back. So rc.2 and rc.3 are loaded with CONBUS_GAP_BUDGET_MS=0 in the plist, and a fixed
+# build has a 0 taken out before it is loaded. Each fake's `install --apply` notes the
+# switch it found there: what launchd would have started that build with.
+plist=$home/Library/LaunchAgents/sh.conbus.daemon.plist
+write_plist() { # write_plist [<name> <value>]...: a plist the way conbus writes one
+    {
+        printf '<?xml version="1.0" encoding="UTF-8"?>\n'
+        printf '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+        printf '<plist version="1.0">\n<dict>\n  <key>Label</key><string>sh.conbus.daemon</string>\n'
+        if [ $# -gt 0 ]; then
+            printf '  <key>EnvironmentVariables</key>\n  <dict>\n'
+            while [ $# -gt 1 ]; do
+                printf '    <key>%s</key><string>%s</string>\n' "$1" "$2"
+                shift 2
+            done
+            printf '  </dict>\n'
+        fi
+        printf '</dict>\n</plist>\n'
+    } >"$plist"
+}
+plist_env() { # plist_env <name>: what the plist gives it, or "unset"
+    plutil -extract "EnvironmentVariables.$1" raw -o - "$plist" 2>/dev/null || echo unset
+}
+install_saw() { sed -n "${1:-\$}p" "$home/.install-gap-switch" 2>/dev/null; }
+
+# preflight says what a restart before the swap would run.
+write_plist CONBUS_RETENTION encrypted_tools
+write_fake 01d old "$install_dir/conbus" 1.0.0-rc.3
+code=0; run preflight >"$tmp/gap-preflight-rc3.out" 2>&1 || code=$?
+expect_grep '^WARN gap-fill-at-start 1.0.0-rc.3 fills gaps at start the way rc.4 fixed' \
+    "$tmp/gap-preflight-rc3.out" "preflight warns that a restart before the swap runs rc.3's fill"
+
+# A rollback to rc.3 sets the switch before rc.3's own install --apply reads the plist,
+# and keeps the rest of the plist.
+write_fake beef live "$install_dir/conbus"
+write_fake 01d old "$rollback_bin" 1.0.0-rc.3
+write_stamp beef 4601
+rm -f "$home/.install-gap-switch"
+code=0; SERVING_LIMIT=2 run_real rollback >"$tmp/gap-rollback.out" 2>&1 || code=$?
+expect 0 "$code" "a rollback to rc.3 is verified"
+expect 0 "$(plist_env CONBUS_GAP_BUDGET_MS)" "it leaves CONBUS_GAP_BUDGET_MS=0 in the plist"
+expect 0 "$(install_saw)" "rc.3's install --apply already found it there"
+expect encrypted_tools "$(plist_env CONBUS_RETENTION)" "the plist keeps what else it gives the recorder"
+expect_grep 'start-up gap fill is off for 1.0.0-rc.3' "$tmp/gap-rollback.out" "the rollback says so"
+code=0; run status >"$tmp/gap-status.out" 2>&1 || code=$?
+expect_grep 'gap fill at start: off: CONBUS_GAP_BUDGET_MS=0' "$tmp/gap-status.out" "status names the switch"
+code=0; run preflight >"$tmp/gap-preflight-off.out" 2>&1 || code=$?
+expect_grep '^WARN gap-fill-at-start off: CONBUS_GAP_BUDGET_MS=0' "$tmp/gap-preflight-off.out" "so does preflight, as a warning"
+
+# start takes it out before a fixed candidate's install --apply, so the candidate's
+# start fills the range waiting in cache/gap-since.
+write_fake beef live "$tmp/stage/conbus-fixed" 1.0.0-rc.4
+rm -f "$rollback_bin" "$home/.conbus/canary.json" "$home/.install-gap-switch"
+daemon_boot beef 4602
+code=0; run_real start --from "$tmp/stage/conbus-fixed" >"$tmp/gap-start.out" 2>&1 || code=$?
+expect 0 "$code" "a fixed candidate starts over a plist an rc.3 rollback left"
+expect unset "$(plist_env CONBUS_GAP_BUDGET_MS)" "start took the 0 out"
+expect unset "$(install_saw)" "before the candidate's install --apply read the plist"
+expect encrypted_tools "$(plist_env CONBUS_RETENTION)" "and left the rest"
+expect_grep 'took CONBUS_GAP_BUDGET_MS=0 out' "$tmp/gap-start.out" "start says so"
+
+# A fixed candidate that fails rolls back to rc.3, and the switch goes back in first.
+write_fake beef dropper "$tmp/stage/conbus-fixed-dropper" 1.0.0-rc.4
+write_fake 01d old "$install_dir/conbus" 1.0.0-rc.3
+rm -f "$rollback_bin" "$home/.conbus/canary.json" "$home/.install-gap-switch"
+cat >"$home/.conbus/drops.jsonl" <<'EOF'
+{"ts":"2026-10-30T09:00:00.000Z","reason":"socket closed early"}
+EOF
+daemon_boot beef 4603
+code=0; SERVING_LIMIT=2 run_real start --from "$tmp/stage/conbus-fixed-dropper" >"$tmp/gap-auto.out" 2>&1 || code=$?
+expect 1 "$code" "a failing fixed candidate rolls back to rc.3"
+expect unset "$(install_saw 1)" "the candidate's install --apply ran with the fill on"
+expect 0 "$(install_saw)" "rc.3's install --apply ran with it off"
+expect 0 "$(plist_env CONBUS_GAP_BUDGET_MS)" "and the switch stays for rc.3's restarts and reboots"
+
+# A restart of rc.3 turns the fill off first, a plist with no environment at all included,
+# and refuses before reloading when the plist cannot take the switch.
+write_plist
+cat >"$home/.conbus/canary.json" <<EOF
+{"swapped":"$(iso_ago 3600)","prev_build":"01d","candidate_build":"beef","candidate_sha256":"x","restarts":[]}
+EOF
+code=0; run restart >"$tmp/gap-restart.out" 2>&1 || code=$?
+expect 0 "$code" "a restart of rc.3"
+expect 0 "$(plist_env CONBUS_GAP_BUDGET_MS)" "sets the switch first, into a new EnvironmentVariables"
+printf 'not a plist\n' >"$plist"
+code=0; run restart >"$tmp/gap-restart-bad.out" 2>&1 || code=$?
+expect 2 "$code" "a restart of rc.3 whose plist cannot take the switch is refused"
+expect_grep 'not restarting' "$tmp/gap-restart-bad.out" "before anything reloads"
+
+# A fixed build keeps a budget someone set. A build with no switch says what it cannot
+# stop, and the plist is left alone.
+write_plist CONBUS_GAP_BUDGET_MS 30000
+write_fake beef live "$install_dir/conbus" 1.0.0-rc.4
+code=0; run restart >"$tmp/gap-own.out" 2>&1 || code=$?
+expect 0 "$code" "a restart of a fixed build"
+expect 30000 "$(plist_env CONBUS_GAP_BUDGET_MS)" "keeps a budget someone set"
+write_plist CONBUS_RETENTION encrypted_tools
+write_fake beef live "$install_dir/conbus"; write_fake 01d old "$rollback_bin"
+write_stamp beef 4604
+code=0; run rollback >"$tmp/gap-noswitch.out" 2>&1 || code=$?
+expect 0 "$code" "a rollback to a build with no switch still happens"
+expect unset "$(plist_env CONBUS_GAP_BUDGET_MS)" "and leaves the plist alone"
+expect_grep 'has no switch to stop it' "$tmp/gap-noswitch.out" "and says what it cannot stop"
+# A 0 left under a build with no switch changes nothing for it, and status says so.
+write_plist CONBUS_GAP_BUDGET_MS 0
+write_fake 01d old "$install_dir/conbus" 0.2.9
+code=0; run status >"$tmp/gap-status-noswitch.out" 2>&1 || code=$?
+expect_grep 'gap fill at start: 0.2.9 fills gaps at start the way rc.4 fixed' "$tmp/gap-status-noswitch.out" \
+    "a 0 under 0.2.9 is not called off"
+# A build that does not say its version is not taken for a fixed one: the 0 stays.
+write_fake 01d old "$install_dir/conbus" 1.0.0-rc.4
+sed -i '' 's/^    --version) echo .*$/    --version) ;;/' "$install_dir/conbus"
+cat >"$home/.conbus/canary.json" <<EOF
+{"swapped":"$(iso_ago 3600)","prev_build":"01d","candidate_build":"beef","candidate_sha256":"x","restarts":[]}
+EOF
+code=0; run restart >"$tmp/gap-noversion.out" 2>&1 || code=$?
+expect 0 "$code" "a restart of a build that says no version"
+expect 0 "$(plist_env CONBUS_GAP_BUDGET_MS)" "leaves the 0 where it is"
+expect_grep 'does not say its version' "$tmp/gap-noversion.out" "and says why"
+code=0; run status >"$tmp/gap-status-noversion.out" 2>&1 || code=$?
+expect_grep 'gap fill at start: the installed build does not say its version' "$tmp/gap-status-noversion.out" \
+    "status does not guess either"
+write_fake 01d old "$install_dir/conbus"
+rm -f "$rollback_bin" "$home/.conbus/canary.json"
+: >"$plist"
+
 # A real build under this throwaway HOME would ask an agy that is not signed
 # in, and a build older than the sign-in check opens a browser tab doing it.
 expect_file "$tmp/agy-bin.seen" "the fakes saw doctor run"
@@ -3302,5 +3442,8 @@ expect 0 "$(grep -cv '^/usr/bin/false$' "$tmp/agy-bin.seen")" "no doctor in a re
 : >"$tmp/agy-bin.seen"
 real_path_agy=$tmp/agy-signed-in run_real status >/dev/null 2>&1 || true
 expect_grep "^$tmp/agy-signed-in\$" "$tmp/agy-bin.seen" "a signed-in agy stays for doctor on the real path"
+
+# Every run above went through the fake launchctl first on PATH, and none may have asked it.
+expect_absent "$tmp/launchctl.calls" "no rehearsal run reached launchctl"
 
 echo "rehearsal: all checks passed"

@@ -83,9 +83,10 @@ pub fn is_refusal(err: &io::Error) -> bool {
 
 /// Whether the server said it has no such method: the one refusal that asking again
 /// cannot change. JSON-RPC's own word for it is -32601. The real server parses a
-/// request into an enum, and its binary holds "Invalid request: " and "unknown
-/// variant" but no "method not found", so it would answer in those words. A real
-/// server has not been seen doing so.
+/// request into an enum, and answers a method it does not have with code -32600 and
+/// "Invalid request: unknown variant `<method>`" (codex-cli 0.166.0). It also gives
+/// -32601 "list_turns is not supported yet" for a continuation file's session id,
+/// a thread it cannot list.
 pub fn is_unknown_method(err: &io::Error, method: &str) -> bool {
     let said = err.to_string();
     is_refusal(err)

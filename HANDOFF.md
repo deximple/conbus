@@ -208,6 +208,37 @@ Argued through four review rounds; the reasoning is in the plan.
 - **Desktop spends quota the hooks never see.** Same account, no hook traffic.
   The bus is a passenger on any surface it did not spawn — the design said so;
   this is the measurement.
+- **What the gap fill's app-server calls do** (codex-cli 0.166.0, 2026-11-04).
+  Measured on APFS clones of the real `state_5.sqlite` and
+  `thread_history_1.sqlite` and the rollouts, with no auth and no network.
+  - The turns come out of those two databases. Rollouts alone list nothing,
+    which is why an earlier probe saw empty lists.
+  - `thread/turns/list` honours `sortDirection: asc`, and its default is
+    descending. Paging by two through a 463-turn thread gave the same turns, in
+    the same order, as one call.
+  - Every turn has an integer `startedAt` and a UUIDv7 `id`, which is what
+    `oldest_first` sorts on.
+  - An unknown thread is `-32600 thread not loaded: <id>`. An unknown method is
+    `-32600 Invalid request: unknown variant …`.
+  - A thread that goes on in a new file names it
+    `rollout-<stamp>-<thread>_<session>.jsonl` and compresses the file before
+    it to `.jsonl.zst`. `thread/list` lists every one of those files under the
+    thread id, and hooks name the thread id. Asking for the session id gets
+    `-32601 list_turns is not supported yet`, which `is_unknown_method` skips
+    without holding the range.
+  - `rollout_thread_id` read such a name as the session, the last 36
+    characters, until rc.4. So the thread's newest file never counted for it,
+    and a start never asked for a thread that was still going. It now reads the
+    thread id before the underscore. A by-hand fill asks every thread, and on
+    clones of this machine's log and `~/.codex` it found the same two missing
+    turns with and without the fix, with a 463-turn thread of this kind among
+    those asked. On 2026-11-04, 20 of 3,421 rollouts were named this way, for 8
+    threads, and 17 of the 20 were `.jsonl.zst`: a continuation file is
+    compressed too.
+  - `initialize` and `thread/turns/list` start no MCP server; `thread/start`
+    does.
+  - With stdin closed, the server exits 0 within 0.1 s, and its MCP child goes
+    with it.
 
 **Grok**
 
@@ -517,13 +548,21 @@ landed, what was measured and what was cut. What is left needs a person:
 1. **rc.4, its canary, and the release.** `v1.0.0-rc.3` was swapped onto the
    live recorder on 2026-11-01. The pre-release sweep's PRs were reviewed and
    merged in order as the 1.0 candidate (#188), with the fixes after it in #189
-   and the version in #190. Those change the recorder path, so the verdict that
-   decides `v1.0.0` comes from a new seven-day canary on `v1.0.0-rc.4`
-   (`docs/plan-1.0.md` §7). What is left is the operator's or a later
-   session's: merge #189 and #190, tag `v1.0.0-rc.4` and sign it, start the
-   canary (O2), read the verdict when its window closes, and only on a pass tag,
-   sign and publish `v1.0.0` (O3). The stable release path, a draft upload and
-   then publishing it, runs on GitHub for the first time at `v1.0.0`.
+   and the version in #190, all merged by 2026-11-03. Those change the recorder
+   path, so the verdict that decides `v1.0.0` comes from a new seven-day canary
+   on `v1.0.0-rc.4` (`docs/plan-1.0.md` §7). What is left is the operator's or a
+   later session's: tag `v1.0.0-rc.4` (on another day than the changelog's,
+   fix that heading's date first) and sign it, start the canary (O2), read the
+   verdict when its window closes, and only on a pass tag, sign and publish
+   `v1.0.0` (O3). The stable release path, a draft upload and then publishing
+   it, runs on GitHub for the first time at `v1.0.0`.
+
+   Until rc.4 is swapped in, every start of the live recorder runs rc.3's
+   start-up gap fill, which copies a parent conversation's turns into its fork
+   and writes a spooled turn twice; the log cannot take either back. So the
+   recorder is not restarted and the machine not rebooted before the swap.
+   `canary.sh` loads rc.2 and rc.3 with that fill off (`docs/release.md`), but
+   only through its own subcommands.
 2. **RFD 0002 and 0003** stay drafts until the operator accepts them; no sync
    service exists.
 3. Then back to `docs/self-improve.md`, from live evidence rather than this

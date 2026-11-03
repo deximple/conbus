@@ -365,8 +365,11 @@ fn a_repair_that_gives_up_takes_its_wedged_server_with_it() {
     env_for(&mut command, &case);
     let mut daemon = DaemonGroup(
         command
-            .env("CONBUS_TEST_PREPARE_LIMIT_MS", "8000")
-            // The server's own limit, which would otherwise end it first.
+            // Well before the server's own limit. That is the gap budget, but never
+            // more than 8 s, so at 8000 ms the two raced, about 70 ms apart, and a
+            // busy runner let the server's limit end it first.
+            .env("CONBUS_TEST_PREPARE_LIMIT_MS", "4000")
+            // So that the budget is not what ends it first either.
             .env("CONBUS_GAP_BUDGET_MS", "120000")
             .stderr(Stdio::piped())
             .spawn()

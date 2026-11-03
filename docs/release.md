@@ -205,6 +205,40 @@ being replaced. It is copied first, so `--parity ~/.local/bin/conbus.rollback` c
 against an older copy before `start` replaces it. `preflight` and `start` print both
 builds by version and hash.
 
+An older build's start-up gap fill: up to rc.3, the gap fill a start runs copies a parent
+conversation's turns into its fork and writes a spooled turn twice, and the log keeps
+both.
+
+- **Loading rc.2 or rc.3.** Before a rollback, or a `restart` of one of those builds,
+  the script sets `CONBUS_GAP_BUDGET_MS=0` in the launchd plist.
+- **The rollback itself.** A real rollback stops the job before the old binary goes
+  back. Otherwise a relaunch in between would start it with the candidate's
+  environment.
+- **What that build then does.** Its start fills nothing and leaves its range in
+  `cache/gap-since`. Its `install --apply` keeps the value for every restart and reboot
+  after it.
+- **Limit: transcripts.** The switch needs a transcript under `~/.claude/projects`. With
+  none, rc.2 and rc.3 never reach the check. They read the chat export folder with no
+  limit and delete `cache/gap-since`.
+- **Limit: the spool drain.** The switch stops only the gap fill. rc.3's spool drain
+  still runs at every start.
+- **Loading rc.4 or later.** `start` and `restart` take a 0 out first, so the build's
+  own start fills the range. A budget someone set stays for a fixed build.
+- **0.2.x and rc.1.** They have no switch, and a rollback to one says so.
+- **Seeing it.** `preflight` and `status` show the switch.
+
+Until the script has set it, a restart or reboot of rc.3 runs its fill. That is the case
+on a recorder that has run rc.3 since its swap.
+
+Once set, the 0 stays through reboots and through every `install --apply`. That includes
+a fixed build loaded any way other than `start` or `restart`. Such a build then puts off
+every start's fill, and `doctor` only shows the held range. Take the 0 out before that
+`install --apply`:
+
+```sh
+plutil -remove EnvironmentVariables.CONBUS_GAP_BUDGET_MS ~/Library/LaunchAgents/sh.conbus.daemon.plist
+```
+
 What the verdict cannot see, so a PASS does not rule it out:
 
 - A drop log truncated back to its size at the swap. It is the same file with the same
@@ -221,7 +255,8 @@ by one rotation reads as evidence rotated away, and gives exit 4.
 `start` exits 1 when it rolled back, or when it found no candidate or install to swap.
 It exits 2 when it refused before anything moved.
 `start` and `rollback` exit 3 when the rollback could not be verified, and say which
-check it was. `restart` exits 1 when the daemon never served.
+check it was. `restart` exits 1 when the daemon never served, and 2 when it refused
+before reloading.
 
 ## Operator decisions
 
