@@ -873,8 +873,86 @@ fn not_regular(path: &Path) -> io::Error {
 }
 
 /// When a file was created, where the file system keeps that.
+///
+/// The standard library asks `statx` for it only in a glibc build. A musl build, the
+/// one the Linux packages ship, has `created()` answer that it cannot tell. Every
+/// line then counted as its file's own, and a start filled a copied or moved
+/// transcript's old turns again. So Linux asks `statx` itself when that happens.
 fn born(path: &Path) -> Option<std::time::SystemTime> {
-    fs::metadata(path).ok()?.created().ok()
+    fs::metadata(path)
+        .ok()?
+        .created()
+        .ok()
+        .or_else(|| statx_birth(path))
+}
+
+/// A file's birth from `statx(2)`, Linux 4.11 on. `None` when the file system keeps
+/// no birth time or the call fails.
+#[cfg(target_os = "linux")]
+fn statx_birth(path: &Path) -> Option<std::time::SystemTime> {
+    use std::os::unix::ffi::OsStrExt;
+
+    /// `struct statx_timestamp` in `linux/stat.h`.
+    #[repr(C)]
+    struct StatxTimestamp {
+        sec: i64,
+        nsec: u32,
+        _reserved: i32,
+    }
+    /// `struct statx` in `linux/stat.h`: what this reads, then the rest of its 256
+    /// bytes, which the kernel may fill and this does not read.
+    #[repr(C)]
+    struct Statx {
+        mask: u32,
+        _blksize: u32,
+        _attributes: u64,
+        _nlink: u32,
+        _uid: u32,
+        _gid: u32,
+        _mode: u16,
+        _spare0: u16,
+        _ino: u64,
+        _size: u64,
+        _blocks: u64,
+        _attributes_mask: u64,
+        _atime: StatxTimestamp,
+        btime: StatxTimestamp,
+        _rest: [u64; 20],
+    }
+    const _: () = assert!(std::mem::size_of::<Statx>() == 256);
+    const STATX_BTIME: u32 = 0x0800;
+
+    let name = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut buf = std::mem::MaybeUninit::<Statx>::zeroed();
+    // SAFETY: `name` is a NUL-terminated path that lives past the call, and `buf` is a
+    // writable `struct statx` the size the kernel writes. `statx` reads the one and
+    // writes only into the other.
+    let said = unsafe {
+        libc::syscall(
+            libc::SYS_statx,
+            libc::AT_FDCWD,
+            name.as_ptr(),
+            0,
+            STATX_BTIME,
+            buf.as_mut_ptr(),
+        )
+    };
+    if said != 0 {
+        return None;
+    }
+    // SAFETY: zeroed is a valid `Statx`, every field an integer, and the kernel has
+    // written over it.
+    let stat = unsafe { buf.assume_init() };
+    if stat.mask & STATX_BTIME == 0 {
+        return None;
+    }
+    let since = std::time::Duration::new(u64::try_from(stat.btime.sec).ok()?, stat.btime.nsec);
+    std::time::UNIX_EPOCH.checked_add(since)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn statx_birth(_: &Path) -> Option<std::time::SystemTime> {
+    None
 }
 
 /// [`born`], as a stamp.
@@ -4081,6 +4159,36 @@ for line in sys.stdin:
         let file = fs::File::create(dir.join(name)).expect("rollout");
         file.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(stamp))
             .expect("mtime");
+    }
+
+    /// On glibc the standard library reads the birth through `statx` too, so the two
+    /// agree to the nanosecond. On musl it cannot tell, and this is the only way the
+    /// birth is known.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn statx_reads_the_birth_the_standard_library_does() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("t.jsonl");
+        fs::write(&file, b"{}\n").expect("write");
+        match fs::metadata(&file).expect("metadata").created() {
+            Ok(birth) => {
+                assert_eq!(statx_birth(&file), Some(birth));
+                assert_eq!(born(&file), Some(birth));
+            }
+            Err(_) if cfg!(target_env = "musl") => {
+                let birth = statx_birth(&file).expect("statx gives the birth on musl");
+                let age = std::time::SystemTime::now()
+                    .duration_since(birth)
+                    .expect("not born in the future");
+                assert!(age < std::time::Duration::from_secs(60), "{age:?}");
+                assert_eq!(born(&file), Some(birth));
+            }
+            // A file system that keeps no birth time.
+            Err(_) => {
+                assert_eq!(statx_birth(&file), None);
+                assert_eq!(born(&file), None);
+            }
+        }
     }
 
     #[test]
