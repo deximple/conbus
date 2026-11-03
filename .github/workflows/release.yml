@@ -117,7 +117,9 @@ jobs:
           rustup target add ${{ matrix.target }}
 
       - name: musl toolchain
-        run: sudo apt-get install -y musl-tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends musl-tools
 
       - name: The tag names the version being released
         if: startsWith(github.ref, 'refs/tags/')

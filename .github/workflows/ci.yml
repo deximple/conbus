@@ -84,6 +84,8 @@ jobs:
           rustup toolchain install
           rustc --version
 
+      # The musl build is made fresh rather than cached: kept, it grew this cache by
+      # half, and the repository's caches are already past GitHub's 10 GB.
       - uses: actions/cache@v4
         with:
           path: |
@@ -91,6 +93,7 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
+            !target/x86_64-unknown-linux-musl
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-
 
@@ -102,6 +105,19 @@ jobs:
 
       - name: test
         run: cargo test --workspace --locked --no-fail-fast
+
+      # The packages are musl builds, and Rust's standard library is not the same on
+      # musl: it reads a file's birth only on glibc, for one. The suite runs on the
+      # target that ships as well, so a musl-only fault fails here rather than on the
+      # release tag.
+      - name: musl toolchain
+        run: |
+          rustup target add x86_64-unknown-linux-musl
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends musl-tools
+
+      - name: test (musl, the target that ships)
+        run: cargo test --workspace --locked --no-fail-fast --target x86_64-unknown-linux-musl
 
       # GNU tar here, where the gate has BSD tar: package.sh's owner flags need both.
       - name: sign-release rehearsal
@@ -118,6 +134,8 @@ jobs:
           rustup toolchain install
           rustc --version
 
+      # The musl build is made fresh rather than cached: kept, it grew this cache by
+      # half, and the repository's caches are already past GitHub's 10 GB.
       - uses: actions/cache@v4
         with:
           path: |
@@ -125,6 +143,7 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
+            !target/aarch64-unknown-linux-musl
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-
 
@@ -136,3 +155,16 @@ jobs:
 
       - name: test
         run: cargo test --workspace --locked --no-fail-fast
+
+      # The packages are musl builds, and Rust's standard library is not the same on
+      # musl: it reads a file's birth only on glibc, for one. The suite runs on the
+      # target that ships as well, so a musl-only fault fails here rather than on the
+      # release tag.
+      - name: musl toolchain
+        run: |
+          rustup target add aarch64-unknown-linux-musl
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends musl-tools
+
+      - name: test (musl, the target that ships)
+        run: cargo test --workspace --locked --no-fail-fast --target aarch64-unknown-linux-musl

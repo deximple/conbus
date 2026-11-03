@@ -6,6 +6,29 @@ the entry says so when it does.
 
 ## [Unreleased]
 
+## [1.0.0-rc.5] — 2026-11-03
+
+rc.4 with one fix to the Linux packages. Everything rc.4 lists below is in it.
+
+### Fixed
+
+- The Linux packages now get rc.4's fix for forks, which needs each transcript's
+  birth time. Gap fill, at a start and in `backfill --gaps`, sets apart lines older
+  than their file and reads the oldest file first.
+  - The packages are musl builds, and Rust's standard library reads a file's birth
+    time only in a glibc build.
+  - So in a musl build every line counted as its file's own, and files were read in
+    path order.
+  - conbus now asks the kernel (`statx`) for the birth itself.
+  - The rc.4 tag's tests caught this, so rc.4 has no Linux package. The pull request
+    checks now run the suite on the musl targets too.
+
+### Known limits
+
+- On a Linux file system that keeps no birth time, or on a kernel before 4.11, gap
+  fill still cannot tell a copied line from its file's own, and it reads files in
+  path order.
+
 ## [1.0.0-rc.4] — 2026-11-03
 
 The candidate the 1.0 canary runs on. Most of it keeps records through trouble: a
