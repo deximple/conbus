@@ -874,10 +874,11 @@ fn not_regular(path: &Path) -> io::Error {
 
 /// When a file was created, where the file system keeps that.
 ///
-/// The standard library asks `statx` for it only in a glibc build. A musl build, the
-/// one the Linux packages ship, has `created()` answer that it cannot tell. Every
-/// line then counted as its file's own, and a start filled a copied or moved
-/// transcript's old turns again. So Linux asks `statx` itself when that happens.
+/// Rust's standard library asks `statx` for it only in a glibc build. A musl build, the
+/// one the Linux packages ship, has `created()` answer that it cannot tell. Every line
+/// then counted as its file's own, a copied or moved transcript's old turns were
+/// filled, and files were read in path order rather than oldest first. So Linux asks
+/// `statx` itself when that happens.
 fn born(path: &Path) -> Option<std::time::SystemTime> {
     fs::metadata(path)
         .ok()?
@@ -4163,24 +4164,50 @@ for line in sys.stdin:
 
     /// On glibc the standard library reads the birth through `statx` too, so the two
     /// agree to the nanosecond. On musl it cannot tell, and this is the only way the
-    /// birth is known.
+    /// birth is known. A new file's other times are its birth to the nanosecond on
+    /// ext4, so they are moved off it first: a `Statx` that read the wrong field fails.
+    /// A musl run needs a file system that keeps birth times.
     #[cfg(target_os = "linux")]
     #[test]
     fn statx_reads_the_birth_the_standard_library_does() {
+        use std::os::unix::fs::MetadataExt;
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
         let dir = tempfile::tempdir().expect("tempdir");
         let file = dir.path().join("t.jsonl");
         fs::write(&file, b"{}\n").expect("write");
-        match fs::metadata(&file).expect("metadata").created() {
+        // Past a clock tick, so the change time `set_times` leaves moves off the birth.
+        std::thread::sleep(Duration::from_millis(50));
+        let long_ago = UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        fs::File::options()
+            .write(true)
+            .open(&file)
+            .expect("open")
+            .set_times(
+                fs::FileTimes::new()
+                    .set_accessed(long_ago)
+                    .set_modified(long_ago),
+            )
+            .expect("set times");
+        let meta = fs::metadata(&file).expect("metadata");
+        let changed = UNIX_EPOCH
+            + Duration::new(
+                u64::try_from(meta.ctime()).expect("ctime"),
+                u32::try_from(meta.ctime_nsec()).expect("ctime_nsec"),
+            );
+        match meta.created() {
             Ok(birth) => {
                 assert_eq!(statx_birth(&file), Some(birth));
                 assert_eq!(born(&file), Some(birth));
             }
             Err(_) if cfg!(target_env = "musl") => {
                 let birth = statx_birth(&file).expect("statx gives the birth on musl");
-                let age = std::time::SystemTime::now()
+                assert_ne!(birth, long_ago, "read the access or the modification time");
+                assert_ne!(birth, changed, "read the change time");
+                let age = SystemTime::now()
                     .duration_since(birth)
                     .expect("not born in the future");
-                assert!(age < std::time::Duration::from_secs(60), "{age:?}");
+                assert!(age < Duration::from_secs(60), "{age:?}");
                 assert_eq!(born(&file), Some(birth));
             }
             // A file system that keeps no birth time.
