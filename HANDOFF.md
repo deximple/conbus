@@ -550,12 +550,18 @@ landed, what was measured and what was cut. What is left needs a person:
    merged in order as the 1.0 candidate (#188), with the fixes after it in #189
    and the version in #190, all merged by 2026-11-03. Those change the recorder
    path, so the verdict that decides `v1.0.0` comes from a new seven-day canary
-   on `v1.0.0-rc.4` (`docs/plan-1.0.md` §7). What is left is the operator's or a
-   later session's: tag `v1.0.0-rc.4` (on another day than the changelog's,
-   fix that heading's date first) and sign it, start the canary (O2), read the
-   verdict when its window closes, and only on a pass tag, sign and publish
-   `v1.0.0` (O3). The stable release path, a draft upload and then publishing
-   it, runs on GitHub for the first time at `v1.0.0`.
+   (`docs/plan-1.0.md` §7).
+   - **rc.4.** `v1.0.0-rc.4` was tagged on 2026-11-04 KST and built no Linux
+     package. Its musl tests caught a fault: musl's standard library cannot read a
+     file's birth, so a start's gap fill no longer set apart a copied transcript's
+     old lines.
+   - **rc.5.** It carries the fix, and the pull request checks now run the suite on
+     the musl targets as well.
+   - **What is left:** tag and sign `v1.0.0-rc.5` and start the canary on it (O2).
+     Read the verdict when its window closes. Only on a pass, tag, sign and publish
+     `v1.0.0` (O3).
+   - **First run of the stable path.** The stable release path, a draft upload and
+     then publishing it, runs on GitHub for the first time at `v1.0.0`.
 
    Until rc.4 is swapped in, every start of the live recorder runs rc.3's
    start-up gap fill, which copies a parent conversation's turns into its fork

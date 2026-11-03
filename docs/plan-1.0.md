@@ -416,7 +416,8 @@ Copilot CLI 어댑터(설치·실 payload 필요), Gemini CLI 어댑터, 프롬�
 | 머지 뒤 정리 | 완료, 머지(2026-11-03) | #189 | 전체 테스트 1,505 통과·0 실패·4 무시, sign-release 리허설 317 통과, 새 check-docs 가드가 옛 문서에서 73줄을 잡음 | 최종 리뷰가 남긴 6건: SIGHUP도 쥔 기록을 착지시킴(시작 복구가 데몬 안에서 돈 뒤 포함), 120 s 감시견이 끝내기 전에 app-server 그룹을 죽임, `uninstall`이 `XDG_STATE_HOME`을 따름, `backfill --gaps --include-older-lines`는 experimental, README와 매뉴얼의 셸 예제를 zsh에 붙여넣을 수 있게 하고 check-docs가 주석을 막음, `conbus auth`의 `could not tell` 배너 설명 |
 | rc.4 버전 | 완료, 머지(2026-11-03). 태그는 운영자 | #190 | `check-docs` 초록(1.0.0-rc.4, 명령 21개). `package.sh`가 뽑는 릴리스 노트는 한 절, 제목 4개 | 버전 1.0.0-rc.4. CHANGELOG의 머지된 절을 Added·Changed·Fixed·Known limits 한 절로 다시 씀(공개 릴리스 노트가 된다). O7 결정 반영. 남은 것은 운영자나 이후 세션의 몫: `v1.0.0-rc.4` 태그·서명·공증 → canary 시작(O2) → 7일 판정. 태그를 다른 날 찍으면 CHANGELOG의 rc.4 제목 날짜를 그날로 먼저 고친다 |
 | rc.4 태그 전 보강 | PR 열림, 머지는 운영자 | #191 | 리허설 855개 통과(두 번). 실제 rc.3과 rc.4 빌드로 시나리오 3개. 실제 Codex app-server 0.166.0 확인. `backfill --gaps` 미리보기는 고치기 전후 같음(Codex 스레드 2개, 턴 2개) | canary는 rc.2와 rc.3을 시작 gap fill을 끈 채로 올리고, rc.4 이후 후보를 올리기 전에 다시 켠다. Codex의 `rollout-<stamp>-<스레드>_<세션>.jsonl`을 세션이 아니라 스레드로 읽는다. 실제 서버에서 확인한 것: 턴 순서와 페이지, 오류 문구, MCP를 띄우지 않음, stdin이 닫히면 종료 |
-| 1.0.0 | 남음 | | | rc.4 canary 판정 통과와 운영자 승인(O3) 뒤 8절 순서대로. 정식 태그의 릴리스 경로(draft 업로드 → 서명 → 게시)는 GitHub에서 아직 한 번도 돌지 않았다 |
+| rc.5 | PR 열림 | | musl 타깃 시험(CI에 새로 추가) | `v1.0.0-rc.4` 태그(2026-11-04 KST)의 Linux 릴리스 job에서 musl 시험이 실패했고, Linux 패키지는 만들어지지 않았다. musl의 표준 라이브러리는 파일 생성 시각을 읽지 못해서, 시작 gap fill이 복사·이동된 transcript의 옛 줄을 가려내지 못했다. rc.5는 `statx`로 직접 읽는다. PR CI의 Linux job도 musl로 시험한다. canary는 rc.5로 시작한다 |
+| 1.0.0 | 남음 | | | rc.5 canary 판정 통과와 운영자 승인(O3) 뒤 8절 순서대로. 정식 태그의 릴리스 경로(draft 업로드 → 서명 → 게시)는 GitHub에서 아직 한 번도 돌지 않았다 |
 
 ### 변경 기록
 
@@ -443,3 +444,4 @@ Copilot CLI 어댑터(설치·실 payload 필요), Gemini CLI 어댑터, 프롬�
 | 2026-11-03 | #188 머지 뒤 정리 #189와 rc.4 버전 PR #190 추가. `v1.0.0`을 정하는 canary 판정은 rc.4로 새로 연 창에서 | #188이 레코더 경로를 바꿈. 7절: 레코더 경로를 고쳤으면 canary 시계도 다시 시작 |
 | 2026-11-03 | O7 결정: E1–E3 사다리가 살아 있는 게이트, E1의 릴리스는 `v1.0.0` 정식 태그, E1 마감은 `v1.0.0` 게시와 랜딩 공개 중 늦은 날의 1주 뒤(글 두 편 포함) | 운영자가 9절 O7의 권고를 받아들임. `docs/saas-strategy.md`·`docs/saas-hypothesis.md`·HANDOFF에 날짜와 함께 덧붙이고, 지난 기록은 고치지 않음 |
 | 2026-11-04 | rc.4 태그 전 보강 #191 추가 | 실제 바이너리와 실제 Codex app-server로 확인하다 두 결함을 찾음: canary 롤백이 rc.3의 시작 gap fill을 다시 돌림, Codex의 이어진 rollout 이름을 세션으로 읽음. 태그 전이라 canary 창에 영향 없음 |
+| 2026-11-04 | rc.4 태그 뒤 rc.5 추가, canary는 rc.5로 | rc.4 태그의 Linux 릴리스 job이 musl에서 생성 시각 결함을 잡았다. PR CI는 glibc만 시험하고 있었다 |
