@@ -6,7 +6,7 @@ the entry says so when it does.
 
 ## [Unreleased]
 
-## [1.0.0-rc.5] — 2026-11-03
+## [1.0.0-rc.5] — 2026-11-04
 
 rc.4 with one fix to the Linux packages. Everything rc.4 lists below is in it.
 
