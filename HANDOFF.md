@@ -557,18 +557,19 @@ landed, what was measured and what was cut. What is left needs a person:
      apart a copied transcript's old lines, and it read files in path order.
    - **rc.5.** It carries the fix, and the pull request checks now run the suite on
      the musl targets as well.
-   - **What is left:** tag and sign `v1.0.0-rc.5` and start the canary on it (O2).
-     Read the verdict when its window closes. Only on a pass, tag, sign and publish
-     `v1.0.0` (O3).
+   - **The rc.5 canary is live.** `v1.0.0-rc.5` was tagged, signed and notarized,
+     and swapped onto the live recorder on 2026-11-04 at 06:34 UTC by
+     `canary.sh start` (O2). Its window closes on 2026-11-11 at 06:34 UTC.
+   - **What is left:** the planned restarts on day 1 and day 6 (`canary.sh restart`),
+     outside the operator's blackout. Read the verdict when the window closes. Only on
+     a pass, tag, sign and publish `v1.0.0` (O3).
    - **First run of the stable path.** The stable release path, a draft upload and
      then publishing it, runs on GitHub for the first time at `v1.0.0`.
 
-   Until rc.5 is swapped in, every start of the live recorder runs rc.3's
-   start-up gap fill, which copies a parent conversation's turns into its fork
-   and writes a spooled turn twice; the log cannot take either back. So the
-   recorder is not restarted and the machine not rebooted before the swap.
-   `canary.sh` loads rc.2 and rc.3 with that fill off (`docs/release.md`), but
-   only through its own subcommands.
+   A rollback returns to rc.3, whose start-up gap fill copies a parent
+   conversation's turns into its fork and writes a spooled turn twice; the log
+   cannot take either back. `canary.sh` loads rc.2 and rc.3 with that fill off
+   (`docs/release.md`), but only through its own subcommands.
 2. **RFD 0002 and 0003** stay drafts until the operator accepts them; no sync
    service exists.
 3. Then back to `docs/self-improve.md`, from live evidence rather than this
