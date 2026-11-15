@@ -266,6 +266,34 @@ await new Promise((resolve) => setTimeout(resolve, 200));
 if (typeof dispose === "function") dispose();
 "#;
 
+    /// As `DRIVER_V2`, with two server locations open in one process. OpenCode
+    /// 2.x sets a plugin up once per location, and each setup's
+    /// `ctx.event.subscribe()` yields the events of every location ("across all
+    /// server locations"), so both instances see each event, with its one `id`.
+    const DRIVER_V2_TWO_LOCATIONS: &str = r#"import { readFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const [plugin, script] = process.argv.slice(2);
+const definition = (await import(pathToFileURL(plugin).href)).default;
+const events = JSON.parse(readFileSync(script, "utf8"));
+const at = (directory) => ({
+  location: { directory },
+  event: {
+    subscribe: ({ signal }) => ({
+      async *[Symbol.asyncIterator]() {
+        for (const event of events) {
+          if (signal?.aborted) return;
+          yield event;
+        }
+      },
+    }),
+  },
+});
+const disposals = [definition.setup(at("/repo")), definition.setup(at("/elsewhere"))];
+await new Promise((resolve) => setTimeout(resolve, 200));
+for (const dispose of disposals) if (typeof dispose === "function") dispose();
+"#;
+
     fn current(bin: &Path) -> String {
         opencode_plugin_source_for(bin, PluginApi::V1)
     }
@@ -874,6 +902,43 @@ if (typeof dispose === "function") dispose();
         assert_eq!(errors[0]["error"], failure);
         assert_eq!(errors[0]["cwd"], "/repo");
         assert_eq!(sent.len(), 2, "nothing else is sent: {sent:?}");
+    }
+
+    #[test]
+    fn opencode_2_sends_each_event_once_with_two_locations_open() {
+        // OpenCode 2.2.5 on this machine, Nov 2026: with two locations open, every
+        // turn reached the log twice, 4 ms apart, under two hook ids.
+        let mut finished = bus(
+            "session.execution.succeeded",
+            json!({ "sessionID": SESSION }),
+        );
+        finished["id"] = json!("evt_finished_1");
+        let mut second = enqueued("msg_2", "user", "and again");
+        second["id"] = json!("evt_enqueued_2");
+        let mut finished_again = finished.clone();
+        finished_again["id"] = json!("evt_finished_2");
+        let sent = drive_with(
+            DRIVER_V2_TWO_LOCATIONS,
+            current_v2,
+            &[
+                enqueued("msg_1", "user", PROMPT),
+                finished,
+                second,
+                finished_again,
+            ],
+            KEEPS,
+        );
+        assert_eq!(
+            turns(&sent),
+            vec![turn("msg_1", PROMPT), turn("msg_2", "and again")],
+            "{sent:?}"
+        );
+        let ends = sent
+            .iter()
+            .filter(|p| p["hook_event_name"] == "session.execution.succeeded")
+            .count();
+        assert_eq!(ends, 2, "one end per finished execution: {sent:?}");
+        assert_eq!(sent.len(), 4, "nothing is sent twice: {sent:?}");
     }
 
     #[test]
