@@ -2656,6 +2656,15 @@ boot_serving_fixture "[]"
 run verdict >"$tmp/verdict-bootserving-none.out" 2>&1 || true
 expect_grep '^UNCHECKED serving-budget — the newest start is a boot.s own' "$tmp/verdict-bootserving-none.out" \
     "with no planned restart, a boot's start leaves serving open"
+# Only a boot's first start is excused: a crash relaunch later in that boot is judged.
+boot_serving_fixture "[{\"ts\":\"$(iso_ago $((5 * DAY)))\",\"serving_ms\":4000,\"new_drops\":0}]"
+printf '%s conbus daemon: beef: socket /x/sock log /x/log (10 record(s), 0 unreadable) core_dumps_disabled=true memory_locked=true booted=%s\n' \
+    "$(iso_ago $((2 * DAY - 900)))" "$(iso_ago $((2 * DAY)))" >>"$home/.conbus/daemon.log"
+printf '{"build":"beef","pid":%s,"started":"%s","serving":"%s"}\n' "$recorder_pid" \
+    "$(iso_ago $((2 * DAY - 860)))" "$(iso_ago $((2 * DAY - 900)))" >"$home/.conbus/daemon.build"
+run verdict >"$tmp/verdict-bootserving-crash.out" 2>&1 || true
+expect_grep '^FAIL serving-budget — start->serving 40000 ms' "$tmp/verdict-bootserving-crash.out" \
+    "a slow relaunch after a crash in a boot is judged, not excused"
 boot_at_none
 
 # Inside the window the verdict is "incomplete", not a pass.

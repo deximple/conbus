@@ -75,7 +75,7 @@ export default {
         } else if (
           event?.type === "session.execution.succeeded" &&
           data.sessionID &&
-          first(event.id)
+          first(event.id && `exec:${data.sessionID}:${event.id}`)
         ) {
           void send({
             opencode_plugin: 1,
@@ -86,7 +86,7 @@ export default {
         } else if (
           event?.type === "session.execution.failed" &&
           data.sessionID &&
-          first(event.id)
+          first(event.id && `exec:${data.sessionID}:${event.id}`)
         ) {
           void send({
             opencode_plugin: 1,

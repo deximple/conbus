@@ -55,14 +55,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_boot_is_in_the_past_and_after_this_code_was_written() {
+    fn the_boot_is_in_the_past_and_not_the_epoch() {
         let booted = booted().expect("the kernel names its boot");
         let now = Timestamp::now();
         assert!(now.seconds_since(booted) >= 0, "{booted} is after {now}");
-        let written = Timestamp::from_unix_seconds(1_793_000_000).expect("a time");
-        assert!(
-            booted.seconds_since(written) > 0,
-            "{booted} is before 2026-10"
-        );
+        // Any host may have booted long ago; a zero or garbage value would not
+        // be after 2000.
+        let floor = Timestamp::from_unix_seconds(946_684_800).expect("a time");
+        assert!(booted.seconds_since(floor) > 0, "{booted} is before 2000");
     }
 }

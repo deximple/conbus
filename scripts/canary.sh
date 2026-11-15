@@ -2649,6 +2649,12 @@ case $sub in
             nb=$(ts_epoch "$newest_booted") nl=$(ts_epoch "${newest_line%% *}")
             if is_uint "${nb:-}" && is_uint "${nl:-}" && [ $((nl - nb)) -ge 0 ] && [ $((nl - nb)) -le "$boot_grace_s" ]; then
                 boot_start=1
+                # Only the boot's first start: a crash relaunch later in the
+                # same boot names that boot too, and its time is the build's.
+                for st in $(awk -v s="$since" '$1 ~ /^[0-9]/ && $1 > s && /conbus daemon: .*: socket .* log / { print $1 }' "$daemon_log" | sed '$d'); do
+                    se=$(ts_epoch "$st")
+                    if is_uint "${se:-}" && [ "$se" -ge "$nb" ]; then boot_start=""; break; fi
+                done
             fi
         fi
         recorded_servings=$(grep -o '"serving_ms":-\{0,1\}[0-9]*' "$state_file" 2>/dev/null | cut -d: -f2 | tr '\n' ' ' || true)
