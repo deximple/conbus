@@ -1969,8 +1969,11 @@ pub fn serve(paths: &Paths, retention: Retention) -> io::Result<()> {
         note!("could not mark the stamp serving: {err}");
     }
 
+    // The boot goes on the line itself: the OS lists of past boots can start
+    // afresh (a macOS update did), and the canary tells a boot's start from a
+    // crash by this line alone.
     note!(
-        "{}: socket {} log {} ({} record(s), {} unreadable) core_dumps_disabled={} memory_locked={}{}",
+        "{}: socket {} log {} ({} record(s), {} unreadable) core_dumps_disabled={} memory_locked={}{} booted={}",
         crate::build_info::BUILD,
         paths.socket().display(),
         paths.log_dir().display(),
@@ -1983,6 +1986,7 @@ pub fn serve(paths: &Paths, retention: Retention) -> io::Result<()> {
             .as_deref()
             .map(|e| format!(" ({e})"))
             .unwrap_or_default(),
+        crate::boot::booted().map_or_else(|| "unknown".to_string(), |at| at.to_string()),
     );
 
     listener.set_nonblocking(true)?;
@@ -2481,13 +2485,19 @@ fn drain_pass(daemon: &mut Daemon, paths: &Paths) {
                 // lost tool call.
                 let kind = kind_of(&request.event);
                 let session: String = request.vendor_session_id.chars().take(8).collect();
+                // And the harness: 9,609 ghost session ends in the rc.5 canary
+                // could not be traced to the vendor that sent them.
+                let named = format!(
+                    "{kind} for session {session} from {}",
+                    request.harness.as_str()
+                );
                 let key = SessionKey::new(request.harness.clone(), &request.vendor_session_id);
                 let waits = mid_turn(&request.event);
                 match daemon.record(request, false) {
                     Response::Failed { error } if error.contains("protocol v") => {
                         // A newer hook wrote this; a newer daemon drains it, if
                         // one comes.
-                        let detail = format!("{kind} for session {session}");
+                        let detail = named;
                         if outlived(&file, WAITING_LIFE) {
                             let_go(paths, &file, error, detail);
                         } else {
@@ -2505,7 +2515,7 @@ fn drain_pass(daemon: &mut Daemon, paths: &Paths) {
                         if !(outlived(&file, WAITING_LIFE) && daemon.refusing_for(WAITING_LIFE)) {
                             break;
                         }
-                        let_go(paths, &file, error, format!("{kind} for session {session}"));
+                        let_go(paths, &file, error, named);
                     }
                     Response::Failed { error } => {
                         crate::drops::record_in(
@@ -2515,7 +2525,7 @@ fn drain_pass(daemon: &mut Daemon, paths: &Paths) {
                         let _ = std::fs::remove_file(&file);
                     }
                     Response::Orphaned => {
-                        let detail = format!("{kind} for session {session}");
+                        let detail = named;
                         if !waits || outlived(&file, ORPHAN_LIFE) {
                             give_up_on_an_orphan(paths, &file, &detail);
                         } else {

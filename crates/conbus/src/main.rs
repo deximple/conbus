@@ -8,6 +8,7 @@ mod arena;
 mod auth;
 mod backfill;
 mod backup;
+mod boot;
 mod build_info;
 mod cli;
 mod code;

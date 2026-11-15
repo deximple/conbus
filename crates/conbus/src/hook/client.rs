@@ -600,8 +600,9 @@ fn send(
             "no conversation for this session; the daemon has no binding for it (no prompt from this session has reached it)",
         )
         .with_detail(format!(
-            "{hook_event_name} for session {}",
-            request.vendor_session_id.chars().take(8).collect::<String>()
+            "{hook_event_name} for session {} from {}",
+            request.vendor_session_id.chars().take(8).collect::<String>(),
+            request.harness.as_str()
         ))),
         Ok(Response::Withheld) => {
             Err("retention withheld this record from disk".to_string().into())

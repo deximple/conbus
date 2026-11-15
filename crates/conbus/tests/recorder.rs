@@ -825,7 +825,7 @@ fn an_event_the_daemon_cannot_place_is_reported_rather_than_dropped_in_silence()
                 .find(|drop| {
                     drop["detail"]
                         .as_str()
-                        .is_some_and(|d| d.ends_with("for session s-orphan"))
+                        .is_some_and(|d| d.ends_with("for session s-orphan from claude_code"))
                 });
             if last.is_some() {
                 break;
@@ -837,8 +837,8 @@ fn an_event_the_daemon_cannot_place_is_reported_rather_than_dropped_in_silence()
     assert!(
         last["detail"]
             .as_str()
-            .is_some_and(|d| d.ends_with("for session s-orphan")),
-        "the drop must name the event and the session: {last}"
+            .is_some_and(|d| d.ends_with("for session s-orphan from claude_code")),
+        "the drop must name the event, the session and the harness: {last}"
     );
 
     daemon.stop();
@@ -1929,6 +1929,28 @@ fn every_line_of_the_daemon_log_says_when_it_happened() {
     assert!(
         text.contains("sent no request"),
         "the silence drop should be in the log: {text}"
+    );
+    // The start line names the boot it ran in, which is how the canary tells a
+    // boot's start from a crash once the OS lists of past boots are gone.
+    let start = lines
+        .iter()
+        .find(|line| line.contains(": socket ") && line.contains(" log "))
+        .unwrap_or_else(|| panic!("no start line: {text}"));
+    let booted = start
+        .split(" booted=")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .unwrap_or_else(|| panic!("the start line names no boot: {start}"));
+    let booted: conbus_core::clock::Timestamp = booted
+        .parse()
+        .unwrap_or_else(|_| panic!("not a time: {booted} in {start}"));
+    let said = start
+        .get(..24)
+        .and_then(|stamp| stamp.parse::<conbus_core::clock::Timestamp>().ok())
+        .expect("a time");
+    assert!(
+        said.seconds_since(booted) >= 0,
+        "booted after the start: {start}"
     );
 }
 
