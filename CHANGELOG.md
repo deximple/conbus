@@ -6,6 +6,38 @@ the entry says so when it does.
 
 ## [Unreleased]
 
+What the rc.5 canary found. Its verdict failed on three items. None of the three
+was a record lost or misread, and the fixes below target each cause.
+
+### Fixed
+
+- OpenCode 2.x turns reached the log twice. OpenCode sets a plugin up once per
+  open server location, and each setup is handed the events of every location.
+  So with two locations open, each prompt and each finished execution ran the
+  hook twice, 4 ms apart. Readers already counted the second one only as
+  `repeated`. The plugin now remembers what it sent for the whole process, by
+  inbox id and by OpenCode's own event id. `conbus install --apply` writes the
+  new plugin.
+- `canary.sh verdict` counted boots as crashes once the OS forgot them. The
+  macOS 27.2.1 update started `last reboot` and the power log afresh, so two
+  earlier boots read as unplanned restarts. The daemon's start line now names the
+  boot it ran in (`booted=`), and the verdict reads boots from there as well.
+- The verdict's usage-parity check rewrote the live sidecar cache on every day it
+  compared, about 10 GB in one verdict. Each sidecar is stamped with the build
+  that wrote it, and the baseline and the candidate took turns replacing them.
+  The baseline now reads past the cache (`CONBUS_NO_CACHE=1`).
+- A drop for an event with no conversation now names the harness that sent it:
+  `session_ended for session 1a2b3c4d from codex`. In the rc.5 canary, 9,609
+  such session ends could not be traced to a vendor.
+
+### Changed
+
+- serving-budget no longer judges a start that a machine boot made. Everything a
+  login starts competes with that start. On the test machine, the same 1 GB of
+  sidecars read in 1.4 s cold on a quiet machine and took 18–47 s just after a
+  boot. The verdict still prints that start's time and judges the planned
+  restarts in its place. With no planned restart recorded, the item stays open.
+
 ## [1.0.0-rc.5] — 2026-11-04
 
 rc.4 with one fix to the Linux packages. Everything rc.4 lists below is in it.

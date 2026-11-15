@@ -2451,6 +2451,27 @@ printf '%s conbus daemon: beef: socket /x/sock log /x/log (10 record(s), 0 unrea
 code=0; run verdict >"$tmp/verdict-reboot-same.out" 2>&1 || code=$?
 expect 0 "$code" "the same boot from both sources"
 expect_grep '^PASS reboots — 1 reboot(s) in the window' "$tmp/verdict-reboot-same.out" "counts once"
+# The OS lists can begin afresh (the macOS 27.2.1 update did): a boot only the start line
+# names is still a boot, and the same boot from the line and kern.boottime counts once.
+verdict_fixture
+boot_at "$(iso_ago $((2 * DAY)))"
+printf '%s conbus daemon: beef: socket /x/sock log /x/log (10 record(s), 0 unreadable) core_dumps_disabled=true memory_locked=true booted=%s\n' \
+    "$(iso_ago $((5 * DAY - 200)))" "$(iso_ago $((5 * DAY)))" >>"$home/.conbus/daemon.log"
+printf '%s conbus daemon: beef: socket /x/sock log /x/log (10 record(s), 0 unreadable) core_dumps_disabled=true memory_locked=true booted=%s\n' \
+    "$(iso_ago $((2 * DAY - 180)))" "$(iso_ago $((2 * DAY)))" >>"$home/.conbus/daemon.log"
+run verdict >"$tmp/verdict-reboot-named.out" 2>&1 || true
+# Not the exit code: the newest start is a boot's own with no planned restart beside
+# it, so serving-budget stays open, which its own scenario pins.
+expect_grep '^PASS restarts' "$tmp/verdict-reboot-named.out" "a boot only its start line names is not a crash"
+expect_grep '^PASS reboots — 2 reboot(s) in the window' "$tmp/verdict-reboot-named.out" "both boots are counted, the shared one once"
+# A crash relaunch names the boot it crashed in, so it is still the second start of that boot.
+verdict_fixture
+boot_at_none
+printf '%s conbus daemon: beef: socket /x/sock log /x/log (10 record(s), 0 unreadable) core_dumps_disabled=true memory_locked=true booted=%s\n' \
+    "$(iso_ago $((3 * DAY - 200)))" "$(iso_ago $((3 * DAY)))" "$(iso_ago $((DAY)))" "$(iso_ago $((3 * DAY)))" >>"$home/.conbus/daemon.log"
+code=0; run verdict >"$tmp/verdict-reboot-named-crash.out" 2>&1 || code=$?
+expect 1 "$code" "a crash in a named boot is a crash"
+expect_grep '^FAIL restarts — 1 unplanned' "$tmp/verdict-reboot-named-crash.out" "and is counted"
 # A crash relaunch is still a fail: with no boot near it, and as a second start after one.
 verdict_fixture
 boot_at "$(iso_ago $((3 * DAY)))"
@@ -2614,6 +2635,37 @@ code=0
 run verdict >"$tmp/verdict-servingms.out" 2>&1 || code=$?
 expect 1 "$code" "a serving time over budget by a fraction fails"
 expect_grep '^FAIL serving-budget.*5900 ms' "$tmp/verdict-servingms.out" "the fraction is kept"
+# A start a boot made is shown, not judged; the planned restarts are judged in its place.
+boot_serving_fixture() { # boot_serving_fixture <restarts-json>
+    verdict_fixture "" "$1"
+    boot_at "$(iso_ago $((2 * DAY)))"
+    printf '%s conbus daemon: beef: socket /x/sock log /x/log (10 record(s), 0 unreadable) core_dumps_disabled=true memory_locked=true booted=%s\n' \
+        "$(iso_ago $((2 * DAY - 260)))" "$(iso_ago $((2 * DAY)))" >>"$home/.conbus/daemon.log"
+    printf '{"build":"beef","pid":%s,"started":"%s","serving":"%s"}\n' "$recorder_pid" \
+        "$(iso_ago $((2 * DAY - 216)))" "$(iso_ago $((2 * DAY - 260)))" >"$home/.conbus/daemon.build"
+}
+boot_serving_fixture "[{\"ts\":\"$(iso_ago $((5 * DAY)))\",\"serving_ms\":4000,\"new_drops\":0}]"
+run verdict >"$tmp/verdict-bootserving.out" 2>&1 || true
+expect_grep '^PASS serving-budget — planned restarts 4000ms ≤ 5000; the newest start is a boot.s own: 44000 ms' \
+    "$tmp/verdict-bootserving.out" "a boot's 44 s start is shown, and the planned restart is judged"
+boot_serving_fixture "[{\"ts\":\"$(iso_ago $((5 * DAY)))\",\"serving_ms\":9000,\"new_drops\":0}]"
+run verdict >"$tmp/verdict-bootserving-slow.out" 2>&1 || true
+expect_grep '^FAIL serving-budget — planned restarts 9000ms' "$tmp/verdict-bootserving-slow.out" \
+    "a slow planned restart still fails beside a boot's start"
+boot_serving_fixture "[]"
+run verdict >"$tmp/verdict-bootserving-none.out" 2>&1 || true
+expect_grep '^UNCHECKED serving-budget — the newest start is a boot.s own' "$tmp/verdict-bootserving-none.out" \
+    "with no planned restart, a boot's start leaves serving open"
+# Only a boot's first start is excused: a crash relaunch later in that boot is judged.
+boot_serving_fixture "[{\"ts\":\"$(iso_ago $((5 * DAY)))\",\"serving_ms\":4000,\"new_drops\":0}]"
+printf '%s conbus daemon: beef: socket /x/sock log /x/log (10 record(s), 0 unreadable) core_dumps_disabled=true memory_locked=true booted=%s\n' \
+    "$(iso_ago $((2 * DAY - 900)))" "$(iso_ago $((2 * DAY)))" >>"$home/.conbus/daemon.log"
+printf '{"build":"beef","pid":%s,"started":"%s","serving":"%s"}\n' "$recorder_pid" \
+    "$(iso_ago $((2 * DAY - 860)))" "$(iso_ago $((2 * DAY - 900)))" >"$home/.conbus/daemon.build"
+run verdict >"$tmp/verdict-bootserving-crash.out" 2>&1 || true
+expect_grep '^FAIL serving-budget — start->serving 40000 ms' "$tmp/verdict-bootserving-crash.out" \
+    "a slow relaunch after a crash in a boot is judged, not excused"
+boot_at_none
 
 # Inside the window the verdict is "incomplete", not a pass.
 verdict_fixture "$(date -u +%Y-%m-%dT00:00:00.000Z)"

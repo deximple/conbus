@@ -12,9 +12,16 @@
 // never receive one.
 import { spawn } from "node:child_process";
 
-// How many inbox ids are remembered; the oldest is forgotten first, so a long
+// How many ids are remembered; the oldest is forgotten first, so a long
 // session cannot grow the set.
 const KNOWN = 1024;
+
+// What this process already sent, shared by every setup in it. OpenCode sets a
+// plugin up once per server location, and each setup's `ctx.event.subscribe()`
+// yields the events of all locations, so with two locations open each event
+// reached the hook twice. Kept on `globalThis` so a module loaded again for
+// another location, or after a hot reload, shares it too.
+const SENT = (globalThis[Symbol.for("conbus.opencode.sent")] ??= new Set());
 
 export default {
   id: "conbus",
@@ -37,11 +44,13 @@ export default {
         }
       });
 
-    const sent = new Set();
+    // An event with no id of its own is sent: a missed duplicate costs a
+    // `repeated` count, a missed event costs the record.
     const first = (id) => {
-      if (sent.has(id)) return false;
-      sent.add(id);
-      if (sent.size > KNOWN) sent.delete(sent.values().next().value);
+      if (typeof id !== "string" || !id) return true;
+      if (SENT.has(id)) return false;
+      SENT.add(id);
+      if (SENT.size > KNOWN) SENT.delete(SENT.values().next().value);
       return true;
     };
     const where = (event) => event?.location?.directory ?? ctx?.location?.directory ?? null;
@@ -54,7 +63,7 @@ export default {
           const item = data.item;
           const text = item?.payload?.text;
           if (item?.type !== "user" || typeof text !== "string" || !text) continue;
-          if (!data.sessionID || !data.inboxID || !first(data.inboxID)) continue;
+          if (!data.sessionID || !data.inboxID || !first(`inbox:${data.inboxID}`)) continue;
           void send({
             opencode_plugin: 1,
             hook_event_name: "message.part.updated",
@@ -63,14 +72,22 @@ export default {
             message_id: data.inboxID,
             prompt: text,
           });
-        } else if (event?.type === "session.execution.succeeded" && data.sessionID) {
+        } else if (
+          event?.type === "session.execution.succeeded" &&
+          data.sessionID &&
+          first(event.id && `exec:${data.sessionID}:${event.id}`)
+        ) {
           void send({
             opencode_plugin: 1,
             hook_event_name: "session.execution.succeeded",
             session_id: data.sessionID,
             cwd: where(event),
           });
-        } else if (event?.type === "session.execution.failed" && data.sessionID) {
+        } else if (
+          event?.type === "session.execution.failed" &&
+          data.sessionID &&
+          first(event.id && `exec:${data.sessionID}:${event.id}`)
+        ) {
           void send({
             opencode_plugin: 1,
             hook_event_name: "session.error",
