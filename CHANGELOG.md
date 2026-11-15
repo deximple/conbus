@@ -6,6 +6,10 @@ the entry says so when it does.
 
 ## [Unreleased]
 
+## [1.0.0-rc.6] — 2026-11-15
+
+rc.5 with what its canary found. Everything rc.5 and rc.4 list below is in it.
+
 What the rc.5 canary found. Its verdict failed on three items. None of the three
 was a record lost or misread, and the fixes below target each cause.
 
