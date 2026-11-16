@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/conbus", "crates/conbus-core"]
 
 [workspace.package]
-version = "1.0.0-rc.6"
+version = "1.0.0-rc.7"
 edition = "2024"
 rust-version = "1.99"
 license = "Apache-2.0"
@@ -17,7 +17,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 time = { version = "0.3", default-features = false, features = ["std", "formatting", "parsing", "macros"] }
 tempfile = "3"
-uuid = { version = "1", default-features = false, features = ["v7", "std"] }
+uuid = { version = "1.29.1", default-features = false, features = ["v7", "std"] }
 
 [profile.release]
 lto = "thin"

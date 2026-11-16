@@ -562,16 +562,20 @@ landed, what was measured and what was cut. What is left needs a person:
      usage-parity agreed on 11 closed days. Each cause is fixed in #195 and listed in
      the rc.6 changelog. The causes were two boots the OS forgot after a macOS
      update, OpenCode sending each event twice, and starts just after a boot.
-   - **rc.6** carries those fixes. Its canary starts once it is tagged and signed.
+   - **rc.6** carries those fixes. Its release run failed on Linux x86_64, on a
+     spool that drained out of order, so rc.6 was never signed or shipped whole.
      The day-6 planned restart of the rc.5 window was missed, because the scheduled
      check-in did nothing after 11-08. Run the planned restarts by hand.
-   - **What is left:** the rc.6 canary and its planned restarts on day 1 and day 6
+   - **rc.7** is rc.6 with that fix: ids now carry the fraction of the millisecond,
+     and the spool drains in the order the hooks wrote it. Its canary starts once
+     it is tagged and signed.
+   - **What is left:** the rc.7 canary and its planned restarts on day 1 and day 6
      (`canary.sh restart`), outside the operator's blackout. Read the verdict when
      the window closes. Only on a pass, tag, sign and publish `v1.0.0` (O3).
    - **First run of the stable path.** The stable release path, a draft upload and
      then publishing it, runs on GitHub for the first time at `v1.0.0`.
 
-   A rollback from rc.6 returns to rc.5. A rollback to rc.3, whose start-up gap fill copies a parent
+   A rollback from rc.7 returns to rc.5. A rollback to rc.3, whose start-up gap fill copies a parent
    conversation's turns into its fork and writes a spooled turn twice; the log
    cannot take either back. `canary.sh` loads rc.2 and rc.3 with that fill off
    (`docs/release.md`), but only through its own subcommands.

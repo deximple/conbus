@@ -2,6 +2,7 @@
 
 use std::fmt;
 use std::str::FromStr;
+use std::sync::{LazyLock, Mutex};
 
 /// The conversation identity the bus owns. Vendor session IDs are aliases of it.
 ///
@@ -16,8 +17,21 @@ const CANONICAL_LEN: usize = 36;
 impl BusId {
     /// Mint a fresh conversation identity.
     pub fn mint() -> Self {
-        BusId(uuid::Uuid::now_v7().as_u128())
+        static CONTEXT: LazyLock<Mutex<uuid::ContextV7>> = LazyLock::new(|| Mutex::new(context()));
+        BusId(uuid::Uuid::new_v7(uuid::Timestamp::now(&*CONTEXT)).as_u128())
     }
+}
+
+/// The context every id is minted from.
+///
+/// To the millisecond, the rest of a version 7 id is random, and ids minted by
+/// two processes in the same millisecond sort either way. Each hook is a
+/// process, and the spool drains in id order. The fraction of the millisecond
+/// goes in too (RFC 9562 section 6.2, method 3), to a quarter of a microsecond.
+/// It takes uuid 1.29.1: before 1.29 the version field overwrote the fraction's
+/// top four bits, and 1.29.1 stopped the fraction overwriting the counter.
+fn context() -> uuid::ContextV7 {
+    uuid::ContextV7::new().with_additional_precision()
 }
 
 impl fmt::Display for BusId {
@@ -102,6 +116,21 @@ mod tests {
             serde_json::from_str::<BusId>(&json).expect("deserialise"),
             id
         );
+    }
+
+    #[test]
+    fn ids_from_two_processes_within_a_millisecond_sort_in_the_order_minted() {
+        // Every hook is a process of its own with a context of its own, seeded
+        // at random, and the spool drains in id order. Two hooks half a
+        // millisecond apart landed in either order before the fraction of the
+        // millisecond went into the id: rc.6's release run caught it.
+        const SECONDS: u64 = 1_763_200_000;
+        for _ in 0..1000 {
+            let earlier =
+                uuid::Uuid::new_v7(uuid::Timestamp::from_unix(context(), SECONDS, 100_000));
+            let later = uuid::Uuid::new_v7(uuid::Timestamp::from_unix(context(), SECONDS, 600_000));
+            assert!(earlier < later, "{earlier} sorts after {later}");
+        }
     }
 
     #[test]
