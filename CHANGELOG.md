@@ -6,6 +6,25 @@ the entry says so when it does.
 
 ## [Unreleased]
 
+## [1.0.0-rc.7] — 2026-11-16
+
+rc.6 with one fix. rc.6 was tagged but never shipped whole: its release run
+failed on Linux x86_64, on the test this fix is for, so it has no x86_64 Linux
+package and was never signed. Everything rc.6 lists below is in rc.7.
+
+### Fixed
+
+- A spool drained in the order its ids sorted, not the order the hooks wrote
+  it. Every hook is a process of its own, and each spooled request is named by
+  an id that is ordered only to the millisecond, with the rest random. So two
+  hooks less than a millisecond apart, a static Linux binary's start-up, could
+  land in either order once the recorder came back. Ids now carry the fraction
+  of the millisecond too (RFC 9562, section 6.2, method 3), to about a quarter
+  of a microsecond. That took uuid 1.29.1: before 1.29, the version field
+  overwrote the top four bits of a counter wider than 12 bits, which is where
+  the fraction goes, and 1.29.1 fixed a case where the fraction overwrote the
+  counter's increment.
+
 ## [1.0.0-rc.6] — 2026-11-15
 
 rc.5 with what its canary found. Everything rc.5 and rc.4 list below is in it.
