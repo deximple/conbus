@@ -289,6 +289,13 @@ fn a_live_thread(case: &Case) {
             "prompt": "before", "turn_id": "t0", "cwd": "/repo", "model": "m",
             "permission_mode": "default", "transcript_path": null}),
     );
+    // A hook whose reply is late on a busy runner spools its record, and the daemon
+    // drains it a tick later. Stopping the daemon before then left the spool behind.
+    let end = Instant::now() + Duration::from_secs(30);
+    while !(prompts_in_the_log(case, "before") > 0 && nothing_spooled(case)) {
+        assert!(Instant::now() < end, "the first prompt never landed");
+        std::thread::sleep(Duration::from_millis(50));
+    }
     let _ = daemon.kill();
     let _ = daemon.wait();
     let rollouts = case.home.join(".codex/sessions/2026/11/01");
@@ -401,6 +408,11 @@ fn parent_of(pid: i32) -> i32 {
         .expect("a parent")
 }
 
+/// Whether the spool holds no request.
+fn nothing_spooled(case: &Case) -> bool {
+    std::fs::read_dir(case.home.join("spool")).map_or(true, |mut entries| entries.next().is_none())
+}
+
 fn chmod(path: &Path, mode: u32) {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("chmod");
@@ -431,6 +443,8 @@ fn a_hangup_after_a_repair_that_fell_back_lands_what_the_daemon_holds() {
     let case = a_case();
     a_live_thread(&case);
     let segment = case.home.join("log/segment-00000000.jsonl");
+    // An empty spool a late reply left is no copy, and the file takes its place.
+    let _ = std::fs::remove_dir(case.home.join("spool"));
     std::fs::write(case.home.join("spool"), "").expect("nowhere for a copy");
     chmod(&segment, 0o400);
     let mut command = Command::new(bin());
